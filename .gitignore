@@ -1,4 +1,5 @@
 /target/
+/services/douluo-media/target/
 *.dll
 *.so
 *.dylib
@@ -21,4 +22,3 @@
 .vscode/
 .DS_Store
 Thumbs.db
-

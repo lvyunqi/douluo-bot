@@ -113,13 +113,7 @@ pub fn parse_config(config_json: &str) -> Result<PluginConfig, String> {
 }
 
 pub fn validate_config(config: &PluginConfig) -> Result<(), String> {
-    let path = Path::new(&config.database.relative_path);
-    if config.database.relative_path.trim().is_empty()
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::RootDir))
-    {
+    if !is_safe_database_path(&config.database.relative_path) {
         return Err("database.relative_path 必须是 data_dir 内的安全相对路径".to_string());
     }
     if !(100..=30_000).contains(&config.database.busy_timeout_ms) {
@@ -148,15 +142,46 @@ fn valid_namespace(value: &str) -> bool {
 }
 
 pub(crate) fn is_safe_asset_key(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 200
-        && !value.starts_with('/')
-        && !value.ends_with('/')
-        && !value.contains("..")
-        && !value.contains("//")
-        && value
+    if value.is_empty()
+        || value.len() > 200
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.contains("//")
+        || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        return false;
+    }
+
+    let mut segments = value.split('/');
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    first != "sha256"
+        && first != "."
+        && first != ".."
+        && segments.all(|segment| segment != "." && segment != "..")
+}
+
+fn is_safe_database_path(value: &str) -> bool {
+    if value.trim().is_empty()
+        || value.len() > 200
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.contains("//")
+        || value.contains(['\\', ':'])
+        || value.chars().any(char::is_control)
+    {
+        return false;
+    }
+
+    value
+        .split('/')
+        .all(|segment| !matches!(segment, "" | "." | ".."))
+        && Path::new(value)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 fn validate_remote_base_url(value: &str) -> Result<(), String> {
@@ -290,6 +315,24 @@ mod tests {
         let error = parse_config(r#"{"database":{"relative_path":"../outside.db"}}"#)
             .expect_err("上级路径必须被拒绝");
         assert!(error.contains("安全相对路径"));
+
+        for path in [
+            "C:outside.db",
+            "C:/outside.db",
+            r"\\server\share\outside.db",
+            r"\\?\C:\outside.db",
+            "douluo-game/./douluo.db",
+            "douluo-game//douluo.db",
+        ] {
+            assert!(
+                parse_config(&format!(
+                    r#"{{"database":{{"relative_path":{}}}}}"#,
+                    serde_json::to_string(path).expect("path json")
+                ))
+                .is_err(),
+                "不安全数据库路径 {path} 不应通过校验"
+            );
+        }
     }
 
     #[test]
@@ -337,5 +380,18 @@ mod tests {
             r#"{"illustrations":{"mode":"remote","remote_base_url":"https://media.example.com/a/../douluo"}}"#
         )
         .is_err());
+
+        for asset_key in [
+            "maps/./village.png",
+            "maps/../village.png",
+            "maps//village.png",
+            "sha256/alias.png",
+            "地图/village.png",
+        ] {
+            assert!(
+                config.illustrations.remote_asset_url(asset_key).is_none(),
+                "不安全资源键 {asset_key} 不应生成 URL"
+            );
+        }
     }
 }

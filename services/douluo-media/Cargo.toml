@@ -1,0 +1,18 @@
+[package]
+name = "douluo-media"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Read-only image media service for the Douluo Bot"
+license = "Apache-2.0"
+repository = "https://github.com/lvyunqi/douluo-bot"
+
+[dependencies]
+axum = "0.8.8"
+httpdate = "1.0.3"
+sha2 = "0.11.0"
+tokio = { version = "1.50", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
+
+[dev-dependencies]
+tempfile = "3.24.0"
+tower = { version = "0.5.3", features = ["util"] }
