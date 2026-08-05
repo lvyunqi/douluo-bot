@@ -55,6 +55,7 @@ fn shutdown_runtime() {
 
 fn with_service(
     req: &CommandRequest,
+    audit_success: bool,
     operation: impl FnOnce(&GameService) -> Result<GameDocument, String>,
 ) -> CommandResponse {
     let service = match runtime_slot().read() {
@@ -64,7 +65,14 @@ fn with_service(
     let Some(service) = service else {
         return CommandResponse::text("斗罗大陆插件尚未完成初始化，请联系管理员");
     };
-    let document = match operation(&service) {
+    let result = operation(&service);
+    let outcome = if result.is_ok() { "ok" } else { "error" };
+    // Successful mutations write their audit row in the same SQLite
+    // transaction. Read-only commands and failed attempts are best-effort.
+    if audit_success || result.is_err() {
+        drop(service.record_operation(req, outcome));
+    }
+    let document = match result {
         Ok(document) => document,
         Err(error) => GameDocument::new("操作失败").line(error),
     };
@@ -119,7 +127,7 @@ mod plugin {
         scope = "all"
     )]
     fn menu(req: &CommandRequest) -> CommandResponse {
-        with_service(req, |service| service.menu(req.args.as_str()))
+        with_service(req, true, |service| service.menu(req.args.as_str()))
     }
 
     #[command(
@@ -130,7 +138,7 @@ mod plugin {
         scope = "all"
     )]
     fn register(req: &CommandRequest) -> CommandResponse {
-        with_service(req, |service| service.register(req))
+        with_service(req, false, |service| service.register(req))
     }
 
     #[command(
@@ -141,7 +149,7 @@ mod plugin {
         scope = "all"
     )]
     fn awaken(req: &CommandRequest) -> CommandResponse {
-        with_service(req, |service| service.awaken(req))
+        with_service(req, false, |service| service.awaken(req))
     }
 
     #[command(
@@ -152,7 +160,7 @@ mod plugin {
         scope = "all"
     )]
     fn status(req: &CommandRequest) -> CommandResponse {
-        with_service(req, |service| service.status(req))
+        with_service(req, true, |service| service.status(req))
     }
 
     #[command(
@@ -163,7 +171,7 @@ mod plugin {
         scope = "all"
     )]
     fn location(req: &CommandRequest) -> CommandResponse {
-        with_service(req, |service| service.location(req))
+        with_service(req, true, |service| service.location(req))
     }
 
     #[command(
@@ -174,7 +182,7 @@ mod plugin {
         scope = "private"
     )]
     fn inspect_legacy(req: &CommandRequest) -> CommandResponse {
-        with_service(req, |service| service.inspect_legacy(req))
+        with_service(req, true, |service| service.inspect_legacy(req))
     }
 
     #[command(
@@ -185,6 +193,6 @@ mod plugin {
         scope = "private"
     )]
     fn claim_legacy(req: &CommandRequest) -> CommandResponse {
-        with_service(req, |service| service.claim_legacy(req))
+        with_service(req, false, |service| service.claim_legacy(req))
     }
 }

@@ -6,7 +6,8 @@ use crate::config::{IllustrationMode, PluginConfig};
 use crate::identity::{ResolvedIdentity, resolve_identity};
 use crate::message::{GameDocument, Illustration};
 use crate::store::{
-    IdentityKey, LegacyClaimActor, LegacyClaimResult, LegacyIdentityState, PlayerStatus, Store,
+    IdentityKey, LegacyClaimActor, LegacyClaimResult, LegacyIdentityState, OperationLogInput,
+    PlayerStatus, Store,
 };
 
 const MENU_PAGES: &[MenuPage] = &[
@@ -83,6 +84,21 @@ impl GameService {
         &self.config.illustrations
     }
 
+    pub fn record_operation(&self, req: &CommandRequest, outcome: &str) -> Result<(), String> {
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req);
+        self.store
+            .append_operation(
+                &key,
+                req.command_name.as_str(),
+                outcome,
+                req.message_id.as_str(),
+                &details,
+            )
+            .map(|_| ())
+    }
+
     pub fn menu(&self, args: &str) -> Result<GameDocument, String> {
         let page_index = parse_menu_page(args)?;
         let page = MENU_PAGES
@@ -128,7 +144,11 @@ impl GameService {
         }
         let identity = resolve_identity(req, &self.config.identity)?;
         let key = self.identity_key(&identity, &identity.subject_id);
-        let player = self.store.register_player(&key, name, gender)?;
+        let details = operation_details(req);
+        let operation = successful_operation(req, &details);
+        let player =
+            self.store
+                .register_player_with_operation(&key, name, gender, Some(&operation))?;
         Ok(GameDocument::new("穿越成功")
             .field("角色", player.name)
             .field("性别", player.gender)
@@ -146,7 +166,11 @@ impl GameService {
     pub fn awaken(&self, req: &CommandRequest) -> Result<GameDocument, String> {
         let identity = resolve_identity(req, &self.config.identity)?;
         let key = self.identity_key(&identity, &identity.subject_id);
-        let wuhun = self.store.awaken_wuhun(&key)?;
+        let details = operation_details(req);
+        let operation = successful_operation(req, &details);
+        let wuhun = self
+            .store
+            .awaken_wuhun_with_operation(&key, Some(&operation))?;
         let illustration = self.wuhun_illustration(&wuhun.name);
         Ok(GameDocument::new("武魂觉醒")
             .line("觉醒仪式完成，你感受到一股崭新的力量。")
@@ -233,7 +257,11 @@ impl GameService {
             message_id: req.message_id.as_str(),
             reason: "owner-explicit-legacy-claim",
         };
-        let result = self.store.claim_legacy_identity(&key, &actor)?;
+        let details = operation_details(req);
+        let operation = successful_operation(req, &details);
+        let result =
+            self.store
+                .claim_legacy_identity_with_operation(&key, &actor, Some(&operation))?;
         let (status, notice) = match result {
             LegacyClaimResult::Claimed { .. } => (
                 "认领成功",
@@ -329,6 +357,30 @@ impl GameService {
                 Illustration::remote_asset(&binding.alt, &binding.asset_key, width, height).ok()
             }
         }
+    }
+}
+
+fn operation_details(req: &CommandRequest) -> String {
+    serde_json::json!({
+        "context": if req.group_id.as_str().is_empty() {
+            "private"
+        } else {
+            "group"
+        },
+        "has_args": !req.args.as_str().trim().is_empty(),
+    })
+    .to_string()
+}
+
+fn successful_operation<'a>(
+    req: &'a CommandRequest,
+    details_json: &'a str,
+) -> OperationLogInput<'a> {
+    OperationLogInput {
+        command: req.command_name.as_str(),
+        outcome: "ok",
+        source_message_id: req.message_id.as_str(),
+        details_json,
     }
 }
 
@@ -474,6 +526,85 @@ mod tests {
             .claim_legacy(&request("legacy-user 0010001 确认"))
             .expect("正确确认但没有旧档时应返回未找到");
         assert!(crate::message::render_text(&result).contains("结果：未找到"));
+    }
+
+    #[test]
+    fn operation_log_records_only_bounded_command_metadata() {
+        let directory = tempfile::tempdir().expect("临时目录应创建");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("数据库应初始化");
+        let service = GameService::with_assets(
+            store,
+            PluginConfig::default(),
+            IllustrationAssets::default(),
+        );
+        let request = CommandRequest {
+            args: abi_stable::std_types::RString::from("唐小三 男"),
+            command_name: abi_stable::std_types::RString::from("开始穿越"),
+            sender_id: abi_stable::std_types::RString::from("user-log"),
+            group_id: abi_stable::std_types::RString::from("group-log"),
+            raw_event_json: abi_stable::std_types::RString::from(
+                r#"{"self_id":10001,"qimen_context":{"version":1,"protocol":"onebot11","account_id":"10001"},"message":"secret raw body"}"#,
+            ),
+            sender_nickname: abi_stable::std_types::RString::from("private nickname"),
+            message_id: abi_stable::std_types::RString::from("message-log"),
+            timestamp: 0,
+        };
+        service
+            .register(&request)
+            .expect("角色与操作日志应原子写入");
+        let identity = resolve_identity(&request, &service.config.identity).expect("身份应解析");
+        let key = service.identity_key(&identity, &identity.subject_id);
+        let page = service
+            .store
+            .list_operation_logs(&key, None, 10)
+            .expect("日志应读取");
+        assert_eq!(page.entries.len(), 1);
+        let entry = &page.entries[0];
+        assert_eq!(entry.command, "开始穿越");
+        assert_eq!(entry.outcome, "ok");
+        assert_eq!(entry.source_message_id, "message-log");
+        assert_eq!(entry.details_json, r#"{"context":"group","has_args":true}"#);
+        for secret in [
+            "唐小三",
+            "secret raw body",
+            "private nickname",
+            "raw_event_json",
+        ] {
+            assert!(!entry.details_json.contains(secret));
+        }
+    }
+
+    #[test]
+    fn mutation_rolls_back_when_atomic_audit_is_invalid() {
+        let directory = tempfile::tempdir().expect("临时目录应创建");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("数据库应初始化");
+        let service = GameService::with_assets(
+            store,
+            PluginConfig::default(),
+            IllustrationAssets::default(),
+        );
+        let mut request = CommandRequest {
+            args: abi_stable::std_types::RString::from("唐小三 男"),
+            command_name: abi_stable::std_types::RString::from(" bad-command"),
+            sender_id: abi_stable::std_types::RString::from("atomic-user"),
+            group_id: abi_stable::std_types::RString::new(),
+            raw_event_json: abi_stable::std_types::RString::from(r#"{"self_id":10001}"#),
+            sender_nickname: abi_stable::std_types::RString::new(),
+            message_id: abi_stable::std_types::RString::from("message-atomic"),
+            timestamp: 0,
+        };
+        assert!(service.register(&request).is_err());
+
+        request.command_name = abi_stable::std_types::RString::from("状态");
+        request.args = abi_stable::std_types::RString::new();
+        assert!(
+            service
+                .status(&request)
+                .expect_err("日志写入失败时角色创建也必须回滚")
+                .contains("还没有角色")
+        );
     }
 
     #[test]

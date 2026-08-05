@@ -144,6 +144,64 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_V3: &str = r#"
+CREATE TABLE operation_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    protocol TEXT NOT NULL CHECK(protocol IN ('onebot11', 'qq-official')),
+    account_id TEXT NOT NULL CHECK(
+        length(account_id) BETWEEN 1 AND 128 AND account_id = trim(account_id)
+    ),
+    namespace TEXT NOT NULL CHECK(length(namespace) BETWEEN 1 AND 64),
+    subject_kind TEXT NOT NULL CHECK(length(subject_kind) BETWEEN 1 AND 64),
+    subject_id TEXT NOT NULL CHECK(length(subject_id) BETWEEN 1 AND 256),
+    command TEXT NOT NULL CHECK(length(command) BETWEEN 1 AND 128),
+    outcome TEXT NOT NULL CHECK(outcome IN ('ok', 'error', 'denied')),
+    source_message_id TEXT NOT NULL CHECK(length(source_message_id) <= 256),
+    details_json TEXT NOT NULL CHECK(
+        length(CAST(details_json AS BLOB)) <= 8192
+        AND json_valid(details_json)
+        AND instr(lower(details_json), 'raw_event_json') = 0
+        AND instr(lower(details_json), 'qimen_raw_event') = 0
+        AND instr(lower(details_json), 'raw_json') = 0
+        AND instr(lower(details_json), 'base64://') = 0
+        AND instr(lower(details_json), 'data:image/') = 0
+    ),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0)
+);
+
+CREATE INDEX operation_log_identity_page
+    ON operation_log(protocol, account_id, namespace, subject_kind, subject_id, id);
+
+CREATE TRIGGER operation_log_no_update
+BEFORE UPDATE ON operation_log
+BEGIN
+    SELECT RAISE(ABORT, 'operation log is append-only');
+END;
+
+CREATE TRIGGER operation_log_no_delete
+BEFORE DELETE ON operation_log
+BEGIN
+    SELECT RAISE(ABORT, 'operation log is append-only');
+END;
+
+CREATE TRIGGER operation_log_no_reinsert
+BEFORE INSERT ON operation_log
+WHEN EXISTS(SELECT 1 FROM operation_log WHERE id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'operation log is append-only');
+END;
+
+CREATE TRIGGER operation_log_safe_details
+BEFORE INSERT ON operation_log
+WHEN EXISTS(
+    SELECT 1 FROM json_each(NEW.details_json)
+     WHERE key NOT IN ('context', 'has_args', 'reason', 'duration_ms')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'operation log details field is not allowed');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -211,6 +269,37 @@ pub struct AwakenedWuhun {
     pub description: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Foundation API; chat commands are wired in a later slice.
+pub struct OperationLogEntry {
+    pub id: i64,
+    pub protocol: Protocol,
+    pub account_id: String,
+    pub namespace: String,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub command: String,
+    pub outcome: String,
+    pub source_message_id: String,
+    pub details_json: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Foundation API; chat commands are wired in a later slice.
+pub struct OperationLogPage {
+    pub entries: Vec<OperationLogEntry>,
+    pub next_after_id: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OperationLogInput<'a> {
+    pub command: &'a str,
+    pub outcome: &'a str,
+    pub source_message_id: &'a str,
+    pub details_json: &'a str,
+}
+
 impl Store {
     pub fn initialize(data_dir: &Path, config: &DatabaseConfig) -> Result<Self, String> {
         let path = data_dir.join(&config.relative_path);
@@ -260,65 +349,92 @@ impl Store {
         }
 
         set_foreign_keys(connection, false)?;
-        let migration_result = (|| -> Result<bool, String> {
+        let migration_result = (|| -> Result<(), String> {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|error| format!("开始数据库迁移 v2 失败：{error}"))?;
-            // The check must happen after BEGIN IMMEDIATE. Otherwise two first-open
-            // connections can both observe v2 as missing and one will fail creating
-            // the already-created tables after the other commits.
-            if migration_applied(&transaction, 2)? {
+                .map_err(|error| format!("开始数据库迁移 v2/v3 失败：{error}"))?;
+            // Both version checks stay behind the same write lock. A second
+            // initializer therefore observes the committed version and only
+            // validates it; it never reruns CREATE TABLE statements.
+            if !migration_applied(&transaction, 2)? {
+                let old_identity_sequence = transaction
+                    .query_row(
+                        "SELECT seq FROM sqlite_sequence WHERE name = 'identity'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(|error| format!("读取旧身份序列失败：{error}"))?;
                 transaction
-                    .commit()
-                    .map_err(|error| format!("确认数据库迁移 v2 失败：{error}"))?;
-                return Ok(false);
+                    .execute_batch(MIGRATION_V2)
+                    .map_err(|error| format!("执行数据库迁移 v2 失败：{error}"))?;
+                if let Some(sequence) = old_identity_sequence {
+                    restore_identity_sequence(&transaction, sequence)?;
+                }
+                validate_v2_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(2, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v2 失败：{error}"))?;
+            } else {
+                validate_v2_schema(&transaction)?;
             }
-            let old_identity_sequence = transaction
-                .query_row(
-                    "SELECT seq FROM sqlite_sequence WHERE name = 'identity'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(|error| format!("读取旧身份序列失败：{error}"))?;
-            transaction
-                .execute_batch(MIGRATION_V2)
-                .map_err(|error| format!("执行数据库迁移 v2 失败：{error}"))?;
-            if let Some(sequence) = old_identity_sequence {
-                restore_identity_sequence(&transaction, sequence)?;
+
+            if !migration_applied(&transaction, 3)? {
+                transaction
+                    .execute_batch(MIGRATION_V3)
+                    .map_err(|error| format!("执行数据库迁移 v3 失败：{error}"))?;
+                validate_v3_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(3, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v3 失败：{error}"))?;
+            } else {
+                validate_v3_schema(&transaction)?;
             }
-            transaction
-                .execute(
-                    "INSERT INTO schema_migration(version, applied_at) VALUES(2, ?1)",
-                    [now_timestamp()?],
-                )
-                .map_err(|error| format!("记录数据库迁移 v2 失败：{error}"))?;
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction
                 .commit()
-                .map_err(|error| format!("提交数据库迁移 v2 失败：{error}"))?;
-            Ok(true)
+                .map_err(|error| format!("提交数据库迁移 v2/v3 失败：{error}"))?;
+            Ok(())
         })();
         let restore_result = set_foreign_keys(connection, true);
 
         match (migration_result, restore_result) {
-            (Ok(_), Ok(())) => {
+            (Ok(()), Ok(())) => {
                 validate_v2_schema(connection)?;
+                validate_v3_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
-            (Ok(_), Err(restore_error)) => Err(restore_error),
+            (Ok(()), Err(restore_error)) => Err(restore_error),
             (Err(migration_error), Err(restore_error)) => Err(format!(
                 "{migration_error}；同时恢复 SQLite 外键约束失败：{restore_error}"
             )),
         }
     }
 
+    #[allow(dead_code)]
     pub fn register_player(
         &self,
         key: &IdentityKey<'_>,
         name: &str,
         gender: &str,
+    ) -> Result<PlayerStatus, String> {
+        self.register_player_with_operation(key, name, gender, None)
+    }
+
+    pub fn register_player_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        name: &str,
+        gender: &str,
+        operation: Option<&OperationLogInput<'_>>,
     ) -> Result<PlayerStatus, String> {
         validate_identity_key(key)?;
         let mut connection = self.open()?;
@@ -344,6 +460,9 @@ impl Store {
                 params![identity_id, name, gender, timestamp],
             )
             .map_err(|error| format!("创建角色失败：{error}"))?;
+        if let Some(operation) = operation {
+            insert_operation_log(&transaction, key, operation)?;
+        }
         transaction
             .commit()
             .map_err(|error| format!("提交注册事务失败：{error}"))?;
@@ -397,7 +516,16 @@ impl Store {
             .map_err(|error| format!("查询角色状态失败：{error}"))
     }
 
+    #[allow(dead_code)]
     pub fn awaken_wuhun(&self, key: &IdentityKey<'_>) -> Result<AwakenedWuhun, String> {
+        self.awaken_wuhun_with_operation(key, None)
+    }
+
+    pub fn awaken_wuhun_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        operation: Option<&OperationLogInput<'_>>,
+    ) -> Result<AwakenedWuhun, String> {
         validate_identity_key(key)?;
         let mut connection = self.open()?;
         let transaction = connection
@@ -458,6 +586,9 @@ impl Store {
                 params![player.0, wuhun.0, player.1, now_timestamp()?],
             )
             .map_err(|error| format!("保存觉醒武魂失败：{error}"))?;
+        if let Some(operation) = operation {
+            insert_operation_log(&transaction, key, operation)?;
+        }
         transaction
             .commit()
             .map_err(|error| format!("提交武魂觉醒事务失败：{error}"))?;
@@ -501,10 +632,20 @@ impl Store {
         })
     }
 
+    #[allow(dead_code)]
     pub fn claim_legacy_identity(
         &self,
         key: &IdentityKey<'_>,
         actor: &LegacyClaimActor<'_>,
+    ) -> Result<LegacyClaimResult, String> {
+        self.claim_legacy_identity_with_operation(key, actor, None)
+    }
+
+    pub fn claim_legacy_identity_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        actor: &LegacyClaimActor<'_>,
+        operation: Option<&OperationLogInput<'_>>,
     ) -> Result<LegacyClaimResult, String> {
         validate_identity_key(key)?;
         validate_claim_actor(actor)?;
@@ -600,10 +741,106 @@ impl Store {
                 ],
             )
             .map_err(|error| format!("写入旧档认领审计失败：{error}"))?;
+        if let Some(operation) = operation {
+            insert_operation_log(&transaction, key, operation)?;
+        }
         transaction
             .commit()
             .map_err(|error| format!("提交旧档认领事务失败：{error}"))?;
         Ok(LegacyClaimResult::Claimed { identity_id })
+    }
+
+    #[allow(dead_code)] // Foundation API; chat commands are wired in a later slice.
+    pub fn append_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        command: &str,
+        outcome: &str,
+        source_message_id: &str,
+        details_json: &str,
+    ) -> Result<i64, String> {
+        validate_identity_key(key)?;
+        let operation = OperationLogInput {
+            command,
+            outcome,
+            source_message_id,
+            details_json,
+        };
+        validate_operation_input(&operation)?;
+        let connection = self.open()?;
+        insert_operation_log(&connection, key, &operation)
+    }
+
+    #[allow(dead_code)] // Foundation API; chat commands are wired in a later slice.
+    pub fn list_operation_logs(
+        &self,
+        key: &IdentityKey<'_>,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> Result<OperationLogPage, String> {
+        validate_identity_key(key)?;
+        if !(1..=100).contains(&limit) {
+            return Err("操作日志分页数量必须在 1 到 100 之间".to_string());
+        }
+        let after_id = after_id.unwrap_or(0);
+        if after_id < 0 {
+            return Err("操作日志分页游标不能为负数".to_string());
+        }
+        let fetch_limit =
+            i64::try_from(limit + 1).map_err(|_| "操作日志分页数量无法转换".to_string())?;
+        let connection = self.open()?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT id, account_id, namespace, subject_kind, subject_id,
+                       command, outcome, source_message_id, details_json, created_at
+                  FROM operation_log
+                 WHERE protocol = ?1 AND account_id = ?2 AND namespace = ?3
+                   AND subject_kind = ?4 AND subject_id = ?5 AND id > ?6
+                 ORDER BY id ASC
+                 LIMIT ?7
+                "#,
+            )
+            .map_err(|error| format!("准备操作日志分页查询失败：{error}"))?;
+        let mut entries = statement
+            .query_map(
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind,
+                    key.subject_id,
+                    after_id,
+                    fetch_limit
+                ],
+                |row| {
+                    Ok(OperationLogEntry {
+                        id: row.get(0)?,
+                        protocol: key.protocol,
+                        account_id: row.get(1)?,
+                        namespace: row.get(2)?,
+                        subject_kind: row.get(3)?,
+                        subject_id: row.get(4)?,
+                        command: row.get(5)?,
+                        outcome: row.get(6)?,
+                        source_message_id: row.get(7)?,
+                        details_json: row.get(8)?,
+                        created_at: row.get(9)?,
+                    })
+                },
+            )
+            .map_err(|error| format!("查询操作日志失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析操作日志失败：{error}"))?;
+        let has_more = entries.len() > limit;
+        entries.truncate(limit);
+        let next_after_id = has_more
+            .then(|| entries.last().map(|entry| entry.id))
+            .flatten();
+        Ok(OperationLogPage {
+            entries,
+            next_after_id,
+        })
     }
 }
 
@@ -921,6 +1158,207 @@ fn validate_audit_schema(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_v3_schema(connection: &Connection) -> Result<(), String> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(operation_log)")
+        .map_err(|error| format!("读取操作日志表结构失败：{error}"))?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, bool>(5)?,
+            ))
+        })
+        .map_err(|error| format!("查询操作日志字段失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析操作日志字段失败：{error}"))?;
+    let expected_columns = vec![
+        ("id".to_string(), false, true),
+        ("protocol".to_string(), true, false),
+        ("account_id".to_string(), true, false),
+        ("namespace".to_string(), true, false),
+        ("subject_kind".to_string(), true, false),
+        ("subject_id".to_string(), true, false),
+        ("command".to_string(), true, false),
+        ("outcome".to_string(), true, false),
+        ("source_message_id".to_string(), true, false),
+        ("details_json".to_string(), true, false),
+        ("created_at".to_string(), true, false),
+    ];
+    if columns != expected_columns {
+        return Err(format!(
+            "数据库已标记迁移 v3，但操作日志字段不匹配：{columns:?}"
+        ));
+    }
+
+    let table_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'operation_log'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取操作日志建表语句失败：{error}"))?
+        .ok_or_else(|| "数据库已标记迁移 v3，但缺少 operation_log 表".to_string())?;
+    let normalized_table_sql = table_sql.to_ascii_uppercase();
+    for marker in [
+        "AUTOINCREMENT",
+        "PROTOCOL IN ('ONEBOT11', 'QQ-OFFICIAL')",
+        "OUTCOME IN ('OK', 'ERROR', 'DENIED')",
+        "JSON_VALID(DETAILS_JSON)",
+        "LENGTH(CAST(DETAILS_JSON AS BLOB)) <= 8192",
+        "INSTR(LOWER(DETAILS_JSON), 'RAW_EVENT_JSON') = 0",
+        "INSTR(LOWER(DETAILS_JSON), 'QIMEN_RAW_EVENT') = 0",
+        "INSTR(LOWER(DETAILS_JSON), 'RAW_JSON') = 0",
+        "INSTR(LOWER(DETAILS_JSON), 'BASE64://') = 0",
+        "INSTR(LOWER(DETAILS_JSON), 'DATA:IMAGE/') = 0",
+    ] {
+        if !normalized_table_sql.contains(marker) {
+            return Err(format!("数据库已标记迁移 v3，但操作日志约束缺少：{marker}"));
+        }
+    }
+
+    let index_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'operation_log_identity_page'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取操作日志分页索引失败：{error}"))?
+        .ok_or_else(|| "数据库已标记迁移 v3，但缺少操作日志分页索引".to_string())?;
+    if !index_sql
+        .to_ascii_uppercase()
+        .contains("ON OPERATION_LOG(PROTOCOL, ACCOUNT_ID, NAMESPACE, SUBJECT_KIND, SUBJECT_ID, ID)")
+    {
+        return Err("数据库已标记迁移 v3，但操作日志分页索引字段不匹配".to_string());
+    }
+
+    let trigger_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'operation_log'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("检查操作日志触发器失败：{error}"))?;
+    let expected_triggers = [
+        ("operation_log_no_update", "BEFORE UPDATE ON OPERATION_LOG"),
+        ("operation_log_no_delete", "BEFORE DELETE ON OPERATION_LOG"),
+        (
+            "operation_log_no_reinsert",
+            "BEFORE INSERT ON OPERATION_LOG",
+        ),
+        (
+            "operation_log_safe_details",
+            "BEFORE INSERT ON OPERATION_LOG",
+        ),
+    ];
+    if trigger_count != expected_triggers.len() as i64 {
+        return Err("数据库已标记迁移 v3，但操作日志触发器数量不匹配".to_string());
+    }
+    for (name, marker) in expected_triggers {
+        let (table_name, sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取操作日志触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v3，但缺少操作日志触发器 {name}"))?;
+        let normalized_sql = sql.to_ascii_uppercase();
+        if table_name != "operation_log"
+            || !normalized_sql.contains(marker)
+            || !normalized_sql.contains("RAISE(ABORT")
+        {
+            return Err(format!(
+                "数据库已标记迁移 v3，但操作日志触发器 {name} 内容不匹配"
+            ));
+        }
+        if name == "operation_log_no_reinsert" && !normalized_sql.contains("EXISTS") {
+            return Err("数据库已标记迁移 v3，但操作日志禁止重插入触发器不完整".to_string());
+        }
+        if name == "operation_log_safe_details"
+            && (!normalized_sql.contains("JSON_EACH")
+                || !normalized_sql
+                    .contains("NOT IN ('CONTEXT', 'HAS_ARGS', 'REASON', 'DURATION_MS')"))
+        {
+            return Err("数据库已标记迁移 v3，但操作日志详情白名单触发器不完整".to_string());
+        }
+    }
+    probe_operation_log_guards(connection)
+}
+
+fn probe_operation_log_guards(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch("SAVEPOINT qimen_operation_log_guard_probe;")
+        .map_err(|error| format!("开始操作日志保护探针失败：{error}"))?;
+    let probe_result = (|| -> Result<(), String> {
+        connection
+            .execute(
+                r#"
+                INSERT INTO operation_log(
+                    protocol, account_id, namespace, subject_kind, subject_id,
+                    command, outcome, source_message_id, details_json, created_at
+                ) VALUES('onebot11', 'schema-probe', 'schema-probe', 'user',
+                         'schema-probe', 'schema-probe', 'ok', '', '{}', 0)
+                "#,
+                [],
+            )
+            .map_err(|error| format!("操作日志保护探针无法插入临时行：{error}"))?;
+        let id = connection.last_insert_rowid();
+        for (label, sql) in [
+            (
+                "UPDATE",
+                "UPDATE operation_log SET outcome = 'error' WHERE id = ?1",
+            ),
+            ("DELETE", "DELETE FROM operation_log WHERE id = ?1"),
+            (
+                "REPLACE",
+                r#"
+                INSERT OR REPLACE INTO operation_log(
+                    id, protocol, account_id, namespace, subject_kind, subject_id,
+                    command, outcome, source_message_id, details_json, created_at
+                ) VALUES(?1, 'onebot11', 'schema-probe', 'schema-probe', 'user',
+                         'schema-probe', 'tampered', 'error', '', '{}', 0)
+                "#,
+            ),
+        ] {
+            if connection.execute(sql, [id]).is_ok() {
+                return Err(format!("操作日志 {label} 保护探针被绕过"));
+            }
+        }
+        if connection
+            .execute(
+                r#"
+                INSERT INTO operation_log(
+                    protocol, account_id, namespace, subject_kind, subject_id,
+                    command, outcome, source_message_id, details_json, created_at
+                ) VALUES('onebot11', 'schema-probe', 'schema-probe', 'user',
+                         'schema-probe-2', 'schema-probe', 'ok', '',
+                         '{"password":"secret"}', 0)
+                "#,
+                [],
+            )
+            .is_ok()
+        {
+            return Err("操作日志详情白名单保护探针被绕过".to_string());
+        }
+        Ok(())
+    })();
+    let rollback_result = connection
+        .execute_batch(
+            "ROLLBACK TO qimen_operation_log_guard_probe; RELEASE qimen_operation_log_guard_probe;",
+        )
+        .map_err(|error| format!("回滚操作日志保护探针失败：{error}"));
+    match (probe_result, rollback_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(probe_error), Err(rollback_error)) => Err(format!("{probe_error}；{rollback_error}")),
+    }
+}
+
 fn validate_identity_key(key: &IdentityKey<'_>) -> Result<(), String> {
     validate_account_id(key.account_id)?;
     if key.namespace.is_empty()
@@ -946,6 +1384,103 @@ fn validate_account_id(value: &str) -> Result<(), String> {
         return Err("机器人 account_id 必须是 1 到 128 个无控制字符的非空字符串".to_string());
     }
     Ok(())
+}
+
+fn insert_operation_log(
+    connection: &Connection,
+    key: &IdentityKey<'_>,
+    operation: &OperationLogInput<'_>,
+) -> Result<i64, String> {
+    validate_operation_input(operation)?;
+    connection
+        .execute(
+            r#"
+            INSERT INTO operation_log(
+                protocol, account_id, namespace, subject_kind, subject_id,
+                command, outcome, source_message_id, details_json, created_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                key.protocol.as_str(),
+                key.account_id,
+                key.namespace,
+                key.subject_kind,
+                key.subject_id,
+                operation.command,
+                operation.outcome,
+                operation.source_message_id,
+                operation.details_json,
+                now_timestamp()?
+            ],
+        )
+        .map_err(|error| format!("写入操作日志失败：{error}"))?;
+    Ok(connection.last_insert_rowid())
+}
+
+fn validate_operation_input(operation: &OperationLogInput<'_>) -> Result<(), String> {
+    let command = operation.command;
+    if command != command.trim() || !valid_audit_value(command, 128) {
+        return Err("操作命令必须是 1 到 128 个无控制字符的非空字符串".to_string());
+    }
+    if !matches!(operation.outcome, "ok" | "error" | "denied") {
+        return Err("操作结果只能是 ok、error 或 denied".to_string());
+    }
+    let source_message_id = operation.source_message_id;
+    if source_message_id.chars().count() > 256 || source_message_id.chars().any(char::is_control) {
+        return Err("来源消息 ID 必须是不超过 256 个字符且不含控制字符的字符串".to_string());
+    }
+    let details_json = operation.details_json;
+    if details_json.len() > 8_192 {
+        return Err("操作日志 details_json 不能超过 8192 字节".to_string());
+    }
+    let details: serde_json::Value = serde_json::from_str(details_json)
+        .map_err(|error| format!("操作日志 details_json 不是有效 JSON：{error}"))?;
+    let object = details
+        .as_object()
+        .ok_or_else(|| "操作日志 details_json 必须是对象".to_string())?;
+    for (key, value) in object {
+        match key.as_str() {
+            "context" => {
+                let context = value
+                    .as_str()
+                    .ok_or_else(|| "操作日志 context 必须是字符串".to_string())?;
+                if !matches!(context, "private" | "group" | "channel" | "dms" | "system") {
+                    return Err("操作日志 context 值无效".to_string());
+                }
+            }
+            "has_args" => {
+                if !value.is_boolean() {
+                    return Err("操作日志 has_args 必须是布尔值".to_string());
+                }
+            }
+            "reason" => {
+                let reason = value
+                    .as_str()
+                    .ok_or_else(|| "操作日志 reason 必须是字符串".to_string())?;
+                if !valid_reason_code(reason) {
+                    return Err("操作日志 reason 必须是不超过 64 个字符的代码".to_string());
+                }
+            }
+            "duration_ms" => {
+                let duration = value
+                    .as_u64()
+                    .ok_or_else(|| "操作日志 duration_ms 必须是非负整数".to_string())?;
+                if duration > 600_000 {
+                    return Err("操作日志 duration_ms 不能超过 600000".to_string());
+                }
+            }
+            _ => return Err(format!("操作日志 details 字段不允许：{key}")),
+        }
+    }
+    Ok(())
+}
+
+fn valid_reason_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn validate_claim_actor(actor: &LegacyClaimActor<'_>) -> Result<(), String> {
@@ -1256,12 +1791,12 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT COUNT(*) FROM schema_migration WHERE version = 2",
+                    "SELECT COUNT(*) FROM schema_migration WHERE version IN (2, 3)",
                     [],
                     |row| row.get::<_, i64>(0)
                 )
                 .expect("应读取迁移记录"),
-            1
+            2
         );
 
         let broken_directory = tempdir().expect("应创建损坏测试目录");
@@ -1306,12 +1841,12 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT COUNT(*) FROM schema_migration WHERE version = 2",
+                    "SELECT COUNT(*) FROM schema_migration WHERE version IN (2, 3)",
                     [],
                     |row| row.get::<_, i64>(0)
                 )
                 .expect("应读取迁移记录"),
-            1
+            2
         );
     }
 
@@ -1568,5 +2103,213 @@ mod tests {
                 .expect("审计应保留"),
             "owner-explicit-legacy-claim"
         );
+    }
+
+    #[test]
+    fn operation_log_appends_and_pages_within_stable_identity() {
+        let (_directory, store) = test_store();
+        let first_id = store
+            .append_operation(&identity(), "状态", "ok", "", r#"{"duration_ms":1}"#)
+            .expect("后台操作日志应允许空消息 ID");
+        let second_id = store
+            .append_operation(
+                &identity(),
+                "武魂觉醒",
+                "error",
+                "message-2",
+                r#"{"reason":"already-awakened"}"#,
+            )
+            .expect("第二条日志应写入");
+        let third_id = store
+            .append_operation(
+                &identity(),
+                "位置",
+                "denied",
+                "message-3",
+                r#"{"reason":"legacy-claim-required"}"#,
+            )
+            .expect("第三条日志应写入");
+        let other_identity = IdentityKey {
+            account_id: "10002",
+            ..identity()
+        };
+        store
+            .append_operation(&other_identity, "状态", "ok", "message-other", "{}")
+            .expect("另一机器人账号日志应写入");
+
+        let first_page = store
+            .list_operation_logs(&identity(), None, 2)
+            .expect("第一页应读取");
+        assert_eq!(
+            first_page
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![first_id, second_id]
+        );
+        assert_eq!(first_page.next_after_id, Some(second_id));
+        assert_eq!(first_page.entries[0].protocol, Protocol::OneBot11);
+        assert_eq!(first_page.entries[0].account_id, "10001");
+        assert_eq!(first_page.entries[0].details_json, r#"{"duration_ms":1}"#);
+
+        let second_page = store
+            .list_operation_logs(&identity(), first_page.next_after_id, 2)
+            .expect("第二页应读取");
+        assert_eq!(second_page.entries.len(), 1);
+        assert_eq!(second_page.entries[0].id, third_id);
+        assert_eq!(second_page.next_after_id, None);
+        assert_eq!(
+            store
+                .list_operation_logs(&other_identity, None, 100)
+                .expect("另一账号应可读取")
+                .entries
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn operation_log_rejects_invalid_or_sensitive_input() {
+        let (_directory, store) = test_store();
+        for command in ["", " padded", "bad\ncommand"] {
+            assert!(
+                store
+                    .append_operation(&identity(), command, "ok", "message", "{}")
+                    .is_err()
+            );
+        }
+        assert!(
+            store
+                .append_operation(&identity(), &"命".repeat(129), "ok", "message", "{}")
+                .is_err()
+        );
+        for outcome in ["", "success", "OK"] {
+            assert!(
+                store
+                    .append_operation(&identity(), "状态", outcome, "message", "{}")
+                    .is_err()
+            );
+        }
+        for source_message_id in ["bad\nmessage".to_string(), "m".repeat(257)] {
+            assert!(
+                store
+                    .append_operation(&identity(), "状态", "ok", &source_message_id, "{}")
+                    .is_err()
+            );
+        }
+        for details in [
+            "not-json".to_string(),
+            r#"{"raw_event_json":{"message":"secret"}}"#.to_string(),
+            r#"{"raw_json":{"message":"secret"}}"#.to_string(),
+            r#"{"qimen_raw_event":{"message":"secret"}}"#.to_string(),
+            r#"{"image":"base64://AAAA"}"#.to_string(),
+            r#"{"image":"data:image/png;base64,AAAA"}"#.to_string(),
+            serde_json::to_string(&"x".repeat(8_192)).expect("过长 JSON 应生成"),
+            r#"{"password":"secret"}"#.to_string(),
+            r#"{"reason":"contains spaces"}"#.to_string(),
+            r#"{"duration_ms":600001}"#.to_string(),
+        ] {
+            assert!(
+                store
+                    .append_operation(&identity(), "状态", "ok", "message", &details)
+                    .is_err(),
+                "敏感或无效 details 不应写入：{}",
+                details.len()
+            );
+        }
+        for (cursor, limit) in [(None, 0), (None, 101), (Some(-1), 1)] {
+            assert!(
+                store
+                    .list_operation_logs(&identity(), cursor, limit)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn operation_log_is_append_only_including_replace() {
+        let (_directory, store) = test_store();
+        let id = store
+            .append_operation(&identity(), "状态", "ok", "message-1", "{}")
+            .expect("日志应写入");
+        let connection = store.open().expect("应打开数据库");
+        assert!(
+            connection
+                .execute(
+                    "UPDATE operation_log SET outcome = 'error' WHERE id = ?1",
+                    [id]
+                )
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute("DELETE FROM operation_log WHERE id = ?1", [id])
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute(
+                    r#"
+                    INSERT OR REPLACE INTO operation_log(
+                        id, protocol, account_id, namespace, subject_kind, subject_id,
+                        command, outcome, source_message_id, details_json, created_at
+                    ) VALUES(?1, 'onebot11', '10001', 'test', 'user', '1875390189',
+                             'tampered', 'error', 'message-2', '{}', 2)
+                    "#,
+                    [id],
+                )
+                .is_err()
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT command FROM operation_log WHERE id = ?1",
+                    [id],
+                    |row| row.get::<_, String>(0)
+                )
+                .expect("原日志应保留"),
+            "状态"
+        );
+    }
+
+    #[test]
+    fn recorded_v3_with_malformed_operation_log_schema_fails_closed() {
+        let directory = tempdir().expect("应创建测试目录");
+        let store =
+            Store::initialize(directory.path(), &DatabaseConfig::default()).expect("迁移应成功");
+        let connection = store.open().expect("应打开数据库");
+        connection
+            .execute("DROP TRIGGER operation_log_no_reinsert", [])
+            .expect("应破坏 v3 结构");
+        drop(connection);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("已记录 v3 但操作日志结构损坏必须失败");
+        assert!(error.contains("v3") || error.contains("操作日志"));
+    }
+
+    #[test]
+    fn recorded_v3_with_weakened_trigger_fails_behavior_probe() {
+        let directory = tempdir().expect("应创建测试目录");
+        let store =
+            Store::initialize(directory.path(), &DatabaseConfig::default()).expect("迁移应成功");
+        let connection = store.open().expect("应打开数据库");
+        connection
+            .execute_batch(
+                r#"
+                DROP TRIGGER operation_log_no_update;
+                CREATE TRIGGER operation_log_no_update
+                BEFORE UPDATE ON operation_log
+                WHEN 0
+                BEGIN
+                    SELECT RAISE(ABORT, 'operation log is append-only');
+                END;
+                "#,
+            )
+            .expect("应弱化触发器但保留名称和关键字");
+        drop(connection);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("弱化触发器必须被行为探针拒绝");
+        assert!(error.contains("探针") || error.contains("UPDATE"));
     }
 }
