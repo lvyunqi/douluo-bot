@@ -130,6 +130,18 @@ BEFORE DELETE ON identity_claim_audit
 BEGIN
     SELECT RAISE(ABORT, 'identity claim audit is immutable');
 END;
+
+CREATE TRIGGER identity_claim_audit_no_reinsert
+BEFORE INSERT ON identity_claim_audit
+WHEN EXISTS(
+    SELECT 1 FROM identity_claim_audit
+     WHERE identity_id = NEW.identity_id
+        OR (protocol = NEW.protocol AND namespace = NEW.namespace
+            AND subject_kind = NEW.subject_kind AND subject_id = NEW.subject_id)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'identity claim audit is immutable');
+END;
 "#;
 
 const LEGACY_CLAIM_REQUIRED: &str =
@@ -247,26 +259,28 @@ impl Store {
                 .map_err(|error| format!("提交数据库迁移 v1 失败：{error}"))?;
         }
 
-        if migration_applied(connection, 2)? {
-            validate_v2_schema(connection)?;
-            verify_foreign_keys(connection, true)?;
-            return Ok(());
-        }
-
-        let old_identity_sequence = connection
-            .query_row(
-                "SELECT seq FROM sqlite_sequence WHERE name = 'identity'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|error| format!("读取旧身份序列失败：{error}"))?;
-
         set_foreign_keys(connection, false)?;
-        let migration_result = (|| -> Result<(), String> {
+        let migration_result = (|| -> Result<bool, String> {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| format!("开始数据库迁移 v2 失败：{error}"))?;
+            // The check must happen after BEGIN IMMEDIATE. Otherwise two first-open
+            // connections can both observe v2 as missing and one will fail creating
+            // the already-created tables after the other commits.
+            if migration_applied(&transaction, 2)? {
+                transaction
+                    .commit()
+                    .map_err(|error| format!("确认数据库迁移 v2 失败：{error}"))?;
+                return Ok(false);
+            }
+            let old_identity_sequence = transaction
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'identity'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| format!("读取旧身份序列失败：{error}"))?;
             transaction
                 .execute_batch(MIGRATION_V2)
                 .map_err(|error| format!("执行数据库迁移 v2 失败：{error}"))?;
@@ -282,17 +296,18 @@ impl Store {
             ensure_no_foreign_key_violations(&transaction)?;
             transaction
                 .commit()
-                .map_err(|error| format!("提交数据库迁移 v2 失败：{error}"))
+                .map_err(|error| format!("提交数据库迁移 v2 失败：{error}"))?;
+            Ok(true)
         })();
         let restore_result = set_foreign_keys(connection, true);
 
         match (migration_result, restore_result) {
-            (Ok(()), Ok(())) => {
+            (Ok(_), Ok(())) => {
                 validate_v2_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
-            (Ok(()), Err(restore_error)) => Err(restore_error),
+            (Ok(_), Err(restore_error)) => Err(restore_error),
             (Err(migration_error), Err(restore_error)) => Err(format!(
                 "{migration_error}；同时恢复 SQLite 外键约束失败：{restore_error}"
             )),
@@ -756,24 +771,154 @@ fn validate_v2_schema(connection: &Connection) -> Result<(), String> {
         }
     }
 
-    let audit_table_exists = connection
+    validate_audit_schema(connection)?;
+    ensure_no_foreign_key_violations(connection)
+}
+
+fn validate_audit_schema(connection: &Connection) -> Result<(), String> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(identity_claim_audit)")
+        .map_err(|error| format!("读取旧档认领审计表结构失败：{error}"))?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, bool>(3)?))
+        })
+        .map_err(|error| format!("查询旧档认领审计表字段失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析旧档认领审计表字段失败：{error}"))?;
+    let expected_columns = vec![
+        ("id".to_string(), false),
+        ("identity_id".to_string(), true),
+        ("protocol".to_string(), true),
+        ("namespace".to_string(), true),
+        ("subject_kind".to_string(), true),
+        ("subject_id".to_string(), true),
+        ("claimed_account_id".to_string(), true),
+        ("actor_account_id".to_string(), true),
+        ("actor_subject_id".to_string(), true),
+        ("source_message_id".to_string(), true),
+        ("reason".to_string(), true),
+        ("created_at".to_string(), true),
+    ];
+    if columns != expected_columns {
+        return Err(format!(
+            "数据库已标记迁移 v2，但旧档认领审计字段不匹配：{columns:?}"
+        ));
+    }
+
+    let mut foreign_keys = connection
+        .prepare("PRAGMA foreign_key_list(identity_claim_audit)")
+        .map_err(|error| format!("读取旧档认领审计外键失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|error| format!("查询旧档认领审计外键失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析旧档认领审计外键失败：{error}"))?;
+    foreign_keys.sort();
+    if foreign_keys
+        != [(
+            "identity".to_string(),
+            "identity_id".to_string(),
+            "id".to_string(),
+            "RESTRICT".to_string(),
+        )]
+    {
+        return Err(format!(
+            "数据库已标记迁移 v2，但旧档认领审计外键不匹配：{foreign_keys:?}"
+        ));
+    }
+
+    let mut index_list = connection
+        .prepare("PRAGMA index_list(identity_claim_audit)")
+        .map_err(|error| format!("读取旧档认领审计索引失败：{error}"))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
+        })
+        .map_err(|error| format!("查询旧档认领审计索引失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析旧档认领审计索引失败：{error}"))?;
+    index_list.retain(|(_, unique)| *unique);
+    let mut unique_columns = Vec::new();
+    for (name, _) in index_list {
+        let escaped_name = name.replace('"', "\"\"");
+        let mut info = connection
+            .prepare(&format!("PRAGMA index_info(\"{escaped_name}\")"))
+            .map_err(|error| format!("读取旧档认领审计索引 {name} 字段失败：{error}"))?;
+        let columns = info
+            .query_map([], |row| row.get::<_, String>(2))
+            .map_err(|error| format!("查询旧档认领审计索引 {name} 字段失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析旧档认领审计索引 {name} 字段失败：{error}"))?;
+        unique_columns.push(columns);
+    }
+    let mut expected_unique_columns = vec![
+        vec!["identity_id".to_string()],
+        vec![
+            "protocol".to_string(),
+            "namespace".to_string(),
+            "subject_kind".to_string(),
+            "subject_id".to_string(),
+        ],
+    ];
+    unique_columns.sort();
+    expected_unique_columns.sort();
+    if unique_columns != expected_unique_columns {
+        return Err(format!(
+            "数据库已标记迁移 v2，但旧档认领审计唯一约束不匹配：{unique_columns:?}"
+        ));
+    }
+
+    let expected_triggers = [
+        (
+            "identity_claim_audit_no_update",
+            "BEFORE UPDATE ON IDENTITY_CLAIM_AUDIT",
+        ),
+        (
+            "identity_claim_audit_no_delete",
+            "BEFORE DELETE ON IDENTITY_CLAIM_AUDIT",
+        ),
+        (
+            "identity_claim_audit_no_reinsert",
+            "BEFORE INSERT ON IDENTITY_CLAIM_AUDIT",
+        ),
+    ];
+    let trigger_count = connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'identity_claim_audit')",
-            [],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(|error| format!("检查旧档认领审计表失败：{error}"))?;
-    let immutable_triggers = connection
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN ('identity_claim_audit_no_update', 'identity_claim_audit_no_delete')",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'identity_claim_audit'",
             [],
             |row| row.get::<_, i64>(0),
         )
         .map_err(|error| format!("检查旧档认领审计触发器失败：{error}"))?;
-    if !audit_table_exists || immutable_triggers != 2 {
-        return Err("数据库已标记迁移 v2，但旧档认领审计结构不完整".to_string());
+    if trigger_count != expected_triggers.len() as i64 {
+        return Err("数据库已标记迁移 v2，但旧档认领审计触发器数量不匹配".to_string());
     }
-    ensure_no_foreign_key_violations(connection)
+    for (name, marker) in expected_triggers {
+        let (table_name, sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取旧档认领审计触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v2，但缺少旧档认领审计触发器 {name}"))?;
+        let normalized_sql = sql.to_ascii_uppercase();
+        if table_name != "identity_claim_audit"
+            || !normalized_sql.contains(marker)
+            || !normalized_sql.contains("RAISE(ABORT")
+        {
+            return Err(format!(
+                "数据库已标记迁移 v2，但旧档认领审计触发器 {name} 内容不匹配"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_identity_key(key: &IdentityKey<'_>) -> Result<(), String> {
@@ -1135,6 +1280,82 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_initialization_is_idempotent() {
+        let directory = tempdir().expect("应创建测试目录");
+        let path = directory.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                Store::initialize(&path, &DatabaseConfig::default()).map(|_| ())
+            }));
+        }
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("线程不应 panic"))
+            .collect::<Vec<_>>();
+        assert!(
+            results.iter().all(Result::is_ok),
+            "并发初始化结果：{results:?}"
+        );
+        let store = Store::initialize(&path, &DatabaseConfig::default()).expect("应可再次打开");
+        let connection = store.open().expect("应检查迁移记录");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migration WHERE version = 2",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("应读取迁移记录"),
+            1
+        );
+    }
+
+    #[test]
+    fn recorded_v2_with_malformed_audit_structure_fails_closed() {
+        let directory = tempdir().expect("应创建测试目录");
+        let store =
+            Store::initialize(directory.path(), &DatabaseConfig::default()).expect("迁移应成功");
+        let connection = store.open().expect("应打开数据库");
+        connection
+            .execute_batch(
+                r#"
+                DROP TABLE identity_claim_audit;
+                CREATE TABLE identity_claim_audit(
+                    id INTEGER PRIMARY KEY,
+                    identity_id INTEGER NOT NULL,
+                    protocol TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    subject_kind TEXT NOT NULL,
+                    subject_id TEXT NOT NULL,
+                    claimed_account_id TEXT NOT NULL,
+                    actor_account_id TEXT NOT NULL,
+                    actor_subject_id TEXT NOT NULL,
+                    source_message_id TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE audit_dummy(id INTEGER);
+                CREATE TRIGGER identity_claim_audit_no_update
+                BEFORE UPDATE ON audit_dummy BEGIN SELECT RAISE(ABORT, 'dummy'); END;
+                CREATE TRIGGER identity_claim_audit_no_delete
+                BEFORE DELETE ON audit_dummy BEGIN SELECT RAISE(ABORT, 'dummy'); END;
+                CREATE TRIGGER identity_claim_audit_no_reinsert
+                BEFORE INSERT ON audit_dummy BEGIN SELECT RAISE(ABORT, 'dummy'); END;
+                "#,
+            )
+            .expect("应构造损坏审计结构");
+        drop(connection);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v2 但审计结构损坏必须失败");
+        assert!(error.contains("审计"));
+    }
+
+    #[test]
     fn migration_failure_restores_foreign_key_enforcement() {
         let directory = tempdir().expect("应创建测试目录");
         let path = create_v1_database(directory.path(), "legacy-user");
@@ -1320,6 +1541,22 @@ mod tests {
         assert!(
             connection
                 .execute("DELETE FROM identity_claim_audit", [])
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute(
+                    r#"
+                    INSERT OR REPLACE INTO identity_claim_audit(
+                        identity_id, protocol, namespace, subject_kind, subject_id,
+                        claimed_account_id, actor_account_id, actor_subject_id,
+                        source_message_id, reason, created_at
+                    ) VALUES(1, 'onebot11', 'test', 'user', 'legacy-user',
+                              '10001', '10001', 'tampered-owner', 'message-2',
+                              'tampered', 2)
+                    "#,
+                    [],
+                )
                 .is_err()
         );
         assert_eq!(
