@@ -13,6 +13,15 @@
 *.db-wal
 *.log
 
+# 公开仓只跟踪逻辑 manifest；图片需经权利审核后再显式调整策略
+/assets/**/*.png
+/assets/**/*.jpg
+/assets/**/*.jpeg
+/assets/**/*.webp
+/assets/**/*.gif
+/assets/**/*.bmp
+/assets/**/*.svg
+
 # 前端依赖和构建产物
 /web/node_modules/
 /web/dist/

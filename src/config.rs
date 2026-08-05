@@ -71,12 +71,13 @@ pub enum IllustrationMode {
     Remote,
 }
 
-/// 插图投递配置：直连模式使用完整 HTTPS URL，远程模式使用配套图片服务。
+/// 插图投递配置：直连模式使用可信 URL 或 data_dir 内图片，远程模式使用配套图片服务。
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct IllustrationConfig {
     pub enabled: bool,
     pub mode: IllustrationMode,
+    pub direct_asset_root: String,
     pub remote_base_url: String,
 }
 
@@ -85,6 +86,7 @@ impl Default for IllustrationConfig {
         Self {
             enabled: true,
             mode: IllustrationMode::Direct,
+            direct_asset_root: "douluo-game/assets".to_string(),
             remote_base_url: String::new(),
         }
     }
@@ -113,7 +115,7 @@ pub fn parse_config(config_json: &str) -> Result<PluginConfig, String> {
 }
 
 pub fn validate_config(config: &PluginConfig) -> Result<(), String> {
-    if !is_safe_database_path(&config.database.relative_path) {
+    if !is_safe_data_relative_path(&config.database.relative_path) {
         return Err("database.relative_path 必须是 data_dir 内的安全相对路径".to_string());
     }
     if !(100..=30_000).contains(&config.database.busy_timeout_ms) {
@@ -126,6 +128,11 @@ pub fn validate_config(config: &PluginConfig) -> Result<(), String> {
     }
     if !(2..=20).contains(&config.identity.max_character_name_chars) {
         return Err("identity.max_character_name_chars 必须在 2 到 20 之间".to_string());
+    }
+    if !config.illustrations.direct_asset_root.is_empty()
+        && !is_safe_data_relative_path(&config.illustrations.direct_asset_root)
+    {
+        return Err("illustrations.direct_asset_root 必须是 data_dir 内的安全相对路径".to_string());
     }
     if config.illustrations.mode == IllustrationMode::Remote {
         validate_remote_base_url(&config.illustrations.remote_base_url)?;
@@ -164,7 +171,7 @@ pub(crate) fn is_safe_asset_key(value: &str) -> bool {
         && segments.all(|segment| segment != "." && segment != "..")
 }
 
-fn is_safe_database_path(value: &str) -> bool {
+pub(crate) fn is_safe_data_relative_path(value: &str) -> bool {
     if value.trim().is_empty()
         || value.len() > 200
         || value.starts_with('/')
@@ -308,6 +315,34 @@ mod tests {
         assert!(config.messages.qq_official_markdown);
         assert!(config.illustrations.enabled);
         assert_eq!(config.illustrations.mode, IllustrationMode::Direct);
+        assert_eq!(config.illustrations.direct_asset_root, "douluo-game/assets");
+    }
+
+    #[test]
+    fn direct_asset_root_must_stay_under_data_dir() {
+        for path in [
+            "C:outside",
+            "C:/outside",
+            r"\\server\share\outside",
+            r"\\?\C:\outside",
+            "../outside",
+            "douluo-game/./assets",
+            "douluo-game//assets",
+            "/absolute/assets",
+        ] {
+            assert!(
+                parse_config(&format!(
+                    r#"{{"illustrations":{{"direct_asset_root":{}}}}}"#,
+                    serde_json::to_string(path).expect("path json")
+                ))
+                .is_err(),
+                "不安全本地资源根 {path} 不应通过校验"
+            );
+        }
+
+        let disabled = parse_config(r#"{"illustrations":{"direct_asset_root":""}}"#)
+            .expect("空本地资源根应代表禁用预加载");
+        assert!(disabled.illustrations.direct_asset_root.is_empty());
     }
 
     #[test]

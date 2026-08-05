@@ -1,5 +1,7 @@
 //! QimenBot 动态插件入口。
 
+mod assets;
+mod catalog;
 pub mod config;
 mod game;
 pub mod message;
@@ -14,6 +16,7 @@ use abi_stable_host_api::{
 };
 use qimen_dynamic_plugin_derive::dynamic_plugin;
 
+use crate::assets::IllustrationAssets;
 use crate::config::parse_config;
 use crate::game::GameService;
 use crate::message::{GameDocument, response_for};
@@ -27,12 +30,15 @@ fn runtime_slot() -> &'static RwLock<Option<Arc<GameService>>> {
 
 fn initialize(config: PluginInitConfig) -> Result<(), String> {
     let parsed = parse_config(config.config_json.as_str())?;
+    catalog::validate_embedded_manifest()?;
     let data_dir = config.data_dir.as_str().trim();
     if data_dir.is_empty() {
         return Err("QimenBot 未提供 data_dir，无法安全创建游戏数据库".to_string());
     }
-    let store = Store::initialize(Path::new(data_dir), &parsed.database)?;
-    let service = Arc::new(GameService::new(store, parsed));
+    let data_dir = Path::new(data_dir);
+    let store = Store::initialize(data_dir, &parsed.database)?;
+    let illustration_assets = IllustrationAssets::load(data_dir, &parsed.illustrations)?;
+    let service = Arc::new(GameService::with_assets(store, parsed, illustration_assets));
     let mut slot = runtime_slot()
         .write()
         .map_err(|_| "插件运行时锁已损坏".to_string())?;
@@ -75,7 +81,7 @@ fn with_service(
     api = "0.6",
     config_schema = "../config.schema.json",
     config_ui = "../config.ui.json",
-    config_version = 1,
+    config_version = 2,
     config_apply = "reload"
 )]
 mod plugin {

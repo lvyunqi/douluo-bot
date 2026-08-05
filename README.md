@@ -7,7 +7,8 @@
 - 独立 Rust `cdylib`，支持 QimenBot 动态加载和热重载。
 - 游戏插件使用 SQLite 本地存档和自动数据迁移。
 - 支持 OneBot 11 通用消息与 QQ 官方机器人 Markdown。
-- 支持由内容资源配置驱动的 OneBot 图片消息段与 QQ 官方 Markdown 公网 HTTPS 插图。
+- 支持由公开 `assets/illustrations.json` 绑定驱动的 OneBot 图片消息段与 QQ 官方 Markdown 插图。
+- `direct` 模式可从 QimenBot `data_dir` 内预加载图片，以 OneBot `base64://` 消息段发送；缺图时完整文字仍可用。
 - 提供可独立运行的只读 `douluo-media` 图片服务。
 - 角色创建、武魂觉醒和角色状态查询。
 
@@ -33,7 +34,7 @@
 
 插件必须与宿主的操作系统、CPU 架构和 C 运行时匹配。
 
-当前已在隔离 QimenBot `0.1.20` 宿主验证 OneBot 消息段和连续 10 次热重载。QQ 官方 Markdown 与图片 payload 已按适配器契约实现，但群、C2C、频道和 DMS 仍需使用真实 QQ Bot Gateway、权限和客户端分别验证。
+当前已在隔离 QimenBot `0.1.20` 宿主验证配置 v2、OneBot 本地 Base64/远程 URL 消息段、QQ 合成事件文字降级和热重载。QQ 官方 Markdown 与图片 payload 已按适配器契约实现，但合成事件不等同于真实平台；群、C2C、频道和 DMS 仍需使用真实 QQ Bot Gateway、权限和客户端分别验证。QQ 官方首版对本地内联图片保留完整 Markdown/文字，不与独立媒体段混发。
 
 ## 构建
 
@@ -94,6 +95,7 @@ max_character_name_chars = 6
 [illustrations]
 enabled = true
 mode = "direct" # direct 或 remote
+direct_asset_root = "douluo-game/assets"
 remote_base_url = ""
 
 [messages]
@@ -104,7 +106,11 @@ legacy_hyphen_arguments = true
 
 `identity.namespace` 用于隔离共享同一数据库的部署，投入使用后不要随意修改。OneBot Markdown 是实现扩展，仅应在目标客户端实际验证通过后开启。
 
-`direct` 模式使用资源记录中的完整 HTTPS 地址；`remote` 模式将稳定资源键拼接为 `{remote_base_url}/media/{asset_key}`。当前内置命令只绑定了稳定资源键，尚未附带直连 URL manifest，因此在 `direct` 模式下会保留完整文字但不显示内置插图。来源和许可证未核验的旧图片不会随源码发布。
+`assets/illustrations.json` 是源码内的逻辑绑定清单，包含地图、武魂、魂兽和魂环共 19 条稳定 `asset_key`；它不包含图片二进制、绝对路径、来源取证或许可证结论。将已审核的文件按清单 key 放在 `data_dir/douluo-game/assets/` 下，插件启动时会有界读取并校验扩展名与文件签名。目录不存在、文件缺失或不合规时自动保留完整文字。
+
+`direct` 模式优先使用上述本地图片并以内联 Base64 图片段发送给 OneBot；清单未来也可以为单个绑定提供审核后的公网 HTTPS `direct_url`。`remote` 模式将稳定资源键拼接为 `{remote_base_url}/media/{asset_key}`，适合部署独立 `douluo-media` 和公网 HTTPS 反向代理。QQ 官方 Markdown 只嵌入 HTTPS URL；本地 Base64 图片在首版统一降级为完整 Markdown/文字，不会发送混合字段。
+
+插件不会把原始图片字节放进 Debug 输出。QimenBot 的 `qimen_raw_message=debug` 可能记录完整 OneBot 出站 JSON，其中包含 Base64；排查协议时应临时开启并在日志访问控制下使用。
 
 命令前缀、私聊裸命令、群聊 @ 和回复触发由 QimenBot `[official_host.commands]` 统一控制，插件不硬编码 `/`。
 

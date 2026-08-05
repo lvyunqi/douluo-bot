@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "bindings": [
+    {
+      "entity_type": "map",
+      "entity_key": "圣魂村",
+      "media_role": "cover",
+      "alt": "圣魂村地图",
+      "asset_key": "maps/holy-soul-village/cover.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 640, "height": 360 }
+    },
+    {
+      "entity_type": "map",
+      "entity_key": "天斗帝国主城",
+      "media_role": "cover",
+      "alt": "天斗帝国主城地图",
+      "asset_key": "maps/tiandou-imperial-city/cover.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 640, "height": 360 }
+    },
+    {
+      "entity_type": "map",
+      "entity_key": "新手村",
+      "media_role": "cover",
+      "alt": "新手村地图",
+      "asset_key": "maps/novice-village/cover.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 640, "height": 360 }
+    },
+    {
+      "entity_type": "map",
+      "entity_key": "落日森林",
+      "media_role": "cover",
+      "alt": "落日森林地图",
+      "asset_key": "maps/sunset-forest/cover.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 640, "height": 360 }
+    },
+    {
+      "entity_type": "map",
+      "entity_key": "西尔维斯",
+      "media_role": "cover",
+      "alt": "西尔维斯地图",
+      "asset_key": "maps/silves/cover.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 640, "height": 360 }
+    },
+    {
+      "entity_type": "wuhun",
+      "entity_key": "独狼",
+      "media_role": "portrait",
+      "alt": "独狼武魂",
+      "asset_key": "wuhun/lone-wolf/portrait.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 640, "height": 640 }
+    },
+    {
+      "entity_type": "wuhun",
+      "entity_key": "萝卜",
+      "media_role": "portrait",
+      "alt": "萝卜武魂",
+      "asset_key": "wuhun/carrot/portrait.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 640, "height": 640 }
+    },
+    {
+      "entity_type": "wuhun",
+      "entity_key": "镰刀",
+      "media_role": "portrait",
+      "alt": "镰刀武魂",
+      "asset_key": "wuhun/sickle/portrait.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 640, "height": 640 }
+    },
+    {
+      "entity_type": "wuhun",
+      "entity_key": "面包",
+      "media_role": "portrait",
+      "alt": "面包武魂",
+      "asset_key": "wuhun/bread/portrait.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 640, "height": 640 }
+    },
+    {
+      "entity_type": "wuhun",
+      "entity_key": "龙神血脉",
+      "media_role": "portrait",
+      "alt": "龙神血脉武魂",
+      "asset_key": "wuhun/dragon-god-bloodline/portrait.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 640, "height": 640 }
+    },
+    {
+      "entity_type": "soul_beast",
+      "entity_key": "史莱姆",
+      "media_role": "battle",
+      "alt": "史莱姆魂兽",
+      "asset_key": "soul-beasts/slime/battle.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 640, "height": 640 }
+    },
+    {
+      "entity_type": "soul_beast",
+      "entity_key": "哥布林",
+      "media_role": "battle",
+      "alt": "哥布林魂兽",
+      "asset_key": "soul-beasts/goblin/battle.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 640, "height": 640 }
+    },
+    {
+      "entity_type": "soul_ring",
+      "entity_key": "白",
+      "media_role": "icon",
+      "alt": "白色魂环",
+      "asset_key": "soul-rings/white/icon.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 256, "height": 256 }
+    },
+    {
+      "entity_type": "soul_ring",
+      "entity_key": "黄",
+      "media_role": "icon",
+      "alt": "黄色魂环",
+      "asset_key": "soul-rings/yellow/icon.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 256, "height": 256 }
+    },
+    {
+      "entity_type": "soul_ring",
+      "entity_key": "紫",
+      "media_role": "icon",
+      "alt": "紫色魂环",
+      "asset_key": "soul-rings/purple/icon.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 256, "height": 256 }
+    },
+    {
+      "entity_type": "soul_ring",
+      "entity_key": "黑",
+      "media_role": "icon",
+      "alt": "黑色魂环",
+      "asset_key": "soul-rings/black/icon.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 256, "height": 256 }
+    },
+    {
+      "entity_type": "soul_ring",
+      "entity_key": "红",
+      "media_role": "icon",
+      "alt": "红色魂环",
+      "asset_key": "soul-rings/red/icon.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 256, "height": 256 }
+    },
+    {
+      "entity_type": "soul_ring",
+      "entity_key": "橙",
+      "media_role": "icon",
+      "alt": "橙色魂环",
+      "asset_key": "soul-rings/orange/icon.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 256, "height": 256 }
+    },
+    {
+      "entity_type": "soul_ring",
+      "entity_key": "金",
+      "media_role": "icon",
+      "alt": "金色魂环",
+      "asset_key": "soul-rings/gold/icon.webp",
+      "distribution": "not_bundled",
+      "direct_url": null,
+      "display": { "width": 256, "height": 256 }
+    }
+  ]
+}

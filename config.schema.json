@@ -67,10 +67,17 @@
         },
         "mode": {
           "title": "图片模式",
-          "description": "direct 直接使用可信 HTTPS 图片；remote 使用可独立部署的斗罗图片服务。",
+          "description": "direct 从 data_dir 内预加载图片并以内联方式发送；remote 使用可独立部署的斗罗图片服务。",
           "type": "string",
           "enum": ["direct", "remote"],
           "default": "direct"
+        },
+        "direct_asset_root": {
+          "title": "本地插图根目录",
+          "description": "direct 模式从 QimenBot data_dir 下此相对目录预加载图片；文件路径必须与稳定 asset_key 一致，目录不存在时纯文字降级。",
+          "type": "string",
+          "maxLength": 200,
+          "default": "douluo-game/assets"
         },
         "remote_base_url": {
           "title": "远程图片服务地址",

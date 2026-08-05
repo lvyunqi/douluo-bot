@@ -15,9 +15,13 @@
   "/illustrations/mode": {
     "ui:widget": "badges",
     "labels": {
-      "direct": "直连图片",
+      "direct": "本地内联",
       "remote": "远程图片服务"
     }
+  },
+  "/illustrations/direct_asset_root": {
+    "placeholder": "douluo-game/assets",
+    "width": "full"
   },
   "/illustrations/remote_base_url": {
     "placeholder": "https://media.example.com/douluo",

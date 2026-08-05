@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 [dependencies]
 abi-stable-host-api = "=0.1.13"
 abi_stable = "0.11"
+base64 = "=0.22.1"
 qimen-dynamic-plugin-derive = "=0.1.13"
 rusqlite = { version = "0.34", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
