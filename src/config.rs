@@ -33,6 +33,7 @@ impl Default for DatabaseConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct IdentityConfig {
     pub namespace: String,
+    pub qq_official_account_id: String,
     pub max_character_name_chars: usize,
 }
 
@@ -40,6 +41,7 @@ impl Default for IdentityConfig {
     fn default() -> Self {
         Self {
             namespace: "default".to_string(),
+            qq_official_account_id: String::new(),
             max_character_name_chars: 6,
         }
     }
@@ -126,6 +128,14 @@ pub fn validate_config(config: &PluginConfig) -> Result<(), String> {
             "identity.namespace 只能包含字母、数字、点、下划线和横线，长度 1-64".to_string(),
         );
     }
+    if !config.identity.qq_official_account_id.is_empty()
+        && !valid_identity_id(&config.identity.qq_official_account_id)
+    {
+        return Err(
+            "identity.qq_official_account_id 必须是无首尾空白和控制字符的 1-128 字符字符串"
+                .to_string(),
+        );
+    }
     if !(2..=20).contains(&config.identity.max_character_name_chars) {
         return Err("identity.max_character_name_chars 必须在 2 到 20 之间".to_string());
     }
@@ -146,6 +156,13 @@ fn valid_namespace(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_identity_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= 128
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
 }
 
 pub(crate) fn is_safe_asset_key(value: &str) -> bool {
@@ -316,6 +333,41 @@ mod tests {
         assert!(config.illustrations.enabled);
         assert_eq!(config.illustrations.mode, IllustrationMode::Direct);
         assert_eq!(config.illustrations.direct_asset_root, "douluo-game/assets");
+        assert!(config.identity.qq_official_account_id.is_empty());
+    }
+
+    #[test]
+    fn qq_official_account_fallback_is_optional_but_strict() {
+        let config = parse_config(r#"{"identity":{"qq_official_account_id":"1024-app-id"}}"#)
+            .expect("稳定 QQ 官方账号应有效");
+        assert_eq!(config.identity.qq_official_account_id, "1024-app-id");
+
+        for account_id in [" ", " padded", "padded ", "line\nbreak"] {
+            assert!(
+                parse_config(&format!(
+                    r#"{{"identity":{{"qq_official_account_id":{}}}}}"#,
+                    serde_json::to_string(account_id).expect("account JSON")
+                ))
+                .is_err(),
+                "不稳定账号值不得通过：{account_id:?}"
+            );
+        }
+        let too_long = "魂".repeat(129);
+        assert!(
+            parse_config(&format!(
+                r#"{{"identity":{{"qq_official_account_id":{}}}}}"#,
+                serde_json::to_string(&too_long).expect("account JSON")
+            ))
+            .is_err()
+        );
+        let exact_limit = "魂".repeat(128);
+        assert!(
+            parse_config(&format!(
+                r#"{{"identity":{{"qq_official_account_id":{}}}}}"#,
+                serde_json::to_string(&exact_limit).expect("account JSON")
+            ))
+            .is_ok()
+        );
     }
 
     #[test]

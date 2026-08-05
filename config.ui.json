@@ -12,6 +12,10 @@
     "unit": "字符",
     "step": 1
   },
+  "/identity/qq_official_account_id": {
+    "placeholder": "QQ 官方机器人 AppID（旧 Host 单 Bot 回退）",
+    "width": "full"
+  },
   "/illustrations/mode": {
     "ui:widget": "badges",
     "labels": {

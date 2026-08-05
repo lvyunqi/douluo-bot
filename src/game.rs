@@ -3,8 +3,11 @@ use abi_stable_host_api::CommandRequest;
 use crate::assets::IllustrationAssets;
 use crate::catalog;
 use crate::config::{IllustrationMode, PluginConfig};
-use crate::message::{GameDocument, Illustration, detect_protocol};
-use crate::store::{IdentityKey, PlayerStatus, Store};
+use crate::identity::{ResolvedIdentity, resolve_identity};
+use crate::message::{GameDocument, Illustration};
+use crate::store::{
+    IdentityKey, LegacyClaimActor, LegacyClaimResult, LegacyIdentityState, PlayerStatus, Store,
+};
 
 const MENU_PAGES: &[MenuPage] = &[
     MenuPage {
@@ -123,7 +126,8 @@ impl GameService {
         if !matches!(gender, "男" | "女") {
             return Err("性别只能填写“男”或“女”".to_string());
         }
-        let key = self.identity_key(req);
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
         let player = self.store.register_player(&key, name, gender)?;
         Ok(GameDocument::new("穿越成功")
             .field("角色", player.name)
@@ -140,7 +144,8 @@ impl GameService {
     }
 
     pub fn awaken(&self, req: &CommandRequest) -> Result<GameDocument, String> {
-        let key = self.identity_key(req);
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
         let wuhun = self.store.awaken_wuhun(&key)?;
         let illustration = self.wuhun_illustration(&wuhun.name);
         Ok(GameDocument::new("武魂觉醒")
@@ -154,7 +159,8 @@ impl GameService {
     }
 
     pub fn status(&self, req: &CommandRequest) -> Result<GameDocument, String> {
-        let key = self.identity_key(req);
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
         let player = self
             .store
             .player_status(&key)?
@@ -166,7 +172,8 @@ impl GameService {
         if !req.args.as_str().trim().is_empty() {
             return Err("用法：位置".to_string());
         }
-        let key = self.identity_key(req);
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
         let player = self
             .store
             .player_status(&key)?
@@ -184,13 +191,85 @@ impl GameService {
             .command("状态"))
     }
 
-    fn identity_key<'a>(&'a self, req: &'a CommandRequest) -> IdentityKey<'a> {
+    pub fn inspect_legacy(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let target_subject_id = parse_legacy_inspect_args(req.args.as_str())?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, target_subject_id);
+        let (status, notice) = match self.store.inspect_legacy_identity(&key)? {
+            LegacyIdentityState::Legacy => (
+                "待认领",
+                "确认目标用户和当前机器人账号无误后，使用“旧档认领 <用户ID> <当前account_id> 确认”",
+            ),
+            LegacyIdentityState::ClaimedToCurrent => {
+                ("已认领到当前账号", "该旧档已完成绑定，无需重复操作")
+            }
+            LegacyIdentityState::ClaimedToOther => (
+                "冲突",
+                "该旧档已由其他机器人账号认领；系统不会合并、删除或重新绑定",
+            ),
+            LegacyIdentityState::Missing => (
+                "未找到",
+                "没有找到可认领的旧版身份行；系统不会自动创建或接管旧档",
+            ),
+        };
+        Ok(GameDocument::new("旧档检查")
+            .field("协议", identity.protocol.as_str())
+            .field("当前账号", &identity.account_id)
+            .field("目标用户", target_subject_id)
+            .field("状态", status)
+            .notice(notice))
+    }
+
+    pub fn claim_legacy(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let (target_subject_id, confirmed_account_id) = parse_legacy_claim_args(req.args.as_str())?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        if confirmed_account_id != identity.account_id {
+            return Err("参数中的 account_id 与当前机器人账号不一致，已取消认领".to_string());
+        }
+        let key = self.identity_key(&identity, target_subject_id);
+        let actor = LegacyClaimActor {
+            account_id: &identity.account_id,
+            subject_id: &identity.subject_id,
+            message_id: req.message_id.as_str(),
+            reason: "owner-explicit-legacy-claim",
+        };
+        let result = self.store.claim_legacy_identity(&key, &actor)?;
+        let (status, notice) = match result {
+            LegacyClaimResult::Claimed { .. } => (
+                "认领成功",
+                "旧身份仅补写了当前 account_id；角色、武魂、主键和外键均保持不变",
+            ),
+            LegacyClaimResult::AlreadyClaimed { .. } => {
+                ("已认领", "该旧档已经绑定到当前账号，本次没有重复写入")
+            }
+            LegacyClaimResult::NotFound => {
+                ("未找到", "没有找到可认领的旧版身份行，本次没有修改数据库")
+            }
+            LegacyClaimResult::Conflict => (
+                "冲突",
+                "检测到已知身份或其他账号的认领记录，本次没有合并、删除或重新绑定",
+            ),
+        };
+        Ok(GameDocument::new("旧档认领")
+            .field("协议", identity.protocol.as_str())
+            .field("当前账号", &identity.account_id)
+            .field("目标用户", target_subject_id)
+            .field("结果", status)
+            .notice(notice))
+    }
+
+    fn identity_key<'a>(
+        &'a self,
+        identity: &'a ResolvedIdentity,
+        subject_id: &'a str,
+    ) -> IdentityKey<'a> {
         IdentityKey {
-            protocol: detect_protocol(req.raw_event_json.as_str()),
+            protocol: identity.protocol,
+            account_id: &identity.account_id,
             namespace: &self.config.identity.namespace,
             // 同一 OneBot 用户在群聊和私聊中必须命中同一份角色存档。
             subject_kind: "user",
-            subject_id: req.sender_id.as_str(),
+            subject_id,
         }
     }
 
@@ -269,6 +348,30 @@ fn parse_registration_args(args: &str, legacy_hyphen: bool) -> Result<(&str, &st
     Err("用法：开始穿越 <角色名> <男|女>；也兼容旧格式“角色名-性别”".to_string())
 }
 
+fn parse_legacy_inspect_args(args: &str) -> Result<&str, String> {
+    let mut parts = args.split_whitespace();
+    let subject_id = parts.next().unwrap_or_default();
+    if subject_id.is_empty() || parts.next().is_some() {
+        return Err("用法：旧档检查 <用户ID>".to_string());
+    }
+    Ok(subject_id)
+}
+
+fn parse_legacy_claim_args(args: &str) -> Result<(&str, &str), String> {
+    let mut parts = args.split_whitespace();
+    let subject_id = parts.next().unwrap_or_default();
+    let account_id = parts.next().unwrap_or_default();
+    let confirmation = parts.next().unwrap_or_default();
+    if subject_id.is_empty()
+        || account_id.is_empty()
+        || confirmation != "确认"
+        || parts.next().is_some()
+    {
+        return Err("用法：旧档认领 <用户ID> <当前account_id> 确认".to_string());
+    }
+    Ok((subject_id, account_id))
+}
+
 fn parse_menu_page(args: &str) -> Result<usize, String> {
     let args = args.trim();
     if args.is_empty() {
@@ -310,6 +413,67 @@ mod tests {
             Ok(("唐-小三", "男"))
         );
         assert!(parse_registration_args("唐小三-男", false).is_err());
+    }
+
+    #[test]
+    fn legacy_claim_arguments_require_explicit_account_confirmation() {
+        assert_eq!(parse_legacy_inspect_args("legacy-user"), Ok("legacy-user"));
+        assert!(parse_legacy_inspect_args("").is_err());
+        assert!(parse_legacy_inspect_args("user extra").is_err());
+
+        assert_eq!(
+            parse_legacy_claim_args("legacy-user 10001 确认"),
+            Ok(("legacy-user", "10001"))
+        );
+        for invalid in [
+            "legacy-user 10001",
+            "legacy-user 10001 取消",
+            "legacy-user 10001 确认 extra",
+        ] {
+            assert!(parse_legacy_claim_args(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_owner_workflow_uses_current_resolved_account() {
+        let directory = tempfile::tempdir().expect("临时目录应创建");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("数据库应初始化");
+        let service = GameService::with_assets(
+            store,
+            PluginConfig::default(),
+            IllustrationAssets::default(),
+        );
+        let request = |args: &str| CommandRequest {
+            args: abi_stable::std_types::RString::from(args),
+            command_name: abi_stable::std_types::RString::from("旧档检查"),
+            sender_id: abi_stable::std_types::RString::from("owner-user"),
+            group_id: abi_stable::std_types::RString::new(),
+            raw_event_json: abi_stable::std_types::RString::from(
+                r#"{"self_id":"0010001","qimen_context":{"version":1,"protocol":"onebot11","account_id":"0010001"}}"#,
+            ),
+            sender_nickname: abi_stable::std_types::RString::new(),
+            message_id: abi_stable::std_types::RString::from("message-1"),
+            timestamp: 0,
+        };
+
+        let inspection = service
+            .inspect_legacy(&request("legacy-user"))
+            .expect("缺失旧档也应返回检查结果");
+        let inspection_text = crate::message::render_text(&inspection);
+        assert!(inspection_text.contains("当前账号：0010001"));
+        assert!(inspection_text.contains("状态：未找到"));
+
+        assert!(
+            service
+                .claim_legacy(&request("legacy-user 10001 确认"))
+                .expect_err("确认账号不一致必须拒绝")
+                .contains("不一致")
+        );
+        let result = service
+            .claim_legacy(&request("legacy-user 0010001 确认"))
+            .expect("正确确认但没有旧档时应返回未找到");
+        assert!(crate::message::render_text(&result).contains("结果：未找到"));
     }
 
     #[test]

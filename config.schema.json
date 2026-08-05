@@ -43,6 +43,14 @@
           "pattern": "^[A-Za-z0-9._-]{1,64}$",
           "default": "default"
         },
+        "qq_official_account_id": {
+          "title": "QQ 官方机器人账号",
+          "description": "仅供不含 qimen_context 的旧版 QimenBot 单机器人部署回退使用。建议填写稳定 AppID；新版宿主提供 account_id 时两者必须完全一致。留空会对无法确认账号的有状态命令安全拒绝。",
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^(?:|[^\\s\\u0000-\\u001F\\u007F-\\u009F](?:[^\\u0000-\\u001F\\u007F-\\u009F]*[^\\s\\u0000-\\u001F\\u007F-\\u009F])?)$",
+          "default": ""
+        },
         "max_character_name_chars": {
           "title": "角色名最大长度",
           "description": "按 Unicode 字符数量计算。",

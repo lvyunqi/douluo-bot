@@ -4,6 +4,7 @@ mod assets;
 mod catalog;
 pub mod config;
 mod game;
+mod identity;
 pub mod message;
 mod store;
 
@@ -81,7 +82,7 @@ fn with_service(
     api = "0.6",
     config_schema = "../config.schema.json",
     config_ui = "../config.ui.json",
-    config_version = 2,
+    config_version = 3,
     config_apply = "reload"
 )]
 mod plugin {
@@ -163,5 +164,27 @@ mod plugin {
     )]
     fn location(req: &CommandRequest) -> CommandResponse {
         with_service(req, |service| service.location(req))
+    }
+
+    #[command(
+        name = "旧档检查",
+        description = "检查指定用户的旧版存档认领状态",
+        category = "斗罗大陆·管理",
+        role = "owner",
+        scope = "private"
+    )]
+    fn inspect_legacy(req: &CommandRequest) -> CommandResponse {
+        with_service(req, |service| service.inspect_legacy(req))
+    }
+
+    #[command(
+        name = "旧档认领",
+        description = "显式认领旧版存档：旧档认领 <用户ID> <当前account_id> 确认",
+        category = "斗罗大陆·管理",
+        role = "owner",
+        scope = "private"
+    )]
+    fn claim_legacy(req: &CommandRequest) -> CommandResponse {
+        with_service(req, |service| service.claim_legacy(req))
     }
 }

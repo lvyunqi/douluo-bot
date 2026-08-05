@@ -35,7 +35,7 @@
 
 插件必须与宿主的操作系统、CPU 架构和 C 运行时匹配。
 
-当前已在隔离 QimenBot `0.1.20` 宿主验证配置 v2、OneBot 本地 Base64/远程 URL 消息段、QQ 合成事件文字降级和热重载。QQ 官方 Markdown 与图片 payload 已按适配器契约实现，但合成事件不等同于真实平台；群、C2C、频道和 DMS 仍需使用真实 QQ Bot Gateway、权限和客户端分别验证。QQ 官方首版对本地内联图片保留完整 Markdown/文字，不与独立媒体段混发。
+当前已在隔离 QimenBot `0.1.20` 宿主验证配置 v3、OneBot 本地 Base64/远程 URL 消息段、QQ 合成事件文字降级和热重载。QQ 官方 Markdown 与图片 payload 已按适配器契约实现，但合成事件不等同于真实平台；群、C2C、频道和 DMS 仍需使用真实 QQ Bot Gateway、权限和客户端分别验证。QQ 官方首版对本地内联图片保留完整 Markdown/文字，不与独立媒体段混发。
 
 `斗罗系统` 支持 `1`/`开始`、`2`/`角色` 和 `3`/`世界` 三个分页入口。菜单只列出当前已经可用的命令；QimenBot 自带的 `/help` 会按插件声明的导航、角色和世界分类分页展示全局命令。
 
@@ -93,6 +93,8 @@ busy_timeout_ms = 3000
 
 [identity]
 namespace = "default"
+# 仅用于没有 qimen_context 的旧版 QimenBot 单官方 QQ Bot 回退；新版宿主会校验两者一致。
+qq_official_account_id = ""
 max_character_name_chars = 6
 
 [illustrations]
@@ -108,6 +110,8 @@ legacy_hyphen_arguments = true
 ```
 
 `identity.namespace` 用于隔离共享同一数据库的部署，投入使用后不要随意修改。OneBot Markdown 是实现扩展，仅应在目标客户端实际验证通过后开启。
+
+新版本宿主会在规范化事件中提供稳定的 `qimen_context.account_id`，用于隔离同一发送者在不同 Bot 上的存档。缺少可验证账号时，插件会拒绝有状态命令，不会使用部署实例别名或 `unknown` 作为账号。`identity.qq_official_account_id` 不是通用多 Bot 方案，只为旧版宿主的单 Bot 官方 QQ 部署保留。
 
 `assets/illustrations.json` 是源码内的逻辑绑定清单，包含地图、武魂、魂兽和魂环共 19 条稳定 `asset_key`；它不包含图片二进制、绝对路径、来源取证或许可证结论。将已审核的文件按清单 key 放在 `data_dir/douluo-game/assets/` 下，插件启动时会有界读取并校验扩展名与文件签名。目录不存在、文件缺失或不合规时自动保留完整文字。
 
