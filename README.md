@@ -5,7 +5,7 @@
 ## 功能
 
 - 独立 Rust `cdylib`，支持 QimenBot 动态加载和热重载。
-- 游戏插件使用 SQLite 本地存档和自动数据迁移。
+- 游戏插件使用 SQLite 本地存档、自动数据迁移和追加式操作审计。
 - 支持 OneBot 11 通用消息与 QQ 官方机器人 Markdown。
 - 支持由公开 `assets/illustrations.json` 绑定驱动的 OneBot 图片消息段与 QQ 官方 Markdown 插图。
 - `direct` 模式可从 QimenBot `data_dir` 内预加载图片，以 OneBot `base64://` 消息段发送；缺图时完整文字仍可用。
