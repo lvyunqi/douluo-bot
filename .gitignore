@@ -1,0 +1,24 @@
+/target/
+*.dll
+*.so
+*.dylib
+
+# 本地运行数据和 QimenBot 部署产物
+/data/
+/config/plugins/*.toml
+/plugins/bin/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# 前端依赖和构建产物
+/web/node_modules/
+/web/dist/
+
+# 编辑器与系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+

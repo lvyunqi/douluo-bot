@@ -1,0 +1,23 @@
+[package]
+name = "qimen-dynamic-plugin-douluo-game"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "QimenBot 动态插件：斗罗大陆文字游戏"
+license = "Apache-2.0"
+repository = "https://github.com/lvyunqi/douluo-bot"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+abi-stable-host-api = "=0.1.13"
+abi_stable = "0.11"
+qimen-dynamic-plugin-derive = "=0.1.13"
+rusqlite = { version = "0.34", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+

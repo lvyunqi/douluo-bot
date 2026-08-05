@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "斗罗大陆文字游戏",
+  "description": "插件启动、身份命名空间和跨协议消息配置。游戏数值将在独立管理端维护。",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "database": {
+      "title": "数据库",
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "relative_path": {
+          "title": "数据库相对路径",
+          "description": "相对 QimenBot data_dir 的路径，不允许绝对路径或上级目录。",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "default": "douluo-game/douluo.db"
+        },
+        "busy_timeout_ms": {
+          "title": "数据库等待超时",
+          "description": "SQLite 被短事务占用时的最大等待时间。",
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 30000,
+          "multipleOf": 100,
+          "default": 3000
+        }
+      }
+    },
+    "identity": {
+      "title": "身份",
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "namespace": {
+          "title": "身份命名空间",
+          "description": "同一数据库部署多个机器人时用于隔离存档；投入使用后不要随意修改。",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]{1,64}$",
+          "default": "default"
+        },
+        "max_character_name_chars": {
+          "title": "角色名最大长度",
+          "description": "按 Unicode 字符数量计算。",
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 20,
+          "default": 6
+        }
+      }
+    },
+    "messages": {
+      "title": "消息",
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "qq_official_markdown": {
+          "title": "QQ 官方机器人使用 Markdown",
+          "type": "boolean",
+          "default": true
+        },
+        "onebot_markdown": {
+          "title": "OneBot 使用 Markdown 扩展",
+          "description": "仅在 NapCat/Lagrange 等目标实现已实测支持时开启；通用 OneBot 11 默认使用文本。",
+          "type": "boolean",
+          "default": false
+        },
+        "legacy_hyphen_arguments": {
+          "title": "兼容旧横线参数",
+          "description": "允许“开始穿越 角色名-性别”。",
+          "type": "boolean",
+          "default": true
+        }
+      }
+    }
+  }
+}
+

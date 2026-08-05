@@ -1,0 +1,16 @@
+{
+  "": {
+    "ui:order": ["database", "identity", "messages"]
+  },
+  "/database/busy_timeout_ms": {
+    "ui:widget": "slider",
+    "unit": "毫秒",
+    "step": 100
+  },
+  "/identity/max_character_name_chars": {
+    "ui:widget": "slider",
+    "unit": "字符",
+    "step": 1
+  }
+}
+
