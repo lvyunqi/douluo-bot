@@ -6,6 +6,44 @@ use crate::config::{IllustrationMode, PluginConfig};
 use crate::message::{GameDocument, Illustration, detect_protocol};
 use crate::store::{IdentityKey, PlayerStatus, Store};
 
+const MENU_PAGES: &[MenuPage] = &[
+    MenuPage {
+        key: "开始",
+        title: "开始游戏",
+        entries: &[MenuEntry {
+            command: "开始穿越 <角色名> <男|女>",
+            description: "创建你的斗罗大陆角色",
+        }],
+    },
+    MenuPage {
+        key: "角色",
+        title: "角色成长",
+        entries: &[
+            MenuEntry {
+                command: "武魂觉醒",
+                description: "觉醒第一武魂",
+            },
+            MenuEntry {
+                command: "状态",
+                description: "查看角色属性、武魂和位置",
+            },
+        ],
+    },
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MenuEntry {
+    command: &'static str,
+    description: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MenuPage {
+    key: &'static str,
+    title: &'static str,
+    entries: &'static [MenuEntry],
+}
+
 #[derive(Clone, Debug)]
 pub struct GameService {
     store: Store,
@@ -34,14 +72,32 @@ impl GameService {
         &self.config.illustrations
     }
 
-    pub fn menu(&self) -> GameDocument {
-        GameDocument::new("斗罗系统")
+    pub fn menu(&self, args: &str) -> Result<GameDocument, String> {
+        let page_index = parse_menu_page(args)?;
+        let page = MENU_PAGES
+            .get(page_index)
+            .ok_or_else(|| format!("菜单页码必须在 1 到 {} 之间", MENU_PAGES.len()))?;
+        let mut document = GameDocument::new(format!("斗罗系统 · {}", page.title))
             .line("欢迎来到斗罗大陆。先创建角色，再觉醒属于你的武魂。")
-            .command("开始穿越 <角色名> <男|女>")
-            .command("武魂觉醒")
-            .command("状态")
-            .illustration_if(self.asset_illustration("map", "圣魂村", "cover"))
-            .notice("命令前缀、群聊 @ 和回复入口由 QimenBot 宿主配置决定")
+            .field("分类", page.title)
+            .field("页码", format!("{} / {}", page_index + 1, MENU_PAGES.len()));
+        for entry in page.entries {
+            document = document.command_help(entry.command, entry.description);
+        }
+        if page_index > 0 {
+            document = document.command(format!("斗罗系统 {}", page_index));
+        }
+        if page_index + 1 < MENU_PAGES.len() {
+            document = document.command(format!("斗罗系统 {}", page_index + 2));
+        }
+        let illustration = if page_index == 0 {
+            self.asset_illustration("map", "圣魂村", "cover")
+        } else {
+            None
+        };
+        Ok(document.illustration_if(illustration).notice(
+            "输入“斗罗系统 <页码或分类>”翻页；命令前缀、群聊 @ 和回复入口由 QimenBot 宿主配置决定",
+        ))
     }
 
     pub fn register(&self, req: &CommandRequest) -> Result<GameDocument, String> {
@@ -183,6 +239,32 @@ fn parse_registration_args(args: &str, legacy_hyphen: bool) -> Result<(&str, &st
     Err("用法：开始穿越 <角色名> <男|女>；也兼容旧格式“角色名-性别”".to_string())
 }
 
+fn parse_menu_page(args: &str) -> Result<usize, String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Ok(0);
+    }
+    let mut parts = args.split_whitespace();
+    let token = parts.next().unwrap_or_default();
+    if parts.next().is_some() {
+        return Err("用法：斗罗系统 [页码|开始|角色]".to_string());
+    }
+    if let Some(page) = token
+        .parse::<usize>()
+        .ok()
+        .and_then(|page| page.checked_sub(1))
+    {
+        if page < MENU_PAGES.len() {
+            return Ok(page);
+        }
+        return Err(format!("菜单页码必须在 1 到 {} 之间", MENU_PAGES.len()));
+    }
+    MENU_PAGES
+        .iter()
+        .position(|page| page.key == token)
+        .ok_or_else(|| "用法：斗罗系统 [页码|开始|角色]".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +283,49 @@ mod tests {
     }
 
     #[test]
+    fn menu_pages_only_expose_implemented_commands() {
+        let first = parse_menu_page("").expect("默认菜单页应有效");
+        let second = parse_menu_page("角色").expect("角色分类应有效");
+        assert_eq!(first, 0);
+        assert_eq!(second, 1);
+        assert!(
+            MENU_PAGES[first]
+                .entries
+                .iter()
+                .any(|entry| entry.command.starts_with("开始穿越"))
+        );
+        assert!(
+            MENU_PAGES[second]
+                .entries
+                .iter()
+                .any(|entry| entry.command == "状态")
+        );
+        assert!(parse_menu_page("3").is_err());
+        assert!(parse_menu_page("角色 多余").is_err());
+    }
+
+    #[test]
+    fn menu_document_renders_page_navigation_without_future_commands() {
+        let directory = tempfile::tempdir().expect("临时目录应创建");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("数据库应初始化");
+        let service = GameService::with_assets(
+            store,
+            PluginConfig::default(),
+            IllustrationAssets::default(),
+        );
+        let first = crate::message::render_text(&service.menu("").expect("第一页应有效"));
+        assert!(first.contains("开始穿越 <角色名> <男|女>：创建你的斗罗大陆角色"));
+        assert!(first.contains("斗罗系统 2"));
+        assert!(!first.contains("地图"));
+
+        let second = crate::message::render_text(&service.menu("2").expect("第二页应有效"));
+        assert!(second.contains("武魂觉醒：觉醒第一武魂"));
+        assert!(second.contains("状态：查看角色属性、武魂和位置"));
+        assert!(second.contains("斗罗系统 1"));
+    }
+
+    #[test]
     fn menu_and_wuhun_documents_carry_stable_asset_keys() {
         let directory = tempfile::tempdir().expect("临时目录应创建");
         let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
@@ -209,7 +334,12 @@ mod tests {
         config.illustrations.mode = crate::config::IllustrationMode::Remote;
         config.illustrations.remote_base_url = "https://media.example.com/douluo".to_string();
         let service = GameService::with_assets(store, config, IllustrationAssets::default());
-        assert!(service.menu().has_illustration());
+        assert!(
+            service
+                .menu("")
+                .expect("默认菜单页应有效")
+                .has_illustration()
+        );
         assert!(catalog::binding("wuhun", "独狼", "portrait").is_some());
         assert!(catalog::binding("wuhun", "不存在", "portrait").is_none());
 
@@ -227,7 +357,7 @@ mod tests {
         };
         let response = crate::message::response_for(
             &request,
-            &service.menu(),
+            &service.menu("").expect("默认菜单页应有效"),
             service.message_config(),
             service.illustration_config(),
         );
@@ -268,7 +398,7 @@ mod tests {
         };
         let response = crate::message::response_for(
             &request,
-            &service.menu(),
+            &service.menu("").expect("默认菜单页应有效"),
             service.message_config(),
             service.illustration_config(),
         );
@@ -293,6 +423,11 @@ mod tests {
         let assets = IllustrationAssets::load(directory.path(), &config.illustrations)
             .expect("缺少本地目录时应降级");
         let service = GameService::with_assets(store, config, assets);
-        assert!(!service.menu().has_illustration());
+        assert!(
+            !service
+                .menu("")
+                .expect("默认菜单页应有效")
+                .has_illustration()
+        );
     }
 }

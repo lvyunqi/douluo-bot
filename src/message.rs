@@ -43,6 +43,20 @@ impl GameDocument {
         self
     }
 
+    /// Adds a command together with a short, user-facing explanation.
+    ///
+    /// Keeping the pair in the command list means both the plain-text and
+    /// Markdown renderers apply the same escaping and list formatting.
+    pub fn command_help(
+        mut self,
+        command: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        self.commands
+            .push(format!("{}：{}", command.into(), description.into()));
+        self
+    }
+
     pub fn notice(mut self, notice: impl Into<String>) -> Self {
         self.notice = Some(notice.into());
         self

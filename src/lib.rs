@@ -112,19 +112,21 @@ mod plugin {
 
     #[command(
         name = "斗罗系统",
-        description = "查看斗罗大陆游戏主菜单",
+        description = "查看斗罗大陆游戏菜单（支持页码或分类）",
         aliases = "斗罗菜单,菜单",
-        category = "斗罗大陆"
+        category = "斗罗大陆·导航",
+        scope = "all"
     )]
     fn menu(req: &CommandRequest) -> CommandResponse {
-        with_service(req, |service| Ok(service.menu()))
+        with_service(req, |service| service.menu(req.args.as_str()))
     }
 
     #[command(
         name = "开始穿越",
-        description = "创建斗罗大陆角色",
+        description = "创建斗罗大陆角色：开始穿越 <角色名> <男|女>",
         aliases = "开始转生",
-        category = "斗罗大陆"
+        category = "斗罗大陆·角色",
+        scope = "all"
     )]
     fn register(req: &CommandRequest) -> CommandResponse {
         with_service(req, |service| service.register(req))
@@ -134,7 +136,8 @@ mod plugin {
         name = "武魂觉醒",
         description = "觉醒第一武魂",
         aliases = "觉醒",
-        category = "斗罗大陆"
+        category = "斗罗大陆·角色",
+        scope = "all"
     )]
     fn awaken(req: &CommandRequest) -> CommandResponse {
         with_service(req, |service| service.awaken(req))
@@ -144,7 +147,8 @@ mod plugin {
         name = "状态",
         description = "查看自己的角色状态",
         aliases = "我的状态,属性",
-        category = "斗罗大陆"
+        category = "斗罗大陆·角色",
+        scope = "all"
     )]
     fn status(req: &CommandRequest) -> CommandResponse {
         with_service(req, |service| service.status(req))
