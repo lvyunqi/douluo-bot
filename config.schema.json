@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "斗罗大陆文字游戏",
-  "description": "插件启动、身份命名空间和跨协议消息配置。游戏数值将在独立管理端维护。",
+  "description": "插件启动、身份命名空间、插图和跨协议消息配置。",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -53,6 +53,52 @@
         }
       }
     },
+    "illustrations": {
+      "title": "插图",
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "enabled": {
+          "title": "启用游戏插图",
+          "description": "为地图、武魂、魂兽、NPC、物品和剧情消息附加插图；正文始终保留文本降级。",
+          "type": "boolean",
+          "default": true
+        },
+        "mode": {
+          "title": "图片模式",
+          "description": "direct 直接使用可信 HTTPS 图片；remote 使用可独立部署的斗罗图片服务。",
+          "type": "string",
+          "enum": ["direct", "remote"],
+          "default": "direct"
+        },
+        "remote_base_url": {
+          "title": "远程图片服务地址",
+          "description": "remote 模式使用的公网 HTTPS 基址，不要填写末尾 /media 路径。",
+          "type": "string",
+          "maxLength": 300,
+          "default": ""
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "mode": { "const": "remote" } },
+            "required": ["mode"]
+          },
+          "then": {
+            "properties": {
+              "remote_base_url": {
+                "type": "string",
+                "pattern": "^https://[^\\s?#()]+(?:/[^\\s?#()]*)?$",
+                "minLength": 9
+              }
+            },
+            "required": ["remote_base_url"]
+          }
+        }
+      ]
+    },
     "messages": {
       "title": "消息",
       "type": "object",
@@ -80,4 +126,3 @@
     }
   }
 }
-

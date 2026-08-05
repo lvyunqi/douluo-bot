@@ -1,6 +1,6 @@
 {
   "": {
-    "ui:order": ["database", "identity", "messages"]
+    "ui:order": ["database", "identity", "illustrations", "messages"]
   },
   "/database/busy_timeout_ms": {
     "ui:widget": "slider",
@@ -11,6 +11,16 @@
     "ui:widget": "slider",
     "unit": "字符",
     "step": 1
+  },
+  "/illustrations/mode": {
+    "ui:widget": "badges",
+    "labels": {
+      "direct": "直连图片",
+      "remote": "远程图片服务"
+    }
+  },
+  "/illustrations/remote_base_url": {
+    "placeholder": "https://media.example.com/douluo",
+    "width": "full"
   }
 }
-

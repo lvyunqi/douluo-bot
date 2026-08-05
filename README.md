@@ -7,6 +7,7 @@
 - 独立 Rust `cdylib`，支持 QimenBot 动态加载和热重载。
 - SQLite 本地存档和自动数据迁移。
 - 支持 OneBot 11 通用消息与 QQ 官方机器人 Markdown。
+- 支持由内容资源配置驱动的 OneBot 图片消息段与 QQ 官方 Markdown 公网 HTTPS 插图。
 - 角色创建、武魂觉醒和角色状态查询。
 
 当前命令：
@@ -74,6 +75,11 @@ busy_timeout_ms = 3000
 namespace = "default"
 max_character_name_chars = 6
 
+[illustrations]
+enabled = true
+mode = "direct" # direct 或 remote
+remote_base_url = ""
+
 [messages]
 qq_official_markdown = true
 onebot_markdown = false
@@ -81,6 +87,8 @@ legacy_hyphen_arguments = true
 ```
 
 `identity.namespace` 用于隔离共享同一数据库的部署，投入使用后不要随意修改。OneBot Markdown 是实现扩展，仅应在目标客户端实际验证通过后开启。
+
+`direct` 模式使用资源记录中的完整 HTTPS 地址；`remote` 模式将稳定资源键拼接为 `{remote_base_url}/media/{asset_key}`。图片服务必须能从公网通过 HTTPS 访问。图片不可用时仍返回完整文字；来源和许可证未核验的旧图片不会随源码发布。
 
 命令前缀、私聊裸命令、群聊 @ 和回复触发由 QimenBot `[official_host.commands]` 统一控制，插件不硬编码 `/`。
 

@@ -1,8 +1,8 @@
 //! QimenBot 动态插件入口。
 
-mod config;
+pub mod config;
 mod game;
-mod message;
+pub mod message;
 mod store;
 
 use std::path::Path;
@@ -61,7 +61,12 @@ fn with_service(
         Ok(document) => document,
         Err(error) => GameDocument::new("操作失败").line(error),
     };
-    response_for(req, &document, service.message_config())
+    response_for(
+        req,
+        &document,
+        service.message_config(),
+        service.illustration_config(),
+    )
 }
 
 #[dynamic_plugin(

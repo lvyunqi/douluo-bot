@@ -1,7 +1,7 @@
 use abi_stable_host_api::CommandRequest;
 
 use crate::config::PluginConfig;
-use crate::message::{GameDocument, detect_protocol};
+use crate::message::{GameDocument, Illustration, detect_protocol};
 use crate::store::{IdentityKey, PlayerStatus, Store};
 
 #[derive(Clone, Debug)]
@@ -19,12 +19,22 @@ impl GameService {
         &self.config.messages
     }
 
+    pub fn illustration_config(&self) -> &crate::config::IllustrationConfig {
+        &self.config.illustrations
+    }
+
     pub fn menu(&self) -> GameDocument {
         GameDocument::new("斗罗系统")
             .line("欢迎来到斗罗大陆。先创建角色，再觉醒属于你的武魂。")
             .command("开始穿越 <角色名> <男|女>")
             .command("武魂觉醒")
             .command("状态")
+            .illustration_if(remote_illustration(
+                "斗罗大陆主菜单",
+                "ui/menu/cover.webp",
+                1200,
+                675,
+            ))
             .notice("命令前缀、群聊 @ 和回复入口由 QimenBot 宿主配置决定")
     }
 
@@ -55,18 +65,26 @@ impl GameService {
                 format!("{}/{}", player.soul_power, player.max_soul_power),
             )
             .command("武魂觉醒")
-            .command("状态"))
+            .command("状态")
+            .illustration_if(remote_illustration(
+                "圣魂村",
+                "maps/holy-soul-village/cover.webp",
+                1200,
+                675,
+            )))
     }
 
     pub fn awaken(&self, req: &CommandRequest) -> Result<GameDocument, String> {
         let key = self.identity_key(req);
         let wuhun = self.store.awaken_wuhun(&key)?;
+        let illustration = wuhun_illustration(&wuhun.name);
         Ok(GameDocument::new("武魂觉醒")
             .line("觉醒仪式完成，你感受到一股崭新的力量。")
             .field("武魂", wuhun.name)
             .field("类别", wuhun.category)
             .field("形态", wuhun.form)
             .field("描述", wuhun.description)
+            .illustration_if(illustration)
             .command("状态"))
     }
 
@@ -107,6 +125,7 @@ fn parse_registration_args(args: &str, legacy_hyphen: bool) -> Result<(&str, &st
 }
 
 fn status_document(player: PlayerStatus) -> GameDocument {
+    let illustration = player.wuhun_name.as_deref().and_then(wuhun_illustration);
     let wuhun = match (player.wuhun_name, player.wuhun_category) {
         (Some(name), Some(category)) => format!("{name}（{category}）"),
         _ => "尚未觉醒".to_string(),
@@ -125,6 +144,26 @@ fn status_document(player: PlayerStatus) -> GameDocument {
         .field("位置", player.map_name)
         .field("转生", format!("第 {} 世", player.life_count))
         .field("状态", player.state)
+        .illustration_if(illustration)
+}
+
+fn remote_illustration(
+    alt: &str,
+    asset_key: &str,
+    width: u16,
+    height: u16,
+) -> Option<Illustration> {
+    Illustration::remote_asset(alt, asset_key, width, height).ok()
+}
+
+fn wuhun_illustration(name: &str) -> Option<Illustration> {
+    let asset_key = match name {
+        "独狼" => "wuhun/lone-wolf/portrait.webp",
+        "萝卜" => "wuhun/carrot/portrait.webp",
+        "镰刀" => "wuhun/sickle/portrait.webp",
+        _ => return None,
+    };
+    remote_illustration(name, asset_key, 640, 640)
 }
 
 #[cfg(test)]
@@ -142,5 +181,45 @@ mod tests {
             Ok(("唐-小三", "男"))
         );
         assert!(parse_registration_args("唐小三-男", false).is_err());
+    }
+
+    #[test]
+    fn menu_and_wuhun_documents_carry_stable_asset_keys() {
+        let directory = tempfile::tempdir().expect("临时目录应创建");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("数据库应初始化");
+        let mut config = PluginConfig::default();
+        config.illustrations.mode = crate::config::IllustrationMode::Remote;
+        config.illustrations.remote_base_url = "https://media.example.com/douluo".to_string();
+        let service = GameService::new(store, config);
+        assert!(service.menu().has_illustration());
+        assert!(wuhun_illustration("独狼").is_some());
+        assert!(wuhun_illustration("不存在").is_none());
+
+        let request = CommandRequest {
+            args: abi_stable::std_types::RString::new(),
+            command_name: abi_stable::std_types::RString::from("斗罗系统"),
+            sender_id: abi_stable::std_types::RString::from("user"),
+            group_id: abi_stable::std_types::RString::new(),
+            raw_event_json: abi_stable::std_types::RString::from(
+                r#"{"qqbot_payload":{"id":"message"}}"#,
+            ),
+            sender_nickname: abi_stable::std_types::RString::new(),
+            message_id: abi_stable::std_types::RString::new(),
+            timestamp: 0,
+        };
+        let response = crate::message::response_for(
+            &request,
+            &service.menu(),
+            service.message_config(),
+            service.illustration_config(),
+        );
+        let segments: serde_json::Value =
+            serde_json::from_str(response.action.segments_json.as_str()).expect("消息段应为 JSON");
+        assert!(
+            segments[0]["data"]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("/media/ui/menu/cover.webp"))
+        );
     }
 }

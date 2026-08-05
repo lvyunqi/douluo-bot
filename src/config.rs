@@ -1,6 +1,7 @@
 use std::path::{Component, Path};
 
 use serde::Deserialize;
+use url::{Host, Url};
 
 /// 插件启动配置。所有字段都提供无配置文件时的安全默认值。
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -8,6 +9,7 @@ use serde::Deserialize;
 pub struct PluginConfig {
     pub database: DatabaseConfig,
     pub identity: IdentityConfig,
+    pub illustrations: IllustrationConfig,
     pub messages: MessageConfig,
 }
 
@@ -61,6 +63,44 @@ impl Default for MessageConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IllustrationMode {
+    #[default]
+    Direct,
+    Remote,
+}
+
+/// 插图投递配置：直连模式使用完整 HTTPS URL，远程模式使用配套图片服务。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct IllustrationConfig {
+    pub enabled: bool,
+    pub mode: IllustrationMode,
+    pub remote_base_url: String,
+}
+
+impl Default for IllustrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: IllustrationMode::Direct,
+            remote_base_url: String::new(),
+        }
+    }
+}
+
+impl IllustrationConfig {
+    pub fn remote_asset_url(&self, asset_key: &str) -> Option<String> {
+        let base_url = self.remote_base_url.trim_end_matches('/');
+        (self.enabled
+            && self.mode == IllustrationMode::Remote
+            && is_safe_asset_key(asset_key)
+            && validate_public_https_url(base_url, false).is_ok())
+        .then(|| format!("{base_url}/media/{asset_key}"))
+    }
+}
+
 /// 解析并执行业务级校验；JSON Schema 校验仍由 QimenBot 宿主负责。
 pub fn parse_config(config_json: &str) -> Result<PluginConfig, String> {
     let config = if config_json.trim().is_empty() {
@@ -93,6 +133,9 @@ pub fn validate_config(config: &PluginConfig) -> Result<(), String> {
     if !(2..=20).contains(&config.identity.max_character_name_chars) {
         return Err("identity.max_character_name_chars 必须在 2 到 20 之间".to_string());
     }
+    if config.illustrations.mode == IllustrationMode::Remote {
+        validate_remote_base_url(&config.illustrations.remote_base_url)?;
+    }
     Ok(())
 }
 
@@ -102,6 +145,130 @@ fn valid_namespace(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+pub(crate) fn is_safe_asset_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 200
+        && !value.starts_with('/')
+        && !value.ends_with('/')
+        && !value.contains("..")
+        && !value.contains("//")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+}
+
+fn validate_remote_base_url(value: &str) -> Result<(), String> {
+    validate_public_https_url(value, false)
+        .map_err(|_| "illustrations.remote_base_url 必须是公网 HTTPS 地址".to_string())
+}
+
+/// Validates a URL that may be handed to a platform or a OneBot adapter.
+///
+/// This is deliberately a syntactic/public-address check. It does not resolve
+/// DNS and therefore cannot prevent a later DNS rebinding; components that
+/// fetch remote media must apply their own DNS, redirect and timeout policy.
+pub(crate) fn validate_public_https_url(value: &str, allow_query: bool) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 2_048
+        || value.contains('\\')
+        || value.contains('(')
+        || value.contains(')')
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err("URL 包含不允许的字符".to_string());
+    }
+    let path_part = value
+        .split_once("://")
+        .and_then(|(_, remainder)| remainder.split_once('/').map(|(_, path)| path))
+        .and_then(|path| path.split(['?', '#']).next())
+        .unwrap_or_default();
+    if path_part
+        .split('/')
+        .any(|segment| matches!(segment, "." | ".."))
+    {
+        return Err("URL 路径包含点段".to_string());
+    }
+    let lowercase = value.to_ascii_lowercase();
+    if ["%00", "%2f", "%2e", "%5c"]
+        .iter()
+        .any(|escape| lowercase.contains(escape))
+    {
+        return Err("URL 包含编码后的路径分隔符".to_string());
+    }
+
+    let url = Url::parse(value).map_err(|_| "URL 解析失败".to_string())?;
+    if url.scheme() != "https"
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || (!allow_query && url.query().is_some())
+        || url.port() == Some(0)
+    {
+        return Err("URL 必须是无凭据的 HTTPS 地址".to_string());
+    }
+
+    let host = url.host().ok_or_else(|| "URL 缺少主机名".to_string())?;
+    if is_non_public_host(host) {
+        return Err("URL 主机不是公网地址".to_string());
+    }
+    Ok(())
+}
+
+fn is_non_public_host(host: Host<&str>) -> bool {
+    match host {
+        Host::Domain(domain) => {
+            let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
+            normalized == "localhost"
+                || normalized.ends_with(".localhost")
+                || normalized.ends_with(".local")
+        }
+        Host::Ipv4(ip) => is_non_public_ipv4(ip),
+        Host::Ipv6(ip) => {
+            let segments = ip.segments();
+            let mapped = if segments[..5].iter().all(|segment| *segment == 0)
+                && matches!(segments[5], 0 | 0xffff)
+            {
+                Some(std::net::Ipv4Addr::new(
+                    (segments[6] >> 8) as u8,
+                    segments[6] as u8,
+                    (segments[7] >> 8) as u8,
+                    segments[7] as u8,
+                ))
+            } else {
+                None
+            };
+            mapped.is_some_and(is_non_public_ipv4)
+                || ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || (segments[0] & 0xfe00 == 0xfc00)
+                || (segments[0] & 0xffc0 == 0xfe80)
+                || (segments[0] & 0xffc0 == 0xfec0)
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        }
+    }
+}
+
+fn is_non_public_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224
 }
 
 #[cfg(test)]
@@ -114,6 +281,8 @@ mod tests {
         assert_eq!(config, PluginConfig::default());
         assert!(!config.messages.onebot_markdown);
         assert!(config.messages.qq_official_markdown);
+        assert!(config.illustrations.enabled);
+        assert_eq!(config.illustrations.mode, IllustrationMode::Direct);
     }
 
     #[test]
@@ -127,5 +296,46 @@ mod tests {
     fn rejects_unknown_fields() {
         let error = parse_config(r#"{"unknown":true}"#).expect_err("未知字段必须被拒绝");
         assert!(error.contains("unknown field"));
+    }
+
+    #[test]
+    fn remote_mode_requires_clean_https_base_url() {
+        let config = parse_config(
+            r#"{"illustrations":{"mode":"remote","remote_base_url":"https://media.example.com/douluo"}}"#,
+        )
+        .expect("公网图片服务地址应有效");
+        assert_eq!(
+            config
+                .illustrations
+                .remote_asset_url("maps/holy-soul-village.webp")
+                .as_deref(),
+            Some("https://media.example.com/douluo/media/maps/holy-soul-village.webp")
+        );
+
+        let error = parse_config(
+            r#"{"illustrations":{"mode":"remote","remote_base_url":"http://127.0.0.1:18181"}}"#,
+        )
+        .expect_err("非 HTTPS 地址必须被拒绝");
+        assert!(error.contains("公网 HTTPS"));
+
+        assert!(
+            parse_config(
+                r#"{"illustrations":{"mode":"remote","remote_base_url":"https://127.0.0.1:18181"}}"#,
+            )
+            .is_err()
+        );
+        for host in ["127.1", "2130706433", "127.0.0.1.", "[::ffff:127.0.0.1]"] {
+            assert!(
+                parse_config(&format!(
+                    r#"{{"illustrations":{{"mode":"remote","remote_base_url":"https://{host}"}}}}"#
+                ))
+                .is_err(),
+                "非公网主机 {host} 不应通过校验"
+            );
+        }
+        assert!(parse_config(
+            r#"{"illustrations":{"mode":"remote","remote_base_url":"https://media.example.com/a/../douluo"}}"#
+        )
+        .is_err());
     }
 }
