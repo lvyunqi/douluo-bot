@@ -153,4 +153,15 @@ mod plugin {
     fn status(req: &CommandRequest) -> CommandResponse {
         with_service(req, |service| service.status(req))
     }
+
+    #[command(
+        name = "位置",
+        description = "查看当前地图",
+        aliases = "地图,当前位置",
+        category = "斗罗大陆·世界",
+        scope = "all"
+    )]
+    fn location(req: &CommandRequest) -> CommandResponse {
+        with_service(req, |service| service.location(req))
+    }
 }

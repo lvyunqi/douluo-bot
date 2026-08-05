@@ -29,6 +29,14 @@ const MENU_PAGES: &[MenuPage] = &[
             },
         ],
     },
+    MenuPage {
+        key: "世界",
+        title: "世界探索",
+        entries: &[MenuEntry {
+            command: "位置",
+            description: "查看当前地图",
+        }],
+    },
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,6 +162,28 @@ impl GameService {
         Ok(self.status_document(player))
     }
 
+    pub fn location(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        if !req.args.as_str().trim().is_empty() {
+            return Err("用法：位置".to_string());
+        }
+        let key = self.identity_key(req);
+        let player = self
+            .store
+            .player_status(&key)?
+            .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())?;
+        let map_name = player.map_name.clone();
+        Ok(GameDocument::new(format!("当前位置 · {map_name}"))
+            .field("角色", player.name)
+            .field("地图", &map_name)
+            .field("生命", format!("{}/{}", player.hp, player.max_hp))
+            .field(
+                "魂力",
+                format!("{}/{}", player.soul_power, player.max_soul_power),
+            )
+            .illustration_if(self.asset_illustration("map", &map_name, "cover"))
+            .command("状态"))
+    }
+
     fn identity_key<'a>(&'a self, req: &'a CommandRequest) -> IdentityKey<'a> {
         IdentityKey {
             protocol: detect_protocol(req.raw_event_json.as_str()),
@@ -247,7 +277,7 @@ fn parse_menu_page(args: &str) -> Result<usize, String> {
     let mut parts = args.split_whitespace();
     let token = parts.next().unwrap_or_default();
     if parts.next().is_some() {
-        return Err("用法：斗罗系统 [页码|开始|角色]".to_string());
+        return Err("用法：斗罗系统 [页码|开始|角色|世界]".to_string());
     }
     if let Some(page) = token
         .parse::<usize>()
@@ -262,7 +292,7 @@ fn parse_menu_page(args: &str) -> Result<usize, String> {
     MENU_PAGES
         .iter()
         .position(|page| page.key == token)
-        .ok_or_else(|| "用法：斗罗系统 [页码|开始|角色]".to_string())
+        .ok_or_else(|| "用法：斗罗系统 [页码|开始|角色|世界]".to_string())
 }
 
 #[cfg(test)]
@@ -300,7 +330,8 @@ mod tests {
                 .iter()
                 .any(|entry| entry.command == "状态")
         );
-        assert!(parse_menu_page("3").is_err());
+        assert_eq!(parse_menu_page("世界").expect("世界分类应有效"), 2);
+        assert!(parse_menu_page("4").is_err());
         assert!(parse_menu_page("角色 多余").is_err());
     }
 
@@ -323,6 +354,94 @@ mod tests {
         assert!(second.contains("武魂觉醒：觉醒第一武魂"));
         assert!(second.contains("状态：查看角色属性、武魂和位置"));
         assert!(second.contains("斗罗系统 1"));
+        assert!(second.contains("斗罗系统 3"));
+
+        let third = crate::message::render_text(&service.menu("世界").expect("世界页应有效"));
+        assert!(third.contains("位置：查看当前地图"));
+        assert!(third.contains("斗罗系统 2"));
+    }
+
+    #[test]
+    fn location_requires_a_player_and_uses_the_current_map_illustration() {
+        let directory = tempfile::tempdir().expect("临时目录应创建");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("数据库应初始化");
+        let mut config = PluginConfig::default();
+        config.illustrations.mode = crate::config::IllustrationMode::Remote;
+        config.illustrations.remote_base_url = "https://media.example.com/douluo".to_string();
+        let service = GameService::with_assets(store, config, IllustrationAssets::default());
+        let request = CommandRequest {
+            args: abi_stable::std_types::RString::new(),
+            command_name: abi_stable::std_types::RString::from("位置"),
+            sender_id: abi_stable::std_types::RString::from("user-location"),
+            group_id: abi_stable::std_types::RString::new(),
+            raw_event_json: abi_stable::std_types::RString::from(
+                r#"{"post_type":"message","self_id":10001}"#,
+            ),
+            sender_nickname: abi_stable::std_types::RString::new(),
+            message_id: abi_stable::std_types::RString::new(),
+            timestamp: 0,
+        };
+        assert!(service.location(&request).is_err());
+        service
+            .register(&CommandRequest {
+                args: abi_stable::std_types::RString::from("唐小三 男"),
+                command_name: abi_stable::std_types::RString::from("开始穿越"),
+                sender_id: abi_stable::std_types::RString::from("user-location"),
+                group_id: abi_stable::std_types::RString::new(),
+                raw_event_json: abi_stable::std_types::RString::from(
+                    r#"{"post_type":"message","self_id":10001}"#,
+                ),
+                sender_nickname: abi_stable::std_types::RString::new(),
+                message_id: abi_stable::std_types::RString::new(),
+                timestamp: 0,
+            })
+            .expect("角色应创建");
+        let location = service.location(&request).expect("位置应可查询");
+        let text = crate::message::render_text(&location);
+        assert!(text.contains("当前位置 · 圣魂村"));
+        assert!(text.contains("角色：唐小三"));
+        assert!(location.has_illustration());
+
+        let response = crate::message::response_for(
+            &request,
+            &location,
+            service.message_config(),
+            service.illustration_config(),
+        );
+        let segments: serde_json::Value =
+            serde_json::from_str(response.action.segments_json.as_str()).expect("消息段应为 JSON");
+        assert_eq!(
+            segments[1]["data"]["file"],
+            "https://media.example.com/douluo/media/maps/holy-soul-village/cover.webp"
+        );
+
+        let direct = GameService::with_assets(
+            Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+                .expect("数据库应重新打开"),
+            PluginConfig::default(),
+            IllustrationAssets::default(),
+        );
+        let direct_location = direct.location(&request).expect("direct 位置应可查询");
+        assert!(!direct_location.has_illustration());
+        assert!(crate::message::render_text(&direct_location).contains("圣魂村"));
+
+        let invalid_request = CommandRequest {
+            args: abi_stable::std_types::RString::from("多余参数"),
+            command_name: abi_stable::std_types::RString::from("位置"),
+            sender_id: abi_stable::std_types::RString::from("user-location"),
+            group_id: abi_stable::std_types::RString::new(),
+            raw_event_json: abi_stable::std_types::RString::from(
+                r#"{"post_type":"message","self_id":10001}"#,
+            ),
+            sender_nickname: abi_stable::std_types::RString::new(),
+            message_id: abi_stable::std_types::RString::new(),
+            timestamp: 0,
+        };
+        assert_eq!(
+            service.location(&invalid_request),
+            Err("用法：位置".to_string())
+        );
     }
 
     #[test]
