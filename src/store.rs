@@ -1600,6 +1600,130 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_V14: &str = r#"
+CREATE TABLE wuhun_state_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    wuhun_id INTEGER NOT NULL REFERENCES wuhun(id) ON DELETE RESTRICT,
+    battle_id INTEGER REFERENCES battle(id) ON DELETE RESTRICT,
+    battle_event_id INTEGER REFERENCES battle_event(id) ON DELETE RESTRICT,
+    operation_log_id INTEGER NOT NULL REFERENCES operation_log(id) ON DELETE RESTRICT,
+    reason TEXT NOT NULL CHECK(reason IN (
+        'manual_toggle', 'battle_damage', 'battle_flee_damage', 'item_restore'
+    )),
+    enabled_before INTEGER NOT NULL CHECK(enabled_before IN (0, 1)),
+    enabled_after INTEGER NOT NULL CHECK(enabled_after IN (0, 1)),
+    stability_before INTEGER NOT NULL CHECK(stability_before BETWEEN 0 AND 100),
+    stability_after INTEGER NOT NULL CHECK(stability_after BETWEEN 0 AND 100),
+    source_message_id TEXT NOT NULL CHECK(
+        length(source_message_id) <= 256
+        AND instr(source_message_id, char(0)) = 0
+        AND source_message_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    CHECK(
+        (battle_id IS NULL AND battle_event_id IS NULL)
+        OR (battle_id IS NOT NULL AND battle_event_id IS NOT NULL)
+    ),
+    CHECK(
+        (reason IN ('battle_damage', 'battle_flee_damage')) = (battle_event_id IS NOT NULL)
+    )
+) STRICT;
+
+CREATE UNIQUE INDEX wuhun_state_event_operation
+    ON wuhun_state_event(operation_log_id);
+CREATE UNIQUE INDEX wuhun_state_event_battle_event
+    ON wuhun_state_event(battle_event_id) WHERE battle_event_id IS NOT NULL;
+CREATE INDEX wuhun_state_event_player_page
+    ON wuhun_state_event(player_id, id);
+
+CREATE TRIGGER wuhun_state_event_no_update
+BEFORE UPDATE ON wuhun_state_event
+BEGIN
+    SELECT RAISE(ABORT, 'wuhun state event is immutable');
+END;
+
+CREATE TRIGGER wuhun_state_event_no_delete
+BEFORE DELETE ON wuhun_state_event
+BEGIN
+    SELECT RAISE(ABORT, 'wuhun state event is immutable');
+END;
+
+CREATE TRIGGER wuhun_state_event_no_reinsert
+BEFORE INSERT ON wuhun_state_event
+WHEN EXISTS(SELECT 1 FROM wuhun_state_event WHERE id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'wuhun state event is append-only');
+END;
+
+CREATE TRIGGER wuhun_state_event_scope_guard
+BEFORE INSERT ON wuhun_state_event
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM player_wuhun_state s
+     WHERE s.player_id = NEW.player_id
+       AND s.wuhun_id = NEW.wuhun_id
+       AND s.slot = 1
+       AND s.enabled = NEW.enabled_after
+       AND s.stability = NEW.stability_after
+)
+OR NOT EXISTS(
+    SELECT 1
+      FROM player p
+      JOIN identity i ON i.id = p.identity_id
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE p.id = NEW.player_id
+       AND audit.protocol = i.protocol
+       AND audit.account_id = i.account_id
+       AND audit.namespace = i.namespace
+       AND audit.subject_kind = i.subject_kind
+       AND audit.subject_id = i.subject_id
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+       AND (
+           (NEW.reason = 'manual_toggle' AND audit.command = CASE NEW.enabled_after
+               WHEN 1 THEN '开武魂' ELSE '关武魂' END)
+           OR (NEW.reason = 'item_restore' AND audit.command = '使用')
+           OR (NEW.reason = 'battle_damage' AND audit.command = '攻击')
+           OR (NEW.reason = 'battle_flee_damage' AND audit.command = '逃跑')
+       )
+)
+OR NEW.battle_event_id IS NOT NULL AND NOT EXISTS(
+    SELECT 1
+      FROM battle_event event
+     WHERE event.id = NEW.battle_event_id
+       AND event.battle_id = NEW.battle_id
+       AND event.player_id = NEW.player_id
+       AND event.operation_log_id = NEW.operation_log_id
+       AND event.source_message_id = NEW.source_message_id
+       AND (
+           (NEW.reason = 'battle_damage' AND event.event_kind = 'attack' AND event.beast_damage > 0)
+           OR (NEW.reason = 'battle_flee_damage' AND event.event_kind = 'flee' AND event.beast_damage > 0)
+       )
+)
+OR (
+    EXISTS(SELECT 1 FROM wuhun_state_event WHERE player_id = NEW.player_id)
+    AND NOT EXISTS(
+        SELECT 1
+          FROM wuhun_state_event previous
+         WHERE previous.id = (
+             SELECT MAX(latest.id)
+               FROM wuhun_state_event latest
+              WHERE latest.player_id = NEW.player_id
+         )
+           AND previous.wuhun_id = NEW.wuhun_id
+           AND previous.enabled_after = NEW.enabled_before
+           AND previous.stability_after = NEW.stability_before
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'wuhun state event scope or audit mismatch');
+END;
+"#;
+
+const WUHUN_STABILITY_DROP_THRESHOLD: i64 = 30;
+const WUHUN_STABILITY_DROP_CHANCE_MULTIPLIER: i64 = 2;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -1802,6 +1926,10 @@ pub struct UseItemReceipt {
     pub max_soul_power: i64,
     pub state_before: String,
     pub state_after: String,
+    pub wuhun_enabled: Option<bool>,
+    pub wuhun_stability_before: Option<i64>,
+    pub wuhun_stability_after: Option<i64>,
+    pub wuhun_max_stability: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1997,6 +2125,7 @@ pub struct BattleActionReceipt {
     pub event: BattleEventRecord,
     pub experience: Option<ExperienceGrantReceipt>,
     pub ground_drop: Option<GroundDropRecord>,
+    pub wuhun_effect: Option<WuhunStateEffect>,
     pub replayed: bool,
 }
 
@@ -2076,6 +2205,15 @@ pub struct WuhunToggleReceipt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WuhunStateEffect {
+    pub enabled_before: bool,
+    pub enabled_after: bool,
+    pub stability_before: i64,
+    pub stability_after: i64,
+    pub auto_dropped: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)] // 为后续只读管理查询保留完整审计字段。
 pub struct OperationLogEntry {
     pub id: i64,
@@ -2104,6 +2242,22 @@ pub struct OperationLogInput<'a> {
     pub outcome: &'a str,
     pub source_message_id: &'a str,
     pub details_json: &'a str,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WuhunStateEventInsert<'a> {
+    player_id: i64,
+    wuhun_id: i64,
+    battle_id: Option<i64>,
+    battle_event_id: Option<i64>,
+    operation_log_id: i64,
+    reason: &'a str,
+    enabled_before: bool,
+    enabled_after: bool,
+    stability_before: i64,
+    stability_after: i64,
+    source_message_id: &'a str,
+    created_at: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2460,6 +2614,25 @@ impl Store {
         Ok(connection)
     }
 
+    fn begin_immediate<'a>(
+        &self,
+        connection: &'a mut Connection,
+        operation: &str,
+    ) -> Result<Transaction<'a>, String> {
+        let deadline = Instant::now() + self.busy_timeout.max(Duration::from_secs(5));
+        loop {
+            // This connection is freshly opened by the caller; unchecked avoids extending a
+            // failed BEGIN borrow across retries while preserving Transaction rollback-on-drop.
+            match Transaction::new_unchecked(&*connection, TransactionBehavior::Immediate) {
+                Ok(transaction) => return Ok(transaction),
+                Err(error) if sqlite_is_busy_or_locked(&error) && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(format!("{operation}：{error}")),
+            }
+        }
+    }
+
     fn ensure_wal_mode(&self, connection: &Connection) -> Result<(), String> {
         let deadline = Instant::now() + self.busy_timeout;
         loop {
@@ -2500,7 +2673,9 @@ impl Store {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
-                    format!("开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13 失败：{error}")
+                    format!(
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14 失败：{error}"
+                    )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
             if !migration_applied(&transaction, 2)? {
@@ -2706,9 +2881,24 @@ impl Store {
                 validate_v13_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 14)? {
+                transaction
+                    .execute_batch(MIGRATION_V14)
+                    .map_err(|error| format!("执行数据库迁移 v14 失败：{error}"))?;
+                validate_v14_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(14, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v14 失败：{error}"))?;
+            } else {
+                validate_v14_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
-                format!("提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13 失败：{error}")
+                format!("提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14 失败：{error}")
             })?;
             Ok(())
         })();
@@ -2728,6 +2918,7 @@ impl Store {
                 validate_v11_schema(connection)?;
                 validate_v12_schema(connection)?;
                 validate_v13_schema(connection)?;
+                validate_v14_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -4567,6 +4758,7 @@ impl Store {
                 event: existing,
                 experience: None,
                 ground_drop: drop,
+                wuhun_effect: None,
                 replayed: true,
             });
         }
@@ -4659,6 +4851,7 @@ impl Store {
             event,
             experience: None,
             ground_drop: None,
+            wuhun_effect: None,
             replayed: false,
         })
     }
@@ -4708,6 +4901,7 @@ impl Store {
                 .map(|id| load_ground_drop_by_id(&transaction, id))
                 .transpose()?
                 .flatten();
+            let wuhun_effect = load_wuhun_state_event_by_battle_event(&transaction, existing.id)?;
             transaction
                 .commit()
                 .map_err(|error| format!("提交{action}重放事务失败：{error}"))?;
@@ -4716,6 +4910,7 @@ impl Store {
                 event: existing,
                 experience: None,
                 ground_drop: drop,
+                wuhun_effect,
                 replayed: true,
             });
         }
@@ -4724,6 +4919,9 @@ impl Store {
         if player.state != "alive" || player.hp != state.player_hp {
             return Err("角色生命状态与战斗快照不一致，战斗已暂停，请联系管理员".to_string());
         }
+        let (wuhun_id, wuhun_state) =
+            load_wuhun_state_with_id_by_player(&transaction, player.player_id)?
+                .ok_or_else(|| "角色缺少武魂状态，请联系管理员".to_string())?;
         let sequence = state
             .action_count
             .checked_add(1)
@@ -4935,6 +5133,38 @@ impl Store {
                 )
             }
         };
+        let mut wuhun_effect = None;
+        if beast_damage > 0 {
+            let effect = wuhun_effect_after_damage(
+                &wuhun_state,
+                player_hp_after,
+                state.player_max_hp,
+                battle_roll(state.random_seed, sequence, 7),
+            )?;
+            let updated = transaction
+                .execute(
+                    r#"
+                    UPDATE player_wuhun_state
+                       SET enabled = ?1,
+                           stability = ?2,
+                           last_toggle_at = CASE WHEN ?3 THEN ?4 ELSE last_toggle_at END,
+                           updated_at = ?4
+                     WHERE player_id = ?5 AND slot = 1
+                    "#,
+                    params![
+                        effect.enabled_after,
+                        effect.stability_after,
+                        effect.auto_dropped,
+                        timestamp,
+                        state.player_id
+                    ],
+                )
+                .map_err(|error| format!("保存战斗后的武魂稳定度失败：{error}"))?;
+            if updated != 1 {
+                return Err("保存战斗后的武魂状态时目标行发生变化".to_string());
+            }
+            wuhun_effect = Some(effect);
+        }
         let operation_log_id = insert_operation_log(&transaction, key, operation)?;
         insert_battle_event(
             &transaction,
@@ -4961,6 +5191,29 @@ impl Store {
             },
         )?;
         let event_id = transaction.last_insert_rowid();
+        if let Some(effect) = &wuhun_effect {
+            insert_wuhun_state_event(
+                &transaction,
+                WuhunStateEventInsert {
+                    player_id: state.player_id,
+                    wuhun_id,
+                    battle_id: Some(state.id),
+                    battle_event_id: Some(event_id),
+                    operation_log_id,
+                    reason: if action == "攻击" {
+                        "battle_damage"
+                    } else {
+                        "battle_flee_damage"
+                    },
+                    enabled_before: effect.enabled_before,
+                    enabled_after: effect.enabled_after,
+                    stability_before: effect.stability_before,
+                    stability_after: effect.stability_after,
+                    source_message_id: operation.source_message_id,
+                    created_at: timestamp,
+                },
+            )?;
+        }
         let battle = load_battle_snapshot(&transaction, state.id)?
             .ok_or_else(|| "战斗结算后无法读取快照".to_string())?;
         let event = load_battle_event_by_id(&transaction, event_id)?
@@ -4977,6 +5230,7 @@ impl Store {
             event,
             experience,
             ground_drop,
+            wuhun_effect,
             replayed: false,
         })
     }
@@ -5296,6 +5550,7 @@ impl Store {
                 .map_err(|error| format!("读取使用物品角色失败：{error}"))?
                 .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())?;
         ensure_no_active_battle_for_player(&transaction, player_id)?;
+        let wuhun_before = load_wuhun_state_with_id_by_player(&transaction, player_id)?;
         if state_before == "deleted" {
             return Err("角色已封存，不能使用物品".to_string());
         }
@@ -5386,6 +5641,7 @@ impl Store {
             inventory_before
         };
         let timestamp = now_timestamp()?;
+        let mut wuhun_stability_after = wuhun_before.as_ref().map(|(_, state)| state.stability);
         if consumed {
             let updated = transaction
                 .execute(
@@ -5413,8 +5669,47 @@ impl Store {
                 inventory_after,
                 timestamp,
             )?;
+            if hp_after != hp_before
+                && let Some((_, state)) = wuhun_before.as_ref()
+            {
+                let stability = stability_from_hp(hp_after, max_hp, state.max_stability)?;
+                let updated = transaction
+                    .execute(
+                        "UPDATE player_wuhun_state SET stability = ?1, updated_at = ?2 WHERE player_id = ?3",
+                        params![stability, timestamp, player_id],
+                    )
+                    .map_err(|error| format!("同步生命恢复后的武魂稳定度失败：{error}"))?;
+                if updated != 1 {
+                    return Err("同步武魂稳定度时目标行发生变化".to_string());
+                }
+                wuhun_stability_after = Some(stability);
+            }
         }
-        insert_operation_log(&transaction, key, operation)?;
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        if consumed
+            && hp_after != hp_before
+            && let Some((wuhun_id, state)) = wuhun_before.as_ref()
+        {
+            insert_wuhun_state_event(
+                &transaction,
+                WuhunStateEventInsert {
+                    player_id,
+                    wuhun_id: *wuhun_id,
+                    battle_id: None,
+                    battle_event_id: None,
+                    operation_log_id,
+                    reason: "item_restore",
+                    enabled_before: state.enabled,
+                    enabled_after: state.enabled,
+                    stability_before: state.stability,
+                    stability_after: wuhun_stability_after.unwrap_or(state.stability),
+                    source_message_id: operation.source_message_id,
+                    created_at: timestamp,
+                },
+            )?;
+        }
+        let wuhun_enabled = wuhun_before.as_ref().map(|(_, state)| state.enabled);
+        let wuhun_stability_before = wuhun_before.as_ref().map(|(_, state)| state.stability);
         transaction
             .commit()
             .map_err(|error| format!("提交使用物品事务失败：{error}"))?;
@@ -5430,6 +5725,10 @@ impl Store {
             max_soul_power,
             state_before,
             state_after,
+            wuhun_enabled,
+            wuhun_stability_before,
+            wuhun_stability_after,
+            wuhun_max_stability: wuhun_before.as_ref().map(|(_, state)| state.max_stability),
         })
     }
 
@@ -5586,10 +5885,10 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("开始{expected_command}事务失败：{error}"))?;
         ensure_no_legacy_identity(&transaction, key)?;
-        let player_id = transaction
+        let (player_id, player_hp, player_max_hp) = transaction
             .query_row(
                 r#"
-                SELECT p.id
+                SELECT p.id, p.hp, p.max_hp
                   FROM identity i
                   JOIN player p ON p.identity_id = i.id
                  WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
@@ -5602,7 +5901,13 @@ impl Store {
                     key.subject_kind,
                     key.subject_id
                 ],
-                |row| row.get::<_, i64>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|error| format!("查询武魂角色失败：{error}"))?
@@ -5657,22 +5962,44 @@ impl Store {
         {
             return Err("战斗中不能切换武魂，请先结束当前战斗".to_string());
         }
-        let state = load_wuhun_state_by_player(&transaction, player_id)?
+        let (wuhun_id, mut state) = load_wuhun_state_with_id_by_player(&transaction, player_id)?
             .ok_or_else(|| "角色尚未完成武魂觉醒".to_string())?;
+        let enabled_before = state.enabled;
+        let stability_before = state.stability;
+        if enabled {
+            state.stability = stability_from_hp(player_hp, player_max_hp, state.max_stability)?;
+        }
         if enabled && state.stability <= 0 {
             return Err("当前武魂稳定度为 0，暂时无法开启".to_string());
         }
         let timestamp = now_timestamp()?;
         let updated = transaction
             .execute(
-                "UPDATE player_wuhun_state SET enabled = ?1, last_toggle_at = ?2, updated_at = ?2 WHERE player_id = ?3",
-                params![enabled, timestamp, player_id],
+                "UPDATE player_wuhun_state SET enabled = ?1, stability = ?2, last_toggle_at = ?3, updated_at = ?3 WHERE player_id = ?4",
+                params![enabled, state.stability, timestamp, player_id],
             )
             .map_err(|error| format!("保存武魂状态失败：{error}"))?;
         if updated != 1 {
             return Err("保存武魂状态时目标行发生变化".to_string());
         }
-        insert_operation_log(&transaction, key, operation)?;
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        insert_wuhun_state_event(
+            &transaction,
+            WuhunStateEventInsert {
+                player_id,
+                wuhun_id,
+                battle_id: None,
+                battle_event_id: None,
+                operation_log_id,
+                reason: "manual_toggle",
+                enabled_before,
+                enabled_after: enabled,
+                stability_before,
+                stability_after: state.stability,
+                source_message_id: operation.source_message_id,
+                created_at: timestamp,
+            },
+        )?;
         let state = load_wuhun_state_by_player(&transaction, player_id)?
             .ok_or_else(|| "保存武魂状态后无法读取状态".to_string())?;
         transaction
@@ -6152,9 +6479,7 @@ impl Store {
         validate_operation_input(operation)?;
 
         let mut connection = self.open()?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| format!("开始签到事务失败：{error}"))?;
+        let transaction = self.begin_immediate(&mut connection, "开始签到事务失败")?;
         ensure_no_legacy_identity(&transaction, key)?;
         let (player_id, current_level, current_exp) = transaction
             .query_row(
@@ -7442,28 +7767,151 @@ fn load_wuhun_state_by_player(
     connection: &Connection,
     player_id: i64,
 ) -> Result<Option<WuhunState>, String> {
+    Ok(load_wuhun_state_with_id_by_player(connection, player_id)?.map(|(_, state)| state))
+}
+
+fn load_wuhun_state_with_id_by_player(
+    connection: &Connection,
+    player_id: i64,
+) -> Result<Option<(i64, WuhunState)>, String> {
     connection
         .query_row(
             r#"
-            SELECT w.name, w.category, w.form, s.enabled, s.stability, s.max_stability
+            SELECT s.wuhun_id, w.name, w.category, w.form,
+                   s.enabled, s.stability, s.max_stability
               FROM player_wuhun_state s
               JOIN wuhun w ON w.id = s.wuhun_id
              WHERE s.player_id = ?1 AND s.slot = 1
             "#,
             [player_id],
             |row| {
-                Ok(WuhunState {
-                    name: row.get(0)?,
-                    category: row.get(1)?,
-                    form: row.get(2)?,
-                    enabled: row.get(3)?,
-                    stability: row.get(4)?,
-                    max_stability: row.get(5)?,
-                })
+                Ok((
+                    row.get(0)?,
+                    WuhunState {
+                        name: row.get(1)?,
+                        category: row.get(2)?,
+                        form: row.get(3)?,
+                        enabled: row.get(4)?,
+                        stability: row.get(5)?,
+                        max_stability: row.get(6)?,
+                    },
+                ))
             },
         )
         .optional()
         .map_err(|error| format!("读取武魂状态失败：{error}"))
+}
+
+fn load_wuhun_state_event_by_battle_event(
+    connection: &Connection,
+    battle_event_id: i64,
+) -> Result<Option<WuhunStateEffect>, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT enabled_before, enabled_after, stability_before, stability_after
+              FROM wuhun_state_event
+             WHERE battle_event_id = ?1
+            "#,
+            [battle_event_id],
+            |row| {
+                let enabled_before = row.get(0)?;
+                let enabled_after = row.get(1)?;
+                Ok(WuhunStateEffect {
+                    enabled_before,
+                    enabled_after,
+                    stability_before: row.get(2)?,
+                    stability_after: row.get(3)?,
+                    auto_dropped: enabled_before && !enabled_after,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取战斗武魂状态事件失败：{error}"))
+}
+
+fn insert_wuhun_state_event(
+    connection: &Connection,
+    event: WuhunStateEventInsert<'_>,
+) -> Result<i64, String> {
+    if !(0..=100).contains(&event.stability_before) || !(0..=100).contains(&event.stability_after) {
+        return Err("武魂状态事件稳定度超出范围".to_string());
+    }
+    let battle_linked = event.battle_id.is_some() && event.battle_event_id.is_some();
+    let detached = event.battle_id.is_none() && event.battle_event_id.is_none();
+    let valid_source = match event.reason {
+        "manual_toggle" | "item_restore" => detached,
+        "battle_damage" | "battle_flee_damage" => battle_linked,
+        _ => false,
+    };
+    if !valid_source {
+        return Err("武魂状态事件来源不匹配".to_string());
+    }
+    connection
+        .execute(
+            r#"
+            INSERT INTO wuhun_state_event(
+                player_id, wuhun_id, battle_id, battle_event_id, operation_log_id,
+                reason, enabled_before, enabled_after, stability_before, stability_after,
+                source_message_id, created_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "#,
+            params![
+                event.player_id,
+                event.wuhun_id,
+                event.battle_id,
+                event.battle_event_id,
+                event.operation_log_id,
+                event.reason,
+                event.enabled_before,
+                event.enabled_after,
+                event.stability_before,
+                event.stability_after,
+                event.source_message_id,
+                event.created_at
+            ],
+        )
+        .map_err(|error| format!("写入武魂状态事件失败：{error}"))?;
+    Ok(connection.last_insert_rowid())
+}
+
+fn stability_from_hp(hp: i64, max_hp: i64, max_stability: i64) -> Result<i64, String> {
+    if hp < 0 || max_hp <= 0 || max_stability <= 0 {
+        return Err("武魂稳定度计算参数无效".to_string());
+    }
+    let value = i128::from(hp)
+        .checked_mul(i128::from(max_stability))
+        .ok_or_else(|| "武魂稳定度计算溢出".to_string())?
+        / i128::from(max_hp);
+    i64::try_from(value.clamp(0, i128::from(max_stability)))
+        .map_err(|_| "武魂稳定度超出整数范围".to_string())
+}
+
+fn should_auto_drop_wuhun(stability: i64, roll: u64) -> bool {
+    if stability >= WUHUN_STABILITY_DROP_THRESHOLD {
+        return false;
+    }
+    let chance = (WUHUN_STABILITY_DROP_THRESHOLD - stability)
+        .saturating_mul(WUHUN_STABILITY_DROP_CHANCE_MULTIPLIER)
+        .clamp(0, 100);
+    roll % 100 < chance as u64
+}
+
+fn wuhun_effect_after_damage(
+    state: &WuhunState,
+    hp_after: i64,
+    max_hp: i64,
+    roll: u64,
+) -> Result<WuhunStateEffect, String> {
+    let stability_after = stability_from_hp(hp_after, max_hp, state.max_stability)?;
+    let auto_dropped = state.enabled && should_auto_drop_wuhun(stability_after, roll);
+    Ok(WuhunStateEffect {
+        enabled_before: state.enabled,
+        enabled_after: state.enabled && !auto_dropped,
+        stability_before: state.stability,
+        stability_after,
+        auto_dropped,
+    })
 }
 
 fn load_battle_player(
@@ -12249,7 +12697,8 @@ fn validate_v13_schema(connection: &Connection) -> Result<(), String> {
             .iter()
             .any(|(expected_name, expected_table, _)| {
                 name == *expected_name && table == *expected_table
-            });
+            })
+            || name == "wuhun_state_event_scope_guard";
         let touches_v13 = table == "player_wuhun_state"
             || sql_mentions_identifier(&trigger_sql, "player_wuhun_state");
         if touches_v13 && !declared {
@@ -12259,6 +12708,216 @@ fn validate_v13_schema(connection: &Connection) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn validate_v14_schema(connection: &Connection) -> Result<(), String> {
+    let actual = table_columns_with_type(connection, "wuhun_state_event")?;
+    let expected = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("wuhun_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("battle_id", "INTEGER", false, false, None, 0),
+        TableColumnInfo::new("battle_event_id", "INTEGER", false, false, None, 0),
+        TableColumnInfo::new("operation_log_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("reason", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("enabled_before", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("enabled_after", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("stability_before", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("stability_after", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("source_message_id", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+    ];
+    if actual != expected {
+        return Err(format!(
+            "数据库已标记迁移 v14，但表 wuhun_state_event 字段不匹配：{actual:?}"
+        ));
+    }
+    let sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'wuhun_state_event'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v14 武魂状态事件建表语句失败：{error}"))?
+        .ok_or_else(|| "数据库已标记迁移 v14，但缺少表 wuhun_state_event".to_string())?
+        .to_ascii_uppercase();
+    for marker in [
+        ") STRICT",
+        "REASON IN",
+        "STABILITY_BEFORE BETWEEN 0 AND 100",
+        "STABILITY_AFTER BETWEEN 0 AND 100",
+        "BATTLE_ID IS NULL AND BATTLE_EVENT_ID IS NULL",
+    ] {
+        if !sql.contains(marker) {
+            return Err(format!(
+                "数据库已标记迁移 v14，但武魂状态事件表缺少约束：{marker}"
+            ));
+        }
+    }
+
+    validate_v14_foreign_keys(
+        connection,
+        "wuhun_state_event",
+        &[
+            ("battle", "battle_id", "id", "NO ACTION", "RESTRICT"),
+            (
+                "battle_event",
+                "battle_event_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            (
+                "operation_log",
+                "operation_log_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+            ("wuhun", "wuhun_id", "id", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+    validate_v14_custom_index_set(
+        connection,
+        "wuhun_state_event",
+        &[
+            "wuhun_state_event_operation",
+            "wuhun_state_event_battle_event",
+            "wuhun_state_event_player_page",
+        ],
+    )?;
+    validate_v14_index(
+        connection,
+        "wuhun_state_event_operation",
+        true,
+        &["operation_log_id"],
+        false,
+    )?;
+    validate_v14_index(
+        connection,
+        "wuhun_state_event_battle_event",
+        true,
+        &["battle_event_id"],
+        true,
+    )?;
+    validate_v14_index(
+        connection,
+        "wuhun_state_event_player_page",
+        false,
+        &["player_id", "id"],
+        false,
+    )?;
+
+    let expected_triggers = [
+        ("wuhun_state_event_no_update", "wuhun_state_event"),
+        ("wuhun_state_event_no_delete", "wuhun_state_event"),
+        ("wuhun_state_event_no_reinsert", "wuhun_state_event"),
+        ("wuhun_state_event_scope_guard", "wuhun_state_event"),
+    ];
+    for (name, table) in expected_triggers {
+        let (actual_table, trigger_sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v14 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v14，但缺少触发器 {name}"))?;
+        let normalized = trigger_sql.to_ascii_uppercase();
+        if actual_table != table || !normalized.contains("RAISE(ABORT") {
+            return Err(format!("v14 触发器 {name} 契约不匹配"));
+        }
+        if name == "wuhun_state_event_scope_guard"
+            && (!normalized.contains("FROM PLAYER_WUHUN_STATE")
+                || !normalized.contains("JOIN OPERATION_LOG AUDIT")
+                || !normalized.contains("FROM BATTLE_EVENT EVENT")
+                || !normalized.contains("MAX(LATEST.ID)")
+                || !normalized.contains("PREVIOUS.STABILITY_AFTER = NEW.STABILITY_BEFORE"))
+        {
+            return Err("v14 武魂状态事件范围触发器不完整".to_string());
+        }
+    }
+    let trigger_names = connection
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'wuhun_state_event'",
+        )
+        .map_err(|error| format!("读取 v14 武魂状态事件触发器失败：{error}"))?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("查询 v14 武魂状态事件触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v14 武魂状态事件触发器失败：{error}"))?;
+    let mut expected_names = expected_triggers
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .collect::<Vec<_>>();
+    let mut actual_names = trigger_names;
+    expected_names.sort();
+    actual_names.sort();
+    if actual_names != expected_names {
+        return Err(format!(
+            "数据库已标记迁移 v14，但武魂状态事件触发器集合不匹配：实际 {actual_names:?}，期望 {expected_names:?}"
+        ));
+    }
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v14 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v14 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v14 全库触发器失败：{error}"))?;
+    for (name, table, trigger_sql) in triggers {
+        let declared = expected_triggers
+            .iter()
+            .any(|(expected_name, expected_table)| {
+                name == *expected_name && table == *expected_table
+            });
+        let touches_v14 = table == "wuhun_state_event"
+            || sql_mentions_identifier(&trigger_sql, "wuhun_state_event");
+        if touches_v14 && !declared {
+            return Err(format!(
+                "v14 触发器 {name} 未声明却引用武魂状态事件表 {table}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v14_foreign_keys(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, &str, &str, &str)],
+) -> Result<(), String> {
+    validate_v9_foreign_keys(connection, table, expected)
+        .map_err(|error| error.replace("v9", "v14"))
+}
+
+fn validate_v14_custom_index_set(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), String> {
+    validate_v10_custom_index_set(connection, table, expected)
+        .map_err(|error| error.replace("v10", "v14"))
+}
+
+fn validate_v14_index(
+    connection: &Connection,
+    index_name: &str,
+    unique: bool,
+    columns: &[&str],
+    partial: bool,
+) -> Result<(), String> {
+    validate_v7_index(connection, index_name, unique, columns, partial)
+        .map_err(|error| error.replace("v7", "v14"))
 }
 
 fn validate_v13_foreign_keys(
@@ -12458,7 +13117,10 @@ fn validate_v12_triggers(connection: &Connection) -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("解析 v12 全库触发器失败：{error}"))?;
     for (name, table, sql) in triggers {
-        if name == "battle_wuhun_state_guard" {
+        if matches!(
+            name.as_str(),
+            "battle_wuhun_state_guard" | "wuhun_state_event_scope_guard"
+        ) {
             continue;
         }
         let declared = expected.iter().any(|(expected_name, expected_table)| {
@@ -13984,6 +14646,24 @@ mod tests {
         assert!(
             error.contains("v13"),
             "v13 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    fn assert_v14_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v14 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v14 迁移应成功");
+        let connection = store.open().expect("应打开 v14 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v14 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v14 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v14"),
+            "v14 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
         );
     }
 
@@ -17525,6 +18205,313 @@ mod tests {
             AFTER INSERT ON battle
             BEGIN
                 SELECT EXISTS(SELECT 1 FROM player_wuhun_state);
+            END;
+            "#,
+        );
+    }
+
+    #[test]
+    fn v14_stability_formula_and_auto_drop_are_deterministic() {
+        let state = WuhunState {
+            name: "独狼".to_string(),
+            category: "敏攻系".to_string(),
+            form: "附体型".to_string(),
+            enabled: true,
+            stability: 100,
+            max_stability: 100,
+        };
+        let threshold = wuhun_effect_after_damage(&state, 30, 100, 0).expect("阈值稳定度应可计算");
+        assert_eq!(threshold.stability_after, 30);
+        assert!(!threshold.auto_dropped);
+        assert!(threshold.enabled_after);
+
+        let dropped = wuhun_effect_after_damage(&state, 20, 100, 0).expect("低稳定度应可计算脱落");
+        assert_eq!(dropped.stability_after, 20);
+        assert!(dropped.auto_dropped);
+        assert!(!dropped.enabled_after);
+
+        let retained = wuhun_effect_after_damage(&state, 20, 100, 20).expect("边界随机值应可计算");
+        assert!(!retained.auto_dropped);
+        assert!(retained.enabled_after);
+    }
+
+    #[test]
+    fn v14_battle_damage_persists_stability_event_and_replays_it() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        let player_id = player_id_for(&store, &identity());
+        store
+            .open()
+            .expect("应打开 v14 战斗测试数据库")
+            .execute(
+                "UPDATE player SET level = 3, updated_at = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置哥布林挑战等级");
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "v14-battle-map"),
+            )
+            .expect("应传送到落日森林");
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "哥布林",
+                &transfer_operation("挑战", "v14-battle-start"),
+            )
+            .expect("应挑战哥布林");
+
+        let attacked = store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "v14-battle-hit"),
+            )
+            .expect("哥布林首回合应结算");
+        assert_eq!(attacked.event.status_after, "active");
+        assert!(attacked.event.beast_damage > 0);
+        let effect = attacked
+            .wuhun_effect
+            .as_ref()
+            .expect("受击应产生武魂稳定度事件");
+        assert_eq!(effect.stability_before, 100);
+        assert_eq!(
+            effect.stability_after,
+            attacked.event.player_hp_after * 100 / attacked.battle.player_max_hp
+        );
+        assert!(!effect.auto_dropped);
+        assert_eq!(
+            store
+                .player_status(&identity())
+                .unwrap()
+                .unwrap()
+                .wuhun_stability,
+            Some(effect.stability_after)
+        );
+
+        let replay = store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "v14-battle-hit"),
+            )
+            .expect("相同战斗消息应重放");
+        assert!(replay.replayed);
+        assert_eq!(replay.wuhun_effect, attacked.wuhun_effect);
+        let connection = store.open().expect("应检查 v14 武魂事件账本");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM wuhun_state_event WHERE reason = 'battle_damage'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn v14_failed_flee_persists_stability_event() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "v14-flee-map"),
+            )
+            .expect("应传送到落日森林");
+        let started = store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "史莱姆",
+                &transfer_operation("挑战", "v14-flee-start"),
+            )
+            .expect("应开始逃跑测试战斗");
+        let seed = (1..10_000)
+            .find(|seed| battle_roll(*seed, 1, 4) % 100 >= 50)
+            .expect("应找到确定性逃跑失败种子");
+        let connection = store.open().expect("应打开 v14 逃跑测试数据库");
+        let transition_trigger = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'battle_transition_guard'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("应读取战斗转换触发器");
+        connection
+            .execute_batch("DROP TRIGGER battle_transition_guard;")
+            .expect("测试应暂时卸载战斗转换触发器");
+        connection
+            .execute(
+                "UPDATE battle SET random_seed = ?1 WHERE id = ?2",
+                params![seed, started.battle.id],
+            )
+            .expect("测试应设置确定性战斗种子");
+        connection
+            .execute_batch(&transition_trigger)
+            .expect("测试应恢复战斗转换触发器");
+        drop(connection);
+
+        let result = store
+            .flee_battle_with_operation(&identity(), &transfer_operation("逃跑", "v14-flee-failed"))
+            .expect("逃跑失败回合应结算");
+        assert_eq!(result.event.flee_success, Some(false));
+        assert!(result.event.beast_damage > 0);
+        assert!(result.wuhun_effect.is_some());
+        assert_eq!(
+            store
+                .open()
+                .unwrap()
+                .query_row(
+                    "SELECT reason FROM wuhun_state_event WHERE battle_event_id = ?1",
+                    [result.event.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "battle_flee_damage"
+        );
+    }
+
+    #[test]
+    fn v14_healing_restores_stability_and_open_recalculates_from_hp() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        let player_id = player_id_for(&store, &identity());
+        let connection = store.open().expect("应打开 v14 恢复测试数据库");
+        connection
+            .execute(
+                "UPDATE player SET hp = 20, updated_at = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应降低测试生命");
+        connection
+            .execute(
+                "UPDATE player_wuhun_state SET enabled = 0, stability = 20 WHERE player_id = ?1",
+                [player_id],
+            )
+            .expect("应设置低稳定度收回状态");
+        drop(connection);
+        seed_inventory(&store, &identity(), "small-healing-potion", 1);
+
+        let used = store
+            .use_item_with_operation(
+                &identity(),
+                "小回复药",
+                &transfer_operation("使用", "v14-heal"),
+            )
+            .expect("生命药应恢复生命与稳定度");
+        assert!(used.consumed);
+        assert_eq!(used.hp_after, 70);
+        assert_eq!(used.wuhun_enabled, Some(false));
+        assert_eq!(used.wuhun_stability_before, Some(20));
+        assert_eq!(used.wuhun_stability_after, Some(70));
+
+        let opened = store
+            .set_wuhun_enabled_with_operation(
+                &identity(),
+                true,
+                &transfer_operation("开武魂", "v14-open"),
+            )
+            .expect("恢复后应重新开启武魂");
+        assert!(opened.state.enabled);
+        assert_eq!(opened.state.stability, 70);
+        let connection = store.open().expect("应检查 v14 恢复事件");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM wuhun_state_event WHERE reason IN ('item_restore', 'manual_toggle')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn v14_state_event_failure_rolls_back_healing_and_audit() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        let player_id = player_id_for(&store, &identity());
+        seed_inventory(&store, &identity(), "small-healing-potion", 1);
+        let connection = store.open().expect("应打开 v14 回滚测试数据库");
+        connection
+            .execute(
+                "UPDATE player SET hp = 20, updated_at = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应降低测试生命");
+        connection
+            .execute(
+                "UPDATE player_wuhun_state SET stability = 20 WHERE player_id = ?1",
+                [player_id],
+            )
+            .expect("应降低测试稳定度");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER wuhun_state_event_test_abort
+                BEFORE INSERT ON wuhun_state_event
+                BEGIN SELECT RAISE(ABORT, 'test wuhun event failure'); END;
+                "#,
+            )
+            .expect("应安装武魂事件失败触发器");
+        drop(connection);
+
+        assert!(
+            store
+                .use_item_with_operation(
+                    &identity(),
+                    "小回复药",
+                    &transfer_operation("使用", "v14-heal-rollback"),
+                )
+                .is_err()
+        );
+        let status = store.player_status(&identity()).unwrap().unwrap();
+        assert_eq!(status.hp, 20);
+        assert_eq!(status.wuhun_stability, Some(20));
+        assert_eq!(
+            inventory_for(&store, &identity(), "small-healing-potion"),
+            1
+        );
+        assert_eq!(
+            store
+                .open()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM operation_log WHERE source_message_id = 'v14-heal-rollback'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn recorded_v14_with_damaged_schema_or_trigger_fails_closed() {
+        for mutation in [
+            "DROP TABLE wuhun_state_event;",
+            "DROP INDEX wuhun_state_event_operation;",
+            "DROP TRIGGER wuhun_state_event_scope_guard;",
+        ] {
+            assert_v14_damage_fails_closed(mutation);
+        }
+        assert_v14_damage_fails_closed(
+            r#"
+            CREATE TRIGGER wuhun_state_event_shadow
+            AFTER INSERT ON wuhun_state_event
+            BEGIN SELECT 1; END;
+            "#,
+        );
+        assert_v14_damage_fails_closed(
+            r#"
+            CREATE TRIGGER player_wuhun_reads_wuhun_state_event
+            AFTER INSERT ON player_wuhun
+            BEGIN
+                SELECT EXISTS(SELECT 1 FROM wuhun_state_event);
             END;
             "#,
         );

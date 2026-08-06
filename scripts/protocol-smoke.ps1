@@ -439,6 +439,9 @@ try {
         $result = Invoke-OneBotCommand $endpoint $check.Message
         Write-Output ("onebot {0}: {1} [{2}]" -f $result.Command, $result.ActionName, $result.Text)
         Assert-Condition ($result.Text.Contains($check.Contains)) "response for '$($check.Message)' did not contain '$($check.Contains)': $($result.ActionJson)"
+        if ($check.Message -eq "使用 小回复药") {
+            Assert-Condition ($result.Text.Contains("武魂稳定度")) "healing item response did not expose wuhun stability"
+        }
     }
 
     $closeWuhun = Invoke-OneBotCommand $endpoint "关武魂"
@@ -452,6 +455,7 @@ try {
     $openWuhun = Invoke-OneBotCommand $endpoint "开武魂"
     Write-Output ("onebot 开武魂: {0} [{1}]" -f $openWuhun.ActionName, $openWuhun.Text)
     Assert-Condition ($openWuhun.Text.Contains("武魂开启")) "could not reopen wuhun"
+    Assert-Condition ($openWuhun.Text.Contains("稳定度随生命变化")) "open wuhun response did not expose stability behavior"
     $beasts = Invoke-OneBotCommand $endpoint "魂兽"
     Write-Output ("onebot 魂兽: {0} [{1}]" -f $beasts.ActionName, $beasts.Text)
     Assert-Condition ($beasts.Text.Contains("史莱姆")) "soul beast list did not expose slime"
@@ -518,7 +522,7 @@ try {
     Assert-Condition ($null -ne $reload.data.message) "dynamic reload did not return a result"
     $afterReload = Invoke-OneBotCommand $endpoint "钱包"
     Assert-Condition ($afterReload.Text.Contains("金魂币")) "command failed after dynamic reload"
-    Write-Output "protocol smoke passed: OneBot tasks/PVE/wuhun/economy, private/group, synthetic QQ payload, descriptor, and reload"
+    Write-Output "protocol smoke passed: OneBot tasks/PVE/wuhun stability/economy, private/group, synthetic QQ payload, descriptor, and reload"
 } finally {
     if ($null -ne $process -and -not $process.HasExited) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue

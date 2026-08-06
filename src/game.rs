@@ -410,7 +410,7 @@ impl GameService {
         .notice(if receipt.replayed {
             "检测到相同消息的重复请求，已返回原武魂状态，未重复执行"
         } else if enabled {
-            "武魂已进入战斗形态；稳定度消耗和技能效果将在后续战斗纵切接入"
+            "武魂已进入战斗形态；稳定度随生命变化，低于 30 时受击可能自动脱落"
         } else {
             "武魂已收回；关闭状态下不能发起魂兽挑战"
         });
@@ -1029,6 +1029,12 @@ impl GameService {
                 if event.beast_critical { "暴击" } else { "" }
             ));
         }
+        if let Some(effect) = &receipt.wuhun_effect {
+            document = document.field(
+                "武魂稳定度",
+                format!("{} → {}", effect.stability_before, effect.stability_after),
+            );
+        }
         if event.status_after == "won" {
             document = document
                 .field("获得经验", event.experience_awarded.to_string())
@@ -1046,6 +1052,19 @@ impl GameService {
             document = document.notice("检测到相同消息的重复请求，已返回原战斗回执，未重复执行");
         } else {
             document = document.notice("本回合已在同一事务内结算，战斗快照可在热重载后继续");
+        }
+        if receipt
+            .wuhun_effect
+            .as_ref()
+            .is_some_and(|effect| effect.auto_dropped)
+        {
+            document = document.notice(if receipt.replayed {
+                "检测到相同消息的重复请求，已返回原回执；该回合武魂因稳定度过低自动脱落"
+            } else if event.status_after == "defeated" {
+                "武魂因稳定度过低自动脱落；你已被救回濒死状态，死亡与复活系统尚未开放"
+            } else {
+                "武魂稳定度过低，武魂已自动脱落；结束战斗后可重新开启"
+            });
         }
         document =
             document.illustration_if(self.asset_illustration("soul_beast", &beast.name, "battle"));
@@ -1291,6 +1310,24 @@ impl GameService {
                     receipt.soul_power_before, receipt.soul_power_after, receipt.max_soul_power
                 ),
             );
+        if let (Some(enabled), Some(before), Some(after)) = (
+            receipt.wuhun_enabled,
+            receipt.wuhun_stability_before,
+            receipt.wuhun_stability_after,
+        ) {
+            document = document.field(
+                "武魂稳定度",
+                format!(
+                    "{} → {}/{}",
+                    before,
+                    after,
+                    receipt.wuhun_max_stability.unwrap_or(100)
+                ),
+            );
+            if !enabled {
+                document = document.line("武魂当前处于收回状态，稳定度会随生命恢复同步");
+            }
+        }
         if receipt.consumed {
             document = document.notice("物品已消耗");
         } else {
