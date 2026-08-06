@@ -67,6 +67,14 @@ const MENU_PAGES: &[MenuPage] = &[
                 command: "传送 [地图]",
                 description: "从传送阵前往可达地图",
             },
+            MenuEntry {
+                command: "掉落 [页码]",
+                description: "查看当前地图可拾取的地面掉落",
+            },
+            MenuEntry {
+                command: "拾取 <掉落ID>",
+                description: "拾取当前地图的一整堆物品",
+            },
         ],
     },
     MenuPage {
@@ -585,6 +593,75 @@ impl GameService {
             .command("使用 <物品>")
             .command("商店")
             .command("钱包"))
+    }
+
+    pub fn ground_drops(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let page = parse_single_page(req.args.as_str(), "掉落")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let drops = self.store.ground_drops_page(&key, page, 8)?;
+        let mut document = GameDocument::new(format!("当前掉落 · {}", drops.map_name))
+            .field("页码", format!("{} / {}", drops.page, drops.page_count))
+            .field("可拾取数量", drops.total.to_string());
+        if drops.entries.is_empty() {
+            document = document.line("当前地图没有可拾取的地面掉落");
+        } else {
+            for drop in &drops.entries {
+                let owner = drop
+                    .owner_subject_id
+                    .as_deref()
+                    .map_or_else(|| "公共掉落".to_string(), |owner| format!("归属 {owner}"));
+                let expiry = drop.expires_at.map_or_else(
+                    || "永久".to_string(),
+                    |expires_at| format!("有效至时间戳 {expires_at}"),
+                );
+                document = document
+                    .line(format!(
+                        "#{} · {} x{} · {} · {}",
+                        drop.id, drop.item.name, drop.quantity, owner, expiry
+                    ))
+                    .command(format!("拾取 {}", drop.id));
+            }
+        }
+        if page > 1 {
+            document = document.command(format!("掉落 {}", page - 1));
+        }
+        if page < drops.page_count {
+            document = document.command(format!("掉落 {}", page + 1));
+        }
+        Ok(document.command("位置").command("背包"))
+    }
+
+    pub fn pick_up_ground_drop(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let drop_id = parse_ground_drop_id(req.args.as_str())?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self
+            .store
+            .pick_up_ground_drop_with_operation(&key, drop_id, &operation)?;
+        let title = if receipt.replayed {
+            "拾取回执"
+        } else {
+            "拾取成功"
+        };
+        let notice = if receipt.replayed {
+            "检测到相同消息的重复请求，已返回原拾取回执，未再次增加物品"
+        } else {
+            "背包、操作日志和不可变拾取账本已在同一事务完成"
+        };
+        Ok(GameDocument::new(title)
+            .field("掉落编号", receipt.drop_id.to_string())
+            .field(
+                "拾取物品",
+                format!("{} x{}", receipt.item.name, receipt.quantity),
+            )
+            .field("背包数量", receipt.inventory_after.to_string())
+            .field("拾取账本编号", receipt.claim_id.to_string())
+            .notice(notice)
+            .command("掉落")
+            .command("背包"))
     }
 
     pub fn buy(&self, req: &CommandRequest) -> Result<GameDocument, String> {
@@ -1294,6 +1371,19 @@ fn parse_single_page(args: &str, label: &str) -> Result<usize, String> {
         return Err(format!("{label}页码必须在 1 到 100 之间"));
     }
     Ok(page)
+}
+
+fn parse_ground_drop_id(args: &str) -> Result<i64, String> {
+    let mut parts = args.split_whitespace();
+    let drop_id = parts
+        .next()
+        .ok_or_else(|| "用法：拾取 <掉落ID>".to_string())?
+        .parse::<i64>()
+        .map_err(|_| "掉落编号必须是正整数".to_string())?;
+    if parts.next().is_some() || drop_id <= 0 {
+        return Err("用法：拾取 <掉落ID>".to_string());
+    }
+    Ok(drop_id)
 }
 
 fn parse_shop_args(args: &str) -> Result<(Option<&str>, usize), String> {
@@ -2048,6 +2138,8 @@ mod tests {
 
         let third = crate::message::render_text(&service.menu("世界").expect("世界页应有效"));
         assert!(third.contains("位置：查看当前地图"));
+        assert!(third.contains("掉落 [页码]：查看当前地图可拾取的地面掉落"));
+        assert!(third.contains("拾取 <掉落ID>：拾取当前地图的一整堆物品"));
         assert!(third.contains("斗罗系统 2"));
         assert!(third.contains("斗罗系统 4"));
 
@@ -2064,6 +2156,10 @@ mod tests {
         assert_eq!(parse_single_page("2", "背包"), Ok(2));
         assert!(parse_single_page("0", "背包").is_err());
         assert!(parse_single_page("2 extra", "背包").is_err());
+        assert_eq!(parse_ground_drop_id("42"), Ok(42));
+        assert!(parse_ground_drop_id("").is_err());
+        assert!(parse_ground_drop_id("0").is_err());
+        assert!(parse_ground_drop_id("42 extra").is_err());
 
         assert_eq!(parse_shop_args(""), Ok((None, 1)));
         assert_eq!(parse_shop_args("2"), Ok((None, 2)));
@@ -2166,6 +2262,13 @@ mod tests {
         service
             .daily_checkin(&command_request("签到", "", "economy-checkin"))
             .expect("应获得购买资金");
+
+        let drops = crate::message::render_text(
+            &service
+                .ground_drops(&command_request("掉落", "", "economy-drops"))
+                .expect("应读取当前地图掉落"),
+        );
+        assert!(drops.contains("当前地图没有可拾取的地面掉落"));
 
         let npcs = crate::message::render_text(
             &service

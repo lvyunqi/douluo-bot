@@ -351,6 +351,28 @@ mod plugin {
     }
 
     #[command(
+        name = "掉落",
+        description = "分页查看当前地图可拾取的地面掉落：掉落 [页码]",
+        aliases = "查看掉落,地面掉落",
+        category = "斗罗大陆·世界",
+        scope = "all"
+    )]
+    fn ground_drops(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.ground_drops(req))
+    }
+
+    #[command(
+        name = "拾取",
+        description = "拾取当前地图的完整掉落堆：拾取 <掉落ID>",
+        aliases = "捡取,拾取物品",
+        category = "斗罗大陆·世界",
+        scope = "all"
+    )]
+    fn pick_up_ground_drop(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.pick_up_ground_drop(req))
+    }
+
+    #[command(
         name = "旧档检查",
         description = "检查指定用户的旧版存档认领状态",
         category = "斗罗大陆·管理",

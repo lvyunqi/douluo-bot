@@ -802,6 +802,205 @@ INSERT INTO item_transfer_policy(item_key, transferable, created_at, updated_at)
     ('soul-power-potion', 1, 0, 0);
 "#;
 
+// v10 将地面掉落与拾取状态拆成不可变实体、拾取账本和过期账本。掉落由
+// 战斗/系统服务写入，聊天侧只允许查看当前地图并拾取完整掉落堆。
+const MIGRATION_V10: &str = r#"
+CREATE TABLE ground_drop (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    map_key TEXT NOT NULL REFERENCES map(map_key) ON DELETE RESTRICT,
+    item_key TEXT NOT NULL REFERENCES item(item_key) ON DELETE RESTRICT,
+    quantity INTEGER NOT NULL CHECK(quantity BETWEEN 1 AND 9999),
+    owner_identity_id INTEGER REFERENCES identity(id) ON DELETE RESTRICT,
+    owner_subject_id TEXT CHECK(
+        owner_subject_id IS NULL OR (
+            length(owner_subject_id) BETWEEN 1 AND 256
+            AND instr(owner_subject_id, char(0)) = 0
+            AND owner_subject_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+        )
+    ),
+    source_kind TEXT NOT NULL CHECK(source_kind IN ('battle', 'system', 'manual')),
+    source_event_id TEXT NOT NULL CHECK(
+        length(source_event_id) BETWEEN 1 AND 256
+        AND instr(source_event_id, char(0)) = 0
+        AND source_event_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    expires_at INTEGER CHECK(expires_at IS NULL OR expires_at >= 0),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    CHECK((owner_identity_id IS NULL AND owner_subject_id IS NULL)
+       OR (owner_identity_id IS NOT NULL AND owner_subject_id IS NOT NULL))
+) STRICT;
+
+CREATE UNIQUE INDEX ground_drop_source
+    ON ground_drop(source_kind, source_event_id);
+CREATE INDEX ground_drop_map_page
+    ON ground_drop(map_key, id);
+
+CREATE TABLE ground_drop_claim (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    drop_id INTEGER NOT NULL REFERENCES ground_drop(id) ON DELETE RESTRICT,
+    claimer_identity_id INTEGER NOT NULL REFERENCES identity(id) ON DELETE RESTRICT,
+    claimer_subject_id TEXT NOT NULL CHECK(
+        length(claimer_subject_id) BETWEEN 1 AND 256
+        AND instr(claimer_subject_id, char(0)) = 0
+        AND claimer_subject_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    item_key TEXT NOT NULL REFERENCES item(item_key) ON DELETE RESTRICT,
+    quantity INTEGER NOT NULL CHECK(quantity BETWEEN 1 AND 9999),
+    inventory_before INTEGER NOT NULL CHECK(inventory_before >= 0),
+    inventory_after INTEGER NOT NULL CHECK(inventory_after >= 0),
+    source_message_id TEXT NOT NULL CHECK(
+        length(source_message_id) BETWEEN 1 AND 256
+        AND instr(source_message_id, char(0)) = 0
+        AND source_message_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    operation_log_id INTEGER NOT NULL REFERENCES operation_log(id) ON DELETE RESTRICT,
+    claimed_at INTEGER NOT NULL CHECK(claimed_at >= 0),
+    CHECK(inventory_after > inventory_before
+       AND inventory_after - inventory_before = quantity)
+) STRICT;
+
+CREATE UNIQUE INDEX ground_drop_claim_drop
+    ON ground_drop_claim(drop_id);
+CREATE UNIQUE INDEX ground_drop_claim_identity_message
+    ON ground_drop_claim(claimer_identity_id, source_message_id);
+CREATE INDEX ground_drop_claim_identity_page
+    ON ground_drop_claim(claimer_identity_id, id);
+
+CREATE TABLE ground_drop_expiration (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    drop_id INTEGER NOT NULL REFERENCES ground_drop(id) ON DELETE RESTRICT,
+    expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+    expired_at INTEGER NOT NULL CHECK(expired_at >= expires_at)
+) STRICT;
+
+CREATE UNIQUE INDEX ground_drop_expiration_drop
+    ON ground_drop_expiration(drop_id);
+
+CREATE TRIGGER ground_drop_no_update
+BEFORE UPDATE ON ground_drop
+BEGIN
+    SELECT RAISE(ABORT, 'ground drop is immutable');
+END;
+
+CREATE TRIGGER ground_drop_no_delete
+BEFORE DELETE ON ground_drop
+BEGIN
+    SELECT RAISE(ABORT, 'ground drop is immutable');
+END;
+
+CREATE TRIGGER ground_drop_no_reinsert
+BEFORE INSERT ON ground_drop
+WHEN EXISTS(
+    SELECT 1 FROM ground_drop
+     WHERE source_kind = NEW.source_kind AND source_event_id = NEW.source_event_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'ground drop is immutable');
+END;
+
+CREATE TRIGGER ground_drop_claim_no_update
+BEFORE UPDATE ON ground_drop_claim
+BEGIN
+    SELECT RAISE(ABORT, 'ground drop claim is immutable');
+END;
+
+CREATE TRIGGER ground_drop_claim_no_delete
+BEFORE DELETE ON ground_drop_claim
+BEGIN
+    SELECT RAISE(ABORT, 'ground drop claim is immutable');
+END;
+
+CREATE TRIGGER ground_drop_claim_no_reinsert
+BEFORE INSERT ON ground_drop_claim
+WHEN EXISTS(
+    SELECT 1 FROM ground_drop_claim
+     WHERE drop_id = NEW.drop_id
+)
+OR EXISTS(
+    SELECT 1 FROM ground_drop_claim
+     WHERE operation_log_id = NEW.operation_log_id
+)
+OR EXISTS(
+    SELECT 1 FROM ground_drop_claim
+     WHERE claimer_identity_id = NEW.claimer_identity_id
+       AND source_message_id = NEW.source_message_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'ground drop claim is immutable');
+END;
+
+CREATE TRIGGER ground_drop_claim_scope_guard
+BEFORE INSERT ON ground_drop_claim
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM ground_drop d
+      JOIN item i ON i.item_key = d.item_key
+      JOIN identity claimer ON claimer.id = NEW.claimer_identity_id
+      JOIN player p ON p.identity_id = claimer.id
+      JOIN player_map pm ON pm.player_id = p.id AND pm.map_key = d.map_key
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE d.id = NEW.drop_id
+       AND d.item_key = NEW.item_key
+       AND d.quantity = NEW.quantity
+       AND (d.owner_identity_id IS NULL OR d.owner_identity_id = NEW.claimer_identity_id)
+       AND p.state = 'alive'
+       AND NEW.inventory_after <= i.max_stack
+       AND claimer.protocol = audit.protocol
+       AND claimer.account_id = audit.account_id
+       AND claimer.namespace = audit.namespace
+       AND claimer.subject_kind = 'user'
+       AND claimer.subject_id = NEW.claimer_subject_id
+       AND audit.subject_kind = 'user'
+       AND audit.subject_id = NEW.claimer_subject_id
+       AND audit.command = '拾取'
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+       AND NOT EXISTS(SELECT 1 FROM ground_drop_claim c WHERE c.drop_id = d.id)
+       AND NOT EXISTS(SELECT 1 FROM ground_drop_expiration e WHERE e.drop_id = d.id)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'ground drop claim scope or audit mismatch');
+END;
+
+CREATE TRIGGER ground_drop_expiration_no_update
+BEFORE UPDATE ON ground_drop_expiration
+BEGIN
+    SELECT RAISE(ABORT, 'ground drop expiration is immutable');
+END;
+
+CREATE TRIGGER ground_drop_expiration_no_delete
+BEFORE DELETE ON ground_drop_expiration
+BEGIN
+    SELECT RAISE(ABORT, 'ground drop expiration is immutable');
+END;
+
+CREATE TRIGGER ground_drop_expiration_no_reinsert
+BEFORE INSERT ON ground_drop_expiration
+WHEN EXISTS(
+    SELECT 1 FROM ground_drop_expiration
+     WHERE drop_id = NEW.drop_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'ground drop expiration is immutable');
+END;
+
+CREATE TRIGGER ground_drop_expiration_scope_guard
+BEFORE INSERT ON ground_drop_expiration
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM ground_drop d
+     WHERE d.id = NEW.drop_id
+       AND d.expires_at IS NOT NULL
+       AND d.expires_at <= NEW.expired_at
+       AND d.expires_at = NEW.expires_at
+       AND NOT EXISTS(SELECT 1 FROM ground_drop_claim c WHERE c.drop_id = d.id)
+       AND NOT EXISTS(SELECT 1 FROM ground_drop_expiration e WHERE e.drop_id = d.id)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'ground drop expiration scope mismatch');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -1023,6 +1222,55 @@ pub struct ItemGiftReceipt {
     pub sender_inventory_after: i64,
     pub recipient_inventory_after: i64,
     pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroundDropRecord {
+    pub id: i64,
+    pub map_key: String,
+    pub map_name: String,
+    pub item: ItemRecord,
+    pub quantity: i64,
+    pub owner_subject_id: Option<String>,
+    pub source_kind: String,
+    pub source_event_id: String,
+    pub expires_at: Option<i64>,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroundDropPage {
+    pub entries: Vec<GroundDropRecord>,
+    pub map_name: String,
+    pub page: usize,
+    pub page_count: usize,
+    pub total: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // 战斗/系统掉落生产器接入前保留可重放的写入回执。
+pub struct GroundDropSpawnReceipt {
+    pub drop: GroundDropRecord,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroundDropPickupReceipt {
+    pub claim_id: i64,
+    pub drop_id: i64,
+    pub item: ItemRecord,
+    pub quantity: i64,
+    pub inventory_after: i64,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GroundDropClaimRecord {
+    id: i64,
+    drop_id: i64,
+    item_key: String,
+    quantity: i64,
+    inventory_after: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1481,7 +1729,9 @@ impl Store {
         let migration_result = (|| -> Result<(), String> {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|error| format!("开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9 失败：{error}"))?;
+                .map_err(|error| {
+                    format!("开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10 失败：{error}")
+                })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
             if !migration_applied(&transaction, 2)? {
                 let old_identity_sequence = transaction
@@ -1626,10 +1876,25 @@ impl Store {
                 validate_v9_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 10)? {
+                transaction
+                    .execute_batch(MIGRATION_V10)
+                    .map_err(|error| format!("执行数据库迁移 v10 失败：{error}"))?;
+                validate_v10_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(10, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v10 失败：{error}"))?;
+            } else {
+                validate_v10_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
-            transaction
-                .commit()
-                .map_err(|error| format!("提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9 失败：{error}"))?;
+            transaction.commit().map_err(|error| {
+                format!("提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10 失败：{error}")
+            })?;
             Ok(())
         })();
         let restore_result = set_foreign_keys(connection, true);
@@ -1644,6 +1909,7 @@ impl Store {
                 validate_v7_schema(connection)?;
                 validate_v8_schema(connection)?;
                 validate_v9_schema(connection)?;
+                validate_v10_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -2528,6 +2794,279 @@ impl Store {
             page,
             page_count,
             total,
+        })
+    }
+
+    #[allow(dead_code)] // 后续战斗/系统服务通过此 API 生成掉落，不开放聊天入口。
+    #[allow(clippy::too_many_arguments)] // 来源、归属和过期策略必须在一次写入中明确给出。
+    pub fn spawn_ground_drop(
+        &self,
+        map_key: &str,
+        item_name_or_key: &str,
+        quantity: i64,
+        owner: Option<&IdentityKey<'_>>,
+        source_kind: &str,
+        source_event_id: &str,
+        expires_at: Option<i64>,
+    ) -> Result<GroundDropSpawnReceipt, String> {
+        validate_catalog_lookup(map_key, "地图")?;
+        validate_catalog_lookup(item_name_or_key, "物品名称")?;
+        validate_ground_drop_quantity(quantity)?;
+        validate_ground_drop_source(source_kind, source_event_id)?;
+        if expires_at.is_some_and(|expires_at| expires_at < 0) {
+            return Err("掉落过期时间不能为负数".to_string());
+        }
+        if let Some(owner) = owner {
+            validate_identity_key(owner)?;
+        }
+
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始创建地面掉落事务失败：{error}"))?;
+        let created_at = now_timestamp()?;
+        if expires_at.is_some_and(|expires_at| expires_at <= created_at) {
+            return Err("掉落过期时间必须晚于创建时间".to_string());
+        }
+        let map_exists = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM map WHERE map_key = ?1)",
+                [map_key],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("检查掉落地图失败：{error}"))?;
+        if !map_exists {
+            return Err("当前世界不存在该地图".to_string());
+        }
+        let item = load_item_by_name_or_key(&transaction, item_name_or_key)?;
+        let owner_identity_id = if let Some(owner) = owner {
+            Some(load_ground_drop_owner(&transaction, owner)?.0)
+        } else {
+            None
+        };
+
+        if let Some(existing) =
+            load_ground_drop_by_source(&transaction, source_kind, source_event_id)?
+        {
+            if existing.map_key != map_key
+                || existing.item.item_key != item.item_key
+                || existing.quantity != quantity
+                || existing.owner_subject_id != owner.map(|owner| owner.subject_id.to_string())
+                || existing.expires_at != expires_at
+            {
+                return Err("相同掉落来源 ID 已用于不同的掉落请求".to_string());
+            }
+            transaction
+                .commit()
+                .map_err(|error| format!("提交地面掉落重放事务失败：{error}"))?;
+            return Ok(GroundDropSpawnReceipt {
+                drop: existing,
+                replayed: true,
+            });
+        }
+
+        transaction
+            .execute(
+                r#"
+                INSERT INTO ground_drop(
+                    map_key, item_key, quantity, owner_identity_id, owner_subject_id,
+                    source_kind, source_event_id, expires_at, created_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+                params![
+                    map_key,
+                    item.item_key,
+                    quantity,
+                    owner_identity_id,
+                    owner.map(|owner| owner.subject_id),
+                    source_kind,
+                    source_event_id,
+                    expires_at,
+                    created_at
+                ],
+            )
+            .map_err(|error| format!("写入地面掉落失败：{error}"))?;
+        let drop_id = transaction.last_insert_rowid();
+        let drop = load_ground_drop_by_id(&transaction, drop_id)?
+            .ok_or_else(|| "写入地面掉落后无法读取记录".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交地面掉落事务失败：{error}"))?;
+        Ok(GroundDropSpawnReceipt {
+            drop,
+            replayed: false,
+        })
+    }
+
+    #[allow(dead_code)] // 后台调度器接入前由查看/拾取事务触发清理。
+    pub fn cleanup_expired_ground_drops(&self) -> Result<usize, String> {
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始清理过期掉落事务失败：{error}"))?;
+        let expired = expire_ground_drops_in_transaction(&transaction)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交过期掉落清理事务失败：{error}"))?;
+        Ok(expired)
+    }
+
+    pub fn ground_drops_page(
+        &self,
+        key: &IdentityKey<'_>,
+        page: usize,
+        limit: usize,
+    ) -> Result<GroundDropPage, String> {
+        validate_identity_key(key)?;
+        validate_catalog_page(page, limit, "掉落")?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始查看地面掉落事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let (_, _, map) = load_player_map_for_identity(&transaction, key)?;
+        expire_ground_drops_in_transaction(&transaction)?;
+        let total = active_ground_drop_count(&transaction, &map.map_key)?;
+        let page_count = total.div_ceil(limit).max(1);
+        if page > page_count {
+            return Err(format!("掉落页码必须在 1 到 {page_count} 之间"));
+        }
+        let offset = page
+            .checked_sub(1)
+            .and_then(|page| page.checked_mul(limit))
+            .ok_or_else(|| "掉落分页偏移量溢出".to_string())?;
+        let fetch_limit = i64::try_from(limit).map_err(|_| "掉落分页数量无法转换".to_string())?;
+        let offset = i64::try_from(offset).map_err(|_| "掉落分页偏移量无法转换".to_string())?;
+        let entries = query_active_ground_drops(&transaction, &map.map_key, fetch_limit, offset)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交查看地面掉落事务失败：{error}"))?;
+        Ok(GroundDropPage {
+            entries,
+            map_name: map.name,
+            page,
+            page_count,
+            total,
+        })
+    }
+
+    pub fn pick_up_ground_drop_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        drop_id: i64,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<GroundDropPickupReceipt, String> {
+        validate_identity_key(key)?;
+        validate_ground_drop_operation(operation)?;
+        if drop_id <= 0 {
+            return Err("掉落编号必须是正整数".to_string());
+        }
+
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始拾取地面掉落事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let claimer_identity_id = load_ground_drop_owner(&transaction, key)?.0;
+        if let Some(existing) = load_ground_drop_claim_by_message(
+            &transaction,
+            claimer_identity_id,
+            operation.source_message_id,
+        )? {
+            if existing.drop_id != drop_id {
+                return Err("该消息 ID 已用于不同的拾取请求".to_string());
+            }
+            let item = load_item_by_name_or_key(&transaction, &existing.item_key)?;
+            transaction
+                .commit()
+                .map_err(|error| format!("提交拾取重放事务失败：{error}"))?;
+            return Ok(GroundDropPickupReceipt {
+                claim_id: existing.id,
+                drop_id,
+                item,
+                quantity: existing.quantity,
+                inventory_after: existing.inventory_after,
+                replayed: true,
+            });
+        }
+
+        expire_ground_drops_in_transaction(&transaction)?;
+        let (player_id, _, map) = load_player_map_for_identity(&transaction, key)?;
+        let state = transaction
+            .query_row(
+                "SELECT state FROM player WHERE id = ?1",
+                [player_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| format!("读取拾取角色状态失败：{error}"))?;
+        if state != "alive" {
+            return Err("当前角色状态不能拾取地面掉落".to_string());
+        }
+
+        let drop = load_active_ground_drop(&transaction, drop_id, &map.map_key)?;
+        let Some(drop) = drop else {
+            return explain_unavailable_ground_drop(&transaction, drop_id, &map.map_key);
+        };
+        if drop
+            .owner_subject_id
+            .as_deref()
+            .is_some_and(|owner_subject_id| owner_subject_id != key.subject_id)
+        {
+            return Err("该掉落属于其他玩家，当前身份不能拾取".to_string());
+        }
+        let inventory_before = inventory_quantity(&transaction, player_id, &drop.item.item_key)?;
+        let inventory_after = inventory_before
+            .checked_add(drop.quantity)
+            .ok_or_else(|| "拾取后背包数量溢出".to_string())?;
+        if inventory_after > drop.item.max_stack {
+            return Err(format!(
+                "{}最多堆叠{}件，当前已有{}件",
+                drop.item.name, drop.item.max_stack, inventory_before
+            ));
+        }
+        let timestamp = now_timestamp()?;
+        set_inventory_quantity(
+            &transaction,
+            player_id,
+            &drop.item.item_key,
+            inventory_after,
+            timestamp,
+        )?;
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO ground_drop_claim(
+                    drop_id, claimer_identity_id, claimer_subject_id, item_key,
+                    quantity, inventory_before, inventory_after,
+                    source_message_id, operation_log_id, claimed_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "#,
+                params![
+                    drop.id,
+                    claimer_identity_id,
+                    key.subject_id,
+                    drop.item.item_key,
+                    drop.quantity,
+                    inventory_before,
+                    inventory_after,
+                    operation.source_message_id,
+                    operation_log_id,
+                    timestamp
+                ],
+            )
+            .map_err(|error| format!("写入地面掉落拾取账本失败：{error}"))?;
+        let claim_id = transaction.last_insert_rowid();
+        transaction
+            .commit()
+            .map_err(|error| format!("提交拾取地面掉落事务失败：{error}"))?;
+        Ok(GroundDropPickupReceipt {
+            claim_id,
+            drop_id,
+            item: drop.item,
+            quantity: drop.quantity,
+            inventory_after,
+            replayed: false,
         })
     }
 
@@ -3973,6 +4512,292 @@ fn load_transferable_item(
         return Err(format!("{}当前不可赠送", item.name));
     }
     Ok(item)
+}
+
+fn load_item_by_name_or_key(
+    connection: &Connection,
+    item_name_or_key: &str,
+) -> Result<ItemRecord, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT item_key, name, category, quality, stackable,
+                   max_stack, buy_price, sell_price, level_required,
+                   effect_kind, effect_amount, revive_hp_percent,
+                   purchasable, sellable, usable, description
+              FROM item
+             WHERE name = ?1 OR item_key = ?1
+             LIMIT 1
+            "#,
+            [item_name_or_key],
+            |row| item_record_from_row(row, 0),
+        )
+        .optional()
+        .map_err(|error| format!("读取物品定义失败：{error}"))?
+        .ok_or_else(|| "当前世界不存在该物品".to_string())
+}
+
+fn load_ground_drop_owner(
+    connection: &Connection,
+    key: &IdentityKey<'_>,
+) -> Result<(i64, i64), String> {
+    validate_identity_key(key)?;
+    ensure_no_legacy_identity(connection, key)?;
+    connection
+        .query_row(
+            r#"
+            SELECT i.id, p.id
+              FROM identity i
+              JOIN player p ON p.identity_id = i.id
+             WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+               AND i.subject_kind = ?4 AND i.subject_id = ?5
+            "#,
+            params![
+                key.protocol.as_str(),
+                key.account_id,
+                key.namespace,
+                key.subject_kind,
+                key.subject_id
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("读取掉落归属身份失败：{error}"))?
+        .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())
+}
+
+fn ground_drop_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GroundDropRecord> {
+    Ok(GroundDropRecord {
+        id: row.get(0)?,
+        map_key: row.get(1)?,
+        map_name: row.get(2)?,
+        item: item_record_from_row(row, 3)?,
+        quantity: row.get(19)?,
+        owner_subject_id: row.get(20)?,
+        source_kind: row.get(21)?,
+        source_event_id: row.get(22)?,
+        expires_at: row.get(23)?,
+        created_at: row.get(24)?,
+    })
+}
+
+const GROUND_DROP_SELECT: &str = r#"
+    SELECT d.id, d.map_key, m.name,
+           i.item_key, i.name, i.category, i.quality, i.stackable,
+           i.max_stack, i.buy_price, i.sell_price, i.level_required,
+           i.effect_kind, i.effect_amount, i.revive_hp_percent,
+           i.purchasable, i.sellable, i.usable, i.description,
+           d.quantity, d.owner_subject_id, d.source_kind,
+           d.source_event_id, d.expires_at, d.created_at
+      FROM ground_drop d
+      JOIN map m ON m.map_key = d.map_key
+      JOIN item i ON i.item_key = d.item_key
+"#;
+
+#[allow(dead_code)] // 生产器创建后需要返回完整掉落记录。
+fn load_ground_drop_by_id(
+    connection: &Connection,
+    drop_id: i64,
+) -> Result<Option<GroundDropRecord>, String> {
+    connection
+        .query_row(
+            &format!("{GROUND_DROP_SELECT} WHERE d.id = ?1"),
+            [drop_id],
+            ground_drop_record_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取地面掉落失败：{error}"))
+}
+
+#[allow(dead_code)] // 生产器按来源事件做幂等检查。
+fn load_ground_drop_by_source(
+    connection: &Connection,
+    source_kind: &str,
+    source_event_id: &str,
+) -> Result<Option<GroundDropRecord>, String> {
+    connection
+        .query_row(
+            &format!("{GROUND_DROP_SELECT} WHERE d.source_kind = ?1 AND d.source_event_id = ?2"),
+            params![source_kind, source_event_id],
+            ground_drop_record_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取掉落来源幂等记录失败：{error}"))
+}
+
+fn load_active_ground_drop(
+    connection: &Connection,
+    drop_id: i64,
+    map_key: &str,
+) -> Result<Option<GroundDropRecord>, String> {
+    connection
+        .query_row(
+            &format!(
+                "{GROUND_DROP_SELECT} WHERE d.id = ?1 AND d.map_key = ?2
+                   AND NOT EXISTS(SELECT 1 FROM ground_drop_claim c WHERE c.drop_id = d.id)
+                   AND NOT EXISTS(SELECT 1 FROM ground_drop_expiration e WHERE e.drop_id = d.id)"
+            ),
+            params![drop_id, map_key],
+            ground_drop_record_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取当前地图地面掉落失败：{error}"))
+}
+
+fn query_active_ground_drops(
+    connection: &Connection,
+    map_key: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<GroundDropRecord>, String> {
+    connection
+        .prepare(&format!(
+            "{GROUND_DROP_SELECT}
+              WHERE d.map_key = ?1
+                AND NOT EXISTS(SELECT 1 FROM ground_drop_claim c WHERE c.drop_id = d.id)
+                AND NOT EXISTS(SELECT 1 FROM ground_drop_expiration e WHERE e.drop_id = d.id)
+             ORDER BY d.id
+             LIMIT ?2 OFFSET ?3"
+        ))
+        .map_err(|error| format!("准备地面掉落分页查询失败：{error}"))?
+        .query_map(params![map_key, limit, offset], ground_drop_record_from_row)
+        .map_err(|error| format!("查询地面掉落分页失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析地面掉落分页失败：{error}"))
+}
+
+fn active_ground_drop_count(connection: &Connection, map_key: &str) -> Result<usize, String> {
+    let total = connection
+        .query_row(
+            r#"
+            SELECT COUNT(*)
+              FROM ground_drop d
+             WHERE d.map_key = ?1
+               AND NOT EXISTS(SELECT 1 FROM ground_drop_claim c WHERE c.drop_id = d.id)
+               AND NOT EXISTS(SELECT 1 FROM ground_drop_expiration e WHERE e.drop_id = d.id)
+            "#,
+            [map_key],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("统计当前地图地面掉落失败：{error}"))?;
+    usize::try_from(total).map_err(|_| "地面掉落数量超出分页范围".to_string())
+}
+
+fn expire_ground_drops_in_transaction(connection: &Connection) -> Result<usize, String> {
+    let now = now_timestamp()?;
+    connection
+        .execute(
+            r#"
+            INSERT INTO ground_drop_expiration(drop_id, expires_at, expired_at)
+            SELECT d.id, d.expires_at, ?1
+              FROM ground_drop d
+             WHERE d.expires_at IS NOT NULL
+               AND d.expires_at <= ?1
+               AND NOT EXISTS(SELECT 1 FROM ground_drop_claim c WHERE c.drop_id = d.id)
+               AND NOT EXISTS(SELECT 1 FROM ground_drop_expiration e WHERE e.drop_id = d.id)
+            "#,
+            [now],
+        )
+        .map_err(|error| format!("记录过期地面掉落失败：{error}"))
+}
+
+fn load_ground_drop_claim_by_message(
+    connection: &Connection,
+    claimer_identity_id: i64,
+    source_message_id: &str,
+) -> Result<Option<GroundDropClaimRecord>, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT id, drop_id, item_key, quantity, inventory_after
+              FROM ground_drop_claim
+             WHERE claimer_identity_id = ?1 AND source_message_id = ?2
+            "#,
+            params![claimer_identity_id, source_message_id],
+            |row| {
+                Ok(GroundDropClaimRecord {
+                    id: row.get(0)?,
+                    drop_id: row.get(1)?,
+                    item_key: row.get(2)?,
+                    quantity: row.get(3)?,
+                    inventory_after: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取地面掉落拾取幂等记录失败：{error}"))
+}
+
+fn explain_unavailable_ground_drop(
+    connection: &Connection,
+    drop_id: i64,
+    current_map_key: &str,
+) -> Result<GroundDropPickupReceipt, String> {
+    let now = now_timestamp()?;
+    let state = connection
+        .query_row(
+            r#"
+            SELECT map_key, expires_at,
+                   EXISTS(SELECT 1 FROM ground_drop_claim c WHERE c.drop_id = d.id),
+                   EXISTS(SELECT 1 FROM ground_drop_expiration e WHERE e.drop_id = d.id)
+              FROM ground_drop d
+             WHERE d.id = ?1
+            "#,
+            [drop_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取不可用地面掉落状态失败：{error}"))?;
+    let Some((map_key, expires_at, claimed, expired)) = state else {
+        return Err("当前世界不存在该掉落".to_string());
+    };
+    if map_key != current_map_key {
+        return Err("该掉落不在当前地图，不能拾取".to_string());
+    }
+    if expired || expires_at.is_some_and(|expires_at| expires_at <= now) {
+        return Err("该掉落已过期".to_string());
+    }
+    if claimed {
+        return Err("该掉落已经被拾取".to_string());
+    }
+    Err("该掉落当前不可拾取".to_string())
+}
+
+#[allow(dead_code)] // 生产器入口使用；聊天拾取只消费已落库数量。
+fn validate_ground_drop_quantity(quantity: i64) -> Result<(), String> {
+    if !(1..=9999).contains(&quantity) {
+        return Err("掉落数量必须在 1 到 9999 之间".to_string());
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // 生产器入口使用；聊天侧不允许伪造来源事件。
+fn validate_ground_drop_source(source_kind: &str, source_event_id: &str) -> Result<(), String> {
+    if !matches!(source_kind, "battle" | "system" | "manual") {
+        return Err("掉落来源类型无效".to_string());
+    }
+    if !valid_audit_value(source_event_id, 256) {
+        return Err("掉落来源 ID 必须是 1 到 256 个无控制字符的字符串".to_string());
+    }
+    Ok(())
+}
+
+fn validate_ground_drop_operation(operation: &OperationLogInput<'_>) -> Result<(), String> {
+    validate_operation_input(operation)?;
+    if operation.command != "拾取" || operation.outcome != "ok" {
+        return Err("拾取成功审计必须使用规范命令“拾取”和 ok 结果".to_string());
+    }
+    if !valid_audit_value(operation.source_message_id, 256) {
+        return Err("拾取要求 1 到 256 个无控制字符的非空消息 ID".to_string());
+    }
+    Ok(())
 }
 
 fn insert_asset_transfer(
@@ -7161,10 +7986,17 @@ fn validate_v8_triggers(connection: &Connection) -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("解析 v8 全库触发器集合失败：{error}"))?;
     for (name, table, sql) in triggers {
-        // v9 在后续迁移中新增自己的触发器；其中 asset_kind 的合法值“item”
-        // 不应被 v8 的简单标识扫描误判为 v8 的 item 表引用。旧表上的跨 v9
-        // 引用仍由 validate_v9_triggers 全库扫描拒绝。
-        if matches!(table.as_str(), "asset_transfer" | "item_transfer_policy") {
+        // 后续迁移拥有自己的触发器；其中合法字段/枚举中的“item”不应被 v8
+        // 的简单标识扫描误判为 v8 的 item 表引用。旧表上的跨版本引用仍由
+        // 对应版本的全库触发器扫描拒绝。
+        if matches!(
+            table.as_str(),
+            "asset_transfer"
+                | "item_transfer_policy"
+                | "ground_drop"
+                | "ground_drop_claim"
+                | "ground_drop_expiration"
+        ) {
             continue;
         }
         let declared = expected.iter().any(|(expected_name, expected_table)| {
@@ -7473,6 +8305,490 @@ fn validate_v9_schema(connection: &Connection) -> Result<(), String> {
     validate_v9_triggers(connection)?;
     validate_v9_policy_seeds(connection)?;
     probe_v9_transfer_guards(connection)
+}
+
+fn validate_v10_schema(connection: &Connection) -> Result<(), String> {
+    let drop_columns = table_columns_with_type(connection, "ground_drop")?;
+    let expected_drop_columns = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("map_key", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("item_key", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("quantity", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("owner_identity_id", "INTEGER", false, false, None, 0),
+        TableColumnInfo::new("owner_subject_id", "TEXT", false, false, None, 0),
+        TableColumnInfo::new("source_kind", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("source_event_id", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("expires_at", "INTEGER", false, false, None, 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+    ];
+    if drop_columns != expected_drop_columns {
+        return Err(format!(
+            "数据库已标记迁移 v10，但 ground_drop 字段不匹配：{drop_columns:?}"
+        ));
+    }
+    let claim_columns = table_columns_with_type(connection, "ground_drop_claim")?;
+    let expected_claim_columns = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("drop_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("claimer_identity_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("claimer_subject_id", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("item_key", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("quantity", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("inventory_before", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("inventory_after", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("source_message_id", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("operation_log_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("claimed_at", "INTEGER", true, false, None, 0),
+    ];
+    if claim_columns != expected_claim_columns {
+        return Err(format!(
+            "数据库已标记迁移 v10，但 ground_drop_claim 字段不匹配：{claim_columns:?}"
+        ));
+    }
+    let expiration_columns = table_columns_with_type(connection, "ground_drop_expiration")?;
+    let expected_expiration_columns = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("drop_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("expires_at", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("expired_at", "INTEGER", true, false, None, 0),
+    ];
+    if expiration_columns != expected_expiration_columns {
+        return Err(format!(
+            "数据库已标记迁移 v10，但 ground_drop_expiration 字段不匹配：{expiration_columns:?}"
+        ));
+    }
+
+    validate_v10_table_sql(
+        connection,
+        "ground_drop",
+        &[
+            ") STRICT",
+            "MAP_KEY TEXT NOT NULL REFERENCES MAP(MAP_KEY) ON DELETE RESTRICT",
+            "ITEM_KEY TEXT NOT NULL REFERENCES ITEM(ITEM_KEY) ON DELETE RESTRICT",
+            "QUANTITY INTEGER NOT NULL CHECK(QUANTITY BETWEEN 1 AND 9999)",
+            "SOURCE_KIND TEXT NOT NULL CHECK(SOURCE_KIND IN ('BATTLE', 'SYSTEM', 'MANUAL'))",
+            "SOURCE_EVENT_ID TEXT NOT NULL CHECK(",
+            "EXPIRES_AT INTEGER CHECK(EXPIRES_AT IS NULL OR EXPIRES_AT >= 0)",
+        ],
+    )?;
+    validate_v10_table_sql(
+        connection,
+        "ground_drop_claim",
+        &[
+            ") STRICT",
+            "DROP_ID INTEGER NOT NULL REFERENCES GROUND_DROP(ID) ON DELETE RESTRICT",
+            "CLAIMER_IDENTITY_ID INTEGER NOT NULL REFERENCES IDENTITY(ID) ON DELETE RESTRICT",
+            "ITEM_KEY TEXT NOT NULL REFERENCES ITEM(ITEM_KEY) ON DELETE RESTRICT",
+            "OPERATION_LOG_ID INTEGER NOT NULL REFERENCES OPERATION_LOG(ID) ON DELETE RESTRICT",
+            "INVENTORY_AFTER > INVENTORY_BEFORE",
+            "INVENTORY_AFTER - INVENTORY_BEFORE = QUANTITY",
+        ],
+    )?;
+    validate_v10_table_sql(
+        connection,
+        "ground_drop_expiration",
+        &[
+            ") STRICT",
+            "DROP_ID INTEGER NOT NULL REFERENCES GROUND_DROP(ID) ON DELETE RESTRICT",
+            "EXPIRED_AT INTEGER NOT NULL CHECK(EXPIRED_AT >= EXPIRES_AT)",
+        ],
+    )?;
+
+    validate_v10_foreign_keys(
+        connection,
+        "ground_drop",
+        &[
+            (
+                "identity",
+                "owner_identity_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("item", "item_key", "item_key", "NO ACTION", "RESTRICT"),
+            ("map", "map_key", "map_key", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+    validate_v10_foreign_keys(
+        connection,
+        "ground_drop_claim",
+        &[
+            ("ground_drop", "drop_id", "id", "NO ACTION", "RESTRICT"),
+            (
+                "identity",
+                "claimer_identity_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("item", "item_key", "item_key", "NO ACTION", "RESTRICT"),
+            (
+                "operation_log",
+                "operation_log_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+        ],
+    )?;
+    validate_v10_foreign_keys(
+        connection,
+        "ground_drop_expiration",
+        &[("ground_drop", "drop_id", "id", "NO ACTION", "RESTRICT")],
+    )?;
+
+    validate_v10_custom_index_set(
+        connection,
+        "ground_drop",
+        &["ground_drop_map_page", "ground_drop_source"],
+    )?;
+    validate_v10_custom_index_set(
+        connection,
+        "ground_drop_claim",
+        &[
+            "ground_drop_claim_drop",
+            "ground_drop_claim_identity_message",
+            "ground_drop_claim_identity_page",
+        ],
+    )?;
+    validate_v10_custom_index_set(
+        connection,
+        "ground_drop_expiration",
+        &["ground_drop_expiration_drop"],
+    )?;
+    validate_named_index(
+        connection,
+        "ground_drop",
+        "ground_drop_source",
+        true,
+        &["source_kind", "source_event_id"],
+    )?;
+    validate_named_index(
+        connection,
+        "ground_drop",
+        "ground_drop_map_page",
+        false,
+        &["map_key", "id"],
+    )?;
+    validate_named_index(
+        connection,
+        "ground_drop_claim",
+        "ground_drop_claim_drop",
+        true,
+        &["drop_id"],
+    )?;
+    validate_named_index(
+        connection,
+        "ground_drop_claim",
+        "ground_drop_claim_identity_message",
+        true,
+        &["claimer_identity_id", "source_message_id"],
+    )?;
+    validate_named_index(
+        connection,
+        "ground_drop_claim",
+        "ground_drop_claim_identity_page",
+        false,
+        &["claimer_identity_id", "id"],
+    )?;
+    validate_named_index(
+        connection,
+        "ground_drop_expiration",
+        "ground_drop_expiration_drop",
+        true,
+        &["drop_id"],
+    )?;
+    validate_v10_triggers(connection)?;
+    probe_v10_ground_drop_guards(connection)
+}
+
+fn validate_v10_table_sql(
+    connection: &Connection,
+    table: &str,
+    markers: &[&str],
+) -> Result<(), String> {
+    let sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v10 表 {table} 建表语句失败：{error}"))?
+        .ok_or_else(|| format!("数据库已标记迁移 v10，但缺少表 {table}"))?
+        .to_ascii_uppercase();
+    for marker in markers {
+        if !sql.contains(marker) {
+            return Err(format!(
+                "数据库已标记迁移 v10，但表 {table} 缺少约束：{marker}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v10_foreign_keys(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, &str, &str, &str)],
+) -> Result<(), String> {
+    validate_v9_foreign_keys(connection, table, expected).map_err(|error| {
+        if error.contains("v9") {
+            error.replace("v9", "v10")
+        } else {
+            error
+        }
+    })
+}
+
+fn validate_v10_custom_index_set(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), String> {
+    let escaped_table = table.replace('"', "\"\"");
+    let mut actual = connection
+        .prepare(&format!("PRAGMA index_list(\"{escaped_table}\")"))
+        .map_err(|error| format!("读取 v10 表 {table} 索引集合失败：{error}"))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, String>(3)?))
+        })
+        .map_err(|error| format!("查询 v10 表 {table} 索引集合失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v10 表 {table} 索引集合失败：{error}"))?
+        .into_iter()
+        .filter_map(|(name, origin)| (origin == "c").then_some(name))
+        .collect::<Vec<_>>();
+    let mut expected = expected
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    actual.sort();
+    expected.sort();
+    if actual != expected {
+        return Err(format!(
+            "数据库已标记迁移 v10，但表 {table} 自定义索引集合不匹配：实际 {actual:?}，期望 {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v10_triggers(connection: &Connection) -> Result<(), String> {
+    let expected = [
+        ("ground_drop_no_update", "ground_drop"),
+        ("ground_drop_no_delete", "ground_drop"),
+        ("ground_drop_no_reinsert", "ground_drop"),
+        ("ground_drop_claim_no_update", "ground_drop_claim"),
+        ("ground_drop_claim_no_delete", "ground_drop_claim"),
+        ("ground_drop_claim_no_reinsert", "ground_drop_claim"),
+        ("ground_drop_claim_scope_guard", "ground_drop_claim"),
+        ("ground_drop_expiration_no_update", "ground_drop_expiration"),
+        ("ground_drop_expiration_no_delete", "ground_drop_expiration"),
+        (
+            "ground_drop_expiration_no_reinsert",
+            "ground_drop_expiration",
+        ),
+        (
+            "ground_drop_expiration_scope_guard",
+            "ground_drop_expiration",
+        ),
+    ];
+    for (name, table) in expected {
+        let (actual_table, sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v10 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v10，但缺少触发器 {name}"))?;
+        let normalized = sql.to_ascii_uppercase();
+        if actual_table != table || !normalized.contains("RAISE(ABORT") {
+            return Err(format!("数据库已标记迁移 v10，但触发器 {name} 契约不匹配"));
+        }
+        if name == "ground_drop_claim_no_reinsert"
+            && (!normalized.contains("DROP_ID = NEW.DROP_ID")
+                || !normalized.contains("OPERATION_LOG_ID = NEW.OPERATION_LOG_ID")
+                || !normalized.contains("SOURCE_MESSAGE_ID = NEW.SOURCE_MESSAGE_ID"))
+        {
+            return Err("数据库已标记迁移 v10，但拾取禁止重插入触发器不完整".to_string());
+        }
+        if name == "ground_drop_claim_scope_guard"
+            && (!normalized.contains("JOIN PLAYER_MAP")
+                || !normalized.contains("D.OWNER_IDENTITY_ID IS NULL")
+                || !normalized.contains("AUDIT.COMMAND = '拾取'")
+                || !normalized.contains("GROUND_DROP_EXPIRATION"))
+        {
+            return Err("数据库已标记迁移 v10，但拾取范围/审计触发器不完整".to_string());
+        }
+        if name == "ground_drop_expiration_scope_guard"
+            && (!normalized.contains("D.EXPIRES_AT <= NEW.EXPIRED_AT")
+                || !normalized.contains("GROUND_DROP_CLAIM")
+                || !normalized.contains("GROUND_DROP_EXPIRATION"))
+        {
+            return Err("数据库已标记迁移 v10，但掉落过期范围触发器不完整".to_string());
+        }
+    }
+    let triggers = connection
+        .prepare(
+            "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name",
+        )
+        .map_err(|error| format!("读取 v10 全库触发器集合失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v10 全库触发器集合失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v10 全库触发器集合失败：{error}"))?;
+    for (name, table, sql) in triggers {
+        let declared = expected.iter().any(|(expected_name, expected_table)| {
+            name == *expected_name && table == *expected_table
+        });
+        let touches_v10 = matches!(
+            table.as_str(),
+            "ground_drop" | "ground_drop_claim" | "ground_drop_expiration"
+        ) || ["ground_drop", "ground_drop_claim", "ground_drop_expiration"]
+            .iter()
+            .any(|identifier| sql_mentions_identifier(&sql, identifier));
+        if touches_v10 && !declared {
+            return Err(format!(
+                "数据库已标记迁移 v10，但触发器 {name}（目标表 {table}）未声明却引用了地面掉落表"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn probe_v10_ground_drop_guards(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch("SAVEPOINT qimen_v10_ground_drop_probe;")
+        .map_err(|error| format!("开始 v10 地面掉落约束探针失败：{error}"))?;
+    let probe_result = (|| -> Result<(), String> {
+        let token = connection
+            .query_row("SELECT lower(hex(randomblob(16)))", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("生成 v10 地面掉落探针标识失败：{error}"))?;
+        let account_id = format!("v10-probe-{token}");
+        let subject_id = format!("v10-owner-{token}");
+        connection
+            .execute(
+                "INSERT INTO identity(protocol, account_id, namespace, subject_kind, subject_id, created_at) VALUES('onebot11', ?1, 'v10-probe', 'user', ?2, 0)",
+                params![account_id, subject_id],
+            )
+            .map_err(|error| format!("v10 地面掉落探针无法创建身份：{error}"))?;
+        let identity_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO player(identity_id, name, gender, created_at, updated_at) VALUES(?1, 'v10-probe', '男', 0, 0)",
+                [identity_id],
+            )
+            .map_err(|error| format!("v10 地面掉落探针无法创建角色：{error}"))?;
+        let player_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO player_map(player_id, map_key, updated_at) VALUES(?1, 'holy-soul-village', 0)",
+                [player_id],
+            )
+            .map_err(|error| format!("v10 地面掉落探针无法绑定地图：{error}"))?;
+        connection
+            .execute(
+                "INSERT INTO ground_drop(map_key, item_key, quantity, owner_identity_id, owner_subject_id, source_kind, source_event_id, expires_at, created_at) VALUES('holy-soul-village', 'small-healing-potion', 1, ?1, ?2, 'system', ?3, NULL, 0)",
+                params![identity_id, subject_id, format!("v10-drop-{token}")],
+            )
+            .map_err(|error| format!("v10 地面掉落探针无法创建掉落：{error}"))?;
+        let drop_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO operation_log(protocol, account_id, namespace, subject_kind, subject_id, command, outcome, source_message_id, details_json, created_at) VALUES('onebot11', ?1, 'v10-probe', 'user', ?2, '拾取', 'ok', 'v10-claim', '{}', 0)",
+                params![account_id, subject_id],
+            )
+            .map_err(|error| format!("v10 地面掉落探针无法创建审计：{error}"))?;
+        let operation_log_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO ground_drop_claim(drop_id, claimer_identity_id, claimer_subject_id, item_key, quantity, inventory_before, inventory_after, source_message_id, operation_log_id, claimed_at) VALUES(?1, ?2, ?3, 'small-healing-potion', 1, 0, 1, 'v10-claim', ?4, 1)",
+                params![drop_id, identity_id, subject_id, operation_log_id],
+            )
+            .map_err(|error| format!("v10 地面掉落探针无法插入合法拾取：{error}"))?;
+        let claim_id = connection.last_insert_rowid();
+        for (label, sql) in [
+            (
+                "claim UPDATE",
+                "UPDATE ground_drop_claim SET quantity = 2 WHERE id = ?1",
+            ),
+            (
+                "claim DELETE",
+                "DELETE FROM ground_drop_claim WHERE id = ?1",
+            ),
+            (
+                "claim REPLACE",
+                "INSERT OR REPLACE INTO ground_drop_claim SELECT * FROM ground_drop_claim WHERE id = ?1",
+            ),
+            (
+                "drop UPDATE",
+                "UPDATE ground_drop SET quantity = 2 WHERE id = ?1",
+            ),
+            ("drop DELETE", "DELETE FROM ground_drop WHERE id = ?1"),
+            (
+                "drop REPLACE",
+                "INSERT OR REPLACE INTO ground_drop SELECT * FROM ground_drop WHERE id = ?1",
+            ),
+        ] {
+            if connection.execute(sql, [claim_id]).is_ok() {
+                return Err(format!("v10 地面掉落 {label} 不可变探针被绕过"));
+            }
+        }
+
+        connection
+            .execute(
+                "INSERT INTO ground_drop(map_key, item_key, quantity, source_kind, source_event_id, expires_at, created_at) VALUES('holy-soul-village', 'small-healing-potion', 1, 'system', ?1, 1, 0)",
+                [format!("v10-expire-{token}")],
+            )
+            .map_err(|error| format!("v10 过期掉落探针无法创建掉落：{error}"))?;
+        let expire_drop_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO ground_drop_expiration(drop_id, expires_at, expired_at) VALUES(?1, 1, 1)",
+                [expire_drop_id],
+            )
+            .map_err(|error| format!("v10 地面掉落探针无法插入合法过期记录：{error}"))?;
+        let expiration_id = connection.last_insert_rowid();
+        for (label, sql) in [
+            (
+                "expiration UPDATE",
+                "UPDATE ground_drop_expiration SET expired_at = 2 WHERE id = ?1",
+            ),
+            (
+                "expiration DELETE",
+                "DELETE FROM ground_drop_expiration WHERE id = ?1",
+            ),
+            (
+                "expiration REPLACE",
+                "INSERT OR REPLACE INTO ground_drop_expiration SELECT * FROM ground_drop_expiration WHERE id = ?1",
+            ),
+        ] {
+            if connection.execute(sql, [expiration_id]).is_ok() {
+                return Err(format!("v10 地面掉落 {label} 不可变探针被绕过"));
+            }
+        }
+        Ok(())
+    })();
+    let rollback_result = connection
+        .execute_batch(
+            "ROLLBACK TO qimen_v10_ground_drop_probe; RELEASE qimen_v10_ground_drop_probe;",
+        )
+        .map_err(|error| format!("回滚 v10 地面掉落约束探针失败：{error}"));
+    match (probe_result, rollback_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(probe_error), Err(rollback_error)) => Err(format!("{probe_error}；{rollback_error}")),
+    }
 }
 
 fn validate_v9_table_sql(
@@ -8043,6 +9359,12 @@ fn validate_v7_triggers(connection: &Connection) -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("解析 v7 触发器集合失败：{error}"))?;
     for (name, table, sql) in triggers {
+        if matches!(
+            table.as_str(),
+            "ground_drop" | "ground_drop_claim" | "ground_drop_expiration"
+        ) {
+            continue;
+        }
         if matches!(table.as_str(), "map" | "map_edge" | "player_map")
             || sql_mentions_identifier(&sql, "map")
             || sql_mentions_identifier(&sql, "map_edge")
@@ -8591,6 +9913,24 @@ mod tests {
         assert!(
             error.contains("v9"),
             "v9 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    fn assert_v10_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v10 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v10 迁移应成功");
+        let connection = store.open().expect("应打开 v10 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v10 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v10 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v10"),
+            "v10 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
         );
     }
 
@@ -11320,6 +12660,431 @@ mod tests {
             AFTER INSERT ON player_wuhun
             BEGIN
                 SELECT EXISTS(SELECT 1 FROM asset_transfer);
+            END;
+            "#,
+        );
+    }
+
+    #[test]
+    fn v10_ground_drop_spawn_and_pickup_are_replay_safe() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "掉落测试角色", "男")
+            .expect("应创建掉落测试角色");
+
+        let spawned = store
+            .spawn_ground_drop(
+                "holy-soul-village",
+                "小回复药",
+                2,
+                Some(&identity()),
+                "system",
+                "drop-source-1",
+                None,
+            )
+            .expect("应创建归属掉落");
+        assert!(!spawned.replayed);
+        assert_eq!(spawned.drop.quantity, 2);
+        assert_eq!(
+            spawned.drop.owner_subject_id.as_deref(),
+            Some(identity().subject_id)
+        );
+        let replayed_spawn = store
+            .spawn_ground_drop(
+                "holy-soul-village",
+                "small-healing-potion",
+                2,
+                Some(&identity()),
+                "system",
+                "drop-source-1",
+                None,
+            )
+            .expect("相同来源应返回原掉落");
+        assert!(replayed_spawn.replayed);
+        assert_eq!(replayed_spawn.drop.id, spawned.drop.id);
+        assert!(
+            store
+                .spawn_ground_drop(
+                    "holy-soul-village",
+                    "小回复药",
+                    3,
+                    Some(&identity()),
+                    "system",
+                    "drop-source-1",
+                    None,
+                )
+                .expect_err("同来源不同 payload 必须拒绝")
+                .contains("不同的掉落请求")
+        );
+
+        let page = store
+            .ground_drops_page(&identity(), 1, 8)
+            .expect("应列出当前地图掉落");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.entries[0].id, spawned.drop.id);
+
+        let picked = store
+            .pick_up_ground_drop_with_operation(
+                &identity(),
+                spawned.drop.id,
+                &map_operation("拾取", "pickup-success"),
+            )
+            .expect("拾取应成功");
+        assert!(!picked.replayed);
+        assert_eq!(picked.inventory_after, 2);
+        assert_eq!(
+            inventory_for(&store, &identity(), "small-healing-potion"),
+            2
+        );
+        let replay = store
+            .pick_up_ground_drop_with_operation(
+                &identity(),
+                spawned.drop.id,
+                &map_operation("拾取", "pickup-success"),
+            )
+            .expect("同消息应返回原拾取回执");
+        assert!(replay.replayed);
+        assert_eq!(replay.claim_id, picked.claim_id);
+        assert_eq!(replay.inventory_after, 2);
+
+        let second = store
+            .spawn_ground_drop(
+                "holy-soul-village",
+                "魂力恢复药",
+                1,
+                None,
+                "system",
+                "drop-source-2",
+                None,
+            )
+            .expect("应创建第二个掉落");
+        assert!(
+            store
+                .pick_up_ground_drop_with_operation(
+                    &identity(),
+                    second.drop.id,
+                    &map_operation("拾取", "pickup-success"),
+                )
+                .expect_err("同消息不同掉落必须拒绝")
+                .contains("不同的拾取请求")
+        );
+        let connection = store.open().expect("应检查拾取账本");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM ground_drop_claim", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operation_log WHERE command = '拾取'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn v10_ground_drop_enforces_map_owner_expiry_and_stack_boundaries() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "掉落边界角色", "男")
+            .expect("应创建掉落边界角色");
+        store
+            .register_player(&recipient_identity(), "掉落归属角色", "女")
+            .expect("应创建掉落归属角色");
+
+        let remote = store
+            .spawn_ground_drop(
+                "novice-village",
+                "小回复药",
+                1,
+                None,
+                "system",
+                "drop-other-map",
+                None,
+            )
+            .expect("应创建其他地图掉落");
+        assert!(
+            store
+                .pick_up_ground_drop_with_operation(
+                    &identity(),
+                    remote.drop.id,
+                    &map_operation("拾取", "pickup-other-map"),
+                )
+                .expect_err("不能跨地图拾取")
+                .contains("不在当前地图")
+        );
+
+        let owned = store
+            .spawn_ground_drop(
+                "holy-soul-village",
+                "魂力恢复药",
+                1,
+                Some(&recipient_identity()),
+                "system",
+                "drop-other-owner",
+                None,
+            )
+            .expect("应创建其他玩家归属掉落");
+        assert!(
+            store
+                .pick_up_ground_drop_with_operation(
+                    &identity(),
+                    owned.drop.id,
+                    &map_operation("拾取", "pickup-other-owner"),
+                )
+                .expect_err("不能拾取其他玩家归属掉落")
+                .contains("其他玩家")
+        );
+
+        let connection = store.open().expect("应打开过期掉落测试数据库");
+        connection
+            .execute(
+                "INSERT INTO ground_drop(map_key, item_key, quantity, source_kind, source_event_id, expires_at, created_at) VALUES('holy-soul-village', 'small-healing-potion', 1, 'system', 'expired-drop', 1, 0)",
+                [],
+            )
+            .expect("应插入已到期测试掉落");
+        let expired_drop_id = connection.last_insert_rowid();
+        drop(connection);
+        assert_eq!(store.cleanup_expired_ground_drops().unwrap(), 1);
+        assert_eq!(store.cleanup_expired_ground_drops().unwrap(), 0);
+        assert!(
+            store
+                .pick_up_ground_drop_with_operation(
+                    &identity(),
+                    expired_drop_id,
+                    &map_operation("拾取", "pickup-expired"),
+                )
+                .expect_err("过期掉落不能拾取")
+                .contains("已过期")
+        );
+
+        seed_inventory(&store, &identity(), "small-healing-potion", 98);
+        let overflowing = store
+            .spawn_ground_drop(
+                "holy-soul-village",
+                "小回复药",
+                2,
+                None,
+                "system",
+                "drop-stack-overflow",
+                None,
+            )
+            .expect("应创建堆叠上限测试掉落");
+        assert!(
+            store
+                .pick_up_ground_drop_with_operation(
+                    &identity(),
+                    overflowing.drop.id,
+                    &map_operation("拾取", "pickup-stack-overflow"),
+                )
+                .expect_err("超过背包堆叠上限必须回滚")
+                .contains("最多堆叠")
+        );
+        assert_eq!(
+            inventory_for(&store, &identity(), "small-healing-potion"),
+            98
+        );
+        let connection = store.open().expect("应检查失败拾取结果");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM ground_drop_claim", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM operation_log", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_v10_pickups_claim_a_drop_exactly_once() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "并发拾取甲", "男")
+            .expect("应创建并发拾取甲");
+        store
+            .register_player(&recipient_identity(), "并发拾取乙", "女")
+            .expect("应创建并发拾取乙");
+        let drop = store
+            .spawn_ground_drop(
+                "holy-soul-village",
+                "小回复药",
+                1,
+                None,
+                "system",
+                "concurrent-drop",
+                None,
+            )
+            .expect("应创建并发掉落")
+            .drop;
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = [identity(), recipient_identity()]
+            .into_iter()
+            .enumerate()
+            .map(|(index, key)| {
+                let store = store.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let message_id = format!("concurrent-pickup-{index}");
+                    let operation = map_operation("拾取", &message_id);
+                    barrier.wait();
+                    store.pick_up_ground_drop_with_operation(&key, drop.id, &operation)
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("并发拾取线程不应 panic"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            inventory_for(&store, &identity(), "small-healing-potion")
+                + inventory_for(&store, &recipient_identity(), "small-healing-potion"),
+            1
+        );
+        assert_eq!(
+            store
+                .open()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM ground_drop_claim", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn v10_pickup_rolls_back_when_audit_or_claim_ledger_fails() {
+        let (_audit_directory, audit_store) = test_store();
+        audit_store
+            .register_player(&identity(), "拾取审计回滚", "男")
+            .expect("应创建拾取审计回滚角色");
+        let audit_drop = audit_store
+            .spawn_ground_drop(
+                "holy-soul-village",
+                "小回复药",
+                2,
+                None,
+                "system",
+                "pickup-audit-drop",
+                None,
+            )
+            .unwrap()
+            .drop;
+        let connection = audit_store.open().expect("应打开拾取审计失败数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER operation_log_pickup_abort
+                BEFORE INSERT ON operation_log
+                WHEN NEW.command = '拾取'
+                BEGIN SELECT RAISE(ABORT, 'test pickup audit failure'); END;
+                "#,
+            )
+            .expect("应安装拾取审计失败触发器");
+        drop(connection);
+        assert!(
+            audit_store
+                .pick_up_ground_drop_with_operation(
+                    &identity(),
+                    audit_drop.id,
+                    &map_operation("拾取", "pickup-audit-failure"),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            inventory_for(&audit_store, &identity(), "small-healing-potion"),
+            0
+        );
+
+        let (_ledger_directory, ledger_store) = test_store();
+        ledger_store
+            .register_player(&identity(), "拾取账本回滚", "男")
+            .expect("应创建拾取账本回滚角色");
+        let ledger_drop = ledger_store
+            .spawn_ground_drop(
+                "holy-soul-village",
+                "小回复药",
+                2,
+                None,
+                "system",
+                "pickup-ledger-drop",
+                None,
+            )
+            .unwrap()
+            .drop;
+        let connection = ledger_store.open().expect("应打开拾取账本失败数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER ground_drop_claim_test_abort
+                BEFORE INSERT ON ground_drop_claim
+                BEGIN SELECT RAISE(ABORT, 'test pickup ledger failure'); END;
+                "#,
+            )
+            .expect("应安装拾取账本失败触发器");
+        drop(connection);
+        assert!(
+            ledger_store
+                .pick_up_ground_drop_with_operation(
+                    &identity(),
+                    ledger_drop.id,
+                    &map_operation("拾取", "pickup-ledger-failure"),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            inventory_for(&ledger_store, &identity(), "small-healing-potion"),
+            0
+        );
+        let connection = ledger_store.open().expect("应检查拾取账本失败回滚");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM operation_log", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM ground_drop_claim", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn recorded_v10_with_damaged_schema_fails_closed() {
+        for mutation in [
+            "DROP TABLE ground_drop_expiration;",
+            "DROP INDEX ground_drop_claim_identity_message;",
+            "DROP TRIGGER ground_drop_claim_scope_guard;",
+            "ALTER TABLE ground_drop ADD COLUMN shadow INTEGER;",
+        ] {
+            assert_v10_damage_fails_closed(mutation);
+        }
+    }
+
+    #[test]
+    fn recorded_v10_with_cross_table_trigger_reference_fails_closed() {
+        assert_v10_damage_fails_closed(
+            r#"
+            CREATE TRIGGER player_wuhun_reads_ground_drop
+            AFTER INSERT ON player_wuhun
+            BEGIN
+                SELECT EXISTS(SELECT 1 FROM ground_drop);
             END;
             "#,
         );
