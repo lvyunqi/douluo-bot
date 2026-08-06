@@ -462,6 +462,7 @@ try {
     $challenge = Invoke-OneBotCommand $endpoint "挑战 史莱姆"
     Write-Output ("onebot 挑战 史莱姆: {0} [{1}]" -f $challenge.ActionName, $challenge.Text)
     Assert-Condition ($challenge.Text.Contains("战斗开始")) "soul beast challenge did not start"
+    Assert-Condition ($challenge.Text.Contains("武魂战斗修正")) "battle challenge did not expose wuhun modifiers"
     $battleFinished = $false
     for ($round = 1; $round -le 5; $round++) {
         $attack = Invoke-OneBotCommand $endpoint "攻击"
@@ -522,7 +523,7 @@ try {
     Assert-Condition ($null -ne $reload.data.message) "dynamic reload did not return a result"
     $afterReload = Invoke-OneBotCommand $endpoint "钱包"
     Assert-Condition ($afterReload.Text.Contains("金魂币")) "command failed after dynamic reload"
-    Write-Output "protocol smoke passed: OneBot tasks/PVE/wuhun stability/economy, private/group, synthetic QQ payload, descriptor, and reload"
+    Write-Output "protocol smoke passed: OneBot tasks/PVE/wuhun stability/modifier/economy, private/group, synthetic QQ payload, descriptor, and reload"
 } finally {
     if ($null -ne $process -and -not $process.HasExited) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue

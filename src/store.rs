@@ -1724,6 +1724,104 @@ END;
 const WUHUN_STABILITY_DROP_THRESHOLD: i64 = 30;
 const WUHUN_STABILITY_DROP_CHANCE_MULTIPLIER: i64 = 2;
 
+const MIGRATION_V15: &str = r#"
+CREATE TABLE battle_wuhun_modifier (
+    battle_id INTEGER PRIMARY KEY REFERENCES battle(id) ON DELETE RESTRICT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    wuhun_id INTEGER NOT NULL REFERENCES wuhun(id) ON DELETE RESTRICT,
+    attack_percent INTEGER NOT NULL CHECK(attack_percent BETWEEN 60 AND 120),
+    defense_percent INTEGER NOT NULL CHECK(defense_percent BETWEEN 80 AND 130),
+    enabled_at_start INTEGER NOT NULL CHECK(enabled_at_start = 1),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0)
+) STRICT;
+
+INSERT INTO battle_wuhun_modifier(
+    battle_id, player_id, wuhun_id, attack_percent, defense_percent,
+    enabled_at_start, created_at
+)
+SELECT b.id,
+       b.player_id,
+       s.wuhun_id,
+       100,
+       100,
+       1,
+       b.started_at
+  FROM battle b
+  JOIN player_wuhun_state s ON s.player_id = b.player_id AND s.slot = 1
+  JOIN wuhun w ON w.id = s.wuhun_id;
+
+CREATE INDEX battle_wuhun_modifier_player_page
+    ON battle_wuhun_modifier(player_id, battle_id);
+
+CREATE TRIGGER battle_wuhun_modifier_no_update
+BEFORE UPDATE ON battle_wuhun_modifier
+BEGIN
+    SELECT RAISE(ABORT, 'battle wuhun modifier is immutable');
+END;
+
+CREATE TRIGGER battle_wuhun_modifier_no_delete
+BEFORE DELETE ON battle_wuhun_modifier
+BEGIN
+    SELECT RAISE(ABORT, 'battle wuhun modifier is immutable');
+END;
+
+CREATE TRIGGER battle_wuhun_modifier_no_reinsert
+BEFORE INSERT ON battle_wuhun_modifier
+WHEN EXISTS(SELECT 1 FROM battle_wuhun_modifier WHERE battle_id = NEW.battle_id)
+BEGIN
+    SELECT RAISE(ABORT, 'battle wuhun modifier is append-only');
+END;
+
+CREATE TRIGGER battle_wuhun_modifier_scope_guard
+BEFORE INSERT ON battle_wuhun_modifier
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM battle b
+      JOIN player_wuhun_state s ON s.player_id = b.player_id AND s.slot = 1
+      JOIN wuhun w ON w.id = s.wuhun_id
+     WHERE b.id = NEW.battle_id
+       AND b.player_id = NEW.player_id
+       AND b.status = 'active'
+       AND b.action_count = 0
+       AND s.enabled = 1
+       AND s.stability > 0
+       AND NEW.wuhun_id = s.wuhun_id
+       AND NEW.enabled_at_start = 1
+       AND NEW.attack_percent = CASE w.category
+           WHEN '强攻系' THEN 120
+           WHEN '控制系' THEN 90
+           WHEN '敏攻系' THEN 100
+           WHEN '辅助系' THEN 70
+           WHEN '防御系' THEN 80
+           WHEN '食物系' THEN 60
+           ELSE 100
+       END
+       AND NEW.defense_percent = CASE w.category
+           WHEN '强攻系' THEN 80
+           WHEN '控制系' THEN 100
+           WHEN '敏攻系' THEN 90
+           WHEN '辅助系' THEN 110
+           WHEN '防御系' THEN 130
+           WHEN '食物系' THEN 100
+           ELSE 100
+       END
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle wuhun modifier scope mismatch');
+END;
+
+CREATE TRIGGER battle_wuhun_modifier_event_guard
+BEFORE INSERT ON battle_event
+WHEN NEW.event_kind = 'challenge'
+ AND NOT EXISTS(
+     SELECT 1 FROM battle_wuhun_modifier
+      WHERE battle_id = NEW.battle_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'battle wuhun modifier is missing');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -2087,6 +2185,8 @@ pub struct BattleSnapshot {
     pub id: i64,
     pub player_name: String,
     pub beast: SoulBeastRecord,
+    pub wuhun_attack_percent: i64,
+    pub wuhun_defense_percent: i64,
     pub status: String,
     pub player_hp: i64,
     pub player_max_hp: i64,
@@ -2196,6 +2296,12 @@ pub struct WuhunState {
     pub enabled: bool,
     pub stability: i64,
     pub max_stability: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WuhunCombatModifier {
+    pub attack_percent: i64,
+    pub defense_percent: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2674,7 +2780,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
                     format!(
-                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14 失败：{error}"
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15 失败：{error}"
                     )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
@@ -2896,9 +3002,26 @@ impl Store {
                 validate_v14_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 15)? {
+                transaction
+                    .execute_batch(MIGRATION_V15)
+                    .map_err(|error| format!("执行数据库迁移 v15 失败：{error}"))?;
+                validate_v15_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(15, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v15 失败：{error}"))?;
+            } else {
+                validate_v15_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
-                format!("提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14 失败：{error}")
+                format!(
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15 失败：{error}"
+                )
             })?;
             Ok(())
         })();
@@ -2919,6 +3042,7 @@ impl Store {
                 validate_v12_schema(connection)?;
                 validate_v13_schema(connection)?;
                 validate_v14_schema(connection)?;
+                validate_v15_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -4724,8 +4848,9 @@ impl Store {
         if !player.awakened {
             return Err("角色尚未完成武魂觉醒，不能挑战魂兽".to_string());
         }
-        let wuhun_state = load_wuhun_state_by_player(&transaction, player.player_id)?
-            .ok_or_else(|| "角色缺少武魂状态，请联系管理员".to_string())?;
+        let (wuhun_id, wuhun_state) =
+            load_wuhun_state_with_id_by_player(&transaction, player.player_id)?
+                .ok_or_else(|| "角色缺少武魂状态，请联系管理员".to_string())?;
         if !wuhun_state.enabled || wuhun_state.stability <= 0 {
             return Err("请先使用“开武魂”再挑战魂兽".to_string());
         }
@@ -4813,6 +4938,15 @@ impl Store {
             )
             .map_err(|error| format!("创建战斗快照失败：{error}"))?;
         let battle_id = transaction.last_insert_rowid();
+        let wuhun_modifier = wuhun_combat_modifier(&wuhun_state.category);
+        insert_battle_wuhun_modifier(
+            &transaction,
+            battle_id,
+            player.player_id,
+            wuhun_id,
+            wuhun_modifier,
+            timestamp,
+        )?;
         let operation_log_id = insert_operation_log(&transaction, key, operation)?;
         insert_battle_event(
             &transaction,
@@ -4922,6 +5056,15 @@ impl Store {
         let (wuhun_id, wuhun_state) =
             load_wuhun_state_with_id_by_player(&transaction, player.player_id)?
                 .ok_or_else(|| "角色缺少武魂状态，请联系管理员".to_string())?;
+        let wuhun_modifier = active_wuhun_modifier(
+            wuhun_state.enabled && wuhun_state.stability > 0,
+            WuhunCombatModifier {
+                attack_percent: state.wuhun_attack_percent,
+                defense_percent: state.wuhun_defense_percent,
+            },
+        );
+        let wuhun_attack_percent = wuhun_modifier.attack_percent;
+        let wuhun_defense_percent = wuhun_modifier.defense_percent;
         let sequence = state
             .action_count
             .checked_add(1)
@@ -4948,10 +5091,14 @@ impl Store {
                 battle_roll(state.random_seed, sequence, 1),
             );
             let mut player_damage = battle_damage(
-                state
-                    .player_strength
-                    .checked_mul(2)
-                    .ok_or_else(|| "玩家攻击力计算溢出".to_string())?,
+                scale_combat_value(
+                    state
+                        .player_strength
+                        .checked_mul(2)
+                        .ok_or_else(|| "玩家攻击力计算溢出".to_string())?,
+                    wuhun_attack_percent,
+                    "武魂攻击修正",
+                )?,
                 state.beast_defense,
                 state.player_level,
                 player_roll,
@@ -5027,7 +5174,11 @@ impl Store {
                     battle_is_critical(10, 10, battle_roll(state.random_seed, sequence, 3));
                 let mut beast_damage = battle_damage(
                     state.beast_attack,
-                    state.player_endurance,
+                    scale_combat_value(
+                        state.player_endurance,
+                        wuhun_defense_percent,
+                        "武魂防御修正",
+                    )?,
                     state.player_level,
                     battle_roll(state.random_seed, sequence, 2),
                 )?;
@@ -5093,7 +5244,11 @@ impl Store {
                     battle_is_critical(10, 10, battle_roll(state.random_seed, sequence, 6));
                 let mut beast_damage = battle_damage(
                     state.beast_attack,
-                    state.player_endurance,
+                    scale_combat_value(
+                        state.player_endurance,
+                        wuhun_defense_percent,
+                        "武魂防御修正",
+                    )?,
                     state.player_level,
                     battle_roll(state.random_seed, sequence, 5),
                 )?;
@@ -7248,6 +7403,8 @@ struct BattleState {
     beast_attack: i64,
     beast_defense: i64,
     beast_speed: i64,
+    wuhun_attack_percent: i64,
+    wuhun_defense_percent: i64,
     random_seed: i64,
     action_count: i64,
     exp_reward: i64,
@@ -7830,6 +7987,92 @@ fn load_wuhun_state_event_by_battle_event(
         .map_err(|error| format!("读取战斗武魂状态事件失败：{error}"))
 }
 
+fn wuhun_combat_modifier(category: &str) -> WuhunCombatModifier {
+    match category {
+        "强攻系" => WuhunCombatModifier {
+            attack_percent: 120,
+            defense_percent: 80,
+        },
+        "控制系" => WuhunCombatModifier {
+            attack_percent: 90,
+            defense_percent: 100,
+        },
+        "敏攻系" => WuhunCombatModifier {
+            attack_percent: 100,
+            defense_percent: 90,
+        },
+        "辅助系" => WuhunCombatModifier {
+            attack_percent: 70,
+            defense_percent: 110,
+        },
+        "防御系" => WuhunCombatModifier {
+            attack_percent: 80,
+            defense_percent: 130,
+        },
+        "食物系" => WuhunCombatModifier {
+            attack_percent: 60,
+            defense_percent: 100,
+        },
+        _ => WuhunCombatModifier {
+            attack_percent: 100,
+            defense_percent: 100,
+        },
+    }
+}
+
+fn active_wuhun_modifier(enabled: bool, modifier: WuhunCombatModifier) -> WuhunCombatModifier {
+    if enabled {
+        modifier
+    } else {
+        WuhunCombatModifier {
+            attack_percent: 100,
+            defense_percent: 100,
+        }
+    }
+}
+
+fn scale_combat_value(value: i64, percent: i64, label: &str) -> Result<i64, String> {
+    if value < 0 || percent <= 0 {
+        return Err(format!("{label}参数无效"));
+    }
+    i64::try_from(
+        i128::from(value)
+            .checked_mul(i128::from(percent))
+            .ok_or_else(|| format!("{label}计算溢出"))?
+            / 100,
+    )
+    .map_err(|_| format!("{label}超出整数范围"))
+}
+
+fn insert_battle_wuhun_modifier(
+    connection: &Connection,
+    battle_id: i64,
+    player_id: i64,
+    wuhun_id: i64,
+    modifier: WuhunCombatModifier,
+    created_at: i64,
+) -> Result<(), String> {
+    connection
+        .execute(
+            r#"
+            INSERT INTO battle_wuhun_modifier(
+                battle_id, player_id, wuhun_id, attack_percent, defense_percent,
+                enabled_at_start, created_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, 1, ?6)
+            "#,
+            params![
+                battle_id,
+                player_id,
+                wuhun_id,
+                modifier.attack_percent,
+                modifier.defense_percent,
+                created_at
+            ],
+        )
+        .map_err(|error| format!("保存战斗武魂修正失败：{error}"))?;
+    Ok(())
+}
+
 fn insert_wuhun_state_event(
     connection: &Connection,
     event: WuhunStateEventInsert<'_>,
@@ -8055,14 +8298,16 @@ fn battle_state_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BattleStat
         beast_attack: row.get(15)?,
         beast_defense: row.get(16)?,
         beast_speed: row.get(17)?,
-        random_seed: row.get(18)?,
-        action_count: row.get(19)?,
-        exp_reward: row.get(20)?,
-        drop_item_key: row.get(21)?,
-        drop_quantity: row.get(22)?,
-        started_at: row.get(23)?,
-        updated_at: row.get(24)?,
-        ended_at: row.get(25)?,
+        wuhun_attack_percent: row.get(18)?,
+        wuhun_defense_percent: row.get(19)?,
+        random_seed: row.get(20)?,
+        action_count: row.get(21)?,
+        exp_reward: row.get(22)?,
+        drop_item_key: row.get(23)?,
+        drop_quantity: row.get(24)?,
+        started_at: row.get(25)?,
+        updated_at: row.get(26)?,
+        ended_at: row.get(27)?,
     })
 }
 
@@ -8072,13 +8317,16 @@ fn load_active_battle_state(
 ) -> Result<Option<BattleState>, String> {
     connection
         .query_row(
-            r#"SELECT id, player_id, soul_beast_id, map_key, status, player_level,
+            r#"SELECT b.id, b.player_id, b.soul_beast_id, b.map_key, b.status, b.player_level,
                       player_max_hp, player_hp, player_strength, player_agility,
                       player_endurance, player_perception, player_luck,
                       beast_max_hp, beast_hp, beast_attack, beast_defense, beast_speed,
+                      m.attack_percent, m.defense_percent,
                       random_seed, action_count, exp_reward, drop_item_key, drop_quantity,
                       started_at, updated_at, ended_at
-                 FROM battle WHERE player_id = ?1 AND status = 'active'"#,
+                 FROM battle b
+                 JOIN battle_wuhun_modifier m ON m.battle_id = b.id
+                WHERE b.player_id = ?1 AND b.status = 'active'"#,
             [player_id],
             battle_state_from_row,
         )
@@ -8109,13 +8357,16 @@ fn load_battle_state_by_id(
 ) -> Result<Option<BattleState>, String> {
     connection
         .query_row(
-            r#"SELECT id, player_id, soul_beast_id, map_key, status, player_level,
+            r#"SELECT b.id, b.player_id, b.soul_beast_id, b.map_key, b.status, b.player_level,
                       player_max_hp, player_hp, player_strength, player_agility,
                       player_endurance, player_perception, player_luck,
                       beast_max_hp, beast_hp, beast_attack, beast_defense, beast_speed,
+                      m.attack_percent, m.defense_percent,
                       random_seed, action_count, exp_reward, drop_item_key, drop_quantity,
                       started_at, updated_at, ended_at
-                 FROM battle WHERE id = ?1"#,
+                 FROM battle b
+                 JOIN battle_wuhun_modifier m ON m.battle_id = b.id
+                WHERE b.id = ?1"#,
             [battle_id],
             battle_state_from_row,
         )
@@ -8143,6 +8394,8 @@ fn load_battle_snapshot(
         id: state.id,
         player_name,
         beast,
+        wuhun_attack_percent: state.wuhun_attack_percent,
+        wuhun_defense_percent: state.wuhun_defense_percent,
         status: state.status,
         player_hp: state.player_hp,
         player_max_hp: state.player_max_hp,
@@ -12698,7 +12951,8 @@ fn validate_v13_schema(connection: &Connection) -> Result<(), String> {
             .any(|(expected_name, expected_table, _)| {
                 name == *expected_name && table == *expected_table
             })
-            || name == "wuhun_state_event_scope_guard";
+            || name == "wuhun_state_event_scope_guard"
+            || table == "battle_wuhun_modifier";
         let touches_v13 = table == "player_wuhun_state"
             || sql_mentions_identifier(&trigger_sql, "player_wuhun_state");
         if touches_v13 && !declared {
@@ -12920,6 +13174,206 @@ fn validate_v14_index(
         .map_err(|error| error.replace("v7", "v14"))
 }
 
+fn validate_v15_schema(connection: &Connection) -> Result<(), String> {
+    let actual = table_columns_with_type(connection, "battle_wuhun_modifier")?;
+    let expected = vec![
+        TableColumnInfo::new("battle_id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("wuhun_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("attack_percent", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("defense_percent", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("enabled_at_start", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+    ];
+    if actual != expected {
+        return Err(format!(
+            "数据库已标记迁移 v15，但表 battle_wuhun_modifier 字段不匹配：{actual:?}"
+        ));
+    }
+    let sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'battle_wuhun_modifier'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v15 战斗武魂修正建表语句失败：{error}"))?
+        .ok_or_else(|| "数据库已标记迁移 v15，但缺少表 battle_wuhun_modifier".to_string())?
+        .to_ascii_uppercase();
+    for marker in [
+        ") STRICT",
+        "ATTACK_PERCENT BETWEEN 60 AND 120",
+        "DEFENSE_PERCENT BETWEEN 80 AND 130",
+        "ENABLED_AT_START = 1",
+    ] {
+        if !sql.contains(marker) {
+            return Err(format!(
+                "数据库已标记迁移 v15，但战斗武魂修正表缺少约束：{marker}"
+            ));
+        }
+    }
+
+    validate_v15_foreign_keys(
+        connection,
+        "battle_wuhun_modifier",
+        &[
+            ("battle", "battle_id", "id", "NO ACTION", "RESTRICT"),
+            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+            ("wuhun", "wuhun_id", "id", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+    validate_v15_custom_index_set(
+        connection,
+        "battle_wuhun_modifier",
+        &["battle_wuhun_modifier_player_page"],
+    )?;
+    validate_v15_index(
+        connection,
+        "battle_wuhun_modifier_player_page",
+        false,
+        &["player_id", "battle_id"],
+        false,
+    )?;
+
+    let missing = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM battle b
+                  LEFT JOIN battle_wuhun_modifier m ON m.battle_id = b.id
+                 WHERE m.battle_id IS NULL
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v15 战斗武魂修正覆盖失败：{error}"))?;
+    if missing {
+        return Err("数据库已标记迁移 v15，但存在缺少战斗武魂修正的战斗".to_string());
+    }
+
+    let expected_triggers = [
+        ("battle_wuhun_modifier_no_update", "battle_wuhun_modifier"),
+        ("battle_wuhun_modifier_no_delete", "battle_wuhun_modifier"),
+        ("battle_wuhun_modifier_no_reinsert", "battle_wuhun_modifier"),
+        ("battle_wuhun_modifier_scope_guard", "battle_wuhun_modifier"),
+        ("battle_wuhun_modifier_event_guard", "battle_event"),
+    ];
+    for (name, table) in expected_triggers {
+        let (actual_table, trigger_sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v15 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v15，但缺少触发器 {name}"))?;
+        let normalized = trigger_sql.to_ascii_uppercase();
+        if actual_table != table || !normalized.contains("RAISE(ABORT") {
+            return Err(format!("v15 触发器 {name} 契约不匹配"));
+        }
+        if name == "battle_wuhun_modifier_scope_guard"
+            && (!normalized.contains("FROM BATTLE B")
+                || !normalized.contains("JOIN PLAYER_WUHUN_STATE S")
+                || !normalized.contains("JOIN WUHUN W")
+                || !normalized.contains("NEW.ATTACK_PERCENT")
+                || !normalized.contains("NEW.DEFENSE_PERCENT"))
+        {
+            return Err("v15 战斗武魂修正范围触发器不完整".to_string());
+        }
+        if name == "battle_wuhun_modifier_event_guard"
+            && (!normalized.contains("NEW.EVENT_KIND = 'CHALLENGE'")
+                || !normalized.contains("FROM BATTLE_WUHUN_MODIFIER"))
+        {
+            return Err("v15 战斗武魂修正事件触发器不完整".to_string());
+        }
+    }
+
+    let modifier_trigger_names = connection
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'battle_wuhun_modifier'",
+        )
+        .map_err(|error| format!("读取 v15 战斗武魂修正触发器失败：{error}"))?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("查询 v15 战斗武魂修正触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v15 战斗武魂修正触发器失败：{error}"))?;
+    let mut expected_modifier_names = expected_triggers
+        .iter()
+        .filter_map(|(name, table)| {
+            (*table == "battle_wuhun_modifier").then_some((*name).to_string())
+        })
+        .collect::<Vec<_>>();
+    let mut actual_modifier_names = modifier_trigger_names;
+    expected_modifier_names.sort();
+    actual_modifier_names.sort();
+    if actual_modifier_names != expected_modifier_names {
+        return Err(format!(
+            "数据库已标记迁移 v15，但战斗武魂修正触发器集合不匹配：实际 {actual_modifier_names:?}，期望 {expected_modifier_names:?}"
+        ));
+    }
+
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v15 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v15 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v15 全库触发器失败：{error}"))?;
+    for (name, table, trigger_sql) in triggers {
+        let declared = expected_triggers
+            .iter()
+            .any(|(expected_name, expected_table)| {
+                name == *expected_name && table == *expected_table
+            });
+        let touches_v15 = table == "battle_wuhun_modifier"
+            || sql_mentions_identifier(&trigger_sql, "battle_wuhun_modifier");
+        if touches_v15 && !declared {
+            return Err(format!(
+                "v15 触发器 {name} 未声明却引用战斗武魂修正表 {table}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v15_foreign_keys(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, &str, &str, &str)],
+) -> Result<(), String> {
+    validate_v9_foreign_keys(connection, table, expected)
+        .map_err(|error| error.replace("v9", "v15"))
+}
+
+fn validate_v15_custom_index_set(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), String> {
+    validate_v10_custom_index_set(connection, table, expected)
+        .map_err(|error| error.replace("v10", "v15"))
+}
+
+fn validate_v15_index(
+    connection: &Connection,
+    index_name: &str,
+    unique: bool,
+    columns: &[&str],
+    partial: bool,
+) -> Result<(), String> {
+    validate_v7_index(connection, index_name, unique, columns, partial)
+        .map_err(|error| error.replace("v7", "v15"))
+}
+
 fn validate_v13_foreign_keys(
     connection: &Connection,
     table: &str,
@@ -13117,10 +13571,11 @@ fn validate_v12_triggers(connection: &Connection) -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("解析 v12 全库触发器失败：{error}"))?;
     for (name, table, sql) in triggers {
-        if matches!(
-            name.as_str(),
-            "battle_wuhun_state_guard" | "wuhun_state_event_scope_guard"
-        ) {
+        if table == "battle_wuhun_modifier"
+            || name == "battle_wuhun_state_guard"
+            || name == "wuhun_state_event_scope_guard"
+            || name == "battle_wuhun_modifier_event_guard"
+        {
             continue;
         }
         let declared = expected.iter().any(|(expected_name, expected_table)| {
@@ -14664,6 +15119,24 @@ mod tests {
         assert!(
             error.contains("v14"),
             "v14 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    fn assert_v15_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v15 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v15 迁移应成功");
+        let connection = store.open().expect("应打开 v15 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v15 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v15 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v15"),
+            "v15 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
         );
     }
 
@@ -18491,6 +18964,243 @@ mod tests {
     }
 
     #[test]
+    fn v15_legacy_wuhun_category_modifiers_are_stable() {
+        assert_eq!(
+            wuhun_combat_modifier("强攻系"),
+            WuhunCombatModifier {
+                attack_percent: 120,
+                defense_percent: 80
+            }
+        );
+        assert_eq!(
+            wuhun_combat_modifier("控制系"),
+            WuhunCombatModifier {
+                attack_percent: 90,
+                defense_percent: 100
+            }
+        );
+        assert_eq!(
+            wuhun_combat_modifier("敏攻系"),
+            WuhunCombatModifier {
+                attack_percent: 100,
+                defense_percent: 90
+            }
+        );
+        assert_eq!(
+            wuhun_combat_modifier("辅助系"),
+            WuhunCombatModifier {
+                attack_percent: 70,
+                defense_percent: 110
+            }
+        );
+        assert_eq!(
+            wuhun_combat_modifier("防御系"),
+            WuhunCombatModifier {
+                attack_percent: 80,
+                defense_percent: 130
+            }
+        );
+        assert_eq!(
+            wuhun_combat_modifier("食物系"),
+            WuhunCombatModifier {
+                attack_percent: 60,
+                defense_percent: 100
+            }
+        );
+        assert_eq!(
+            wuhun_combat_modifier("未知系"),
+            WuhunCombatModifier {
+                attack_percent: 100,
+                defense_percent: 100
+            }
+        );
+        assert_eq!(
+            active_wuhun_modifier(
+                false,
+                WuhunCombatModifier {
+                    attack_percent: 120,
+                    defense_percent: 80
+                }
+            ),
+            WuhunCombatModifier {
+                attack_percent: 100,
+                defense_percent: 100
+            }
+        );
+        assert_eq!(scale_combat_value(10, 120, "测试").unwrap(), 12);
+        assert_eq!(scale_combat_value(10, 80, "测试").unwrap(), 8);
+    }
+
+    #[test]
+    fn v15_battle_freezes_wuhun_modifier_and_applies_damage() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        let player_id = player_id_for(&store, &identity());
+        let connection = store.open().expect("应打开 v15 战斗修正测试数据库");
+        connection
+            .execute(
+                r#"
+                UPDATE wuhun
+                   SET category = '强攻系'
+                 WHERE id = (SELECT wuhun_id FROM player_wuhun_state WHERE player_id = ?1)
+                "#,
+                [player_id],
+            )
+            .expect("应设置强攻系武魂");
+        connection
+            .execute(
+                "UPDATE player SET level = 3, perception = 0, luck = 0, updated_at = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置确定性战斗属性");
+        drop(connection);
+
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "v15-battle-map"),
+            )
+            .expect("应传送到落日森林");
+        let started = store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "哥布林",
+                &transfer_operation("挑战", "v15-battle-start"),
+            )
+            .expect("应创建带武魂修正快照的战斗");
+        assert_eq!(started.battle.wuhun_attack_percent, 120);
+        assert_eq!(started.battle.wuhun_defense_percent, 80);
+
+        let connection = store.open().expect("应读取 v15 战斗快照");
+        let (seed, level, strength, endurance, perception, luck, beast_attack, beast_defense) =
+            connection
+                .query_row(
+                    r#"
+                    SELECT b.random_seed, b.player_level, b.player_strength,
+                           b.player_endurance, b.player_perception, b.player_luck,
+                           b.beast_attack, b.beast_defense
+                      FROM battle b
+                     WHERE b.id = ?1
+                    "#,
+                    [started.battle.id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, i64>(7)?,
+                        ))
+                    },
+                )
+                .expect("应读取战斗冻结属性");
+        let mut expected_player_damage = battle_damage(
+            scale_combat_value(
+                strength.checked_mul(2).expect("测试力量不应溢出"),
+                120,
+                "测试武魂攻击",
+            )
+            .unwrap(),
+            beast_defense,
+            level,
+            battle_roll(seed, 1, 0),
+        )
+        .unwrap();
+        if battle_is_critical(perception, luck, battle_roll(seed, 1, 1)) {
+            expected_player_damage = battle_critical_damage(expected_player_damage, luck).unwrap();
+        }
+        let mut expected_beast_damage = battle_damage(
+            beast_attack,
+            scale_combat_value(endurance, 80, "测试武魂防御").unwrap(),
+            level,
+            battle_roll(seed, 1, 2),
+        )
+        .unwrap();
+        let expected_beast_critical = battle_is_critical(10, 10, battle_roll(seed, 1, 3));
+        if expected_beast_critical {
+            expected_beast_damage = battle_critical_damage(expected_beast_damage, 10).unwrap();
+        }
+        drop(connection);
+
+        let attacked = store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "v15-battle-hit"),
+            )
+            .expect("应按武魂修正结算攻击和反击");
+        assert_eq!(attacked.event.player_damage, expected_player_damage);
+        assert_eq!(attacked.event.beast_damage, expected_beast_damage);
+        assert_eq!(attacked.event.beast_critical, expected_beast_critical);
+        assert_eq!(attacked.battle.wuhun_attack_percent, 120);
+        assert_eq!(attacked.battle.wuhun_defense_percent, 80);
+    }
+
+    #[test]
+    fn v15_migration_backfills_existing_battle_with_neutral_modifier() {
+        let (directory, store) = test_store();
+        register_awakened_pair(&store);
+        let player_id = player_id_for(&store, &identity());
+        let connection = store.open().expect("应打开 v15 回填测试数据库");
+        connection
+            .execute(
+                r#"
+                UPDATE wuhun
+                   SET category = '防御系'
+                 WHERE id = (SELECT wuhun_id FROM player_wuhun_state WHERE player_id = ?1)
+                "#,
+                [player_id],
+            )
+            .expect("应设置防御系武魂");
+        drop(connection);
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "v15-backfill-map"),
+            )
+            .expect("应传送到回填测试地图");
+        let started = store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "史莱姆",
+                &transfer_operation("挑战", "v15-backfill-start"),
+            )
+            .expect("应创建待回填的旧战斗");
+
+        let connection = store.open().expect("应删除 v15 产物模拟旧数据库");
+        connection
+            .execute_batch(
+                r#"
+                DROP TRIGGER battle_wuhun_modifier_event_guard;
+                DROP TRIGGER battle_wuhun_modifier_scope_guard;
+                DROP TRIGGER battle_wuhun_modifier_no_reinsert;
+                DROP TRIGGER battle_wuhun_modifier_no_delete;
+                DROP TRIGGER battle_wuhun_modifier_no_update;
+                DROP INDEX battle_wuhun_modifier_player_page;
+                DROP TABLE battle_wuhun_modifier;
+                DELETE FROM schema_migration WHERE version = 15;
+                "#,
+            )
+            .expect("应移除 v15 结构并保留旧战斗");
+        drop(connection);
+        drop(store);
+
+        let restored = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v15 应为已有战斗回填修正");
+        let battle = restored
+            .active_battle(&identity())
+            .expect("应读取回填后的 active 战斗")
+            .expect("旧 active 战斗应保留");
+        assert_eq!(battle.id, started.battle.id);
+        assert_eq!(battle.wuhun_attack_percent, 100);
+        assert_eq!(battle.wuhun_defense_percent, 100);
+    }
+
+    #[test]
     fn recorded_v14_with_damaged_schema_or_trigger_fails_closed() {
         for mutation in [
             "DROP TABLE wuhun_state_event;",
@@ -18513,6 +19223,24 @@ mod tests {
             BEGIN
                 SELECT EXISTS(SELECT 1 FROM wuhun_state_event);
             END;
+            "#,
+        );
+    }
+
+    #[test]
+    fn recorded_v15_with_damaged_schema_or_trigger_fails_closed() {
+        for mutation in [
+            "DROP TABLE battle_wuhun_modifier;",
+            "DROP INDEX battle_wuhun_modifier_player_page;",
+            "DROP TRIGGER battle_wuhun_modifier_scope_guard;",
+        ] {
+            assert_v15_damage_fails_closed(mutation);
+        }
+        assert_v15_damage_fails_closed(
+            r#"
+            CREATE TRIGGER battle_wuhun_modifier_shadow
+            AFTER INSERT ON battle_wuhun_modifier
+            BEGIN SELECT 1; END;
             "#,
         );
     }

@@ -169,7 +169,7 @@ const MENU_PAGES: &[MenuPage] = &[
             },
             MenuEntry {
                 command: "攻击",
-                description: "进行一次普通攻击并承受魂兽反击",
+                description: "按武魂修正进行普通攻击并承受魂兽反击",
             },
             MenuEntry {
                 command: "逃跑",
@@ -1002,6 +1002,13 @@ impl GameService {
                 "{} → {}/{}",
                 event.beast_hp_before, event.beast_hp_after, receipt.battle.beast_max_hp
             ),
+        )
+        .field(
+            "武魂战斗修正",
+            format!(
+                "攻击 {}% · 防御 {}%",
+                receipt.battle.wuhun_attack_percent, receipt.battle.wuhun_defense_percent
+            ),
         );
         if event.event_kind == "challenge" {
             document = document
@@ -1083,6 +1090,13 @@ impl GameService {
             )
             .field("状态", battle_status_label(&battle.status))
             .field("回合", battle.action_count.to_string())
+            .field(
+                "武魂战斗修正",
+                format!(
+                    "攻击 {}% · 防御 {}%",
+                    battle.wuhun_attack_percent, battle.wuhun_defense_percent
+                ),
+            )
             .field(
                 "玩家生命",
                 format!("{}/{}", battle.player_hp, battle.player_max_hp),
@@ -2820,7 +2834,7 @@ mod tests {
         let sixth = crate::message::render_text(&service.menu("战斗").expect("战斗页应有效"));
         assert!(sixth.contains("魂兽 [页码]：查看当前地图可挑战的魂兽"));
         assert!(sixth.contains("挑战 <魂兽>：发起一场魂兽挑战"));
-        assert!(sixth.contains("攻击：进行一次普通攻击并承受魂兽反击"));
+        assert!(sixth.contains("攻击：按武魂修正进行普通攻击并承受魂兽反击"));
         assert!(sixth.contains("斗罗系统 5"));
     }
 
