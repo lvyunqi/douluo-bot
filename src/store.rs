@@ -1822,6 +1822,350 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_V16: &str = r#"
+CREATE TABLE skill (
+    skill_key TEXT PRIMARY KEY CHECK(
+        length(skill_key) BETWEEN 1 AND 96
+        AND skill_key = trim(skill_key)
+        AND skill_key GLOB '[a-z0-9][a-z0-9._-]*'
+        AND skill_key NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    name TEXT NOT NULL UNIQUE CHECK(length(name) BETWEEN 1 AND 128),
+    skill_type TEXT NOT NULL CHECK(skill_type IN ('active', 'passive', 'domain', 'ultimate')),
+    wuhun_category TEXT NOT NULL CHECK(wuhun_category IN (
+        'all', '强攻系', '控制系', '敏攻系', '辅助系', '防御系', '食物系'
+    )),
+    ring_index INTEGER NOT NULL CHECK(ring_index BETWEEN 1 AND 9),
+    soul_power_cost INTEGER NOT NULL CHECK(soul_power_cost BETWEEN 1 AND 1000),
+    cooldown_rounds INTEGER NOT NULL CHECK(cooldown_rounds BETWEEN 0 AND 100),
+    base_damage INTEGER NOT NULL CHECK(base_damage BETWEEN 1 AND 1000000),
+    spirit_ratio_percent INTEGER NOT NULL CHECK(spirit_ratio_percent BETWEEN 0 AND 1000),
+    strength_ratio_percent INTEGER NOT NULL CHECK(strength_ratio_percent BETWEEN 0 AND 1000),
+    description TEXT NOT NULL CHECK(length(description) BETWEEN 1 AND 2000),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= created_at)
+) STRICT;
+
+CREATE INDEX skill_type_page
+    ON skill(skill_type, wuhun_category, ring_index, skill_key);
+
+INSERT INTO skill(
+    skill_key, name, skill_type, wuhun_category, ring_index,
+    soul_power_cost, cooldown_rounds, base_damage,
+    spirit_ratio_percent, strength_ratio_percent, description,
+    enabled, created_at, updated_at
+) VALUES(
+    'entangle', '缠绕', 'active', 'all', 1,
+    10, 2, 18, 100, 0,
+    '将武魂能量凝成束缚冲击，造成魂技伤害；每次释放消耗魂力并进入回合冷却。',
+    1, 0, 0
+);
+
+CREATE TRIGGER skill_no_update
+BEFORE UPDATE ON skill
+BEGIN
+    SELECT RAISE(ABORT, 'skill catalog is immutable');
+END;
+
+CREATE TRIGGER skill_no_delete
+BEFORE DELETE ON skill
+BEGIN
+    SELECT RAISE(ABORT, 'skill catalog is immutable');
+END;
+
+CREATE TRIGGER skill_no_reinsert
+BEFORE INSERT ON skill
+WHEN EXISTS(SELECT 1 FROM skill WHERE skill_key = NEW.skill_key OR name = NEW.name)
+BEGIN
+    SELECT RAISE(ABORT, 'skill catalog is append-only');
+END;
+
+CREATE TABLE player_skill (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE CASCADE,
+    wuhun_id INTEGER NOT NULL REFERENCES wuhun(id) ON DELETE RESTRICT,
+    skill_key TEXT NOT NULL REFERENCES skill(skill_key) ON DELETE RESTRICT,
+    wuhun_slot INTEGER NOT NULL CHECK(wuhun_slot = 1),
+    level INTEGER NOT NULL DEFAULT 1 CHECK(level BETWEEN 1 AND 10),
+    proficiency INTEGER NOT NULL DEFAULT 0 CHECK(proficiency >= 0),
+    equipped INTEGER NOT NULL DEFAULT 1 CHECK(equipped IN (0, 1)),
+    learned_at INTEGER NOT NULL CHECK(learned_at >= 0),
+    UNIQUE(player_id, skill_key)
+) STRICT;
+
+CREATE INDEX player_skill_player_page
+    ON player_skill(player_id, id);
+CREATE INDEX player_skill_equipped
+    ON player_skill(player_id, equipped, id);
+
+INSERT INTO player_skill(
+    player_id, wuhun_id, skill_key, wuhun_slot,
+    level, proficiency, equipped, learned_at
+)
+SELECT state.player_id, state.wuhun_id, skill.skill_key, state.slot,
+       1, 0, 1, state.updated_at
+  FROM player_wuhun_state state
+  JOIN wuhun w ON w.id = state.wuhun_id
+  JOIN skill ON skill.enabled = 1
+             AND (skill.wuhun_category = 'all' OR skill.wuhun_category = w.category)
+ WHERE state.slot = 1;
+
+CREATE TRIGGER player_skill_no_delete
+BEFORE DELETE ON player_skill
+BEGIN
+    SELECT RAISE(ABORT, 'player skill history is immutable');
+END;
+
+CREATE TRIGGER player_skill_no_reinsert
+BEFORE INSERT ON player_skill
+WHEN EXISTS(
+    SELECT 1 FROM player_skill
+     WHERE id = NEW.id OR (player_id = NEW.player_id AND skill_key = NEW.skill_key)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'player skill is append-only');
+END;
+
+CREATE TRIGGER player_skill_identity_guard
+BEFORE UPDATE ON player_skill
+WHEN NEW.player_id <> OLD.player_id
+  OR NEW.wuhun_id <> OLD.wuhun_id
+  OR NEW.skill_key <> OLD.skill_key
+  OR NEW.wuhun_slot <> OLD.wuhun_slot
+BEGIN
+    SELECT RAISE(ABORT, 'player skill identity is immutable');
+END;
+
+CREATE TRIGGER player_skill_scope_guard
+BEFORE INSERT ON player_skill
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM player_wuhun_state state
+      JOIN wuhun w ON w.id = state.wuhun_id
+      JOIN skill ON skill.skill_key = NEW.skill_key
+     WHERE state.player_id = NEW.player_id
+       AND state.wuhun_id = NEW.wuhun_id
+       AND state.slot = NEW.wuhun_slot
+       AND skill.enabled = 1
+       AND (skill.wuhun_category = 'all' OR skill.wuhun_category = w.category)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'player skill scope mismatch');
+END;
+
+CREATE TABLE battle_skill_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    battle_id INTEGER NOT NULL REFERENCES battle(id) ON DELETE RESTRICT,
+    battle_event_id INTEGER NOT NULL UNIQUE REFERENCES battle_event(id) ON DELETE RESTRICT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    player_skill_id INTEGER NOT NULL REFERENCES player_skill(id) ON DELETE RESTRICT,
+    skill_key TEXT NOT NULL REFERENCES skill(skill_key) ON DELETE RESTRICT,
+    sequence INTEGER NOT NULL CHECK(sequence > 0),
+    soul_power_before INTEGER NOT NULL CHECK(soul_power_before >= 0),
+    soul_power_after INTEGER NOT NULL CHECK(soul_power_after >= 0),
+    soul_power_cost INTEGER NOT NULL CHECK(soul_power_cost > 0),
+    cooldown_rounds INTEGER NOT NULL CHECK(cooldown_rounds >= 0),
+    damage INTEGER NOT NULL CHECK(damage > 0),
+    source_message_id TEXT NOT NULL CHECK(
+        length(source_message_id) <= 256
+        AND instr(source_message_id, char(0)) = 0
+        AND source_message_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    operation_log_id INTEGER NOT NULL UNIQUE REFERENCES operation_log(id) ON DELETE RESTRICT,
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    UNIQUE(battle_id, sequence),
+    CHECK(soul_power_after + soul_power_cost = soul_power_before)
+) STRICT;
+
+CREATE INDEX battle_skill_event_battle_page
+    ON battle_skill_event(battle_id, sequence, id);
+CREATE INDEX battle_skill_event_player_page
+    ON battle_skill_event(player_id, id);
+CREATE UNIQUE INDEX battle_skill_event_player_message
+    ON battle_skill_event(player_id, source_message_id)
+    WHERE length(source_message_id) > 0;
+
+CREATE TRIGGER battle_skill_event_no_update
+BEFORE UPDATE ON battle_skill_event
+BEGIN
+    SELECT RAISE(ABORT, 'battle skill event is immutable');
+END;
+
+CREATE TRIGGER battle_skill_event_no_delete
+BEFORE DELETE ON battle_skill_event
+BEGIN
+    SELECT RAISE(ABORT, 'battle skill event is immutable');
+END;
+
+CREATE TRIGGER battle_skill_event_no_reinsert
+BEFORE INSERT ON battle_skill_event
+WHEN EXISTS(
+    SELECT 1 FROM battle_skill_event
+     WHERE battle_event_id = NEW.battle_event_id
+        OR operation_log_id = NEW.operation_log_id
+        OR (
+            length(NEW.source_message_id) > 0
+            AND player_id = NEW.player_id
+            AND source_message_id = NEW.source_message_id
+        )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle skill event is append-only');
+END;
+
+CREATE TRIGGER battle_skill_event_scope_guard
+BEFORE INSERT ON battle_skill_event
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM battle_event event
+      JOIN battle b ON b.id = event.battle_id
+      JOIN player p ON p.id = event.player_id
+      JOIN player_skill learned ON learned.id = NEW.player_skill_id
+      JOIN skill ON skill.skill_key = NEW.skill_key
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE event.id = NEW.battle_event_id
+       AND event.battle_id = NEW.battle_id
+       AND event.player_id = NEW.player_id
+       AND event.sequence = NEW.sequence
+       AND event.event_kind = 'attack'
+       AND event.player_damage = NEW.damage
+       AND b.status = event.status_after
+       AND learned.player_id = NEW.player_id
+       AND learned.skill_key = NEW.skill_key
+       AND learned.equipped = 1
+       AND skill.enabled = 1
+       AND skill.skill_type = 'active'
+       AND NEW.soul_power_cost = skill.soul_power_cost
+       AND NEW.cooldown_rounds = skill.cooldown_rounds
+       AND p.soul_power = NEW.soul_power_after
+       AND audit.protocol = (SELECT i.protocol FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.account_id = (SELECT i.account_id FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.namespace = (SELECT i.namespace FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.subject_kind = (SELECT i.subject_kind FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.subject_id = (SELECT i.subject_id FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.command = '释放技能'
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+       AND NOT EXISTS(
+           SELECT 1
+             FROM battle_skill_event previous
+            WHERE previous.battle_id = NEW.battle_id
+              AND previous.player_skill_id = NEW.player_skill_id
+              AND NEW.sequence - previous.sequence < NEW.cooldown_rounds
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle skill event scope, cooldown, or audit mismatch');
+END;
+
+DROP TRIGGER wuhun_state_event_scope_guard;
+
+CREATE TRIGGER wuhun_state_event_scope_guard
+BEFORE INSERT ON wuhun_state_event
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM player_wuhun_state s
+     WHERE s.player_id = NEW.player_id
+       AND s.wuhun_id = NEW.wuhun_id
+       AND s.slot = 1
+       AND s.enabled = NEW.enabled_after
+       AND s.stability = NEW.stability_after
+)
+OR NOT EXISTS(
+    SELECT 1
+      FROM player p
+      JOIN identity i ON i.id = p.identity_id
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE p.id = NEW.player_id
+       AND audit.protocol = i.protocol
+       AND audit.account_id = i.account_id
+       AND audit.namespace = i.namespace
+       AND audit.subject_kind = i.subject_kind
+       AND audit.subject_id = i.subject_id
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+       AND (
+           (NEW.reason = 'manual_toggle' AND audit.command = CASE NEW.enabled_after
+               WHEN 1 THEN '开武魂' ELSE '关武魂' END)
+           OR (NEW.reason = 'item_restore' AND audit.command = '使用')
+           OR (NEW.reason = 'battle_damage' AND audit.command IN ('攻击', '释放技能'))
+           OR (NEW.reason = 'battle_flee_damage' AND audit.command = '逃跑')
+       )
+)
+OR NEW.battle_event_id IS NOT NULL AND NOT EXISTS(
+    SELECT 1
+      FROM battle_event event
+     WHERE event.id = NEW.battle_event_id
+       AND event.battle_id = NEW.battle_id
+       AND event.player_id = NEW.player_id
+       AND event.operation_log_id = NEW.operation_log_id
+       AND event.source_message_id = NEW.source_message_id
+       AND (
+           (NEW.reason = 'battle_damage' AND event.event_kind = 'attack' AND event.beast_damage > 0)
+           OR (NEW.reason = 'battle_flee_damage' AND event.event_kind = 'flee' AND event.beast_damage > 0)
+       )
+)
+OR (
+    EXISTS(SELECT 1 FROM wuhun_state_event WHERE player_id = NEW.player_id)
+    AND NOT EXISTS(
+        SELECT 1
+          FROM wuhun_state_event previous
+         WHERE previous.id = (
+             SELECT MAX(latest.id)
+               FROM wuhun_state_event latest
+              WHERE latest.player_id = NEW.player_id
+         )
+           AND previous.wuhun_id = NEW.wuhun_id
+           AND previous.enabled_after = NEW.enabled_before
+           AND previous.stability_after = NEW.stability_before
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'wuhun state event scope or audit mismatch');
+END;
+
+DROP TRIGGER battle_event_scope_guard;
+
+CREATE TRIGGER battle_event_scope_guard
+BEFORE INSERT ON battle_event
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM battle b
+      JOIN player p ON p.id = b.player_id
+      JOIN identity i ON i.id = p.identity_id
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE b.id = NEW.battle_id AND b.player_id = NEW.player_id
+       AND b.action_count = NEW.sequence AND b.status = NEW.status_after
+       AND b.player_hp = NEW.player_hp_after AND b.beast_hp = NEW.beast_hp_after
+       AND i.protocol = audit.protocol AND i.account_id = audit.account_id
+       AND i.namespace = audit.namespace AND i.subject_kind = audit.subject_kind
+       AND i.subject_id = audit.subject_id
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+       AND (
+           audit.command = CASE NEW.event_kind
+               WHEN 'challenge' THEN '挑战'
+               WHEN 'attack' THEN '攻击'
+               WHEN 'flee' THEN '逃跑'
+           END
+           OR (NEW.event_kind = 'attack' AND audit.command = '释放技能')
+       )
+       AND (NEW.ground_drop_id IS NULL OR EXISTS(
+           SELECT 1 FROM ground_drop d
+            WHERE d.id = NEW.ground_drop_id AND d.map_key = b.map_key
+              AND d.item_key = b.drop_item_key AND d.quantity = b.drop_quantity
+              AND d.owner_identity_id = i.id AND d.owner_subject_id = i.subject_id
+              AND d.source_kind = 'battle' AND d.source_event_id = 'battle:' || b.id
+       ))
+       AND ((b.status = 'won' AND NEW.experience_awarded = b.exp_reward)
+            OR (b.status <> 'won' AND NEW.experience_awarded = 0))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle event scope, reward, or audit mismatch');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -2204,6 +2548,7 @@ pub struct BattleEventRecord {
     pub battle_id: i64,
     pub sequence: i64,
     pub event_kind: String,
+    pub skill_name: Option<String>,
     pub status_after: String,
     pub player_hp_before: i64,
     pub player_hp_after: i64,
@@ -2220,12 +2565,52 @@ pub struct BattleEventRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillRecord {
+    pub skill_key: String,
+    pub name: String,
+    pub skill_type: String,
+    pub wuhun_category: String,
+    pub ring_index: i64,
+    pub soul_power_cost: i64,
+    pub cooldown_rounds: i64,
+    pub base_damage: i64,
+    pub spirit_ratio_percent: i64,
+    pub strength_ratio_percent: i64,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerSkillRecord {
+    pub id: i64,
+    pub skill: SkillRecord,
+    pub level: i64,
+    pub proficiency: i64,
+    pub equipped: bool,
+    pub learned_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillPage {
+    pub entries: Vec<PlayerSkillRecord>,
+    pub soul_power: i64,
+    pub max_soul_power: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillUseRecord {
+    pub skill: SkillRecord,
+    pub soul_power_before: i64,
+    pub soul_power_after: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BattleActionReceipt {
     pub battle: BattleSnapshot,
     pub event: BattleEventRecord,
     pub experience: Option<ExperienceGrantReceipt>,
     pub ground_drop: Option<GroundDropRecord>,
     pub wuhun_effect: Option<WuhunStateEffect>,
+    pub skill: Option<SkillUseRecord>,
     pub replayed: bool,
 }
 
@@ -2780,7 +3165,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
                     format!(
-                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15 失败：{error}"
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16 失败：{error}"
                     )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
@@ -3017,10 +3402,25 @@ impl Store {
                 validate_v15_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 16)? {
+                transaction
+                    .execute_batch(MIGRATION_V16)
+                    .map_err(|error| format!("执行数据库迁移 v16 失败：{error}"))?;
+                validate_v16_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(16, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v16 失败：{error}"))?;
+            } else {
+                validate_v16_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16 失败：{error}"
                 )
             })?;
             Ok(())
@@ -3043,6 +3443,7 @@ impl Store {
                 validate_v13_schema(connection)?;
                 validate_v14_schema(connection)?;
                 validate_v15_schema(connection)?;
+                validate_v16_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -4790,6 +5191,99 @@ impl Store {
         })
     }
 
+    pub fn skills_page(&self, key: &IdentityKey<'_>) -> Result<SkillPage, String> {
+        validate_identity_key(key)?;
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let (player_id, soul_power, max_soul_power) = connection
+            .query_row(
+                r#"
+                SELECT p.id, p.soul_power, p.max_soul_power
+                  FROM identity i
+                  JOIN player p ON p.identity_id = i.id
+                 WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+                   AND i.subject_kind = ?4 AND i.subject_id = ?5
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind,
+                    key.subject_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("查询魂力状态失败：{error}"))?
+            .ok_or_else(|| "你还没有角色，请先使用“开始穿越 <角色名> <男|女>”".to_string())?;
+        let entries = connection
+            .prepare(&format!(
+                "{} WHERE ps.player_id = ?1 ORDER BY s.ring_index, ps.id",
+                player_skill_select_sql()
+            ))
+            .map_err(|error| format!("准备魂技列表失败：{error}"))?
+            .query_map([player_id], player_skill_record_from_row)
+            .map_err(|error| format!("查询魂技列表失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析魂技列表失败：{error}"))?;
+        Ok(SkillPage {
+            entries,
+            soul_power,
+            max_soul_power,
+        })
+    }
+
+    pub fn skill_detail(
+        &self,
+        key: &IdentityKey<'_>,
+        requested_name_or_key: &str,
+    ) -> Result<Option<PlayerSkillRecord>, String> {
+        validate_identity_key(key)?;
+        validate_catalog_lookup(requested_name_or_key, "魂技名称")?;
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let player_id = connection
+            .query_row(
+                r#"
+                SELECT p.id
+                  FROM identity i
+                  JOIN player p ON p.identity_id = i.id
+                 WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+                   AND i.subject_kind = ?4 AND i.subject_id = ?5
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind,
+                    key.subject_id
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("查询角色失败：{error}"))?;
+        let Some(player_id) = player_id else {
+            return Ok(None);
+        };
+        connection
+            .query_row(
+                &format!(
+                    "{} WHERE ps.player_id = ?1 AND (s.name = ?2 OR s.skill_key = ?2) LIMIT 1",
+                    player_skill_select_sql()
+                ),
+                params![player_id, requested_name_or_key],
+                player_skill_record_from_row,
+            )
+            .optional()
+            .map_err(|error| format!("查询魂技详情失败：{error}"))
+    }
+
     pub fn active_battle(&self, key: &IdentityKey<'_>) -> Result<Option<BattleSnapshot>, String> {
         validate_identity_key(key)?;
         let connection = self.open()?;
@@ -4884,6 +5378,7 @@ impl Store {
                 experience: None,
                 ground_drop: drop,
                 wuhun_effect: None,
+                skill: None,
                 replayed: true,
             });
         }
@@ -4986,6 +5481,7 @@ impl Store {
             experience: None,
             ground_drop: None,
             wuhun_effect: None,
+            skill: None,
             replayed: false,
         })
     }
@@ -4995,7 +5491,17 @@ impl Store {
         key: &IdentityKey<'_>,
         operation: &OperationLogInput<'_>,
     ) -> Result<BattleActionReceipt, String> {
-        self.resolve_battle_action(key, operation, "攻击")
+        self.resolve_battle_action(key, operation, "攻击", None)
+    }
+
+    pub fn use_skill_battle_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        skill_name_or_key: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<BattleActionReceipt, String> {
+        validate_catalog_lookup(skill_name_or_key, "魂技名称")?;
+        self.resolve_battle_action(key, operation, "释放技能", Some(skill_name_or_key))
     }
 
     pub fn flee_battle_with_operation(
@@ -5003,7 +5509,7 @@ impl Store {
         key: &IdentityKey<'_>,
         operation: &OperationLogInput<'_>,
     ) -> Result<BattleActionReceipt, String> {
-        self.resolve_battle_action(key, operation, "逃跑")
+        self.resolve_battle_action(key, operation, "逃跑", None)
     }
 
     fn resolve_battle_action(
@@ -5011,6 +5517,7 @@ impl Store {
         key: &IdentityKey<'_>,
         operation: &OperationLogInput<'_>,
         action: &str,
+        skill_name_or_key: Option<&str>,
     ) -> Result<BattleActionReceipt, String> {
         validate_identity_key(key)?;
         validate_battle_operation(operation, action)?;
@@ -5020,6 +5527,9 @@ impl Store {
             .map_err(|error| format!("开始{action}事务失败：{error}"))?;
         ensure_no_legacy_identity(&transaction, key)?;
         let player = load_battle_player(&transaction, key)?;
+        let learned_skill = skill_name_or_key
+            .map(|name| load_player_skill_by_name_or_key(&transaction, player.player_id, name))
+            .transpose()?;
         if let Some(existing) = load_battle_event_by_message(
             &transaction,
             player.player_id,
@@ -5027,6 +5537,14 @@ impl Store {
         )? {
             if existing.event_kind != action_event_kind(action) {
                 return Err("该消息 ID 已用于不同的战斗操作，拒绝重放".to_string());
+            }
+            let previous_skill = load_battle_skill_use_by_event(&transaction, existing.id)?;
+            match (skill_name_or_key, previous_skill.as_ref()) {
+                (Some(requested), Some(previous))
+                    if requested == previous.skill.skill_key
+                        || requested == previous.skill.name => {}
+                (None, None) => {}
+                _ => return Err("该消息 ID 已用于不同的战斗操作，拒绝重放".to_string()),
             }
             let battle = load_battle_snapshot(&transaction, existing.battle_id)?
                 .ok_or_else(|| "原战斗记录不存在".to_string())?;
@@ -5045,6 +5563,7 @@ impl Store {
                 experience: None,
                 ground_drop: drop,
                 wuhun_effect,
+                skill: previous_skill,
                 replayed: true,
             });
         }
@@ -5070,6 +5589,63 @@ impl Store {
             .checked_add(1)
             .ok_or_else(|| "战斗行动次数溢出".to_string())?;
         let timestamp = now_timestamp()?;
+        let (player_skill_id, skill_use, soul_power_before, soul_power_after) = if let Some(
+            learned,
+        ) = learned_skill
+        {
+            if !learned.equipped {
+                return Err(format!("魂技“{}”尚未装备", learned.skill.name));
+            }
+            let soul_power_before = transaction
+                .query_row(
+                    "SELECT soul_power FROM player WHERE id = ?1",
+                    [state.player_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| format!("读取魂力失败：{error}"))?;
+            if soul_power_before < learned.skill.soul_power_cost {
+                return Err(format!(
+                    "魂力不足，需要 {} 点，当前只有 {} 点",
+                    learned.skill.soul_power_cost, soul_power_before
+                ));
+            }
+            let last_sequence = transaction
+                    .query_row(
+                        "SELECT MAX(sequence) FROM battle_skill_event WHERE battle_id = ?1 AND player_skill_id = ?2",
+                        params![state.id, learned.id],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )
+                    .map_err(|error| format!("读取魂技冷却失败：{error}"))?;
+            if let Some(last_sequence) = last_sequence {
+                let elapsed = state.action_count.saturating_sub(last_sequence);
+                if elapsed < learned.skill.cooldown_rounds {
+                    return Err(format!(
+                        "魂技“{}”还在冷却中，剩余 {} 回合",
+                        learned.skill.name,
+                        learned.skill.cooldown_rounds - elapsed
+                    ));
+                }
+            }
+            let soul_power_after = soul_power_before - learned.skill.soul_power_cost;
+            transaction
+                .execute(
+                    "UPDATE player SET soul_power = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![soul_power_after, timestamp, state.player_id],
+                )
+                .map_err(|error| format!("扣除魂力失败：{error}"))?;
+            (
+                Some(learned.id),
+                Some(SkillUseRecord {
+                    skill: learned.skill,
+                    soul_power_before,
+                    soul_power_after,
+                }),
+                Some(soul_power_before),
+                Some(soul_power_after),
+            )
+        } else {
+            (None, None, None, None)
+        };
         let event_kind = action_event_kind(action);
         let (
             status_after,
@@ -5083,21 +5659,38 @@ impl Store {
             experience_awarded,
             ground_drop_id,
             experience,
-        ) = if action == "攻击" {
-            let player_roll = battle_roll(state.random_seed, sequence, 0);
+        ) = if matches!(action, "攻击" | "释放技能") {
+            let player_roll = battle_roll(
+                state.random_seed,
+                sequence,
+                if skill_use.is_some() { 10 } else { 0 },
+            );
             let player_critical = battle_is_critical(
                 state.player_perception,
                 state.player_luck,
-                battle_roll(state.random_seed, sequence, 1),
+                battle_roll(
+                    state.random_seed,
+                    sequence,
+                    if skill_use.is_some() { 11 } else { 1 },
+                ),
             );
+            let raw_damage = if let Some(skill) = skill_use.as_ref() {
+                skill_raw_damage(&skill.skill, state.player_strength, state.player_perception)?
+            } else {
+                state
+                    .player_strength
+                    .checked_mul(2)
+                    .ok_or_else(|| "玩家攻击力计算溢出".to_string())?
+            };
             let mut player_damage = battle_damage(
                 scale_combat_value(
-                    state
-                        .player_strength
-                        .checked_mul(2)
-                        .ok_or_else(|| "玩家攻击力计算溢出".to_string())?,
+                    raw_damage,
                     wuhun_attack_percent,
-                    "武魂攻击修正",
+                    if skill_use.is_some() {
+                        "武魂魂技攻击修正"
+                    } else {
+                        "武魂攻击修正"
+                    },
                 )?,
                 state.beast_defense,
                 state.player_level,
@@ -5346,6 +5939,35 @@ impl Store {
             },
         )?;
         let event_id = transaction.last_insert_rowid();
+        if let (
+            Some(player_skill_id),
+            Some(skill_use),
+            Some(soul_power_before),
+            Some(soul_power_after),
+        ) = (
+            player_skill_id,
+            skill_use.as_ref(),
+            soul_power_before,
+            soul_power_after,
+        ) {
+            insert_battle_skill_event(
+                &transaction,
+                BattleSkillEventInsert {
+                    battle_event_id: event_id,
+                    battle_id: state.id,
+                    player_id: state.player_id,
+                    player_skill_id,
+                    skill: &skill_use.skill,
+                    sequence,
+                    soul_power_before,
+                    soul_power_after,
+                    damage: player_damage,
+                    source_message_id: operation.source_message_id,
+                    operation_log_id,
+                    created_at: timestamp,
+                },
+            )?;
+        }
         if let Some(effect) = &wuhun_effect {
             insert_wuhun_state_event(
                 &transaction,
@@ -5355,10 +5977,10 @@ impl Store {
                     battle_id: Some(state.id),
                     battle_event_id: Some(event_id),
                     operation_log_id,
-                    reason: if action == "攻击" {
-                        "battle_damage"
-                    } else {
+                    reason: if action == "逃跑" {
                         "battle_flee_damage"
+                    } else {
+                        "battle_damage"
                     },
                     enabled_before: effect.enabled_before,
                     enabled_after: effect.enabled_after,
@@ -5386,6 +6008,7 @@ impl Store {
             experience,
             ground_drop,
             wuhun_effect,
+            skill: skill_use,
             replayed: false,
         })
     }
@@ -6011,12 +6634,14 @@ impl Store {
                 },
             )
             .map_err(|error| format!("选择武魂失败：{error}"))?;
+        let timestamp = now_timestamp()?;
         transaction
             .execute(
                 "INSERT INTO player_wuhun(player_id, wuhun_id, slot, awaken_life, created_at) VALUES(?1, ?2, 1, ?3, ?4)",
-                params![player.0, wuhun.0, player.1, now_timestamp()?],
+                params![player.0, wuhun.0, player.1, timestamp],
             )
             .map_err(|error| format!("保存觉醒武魂失败：{error}"))?;
+        seed_player_skills(&transaction, player.0, wuhun.0, timestamp)?;
         if let Some(operation) = operation {
             insert_operation_log(&transaction, key, operation)?;
         }
@@ -7438,6 +8063,22 @@ struct BattleEventInsert<'a> {
     created_at: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BattleSkillEventInsert<'a> {
+    battle_event_id: i64,
+    battle_id: i64,
+    player_id: i64,
+    player_skill_id: i64,
+    skill: &'a SkillRecord,
+    sequence: i64,
+    soul_power_before: i64,
+    soul_power_after: i64,
+    damage: i64,
+    source_message_id: &'a str,
+    operation_log_id: i64,
+    created_at: i64,
+}
+
 fn quest_record_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<QuestRecord> {
     Ok(QuestRecord {
         id: row.get(offset)?,
@@ -7927,6 +8568,88 @@ fn load_wuhun_state_by_player(
     Ok(load_wuhun_state_with_id_by_player(connection, player_id)?.map(|(_, state)| state))
 }
 
+fn seed_player_skills(
+    connection: &Connection,
+    player_id: i64,
+    wuhun_id: i64,
+    learned_at: i64,
+) -> Result<(), String> {
+    connection
+        .execute(
+            r#"
+            INSERT INTO player_skill(
+                player_id, wuhun_id, skill_key, wuhun_slot,
+                level, proficiency, equipped, learned_at
+            )
+            SELECT ?1, ?2, skill.skill_key, 1, 1, 0, 1, ?3
+              FROM skill
+             WHERE skill.enabled = 1
+               AND skill.wuhun_category = 'all'
+            "#,
+            params![player_id, wuhun_id, learned_at],
+        )
+        .map_err(|error| format!("保存初始魂技失败：{error}"))?;
+    Ok(())
+}
+
+fn skill_record_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<SkillRecord> {
+    Ok(SkillRecord {
+        skill_key: row.get(offset)?,
+        name: row.get(offset + 1)?,
+        skill_type: row.get(offset + 2)?,
+        wuhun_category: row.get(offset + 3)?,
+        ring_index: row.get(offset + 4)?,
+        soul_power_cost: row.get(offset + 5)?,
+        cooldown_rounds: row.get(offset + 6)?,
+        base_damage: row.get(offset + 7)?,
+        spirit_ratio_percent: row.get(offset + 8)?,
+        strength_ratio_percent: row.get(offset + 9)?,
+        description: row.get(offset + 10)?,
+    })
+}
+
+fn player_skill_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlayerSkillRecord> {
+    Ok(PlayerSkillRecord {
+        id: row.get(0)?,
+        skill: skill_record_from_row(row, 1)?,
+        level: row.get(12)?,
+        proficiency: row.get(13)?,
+        equipped: row.get(14)?,
+        learned_at: row.get(15)?,
+    })
+}
+
+fn player_skill_select_sql() -> &'static str {
+    r#"
+    SELECT ps.id,
+           s.skill_key, s.name, s.skill_type, s.wuhun_category,
+           s.ring_index, s.soul_power_cost, s.cooldown_rounds, s.base_damage,
+           s.spirit_ratio_percent, s.strength_ratio_percent, s.description,
+           ps.level, ps.proficiency, ps.equipped, ps.learned_at
+      FROM player_skill ps
+      JOIN skill s ON s.skill_key = ps.skill_key
+    "#
+}
+
+fn load_player_skill_by_name_or_key(
+    connection: &Connection,
+    player_id: i64,
+    requested_name_or_key: &str,
+) -> Result<PlayerSkillRecord, String> {
+    connection
+        .query_row(
+            &format!(
+                "{} WHERE ps.player_id = ?1 AND (s.name = ?2 OR s.skill_key = ?2) LIMIT 1",
+                player_skill_select_sql()
+            ),
+            params![player_id, requested_name_or_key],
+            player_skill_record_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取玩家魂技失败：{error}"))
+        .and_then(|record| record.ok_or_else(|| format!("你尚未学习魂技“{requested_name_or_key}”")))
+}
+
 fn load_wuhun_state_with_id_by_player(
     connection: &Connection,
     player_id: i64,
@@ -8042,6 +8765,26 @@ fn scale_combat_value(value: i64, percent: i64, label: &str) -> Result<i64, Stri
             / 100,
     )
     .map_err(|_| format!("{label}超出整数范围"))
+}
+
+fn skill_raw_damage(skill: &SkillRecord, strength: i64, spirit: i64) -> Result<i64, String> {
+    if strength < 0 || spirit < 0 {
+        return Err("魂技属性参数无效".to_string());
+    }
+    let value = i128::from(skill.base_damage)
+        .checked_add(
+            i128::from(strength)
+                .checked_mul(i128::from(skill.strength_ratio_percent))
+                .ok_or_else(|| "魂技力量加成计算溢出".to_string())?
+                / 100,
+        )
+        .and_then(|value| {
+            value.checked_add(
+                i128::from(spirit).checked_mul(i128::from(skill.spirit_ratio_percent))? / 100,
+            )
+        })
+        .ok_or_else(|| "魂技精神加成计算溢出".to_string())?;
+    i64::try_from(value).map_err(|_| "魂技基础伤害超出整数范围".to_string())
 }
 
 fn insert_battle_wuhun_modifier(
@@ -8414,23 +9157,24 @@ fn battle_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BattleEven
         battle_id: row.get(1)?,
         sequence: row.get(2)?,
         event_kind: row.get(3)?,
-        status_after: row.get(4)?,
-        player_hp_before: row.get(5)?,
-        player_hp_after: row.get(6)?,
-        beast_hp_before: row.get(7)?,
-        beast_hp_after: row.get(8)?,
-        player_damage: row.get(9)?,
-        beast_damage: row.get(10)?,
-        player_critical: row.get(11)?,
-        beast_critical: row.get(12)?,
-        flee_success: row.get(13)?,
-        experience_awarded: row.get(14)?,
-        ground_drop_id: row.get(15)?,
-        created_at: row.get(16)?,
+        skill_name: row.get(4)?,
+        status_after: row.get(5)?,
+        player_hp_before: row.get(6)?,
+        player_hp_after: row.get(7)?,
+        beast_hp_before: row.get(8)?,
+        beast_hp_after: row.get(9)?,
+        player_damage: row.get(10)?,
+        beast_damage: row.get(11)?,
+        player_critical: row.get(12)?,
+        beast_critical: row.get(13)?,
+        flee_success: row.get(14)?,
+        experience_awarded: row.get(15)?,
+        ground_drop_id: row.get(16)?,
+        created_at: row.get(17)?,
     })
 }
 
-const BATTLE_EVENT_SELECT: &str = "SELECT id, battle_id, sequence, event_kind, status_after, player_hp_before, player_hp_after, beast_hp_before, beast_hp_after, player_damage, beast_damage, player_critical, beast_critical, flee_success, experience_awarded, ground_drop_id, created_at FROM battle_event";
+const BATTLE_EVENT_SELECT: &str = "SELECT e.id, e.battle_id, e.sequence, e.event_kind, (SELECT s.name FROM battle_skill_event use_event JOIN skill s ON s.skill_key = use_event.skill_key WHERE use_event.battle_event_id = e.id), e.status_after, e.player_hp_before, e.player_hp_after, e.beast_hp_before, e.beast_hp_after, e.player_damage, e.beast_damage, e.player_critical, e.beast_critical, e.flee_success, e.experience_awarded, e.ground_drop_id, e.created_at FROM battle_event e";
 
 fn load_battle_event_by_id(
     connection: &Connection,
@@ -8438,7 +9182,7 @@ fn load_battle_event_by_id(
 ) -> Result<Option<BattleEventRecord>, String> {
     connection
         .query_row(
-            &format!("{BATTLE_EVENT_SELECT} WHERE id = ?1"),
+            &format!("{BATTLE_EVENT_SELECT} WHERE e.id = ?1"),
             [event_id],
             battle_event_from_row,
         )
@@ -8456,7 +9200,7 @@ fn load_battle_event_by_message(
     }
     connection
         .query_row(
-            &format!("{BATTLE_EVENT_SELECT} WHERE player_id = ?1 AND source_message_id = ?2"),
+            &format!("{BATTLE_EVENT_SELECT} WHERE e.player_id = ?1 AND e.source_message_id = ?2"),
             params![player_id, source_message_id],
             battle_event_from_row,
         )
@@ -8472,7 +9216,7 @@ fn load_battle_events(
     let limit = i64::try_from(limit).map_err(|_| "战斗日志数量无法转换".to_string())?;
     let mut events = connection
         .prepare(&format!(
-            "{BATTLE_EVENT_SELECT} WHERE battle_id = ?1 ORDER BY sequence DESC, id DESC LIMIT ?2"
+            "{BATTLE_EVENT_SELECT} WHERE e.battle_id = ?1 ORDER BY e.sequence DESC, e.id DESC LIMIT ?2"
         ))
         .map_err(|error| format!("准备战斗日志查询失败：{error}"))?
         .query_map(params![battle_id, limit], battle_event_from_row)
@@ -8481,6 +9225,34 @@ fn load_battle_events(
         .map_err(|error| format!("解析战斗日志失败：{error}"))?;
     events.reverse();
     Ok(events)
+}
+
+fn load_battle_skill_use_by_event(
+    connection: &Connection,
+    battle_event_id: i64,
+) -> Result<Option<SkillUseRecord>, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT s.skill_key, s.name, s.skill_type, s.wuhun_category,
+                   s.ring_index, s.soul_power_cost, s.cooldown_rounds, s.base_damage,
+                   s.spirit_ratio_percent, s.strength_ratio_percent, s.description,
+                   use_event.soul_power_before, use_event.soul_power_after
+              FROM battle_skill_event use_event
+              JOIN skill s ON s.skill_key = use_event.skill_key
+             WHERE use_event.battle_event_id = ?1
+            "#,
+            [battle_event_id],
+            |row| {
+                Ok(SkillUseRecord {
+                    skill: skill_record_from_row(row, 0)?,
+                    soul_power_before: row.get(11)?,
+                    soul_power_after: row.get(12)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取战斗魂技事件失败：{error}"))
 }
 
 fn insert_battle_event(
@@ -8525,6 +9297,40 @@ fn insert_battle_event(
     Ok(())
 }
 
+fn insert_battle_skill_event(
+    connection: &Connection,
+    event: BattleSkillEventInsert<'_>,
+) -> Result<(), String> {
+    connection
+        .execute(
+            r#"
+            INSERT INTO battle_skill_event(
+                battle_id, battle_event_id, player_id, player_skill_id, skill_key,
+                sequence, soul_power_before, soul_power_after, soul_power_cost,
+                cooldown_rounds, damage, source_message_id, operation_log_id, created_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            "#,
+            params![
+                event.battle_id,
+                event.battle_event_id,
+                event.player_id,
+                event.player_skill_id,
+                event.skill.skill_key,
+                event.sequence,
+                event.soul_power_before,
+                event.soul_power_after,
+                event.skill.soul_power_cost,
+                event.skill.cooldown_rounds,
+                event.damage,
+                event.source_message_id,
+                event.operation_log_id,
+                event.created_at
+            ],
+        )
+        .map_err(|error| format!("保存战斗魂技事件失败：{error}"))?;
+    Ok(())
+}
+
 fn validate_battle_operation(
     operation: &OperationLogInput<'_>,
     command: &str,
@@ -8555,6 +9361,7 @@ fn action_event_kind(action: &str) -> &'static str {
     match action {
         "挑战" => "challenge",
         "攻击" => "attack",
+        "释放技能" => "attack",
         "逃跑" => "flee",
         _ => unreachable!("已校验战斗动作"),
     }
@@ -12952,7 +13759,8 @@ fn validate_v13_schema(connection: &Connection) -> Result<(), String> {
                 name == *expected_name && table == *expected_table
             })
             || name == "wuhun_state_event_scope_guard"
-            || table == "battle_wuhun_modifier";
+            || table == "battle_wuhun_modifier"
+            || name == "player_skill_scope_guard";
         let touches_v13 = table == "player_wuhun_state"
             || sql_mentions_identifier(&trigger_sql, "player_wuhun_state");
         if touches_v13 && !declared {
@@ -13345,6 +14153,355 @@ fn validate_v15_schema(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
+    let expected_tables = [
+        (
+            "skill",
+            vec![
+                TableColumnInfo::new("skill_key", "TEXT", true, true, None, 0),
+                TableColumnInfo::new("name", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("skill_type", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("wuhun_category", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("ring_index", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("soul_power_cost", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("cooldown_rounds", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("base_damage", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("spirit_ratio_percent", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("strength_ratio_percent", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("description", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("enabled", "INTEGER", true, false, Some("1"), 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("updated_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+        (
+            "player_skill",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("wuhun_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("skill_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("wuhun_slot", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("level", "INTEGER", true, false, Some("1"), 0),
+                TableColumnInfo::new("proficiency", "INTEGER", true, false, Some("0"), 0),
+                TableColumnInfo::new("equipped", "INTEGER", true, false, Some("1"), 0),
+                TableColumnInfo::new("learned_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+        (
+            "battle_skill_event",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("battle_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("battle_event_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_skill_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("skill_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("sequence", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("soul_power_before", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("soul_power_after", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("soul_power_cost", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("cooldown_rounds", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("damage", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("source_message_id", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("operation_log_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+    ];
+    for (table, expected) in expected_tables {
+        let actual = table_columns_with_type(connection, table)?;
+        if actual != expected {
+            return Err(format!(
+                "数据库已标记迁移 v16，但表 {table} 字段不匹配：{actual:?}"
+            ));
+        }
+        let sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v16 表 {table} 建表语句失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v16，但缺少表 {table}"))?
+            .to_ascii_uppercase();
+        if !sql.contains(") STRICT") {
+            return Err(format!("v16 表 {table} 必须是 STRICT"));
+        }
+    }
+    validate_v16_foreign_keys(
+        connection,
+        "player_skill",
+        &[
+            ("player", "player_id", "id", "NO ACTION", "CASCADE"),
+            ("skill", "skill_key", "skill_key", "NO ACTION", "RESTRICT"),
+            ("wuhun", "wuhun_id", "id", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+    validate_v16_foreign_keys(
+        connection,
+        "battle_skill_event",
+        &[
+            ("battle", "battle_id", "id", "NO ACTION", "RESTRICT"),
+            (
+                "battle_event",
+                "battle_event_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            (
+                "operation_log",
+                "operation_log_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+            (
+                "player_skill",
+                "player_skill_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("skill", "skill_key", "skill_key", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+    validate_v16_custom_index_set(connection, "skill", &["skill_type_page"])?;
+    validate_v16_custom_index_set(
+        connection,
+        "player_skill",
+        &["player_skill_equipped", "player_skill_player_page"],
+    )?;
+    validate_v16_custom_index_set(
+        connection,
+        "battle_skill_event",
+        &[
+            "battle_skill_event_battle_page",
+            "battle_skill_event_player_message",
+            "battle_skill_event_player_page",
+        ],
+    )?;
+    validate_v16_index(
+        connection,
+        "skill_type_page",
+        false,
+        &["skill_type", "wuhun_category", "ring_index", "skill_key"],
+        false,
+    )?;
+    validate_v16_index(
+        connection,
+        "player_skill_player_page",
+        false,
+        &["player_id", "id"],
+        false,
+    )?;
+    validate_v16_index(
+        connection,
+        "player_skill_equipped",
+        false,
+        &["player_id", "equipped", "id"],
+        false,
+    )?;
+    validate_v16_index(
+        connection,
+        "battle_skill_event_battle_page",
+        false,
+        &["battle_id", "sequence", "id"],
+        false,
+    )?;
+    validate_v16_index(
+        connection,
+        "battle_skill_event_player_page",
+        false,
+        &["player_id", "id"],
+        false,
+    )?;
+    validate_v16_index(
+        connection,
+        "battle_skill_event_player_message",
+        true,
+        &["player_id", "source_message_id"],
+        true,
+    )?;
+
+    let (skill_count, missing_player_skills, orphan_skill_events) = connection
+        .query_row(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM skill WHERE enabled = 1),
+                EXISTS(
+                    SELECT 1
+                      FROM player_wuhun_state state
+                      LEFT JOIN player_skill learned
+                        ON learned.player_id = state.player_id
+                       AND learned.wuhun_id = state.wuhun_id
+                       AND learned.wuhun_slot = state.slot
+                     WHERE state.slot = 1 AND learned.id IS NULL
+                ),
+                EXISTS(
+                    SELECT 1
+                      FROM battle_skill_event use_event
+                      LEFT JOIN battle_event event ON event.id = use_event.battle_event_id
+                     WHERE event.id IS NULL
+                        OR event.battle_id <> use_event.battle_id
+                        OR event.player_id <> use_event.player_id
+                )
+            "#,
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )
+        .map_err(|error| format!("检查 v16 技能种子和引用失败：{error}"))?;
+    if skill_count < 1 {
+        return Err("数据库已标记迁移 v16，但缺少启用的基础技能".to_string());
+    }
+    if missing_player_skills {
+        return Err("数据库已标记迁移 v16，但存在觉醒武魂没有玩家技能".to_string());
+    }
+    if orphan_skill_events {
+        return Err("数据库已标记迁移 v16，但存在孤立战斗技能事件".to_string());
+    }
+
+    let expected_triggers = [
+        ("skill_no_update", "skill"),
+        ("skill_no_delete", "skill"),
+        ("skill_no_reinsert", "skill"),
+        ("player_skill_no_delete", "player_skill"),
+        ("player_skill_no_reinsert", "player_skill"),
+        ("player_skill_identity_guard", "player_skill"),
+        ("player_skill_scope_guard", "player_skill"),
+        ("battle_skill_event_no_update", "battle_skill_event"),
+        ("battle_skill_event_no_delete", "battle_skill_event"),
+        ("battle_skill_event_no_reinsert", "battle_skill_event"),
+        ("battle_skill_event_scope_guard", "battle_skill_event"),
+    ];
+    for (name, table) in expected_triggers {
+        let (actual_table, trigger_sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v16 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v16，但缺少触发器 {name}"))?;
+        let normalized = trigger_sql.to_ascii_uppercase();
+        if actual_table != table || !normalized.contains("RAISE(ABORT") {
+            return Err(format!("v16 触发器 {name} 契约不匹配"));
+        }
+        if name == "player_skill_scope_guard"
+            && (!normalized.contains("FROM PLAYER_WUHUN_STATE")
+                || !normalized.contains("JOIN SKILL")
+                || !normalized.contains("NEW.SKILL_KEY"))
+        {
+            return Err("v16 玩家技能范围触发器不完整".to_string());
+        }
+        if name == "battle_skill_event_scope_guard"
+            && (!normalized.contains("FROM BATTLE_EVENT EVENT")
+                || !normalized.contains("JOIN PLAYER_SKILL LEARNED")
+                || !normalized.contains("NEW.COOLDOWN_ROUNDS")
+                || !normalized.contains("释放技能"))
+        {
+            return Err("v16 战斗技能事件范围触发器不完整".to_string());
+        }
+    }
+    let event_scope_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'battle_event_scope_guard'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v16 战斗事件触发器失败：{error}"))?
+        .ok_or_else(|| "数据库已标记迁移 v16，但缺少战斗事件触发器".to_string())?
+        .to_ascii_uppercase();
+    if !event_scope_sql.contains("释放技能") {
+        return Err("v16 战斗事件触发器未允许技能审计命令".to_string());
+    }
+    let wuhun_event_scope_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'wuhun_state_event_scope_guard'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v16 武魂状态事件触发器失败：{error}"))?
+        .ok_or_else(|| "数据库已标记迁移 v16，但缺少武魂状态事件触发器".to_string())?
+        .to_ascii_uppercase();
+    if !wuhun_event_scope_sql.contains("释放技能") {
+        return Err("v16 武魂状态事件触发器未允许技能审计命令".to_string());
+    }
+
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v16 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v16 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v16 全库触发器失败：{error}"))?;
+    for (name, table, trigger_sql) in triggers {
+        let declared = expected_triggers
+            .iter()
+            .any(|(expected_name, expected_table)| {
+                name == *expected_name && table == *expected_table
+            })
+            || name == "battle_event_scope_guard";
+        let touches_v16 = matches!(
+            table.as_str(),
+            "skill" | "player_skill" | "battle_skill_event"
+        ) || ["skill", "player_skill", "battle_skill_event"]
+            .iter()
+            .any(|identifier| sql_mentions_identifier(&trigger_sql, identifier));
+        if touches_v16 && !declared {
+            return Err(format!("v16 触发器 {name} 未声明却引用技能表 {table}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v16_foreign_keys(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, &str, &str, &str)],
+) -> Result<(), String> {
+    validate_v9_foreign_keys(connection, table, expected)
+        .map_err(|error| error.replace("v9", "v16"))
+}
+
+fn validate_v16_custom_index_set(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), String> {
+    validate_v10_custom_index_set(connection, table, expected)
+        .map_err(|error| error.replace("v10", "v16"))
+}
+
+fn validate_v16_index(
+    connection: &Connection,
+    index_name: &str,
+    unique: bool,
+    columns: &[&str],
+    partial: bool,
+) -> Result<(), String> {
+    validate_v7_index(connection, index_name, unique, columns, partial)
+        .map_err(|error| error.replace("v7", "v16"))
+}
+
 fn validate_v15_foreign_keys(
     connection: &Connection,
     table: &str,
@@ -13572,6 +14729,7 @@ fn validate_v12_triggers(connection: &Connection) -> Result<(), String> {
         .map_err(|error| format!("解析 v12 全库触发器失败：{error}"))?;
     for (name, table, sql) in triggers {
         if table == "battle_wuhun_modifier"
+            || table == "battle_skill_event"
             || name == "battle_wuhun_state_guard"
             || name == "wuhun_state_event_scope_guard"
             || name == "battle_wuhun_modifier_event_guard"
@@ -15137,6 +16295,24 @@ mod tests {
         assert!(
             error.contains("v15"),
             "v15 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    fn assert_v16_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v16 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v16 迁移应成功");
+        let connection = store.open().expect("应打开 v16 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v16 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v16 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v16"),
+            "v16 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
         );
     }
 
@@ -19201,6 +20377,173 @@ mod tests {
     }
 
     #[test]
+    fn v16_awakened_players_learn_and_query_the_base_skill() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "技能测试", "男")
+            .expect("角色应创建");
+        let before = store.skills_page(&identity()).expect("觉醒前应可查询魂技");
+        assert!(before.entries.is_empty());
+
+        store.awaken_wuhun(&identity()).expect("应完成武魂觉醒");
+        let page = store.skills_page(&identity()).expect("觉醒后应可查询魂技");
+        assert_eq!(page.entries.len(), 1);
+        let learned = &page.entries[0];
+        assert_eq!(learned.skill.skill_key, "entangle");
+        assert_eq!(learned.skill.soul_power_cost, 10);
+        assert_eq!(learned.skill.cooldown_rounds, 2);
+        assert!(learned.equipped);
+
+        let detail = store
+            .skill_detail(&identity(), "缠绕")
+            .expect("应查询魂技详情")
+            .expect("觉醒后应自动学习缠绕");
+        assert_eq!(detail.skill.skill_key, "entangle");
+        assert_eq!(detail.skill.name, "缠绕");
+    }
+
+    #[test]
+    fn v16_skill_consumes_power_replays_cools_and_allows_empty_message_ids() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        let player_id = player_id_for(&store, &identity());
+        let connection = store.open().expect("应打开 v16 战斗测试数据库");
+        connection
+            .execute(
+                "UPDATE player SET level = 3, hp = 100, max_hp = 100, soul_power = 50, max_soul_power = 50, strength = 1, perception = 0, luck = 0, endurance = 100, updated_at = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置可重复战斗属性");
+        drop(connection);
+
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "v16-skill-map"),
+            )
+            .expect("应传送到战斗地图");
+        let started = store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "哥布林",
+                &transfer_operation("挑战", "v16-skill-start"),
+            )
+            .expect("应创建魂兽战斗");
+
+        let first_operation = transfer_operation("释放技能", "v16-skill-first");
+        let first = store
+            .use_skill_battle_with_operation(&identity(), "缠绕", &first_operation)
+            .expect("首次释放魂技应成功");
+        assert!(!first.replayed);
+        assert_eq!(
+            first.skill.as_ref().map(|skill| skill.skill.name.as_str()),
+            Some("缠绕")
+        );
+        assert_eq!(first.event.skill_name.as_deref(), Some("缠绕"));
+        assert!(first.event.player_damage > 0);
+        assert_eq!(first.skill.as_ref().unwrap().soul_power_before, 50);
+        assert_eq!(first.skill.as_ref().unwrap().soul_power_after, 40);
+
+        let replay = store
+            .use_skill_battle_with_operation(&identity(), "缠绕", &first_operation)
+            .expect("相同消息重放应返回原事件");
+        assert!(replay.replayed);
+        assert_eq!(replay.event.id, first.event.id);
+        assert_eq!(replay.skill, first.skill);
+        assert_eq!(
+            store
+                .player_status(&identity())
+                .unwrap()
+                .unwrap()
+                .soul_power,
+            40
+        );
+
+        let cooldown = store.use_skill_battle_with_operation(
+            &identity(),
+            "缠绕",
+            &transfer_operation("释放技能", "v16-skill-cooldown"),
+        );
+        assert!(cooldown.expect_err("冷却期间应拒绝释放").contains("冷却"));
+
+        store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "v16-skill-attack-1"),
+            )
+            .expect("冷却期间应允许普通攻击");
+        let cooldown = store.use_skill_battle_with_operation(
+            &identity(),
+            "缠绕",
+            &transfer_operation("释放技能", "v16-skill-cooldown-2"),
+        );
+        assert!(
+            cooldown
+                .expect_err("尚未经过完整冷却应拒绝释放")
+                .contains("冷却")
+        );
+
+        store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "v16-skill-attack-2"),
+            )
+            .expect("第二个冷却回合应允许普通攻击");
+        let second = store
+            .use_skill_battle_with_operation(
+                &identity(),
+                "entangle",
+                &transfer_operation("释放技能", ""),
+            )
+            .expect("冷却结束后应允许用空消息 ID 释放");
+        assert!(!second.replayed);
+        assert_eq!(second.skill.as_ref().unwrap().soul_power_before, 40);
+        assert_eq!(second.skill.as_ref().unwrap().soul_power_after, 30);
+
+        store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "v16-skill-attack-3"),
+            )
+            .expect("应继续战斗到第三回合");
+        store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "v16-skill-attack-4"),
+            )
+            .expect("应继续战斗到第四回合");
+        let third = store
+            .use_skill_battle_with_operation(
+                &identity(),
+                "缠绕",
+                &transfer_operation("释放技能", ""),
+            )
+            .expect("空消息 ID 不应被唯一约束阻止第二次成功释放");
+        assert!(!third.replayed);
+        assert_eq!(third.skill.as_ref().unwrap().soul_power_after, 20);
+
+        let connection = store.open().expect("应读取魂技事件");
+        let (event_count, empty_message_count, last_damage) = connection
+            .query_row(
+                "SELECT COUNT(*), SUM(CASE WHEN source_message_id = '' THEN 1 ELSE 0 END), (SELECT damage FROM battle_skill_event WHERE battle_event_id = ?2) FROM battle_skill_event WHERE battle_id = ?1",
+                params![started.battle.id, third.event.id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("应读取魂技事件字段");
+        assert_eq!(event_count, 3);
+        assert_eq!(empty_message_count, 2);
+        assert_eq!(last_damage, third.event.player_damage);
+        assert_eq!(third.battle.id, started.battle.id);
+    }
+
+    #[test]
     fn recorded_v14_with_damaged_schema_or_trigger_fails_closed() {
         for mutation in [
             "DROP TABLE wuhun_state_event;",
@@ -19241,6 +20584,31 @@ mod tests {
             CREATE TRIGGER battle_wuhun_modifier_shadow
             AFTER INSERT ON battle_wuhun_modifier
             BEGIN SELECT 1; END;
+            "#,
+        );
+    }
+
+    #[test]
+    fn recorded_v16_with_damaged_schema_or_trigger_fails_closed() {
+        for mutation in [
+            "DROP INDEX battle_skill_event_player_message;",
+            "DROP INDEX skill_type_page;",
+            "DROP TRIGGER battle_skill_event_scope_guard;",
+        ] {
+            assert_v16_damage_fails_closed(mutation);
+        }
+        assert_v16_damage_fails_closed(
+            r#"
+            CREATE TRIGGER battle_skill_event_shadow
+            AFTER INSERT ON battle_skill_event
+            BEGIN SELECT 1; END;
+            "#,
+        );
+        assert_v16_damage_fails_closed(
+            r#"
+            CREATE TRIGGER player_skill_reads_skill
+            AFTER INSERT ON player_skill
+            BEGIN SELECT EXISTS(SELECT 1 FROM skill); END;
             "#,
         );
     }

@@ -199,6 +199,38 @@ mod plugin {
     }
 
     #[command(
+        name = "技能",
+        description = "查看已学习魂技和魂力消耗",
+        aliases = "魂技,技能列表",
+        category = "斗罗大陆·角色",
+        scope = "all"
+    )]
+    fn skills(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.skills(req))
+    }
+
+    #[command(
+        name = "技能详情",
+        description = "查看已学习魂技的详细属性：技能详情 <魂技>",
+        category = "斗罗大陆·角色",
+        scope = "all"
+    )]
+    fn skill_detail(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.skill_detail(req))
+    }
+
+    #[command(
+        name = "释放技能",
+        description = "在魂兽战斗中释放魂技：释放技能 <魂技>",
+        aliases = "使用技能,使用魂技,施放魂技",
+        category = "斗罗大陆·战斗",
+        scope = "all"
+    )]
+    fn use_skill(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.use_skill(req))
+    }
+
+    #[command(
         name = "签到",
         description = "领取每日经验和金魂币",
         aliases = "每日签到,打卡",

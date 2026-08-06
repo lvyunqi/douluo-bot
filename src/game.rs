@@ -14,8 +14,8 @@ use crate::store::{
     AuthorizedContextChange, BattleActionReceipt, BattleEventRecord, BattleLog, BattleSnapshot,
     DailyCheckinInput, DailyCheckinResult, GOLD_SOUL_COIN, IdentityKey, LegacyClaimActor,
     LegacyClaimResult, LegacyIdentityState, MapExit, MapRecord, MapTravelReceipt,
-    OperationLogInput, PlayerStatus, QuestActionReceipt, QuestListEntry, SoulBeastPage, Store,
-    WuhunToggleReceipt, experience_progress,
+    OperationLogInput, PlayerStatus, QuestActionReceipt, QuestListEntry, SkillPage, SoulBeastPage,
+    Store, WuhunToggleReceipt, experience_progress,
 };
 
 const MENU_PAGES: &[MenuPage] = &[
@@ -46,6 +46,10 @@ const MENU_PAGES: &[MenuPage] = &[
             MenuEntry {
                 command: "状态",
                 description: "查看角色属性、武魂和位置",
+            },
+            MenuEntry {
+                command: "技能",
+                description: "查看已学习魂技和魂力消耗",
             },
             MenuEntry {
                 command: "签到",
@@ -360,6 +364,64 @@ impl GameService {
             .field("描述", wuhun.description)
             .illustration_if(illustration)
             .command("状态"))
+    }
+
+    pub fn skills(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        if !req.args.as_str().trim().is_empty() {
+            return Err("用法：技能".to_string());
+        }
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let page = self.store.skills_page(&key)?;
+        Ok(self.skills_document(page))
+    }
+
+    pub fn skill_detail(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let skill_name = parse_required_catalog_name(req.args.as_str(), "技能详情 <魂技>")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let skill = self
+            .store
+            .skill_detail(&key, skill_name)?
+            .ok_or_else(|| format!("你尚未学习魂技“{skill_name}”"))?;
+        Ok(
+            GameDocument::new(format!("魂技详情 · {}", skill.skill.name))
+                .field("类型", skill.skill.skill_type.clone())
+                .field("魂环", format!("第{}魂技", skill.skill.ring_index))
+                .field("等级", skill.level.to_string())
+                .field("魂力消耗", skill.skill.soul_power_cost.to_string())
+                .field("冷却", format!("{} 回合", skill.skill.cooldown_rounds))
+                .field("基础伤害", skill.skill.base_damage.to_string())
+                .line(skill.skill.description)
+                .command("技能")
+                .command(format!("释放技能 {}", skill.skill.name)),
+        )
+    }
+
+    fn skills_document(&self, page: SkillPage) -> GameDocument {
+        let mut document = GameDocument::new("魂技列表").field(
+            "魂力",
+            format!("{}/{}", page.soul_power, page.max_soul_power),
+        );
+        if page.entries.is_empty() {
+            return document
+                .line("你还没有学习任何魂技")
+                .notice("觉醒武魂后会获得基础魂技");
+        }
+        for entry in page.entries {
+            document = document
+                .line(format!(
+                    "#{} · {} · Lv.{} · {}魂力 · 冷却 {} 回合",
+                    entry.skill.ring_index,
+                    entry.skill.name,
+                    entry.level,
+                    entry.skill.soul_power_cost,
+                    entry.skill.cooldown_rounds
+                ))
+                .line(entry.skill.description.clone())
+                .command(format!("技能详情 {}", entry.skill.name));
+        }
+        document.command("状态")
     }
 
     /// 按北京时间每日 04:00 划分游戏日，并由 Store 在单事务内发放奖励。
@@ -898,6 +960,18 @@ impl GameService {
         Ok(self.battle_action_document(receipt))
     }
 
+    pub fn use_skill(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let skill_name = parse_required_catalog_name(req.args.as_str(), "释放技能 <魂技>")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self
+            .store
+            .use_skill_battle_with_operation(&key, skill_name, &operation)?;
+        Ok(self.battle_action_document(receipt))
+    }
+
     pub fn flee(&self, req: &CommandRequest) -> Result<GameDocument, String> {
         if !req.args.as_str().trim().is_empty() {
             return Err("用法：逃跑".to_string());
@@ -1010,16 +1084,34 @@ impl GameService {
                 receipt.battle.wuhun_attack_percent, receipt.battle.wuhun_defense_percent
             ),
         );
+        if let Some(skill) = &receipt.skill {
+            document = document
+                .field("魂技", skill.skill.name.clone())
+                .field(
+                    "魂力",
+                    format!("{} → {}", skill.soul_power_before, skill.soul_power_after),
+                )
+                .field("魂技冷却", format!("{} 回合", skill.skill.cooldown_rounds));
+        }
         if event.event_kind == "challenge" {
             document = document
                 .line(beast.description.clone())
                 .line("魂兽会在你的每次行动后反击");
         } else if event.event_kind == "attack" {
-            document = document.line(format!(
-                "你造成 {} 点{}伤害",
-                event.player_damage,
-                if event.player_critical { "暴击" } else { "" }
-            ));
+            document = document.line(if let Some(skill) = &receipt.skill {
+                format!(
+                    "你释放{}，造成 {} 点{}伤害",
+                    skill.skill.name,
+                    event.player_damage,
+                    if event.player_critical { "暴击" } else { "" }
+                )
+            } else {
+                format!(
+                    "你造成 {} 点{}伤害",
+                    event.player_damage,
+                    if event.player_critical { "暴击" } else { "" }
+                )
+            });
             if event.beast_damage > 0 {
                 document = document.line(format!(
                     "魂兽反击造成 {} 点{}伤害",
@@ -1076,7 +1168,11 @@ impl GameService {
         document =
             document.illustration_if(self.asset_illustration("soul_beast", &beast.name, "battle"));
         match event.status_after.as_str() {
-            "active" => document.command("攻击").command("逃跑").command("战斗状态"),
+            "active" => document
+                .command("攻击")
+                .command("释放技能 <魂技>")
+                .command("逃跑")
+                .command("战斗状态"),
             "won" => document.command("掉落").command("魂兽"),
             _ => document.command("魂兽").command("状态"),
         }
@@ -1107,6 +1203,7 @@ impl GameService {
             )
             .illustration_if(self.asset_illustration("soul_beast", &battle.beast.name, "battle"))
             .command("攻击")
+            .command("释放技能 <魂技>")
             .command("逃跑")
             .command("战斗日志")
     }
@@ -2349,12 +2446,16 @@ fn battle_status_label(status: &str) -> &'static str {
 }
 
 fn format_battle_event(event: &BattleEventRecord) -> String {
-    let action = match event.event_kind.as_str() {
-        "challenge" => "挑战",
-        "attack" => "攻击",
-        "flee" => "逃跑",
-        _ => "未知动作",
-    };
+    let action = event
+        .skill_name
+        .as_ref()
+        .map(|name| format!("魂技 {name}"))
+        .unwrap_or_else(|| match event.event_kind.as_str() {
+            "challenge" => "挑战".to_string(),
+            "attack" => "攻击".to_string(),
+            "flee" => "逃跑".to_string(),
+            _ => "未知动作".to_string(),
+        });
     let mut text = format!(
         "#{} · {} · 玩家 {}/{} · 魂兽 {}/{}",
         event.sequence,
@@ -2782,6 +2883,12 @@ mod tests {
                 .iter()
                 .any(|entry| entry.command == "钱包")
         );
+        assert!(
+            MENU_PAGES[second]
+                .entries
+                .iter()
+                .any(|entry| entry.command == "技能")
+        );
         assert_eq!(parse_menu_page("世界").expect("世界分类应有效"), 2);
         assert_eq!(parse_menu_page("经济").expect("经济分类应有效"), 3);
         assert_eq!(parse_menu_page("任务").expect("任务分类应有效"), 4);
@@ -2808,6 +2915,7 @@ mod tests {
         let second = crate::message::render_text(&service.menu("2").expect("第二页应有效"));
         assert!(second.contains("武魂觉醒：觉醒第一武魂"));
         assert!(second.contains("状态：查看角色属性、武魂和位置"));
+        assert!(second.contains("技能：查看已学习魂技和魂力消耗"));
         assert!(second.contains("签到：领取每日经验和金魂币"));
         assert!(second.contains("钱包：查看金魂币余额"));
         assert!(second.contains("斗罗系统 1"));

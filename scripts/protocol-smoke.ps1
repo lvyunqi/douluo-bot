@@ -404,7 +404,7 @@ try {
         "斗罗系统", "开始穿越", "武魂觉醒", "开武魂", "关武魂", "签到", "钱包", "状态", "位置",
         "地图列表", "向", "传送", "掉落", "拾取", "NPC", "对话", "商店", "背包",
         "购买", "出售", "使用", "转账", "发送物品", "任务", "接取任务", "任务进度",
-        "提交任务", "放弃任务", "魂兽", "挑战", "攻击", "逃跑", "战斗状态", "战斗日志"
+        "提交任务", "放弃任务", "魂兽", "挑战", "攻击", "技能", "技能详情", "释放技能", "逃跑", "战斗状态", "战斗日志"
     )) {
         $found = $commands | Where-Object { $_ -eq $command }
         Assert-Condition ($null -ne $found) "descriptor is missing command '$command' (commands=$($commands -join ', '))"
@@ -463,8 +463,19 @@ try {
     Write-Output ("onebot 挑战 史莱姆: {0} [{1}]" -f $challenge.ActionName, $challenge.Text)
     Assert-Condition ($challenge.Text.Contains("战斗开始")) "soul beast challenge did not start"
     Assert-Condition ($challenge.Text.Contains("武魂战斗修正")) "battle challenge did not expose wuhun modifiers"
-    $battleFinished = $false
-    for ($round = 1; $round -le 5; $round++) {
+    $skills = Invoke-OneBotCommand $endpoint "技能"
+    Write-Output ("onebot 技能: {0} [{1}]" -f $skills.ActionName, $skills.Text)
+    Assert-Condition ($skills.Text.Contains("缠绕")) "skill list did not expose the base skill"
+    Assert-Condition ($skills.Text.Contains("魂力")) "skill list did not expose soul power"
+    $skillDetail = Invoke-OneBotCommand $endpoint "技能详情 缠绕"
+    Write-Output ("onebot 技能详情 缠绕: {0} [{1}]" -f $skillDetail.ActionName, $skillDetail.Text)
+    Assert-Condition ($skillDetail.Text.Contains("魂力消耗")) "skill detail did not expose cost"
+    $skill = Invoke-OneBotCommand $endpoint "释放技能 缠绕"
+    Write-Output ("onebot 释放技能 缠绕: {0} [{1}]" -f $skill.ActionName, $skill.Text)
+    Assert-Condition ($skill.Text.Contains("魂技")) "skill release did not expose skill receipt"
+    Assert-Condition ($skill.Text.Contains("魂力")) "skill release did not expose soul power receipt"
+    $battleFinished = $skill.Text.Contains("战斗胜利") -or $skill.Text.Contains("战斗失败")
+    for ($round = 1; $round -le 5 -and -not $battleFinished; $round++) {
         $attack = Invoke-OneBotCommand $endpoint "攻击"
         Write-Output ("onebot 攻击 {0}: {1} [{2}]" -f $round, $attack.ActionName, $attack.Text)
         if ($attack.Text.Contains("战斗胜利") -or $attack.Text.Contains("战斗失败")) {
