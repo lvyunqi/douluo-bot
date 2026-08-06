@@ -9,7 +9,8 @@ use crate::identity::{ResolvedIdentity, resolve_identity, resolve_protocol};
 use crate::message::{GameDocument, Illustration};
 use crate::store::{
     AuthorizedContextChange, DailyCheckinInput, DailyCheckinResult, IdentityKey, LegacyClaimActor,
-    LegacyClaimResult, LegacyIdentityState, OperationLogInput, PlayerStatus, Store,
+    LegacyClaimResult, LegacyIdentityState, MapExit, MapRecord, MapTravelReceipt,
+    OperationLogInput, PlayerStatus, Store, experience_progress,
 };
 
 const MENU_PAGES: &[MenuPage] = &[
@@ -46,12 +47,28 @@ const MENU_PAGES: &[MenuPage] = &[
     MenuPage {
         key: "世界",
         title: "世界探索",
-        entries: &[MenuEntry {
-            command: "位置",
-            description: "查看当前地图",
-        }],
+        entries: &[
+            MenuEntry {
+                command: "位置",
+                description: "查看当前地图、出口和区域信息",
+            },
+            MenuEntry {
+                command: "地图列表 [页码]",
+                description: "分页查看地图和等级要求",
+            },
+            MenuEntry {
+                command: "向 <上|下|左|右>",
+                description: "沿当前地图出口移动",
+            },
+            MenuEntry {
+                command: "传送 [地图]",
+                description: "从传送阵前往可达地图",
+            },
+        ],
     },
 ];
+
+const MAP_PAGE_SIZE: usize = 5;
 
 const CHECKIN_CURRENCY_CODE: &str = "gold_soul_coin";
 const CHECKIN_CURRENCY_NAME: &str = "金魂币";
@@ -259,6 +276,7 @@ impl GameService {
             .field("累计签到", format!("{} 天", receipt.total_claims))
             .field("连续签到", format!("{} 天", receipt.streak_days))
             .field("本轮", format!("第 {}/7 天", receipt.cycle_day))
+            .field("当前境界", receipt.title_after.clone())
             .field("当前经验", receipt.exp_after.to_string())
             .field(
                 format!("当前{CHECKIN_CURRENCY_NAME}"),
@@ -282,6 +300,11 @@ impl GameService {
         };
         document = if already_claimed {
             document.notice("本游戏日已经签到过了，奖励不会重复发放")
+        } else if receipt.levels_gained > 0 {
+            document.notice(format!(
+                "升级成功：{} → {}，继续积累经验解锁更高境界",
+                receipt.level_before, receipt.title_after
+            ))
         } else {
             document.notice("签到成功，下一个北京时间 04:00 刷新后可再次领取")
         };
@@ -324,17 +347,168 @@ impl GameService {
             .store
             .player_status(&key)?
             .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())?;
-        let map_name = player.map_name.clone();
-        Ok(GameDocument::new(format!("当前位置 · {map_name}"))
-            .field("角色", player.name)
-            .field("地图", &map_name)
-            .field("生命", format!("{}/{}", player.hp, player.max_hp))
+        let map = self
+            .store
+            .current_map(&key)?
+            .ok_or_else(|| "角色的地图存档不存在，请联系管理员修复地图绑定".to_string())?;
+        let exits = self.store.map_exits(&key)?;
+        Ok(self.world_document(&map, &exits, Some(&player)))
+    }
+
+    pub fn map_list(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let page = parse_map_page(req.args.as_str())?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let player = self
+            .store
+            .player_status(&key)?
+            .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())?;
+        let maps = self.store.list_maps_page(page, MAP_PAGE_SIZE)?;
+        let mut document = GameDocument::new("地图列表")
+            .field("页码", format!("{} / {}", maps.page, maps.page_count))
+            .field("地图总数", maps.total.to_string());
+        for map in &maps.entries {
+            let mut tags = Vec::new();
+            if map.safe {
+                tags.push("安全区");
+            } else if map.pvp_enabled {
+                tags.push("可战斗");
+            }
+            if map.teleport_enabled {
+                tags.push("传送阵");
+            }
+            if player.level < map.level_required {
+                tags.push("等级不足");
+            }
+            let suffix = if tags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", tags.join("、"))
+            };
+            document = document.line(format!(
+                "{} · Lv.{}{}\n{}",
+                map.name, map.level_required, suffix, map.description
+            ));
+        }
+        if page > 1 {
+            document = document.command(format!("地图列表 {}", page - 1));
+        }
+        if page < maps.page_count {
+            document = document.command(format!("地图列表 {}", page + 1));
+        }
+        Ok(document
+            .command("位置")
+            .command("传送 <地图>")
+            .notice("地图拓扑来自游戏数据表；图片资源只负责展示，不决定可通行方向"))
+    }
+
+    pub fn move_direction(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let direction = parse_direction_arg(req.args.as_str())?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self
+            .store
+            .move_direction_with_operation(&key, direction, &operation)?;
+        self.transition_document(&key, receipt, "移动成功")
+    }
+
+    pub fn teleport(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let target_name = parse_optional_map_name(req.args.as_str())?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self
+            .store
+            .teleport_with_operation(&key, target_name, &operation)?;
+        self.transition_document(&key, receipt, "传送成功")
+    }
+
+    fn transition_document(
+        &self,
+        key: &IdentityKey<'_>,
+        receipt: MapTravelReceipt,
+        title: &str,
+    ) -> Result<GameDocument, String> {
+        let exits = self.store.map_exits(key)?;
+        let document = self
+            .world_document(&receipt.to, &exits, None)
+            .field("结果", title)
+            .field("出发地", receipt.from.name)
+            .field("到达地", receipt.to.name);
+        Ok(document.notice(match receipt.travel_kind.as_str() {
+            "teleport" => "传送阵已完成定位",
+            _ => "已沿地图出口抵达目标区域",
+        }))
+    }
+
+    fn world_document(
+        &self,
+        map: &MapRecord,
+        exits: &[MapExit],
+        player: Option<&PlayerStatus>,
+    ) -> GameDocument {
+        let mut document = GameDocument::new(format!("当前位置 · {}", map.name))
+            .field("地图", &map.name)
+            .field("简介", &map.description)
+            .field("等级要求", format!("{} 级", map.level_required))
             .field(
-                "魂力",
-                format!("{}/{}", player.soul_power, player.max_soul_power),
+                "区域",
+                if map.safe {
+                    "安全区"
+                } else if map.pvp_enabled {
+                    "野外区域（可战斗）"
+                } else {
+                    "普通区域"
+                },
             )
-            .illustration_if(self.asset_illustration("map", &map_name, "cover"))
-            .command("状态"))
+            .field(
+                "传送阵",
+                if map.teleport_enabled {
+                    "可用"
+                } else {
+                    "无"
+                },
+            );
+        if let Some(player) = player {
+            document = document
+                .field("角色", &player.name)
+                .field("生命", format!("{}/{}", player.hp, player.max_hp))
+                .field(
+                    "魂力",
+                    format!("{}/{}", player.soul_power, player.max_soul_power),
+                );
+        }
+        let walk_exits = exits
+            .iter()
+            .filter(|exit| exit.travel_kind == "walk")
+            .map(|exit| {
+                format!(
+                    "{}：{}",
+                    display_direction(exit.direction.as_deref().unwrap_or_default()),
+                    exit.target.name
+                )
+            })
+            .collect::<Vec<_>>();
+        document = document.field(
+            "方向",
+            if walk_exits.is_empty() {
+                "无可通行方向".to_string()
+            } else {
+                walk_exits.join("、")
+            },
+        );
+        if exits.iter().any(|exit| exit.travel_kind == "teleport") {
+            document = document.field("传送目标", "可使用“传送 地图名称”查看并前往");
+        }
+        document
+            .illustration_if(self.asset_illustration("map", &map.name, "cover"))
+            .command("状态")
+            .command("地图列表")
+            .command("向 <上|下|左|右>")
+            .command("传送 <地图>")
     }
 
     pub fn inspect_legacy(&self, req: &CommandRequest) -> Result<GameDocument, String> {
@@ -535,11 +709,23 @@ impl GameService {
             (Some(name), Some(category)) => format!("{name}（{category}）"),
             _ => "尚未觉醒".to_string(),
         };
+        let progress = experience_progress(player.level, player.exp).ok();
+        let realm = progress
+            .map(|progress| format!("{}级{}", progress.level, progress.title))
+            .unwrap_or_else(|| format!("{}级未知", player.level));
+        let progress_text = match progress {
+            Some(progress) => match progress.exp_for_next {
+                Some(required) => format!("{} / {}", progress.exp_in_level, required),
+                None => format!("{}（满级）", progress.total_exp),
+            },
+            None => "不可用".to_string(),
+        };
         GameDocument::new("角色状态")
             .field("角色", player.name)
             .field("性别", player.gender)
-            .field("境界", format!("{} 级魂士", player.level))
+            .field("境界", realm)
             .field("经验", player.exp.to_string())
+            .field("升级进度", progress_text)
             .field("生命", format!("{}/{}", player.hp, player.max_hp))
             .field(
                 "魂力",
@@ -688,6 +874,60 @@ fn parse_context_cursor(args: &str) -> Result<Option<i64>, String> {
         return Err("授权列表游标不能为负数".to_string());
     }
     Ok(Some(cursor))
+}
+
+fn parse_map_page(args: &str) -> Result<usize, String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Ok(1);
+    }
+    let mut parts = args.split_whitespace();
+    let page = parts
+        .next()
+        .ok_or_else(|| "用法：地图列表 [页码]".to_string())?
+        .parse::<usize>()
+        .map_err(|_| "用法：地图列表 [页码]".to_string())?;
+    if parts.next().is_some() || page == 0 || page > 100 {
+        return Err("地图页码必须在 1 到 100 之间".to_string());
+    }
+    Ok(page)
+}
+
+fn parse_direction_arg(args: &str) -> Result<&str, String> {
+    let mut parts = args.split_whitespace();
+    let direction = parts.next().unwrap_or_default();
+    if direction.is_empty() || parts.next().is_some() {
+        return Err("用法：向 <上|下|左|右>".to_string());
+    }
+    match direction {
+        "上" | "下" | "左" | "右" | "北" | "南" | "西" | "东" | "north" | "south" | "west"
+        | "east" => Ok(direction),
+        _ => Err("方向只能是上、下、左或右".to_string()),
+    }
+}
+
+fn parse_optional_map_name(args: &str) -> Result<Option<&str>, String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Ok(None);
+    }
+    if args.split_whitespace().count() != 1
+        || args.chars().count() > 128
+        || args.chars().any(char::is_control)
+    {
+        return Err("用法：传送 [地图名称]".to_string());
+    }
+    Ok(Some(args))
+}
+
+fn display_direction(direction: &str) -> &'static str {
+    match direction {
+        "north" => "上",
+        "south" => "下",
+        "west" => "左",
+        "east" => "右",
+        _ => "未知",
+    }
 }
 
 fn game_day_from_timestamp(timestamp: i64) -> Result<i64, String> {
@@ -843,6 +1083,22 @@ mod tests {
         assert_eq!(parse_context_cursor(""), Ok(None));
         assert_eq!(parse_context_cursor("12"), Ok(Some(12)));
         assert!(parse_context_cursor("-1").is_err());
+    }
+
+    #[test]
+    fn map_command_arguments_are_bounded_and_directional() {
+        assert_eq!(parse_map_page(""), Ok(1));
+        assert_eq!(parse_map_page("2"), Ok(2));
+        assert!(parse_map_page("0").is_err());
+        assert!(parse_map_page("1 extra").is_err());
+        assert_eq!(parse_direction_arg("上"), Ok("上"));
+        assert_eq!(parse_direction_arg("东"), Ok("东"));
+        assert!(parse_direction_arg("").is_err());
+        assert!(parse_direction_arg("前").is_err());
+        assert!(parse_direction_arg("上 下").is_err());
+        assert_eq!(parse_optional_map_name(""), Ok(None));
+        assert_eq!(parse_optional_map_name("圣魂村"), Ok(Some("圣魂村")));
+        assert!(parse_optional_map_name("圣魂村 多余").is_err());
     }
 
     #[test]
@@ -1266,6 +1522,98 @@ mod tests {
         assert_eq!(
             service.location(&invalid_request),
             Err("用法：位置".to_string())
+        );
+    }
+
+    #[test]
+    fn map_list_move_and_teleport_render_from_world_contract() {
+        let directory = tempfile::tempdir().expect("临时目录应创建");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("数据库应初始化");
+        let mut config = PluginConfig::default();
+        config.illustrations.mode = crate::config::IllustrationMode::Remote;
+        config.illustrations.remote_base_url = "https://media.example.com/douluo".to_string();
+        let service = GameService::with_assets(store, config, IllustrationAssets::default());
+        let request = |command: &str, args: &str, message_id: &str| CommandRequest {
+            args: abi_stable::std_types::RString::from(args),
+            command_name: abi_stable::std_types::RString::from(command),
+            sender_id: abi_stable::std_types::RString::from("world-user"),
+            group_id: abi_stable::std_types::RString::new(),
+            raw_event_json: abi_stable::std_types::RString::from(
+                r#"{"self_id":"10001","qimen_context":{"version":1,"protocol":"onebot11","account_id":"10001"}}"#,
+            ),
+            sender_nickname: abi_stable::std_types::RString::new(),
+            message_id: abi_stable::std_types::RString::from(message_id),
+            timestamp: 0,
+        };
+        service
+            .register(&request("开始穿越", "旅行者 女", "world-register"))
+            .expect("应创建旅行角色");
+
+        let location = crate::message::render_text(
+            &service
+                .location(&request("位置", "", "world-location"))
+                .expect("位置应可查询"),
+        );
+        assert!(location.contains("方向：上：天斗帝国主城"));
+        assert!(location.contains("下：西尔维斯"));
+        assert!(location.contains("传送阵：可用"));
+
+        let first_page = crate::message::render_text(
+            &service
+                .map_list(&request("地图列表", "", "world-list-1"))
+                .expect("地图第一页应可查询"),
+        );
+        assert!(first_page.contains("页码：1 / 2"));
+        assert!(first_page.contains("圣魂村 · Lv.1"));
+        assert!(first_page.contains("地图列表 2"));
+        let second_page = crate::message::render_text(
+            &service
+                .map_list(&request("地图列表", "2", "world-list-2"))
+                .expect("地图第二页应可查询"),
+        );
+        assert!(second_page.contains("星斗中心 · Lv.20"));
+        assert!(second_page.contains("等级不足"));
+
+        let moved = service
+            .move_direction(&request("向", "上", "world-move"))
+            .expect("向上应成功移动");
+        let moved_text = crate::message::render_text(&moved);
+        assert!(moved_text.contains("当前位置 · 天斗帝国主城"));
+        assert!(moved_text.contains("结果：移动成功"));
+        assert!(moved.has_illustration());
+
+        let teleported = service
+            .teleport(&request("传送", "圣魂村", "world-teleport"))
+            .expect("应传送回圣魂村");
+        let teleported_text = crate::message::render_text(&teleported);
+        assert!(teleported_text.contains("当前位置 · 圣魂村"));
+        assert!(teleported_text.contains("结果：传送成功"));
+        assert!(teleported.has_illustration());
+
+        let identity = resolve_identity(
+            &request("状态", "", "world-status"),
+            &service.config.identity,
+        )
+        .expect("身份应解析");
+        let key = service.identity_key(&identity, &identity.subject_id);
+        let logs = service
+            .store
+            .list_operation_logs(&key, None, 100)
+            .expect("旅行日志应可读取");
+        assert_eq!(
+            logs.entries
+                .iter()
+                .filter(|entry| entry.command == "向")
+                .count(),
+            1
+        );
+        assert_eq!(
+            logs.entries
+                .iter()
+                .filter(|entry| entry.command == "传送")
+                .count(),
+            1
         );
     }
 

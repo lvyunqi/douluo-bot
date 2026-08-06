@@ -310,6 +310,158 @@ CREATE INDEX daily_checkin_claim_player_page
     ON daily_checkin_claim(player_id, id);
 "#;
 
+// v1 的 player.level 上限是 100；成长曲线沿用旧项目的神级 120 级上限。
+// SQLite 不能直接修改 CHECK 约束，因此通过同一事务重建 player，保留主键和所有角色字段。
+const MIGRATION_V6: &str = r#"
+CREATE TABLE player_v6 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    identity_id INTEGER NOT NULL UNIQUE REFERENCES identity(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    gender TEXT NOT NULL CHECK(gender IN ('男', '女')),
+    level INTEGER NOT NULL DEFAULT 1 CHECK(level BETWEEN 1 AND 120),
+    exp INTEGER NOT NULL DEFAULT 0 CHECK(exp >= 0),
+    hp INTEGER NOT NULL DEFAULT 100 CHECK(hp >= 0),
+    max_hp INTEGER NOT NULL DEFAULT 100 CHECK(max_hp > 0),
+    soul_power INTEGER NOT NULL DEFAULT 50 CHECK(soul_power >= 0),
+    max_soul_power INTEGER NOT NULL DEFAULT 50 CHECK(max_soul_power > 0),
+    strength INTEGER NOT NULL DEFAULT 10 CHECK(strength >= 0),
+    agility INTEGER NOT NULL DEFAULT 10 CHECK(agility >= 0),
+    spirit INTEGER NOT NULL DEFAULT 10 CHECK(spirit >= 0),
+    endurance INTEGER NOT NULL DEFAULT 10 CHECK(endurance >= 0),
+    perception INTEGER NOT NULL DEFAULT 10 CHECK(perception >= 0),
+    luck INTEGER NOT NULL DEFAULT 10 CHECK(luck >= 0),
+    life_count INTEGER NOT NULL DEFAULT 1 CHECK(life_count BETWEEN 1 AND 3),
+    state TEXT NOT NULL DEFAULT 'alive' CHECK(state IN ('alive', 'dead', 'reviving', 'deleted')),
+    map_name TEXT NOT NULL DEFAULT '圣魂村',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+INSERT INTO player_v6(
+    id, identity_id, name, gender, level, exp, hp, max_hp, soul_power,
+    max_soul_power, strength, agility, spirit, endurance, perception, luck,
+    life_count, state, map_name, created_at, updated_at
+)
+SELECT
+    id, identity_id, name, gender, level, exp, hp, max_hp, soul_power,
+    max_soul_power, strength, agility, spirit, endurance, perception, luck,
+    life_count, state, map_name, created_at, updated_at
+  FROM player;
+
+DROP TABLE player;
+ALTER TABLE player_v6 RENAME TO player;
+"#;
+
+// v7 将地图拓扑从图片 manifest 和玩家展示文本中分离出来。map_key 是稳定的
+// 内容标识，map_edge 保存有向出口；player_map 以外键把玩家位置绑定到地图。
+const MIGRATION_V7: &str = r#"
+CREATE TABLE map (
+    map_key TEXT PRIMARY KEY CHECK(
+        length(map_key) BETWEEN 1 AND 96
+        AND map_key = trim(map_key)
+        AND map_key GLOB '[a-z0-9][a-z0-9._-]*'
+        AND map_key NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 128),
+    description TEXT NOT NULL DEFAULT '' CHECK(length(description) <= 2000),
+    level_required INTEGER NOT NULL DEFAULT 1 CHECK(level_required BETWEEN 1 AND 120),
+    safe INTEGER NOT NULL DEFAULT 0 CHECK(safe IN (0, 1)),
+    pvp_enabled INTEGER NOT NULL DEFAULT 1 CHECK(pvp_enabled IN (0, 1)),
+    teleport_enabled INTEGER NOT NULL DEFAULT 0 CHECK(teleport_enabled IN (0, 1)),
+    sort_order INTEGER NOT NULL CHECK(sort_order >= 0),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+) STRICT;
+
+CREATE UNIQUE INDEX map_name_unique ON map(name);
+CREATE UNIQUE INDEX map_sort_order_unique ON map(sort_order);
+CREATE INDEX map_page ON map(sort_order, map_key);
+
+CREATE TABLE map_edge (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_map_key TEXT NOT NULL REFERENCES map(map_key) ON DELETE CASCADE,
+    to_map_key TEXT NOT NULL REFERENCES map(map_key) ON DELETE RESTRICT,
+    travel_kind TEXT NOT NULL CHECK(travel_kind IN ('walk', 'teleport')),
+    direction TEXT CHECK(
+        (travel_kind = 'walk' AND direction IN ('north', 'south', 'west', 'east'))
+        OR (travel_kind = 'teleport' AND direction IS NULL)
+    ),
+    level_required INTEGER NOT NULL DEFAULT 1 CHECK(level_required BETWEEN 1 AND 120),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    CHECK(from_map_key <> to_map_key)
+) STRICT;
+
+CREATE UNIQUE INDEX map_edge_walk_direction
+    ON map_edge(from_map_key, direction)
+    WHERE travel_kind = 'walk';
+CREATE UNIQUE INDEX map_edge_teleport_target
+    ON map_edge(from_map_key, to_map_key)
+    WHERE travel_kind = 'teleport';
+CREATE INDEX map_edge_from_kind
+    ON map_edge(from_map_key, travel_kind, enabled, id);
+
+CREATE TABLE player_map (
+    player_id INTEGER PRIMARY KEY REFERENCES player(id) ON DELETE CASCADE,
+    map_key TEXT NOT NULL REFERENCES map(map_key) ON DELETE RESTRICT,
+    updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+) STRICT;
+
+INSERT INTO map(
+    map_key, name, description, level_required, safe, pvp_enabled,
+    teleport_enabled, sort_order, created_at, updated_at
+) VALUES
+    ('holy-soul-village', '圣魂村', '新手出生地，宁静而安全的小村庄。', 1, 1, 0, 1, 10, 0, 0),
+    ('novice-village', '新手村', '魂师初次历练的村落。', 1, 1, 0, 1, 20, 0, 0),
+    ('silves', '西尔维斯', '通往帝国西部的城镇。', 1, 1, 0, 1, 30, 0, 0),
+    ('tiandou-imperial-city', '天斗帝国主城', '天斗帝国的繁华主城。', 1, 1, 0, 1, 40, 0, 0),
+    ('sunset-forest', '落日森林', '森林深处有魂兽出没，行走需保持警惕。', 1, 0, 1, 1, 50, 0, 0),
+    ('star-dou-outer', '星斗外围', '星斗大森林外围，低阶魂兽活动区域。', 1, 0, 1, 0, 60, 0, 0),
+    ('star-dou-inner', '星斗中心', '星斗大森林核心区域，强大的魂兽守护着生命之湖。', 20, 0, 1, 0, 70, 0, 0);
+
+-- 方向是有向数据，不通过图片文件名或 manifest 推断；首批种子保留旧版圣魂村出口。
+INSERT INTO map_edge(
+    from_map_key, to_map_key, travel_kind, direction, level_required, enabled, created_at
+) VALUES
+    ('holy-soul-village', 'tiandou-imperial-city', 'walk', 'north', 1, 1, 0),
+    ('holy-soul-village', 'silves', 'walk', 'south', 1, 1, 0),
+    ('holy-soul-village', 'sunset-forest', 'walk', 'west', 1, 1, 0),
+    ('holy-soul-village', 'novice-village', 'walk', 'east', 1, 1, 0),
+    ('tiandou-imperial-city', 'holy-soul-village', 'walk', 'south', 1, 1, 0),
+    ('silves', 'holy-soul-village', 'walk', 'north', 1, 1, 0),
+    ('sunset-forest', 'holy-soul-village', 'walk', 'east', 1, 1, 0),
+    ('novice-village', 'holy-soul-village', 'walk', 'west', 1, 1, 0),
+    ('novice-village', 'star-dou-outer', 'walk', 'south', 1, 1, 0),
+    ('star-dou-outer', 'novice-village', 'walk', 'north', 1, 1, 0),
+    ('star-dou-outer', 'star-dou-inner', 'walk', 'south', 20, 1, 0),
+    ('star-dou-inner', 'star-dou-outer', 'walk', 'north', 20, 1, 0),
+    ('holy-soul-village', 'novice-village', 'teleport', NULL, 1, 1, 0),
+    ('holy-soul-village', 'silves', 'teleport', NULL, 1, 1, 0),
+    ('holy-soul-village', 'tiandou-imperial-city', 'teleport', NULL, 1, 1, 0),
+    ('holy-soul-village', 'sunset-forest', 'teleport', NULL, 1, 1, 0),
+    ('novice-village', 'holy-soul-village', 'teleport', NULL, 1, 1, 0),
+    ('novice-village', 'silves', 'teleport', NULL, 1, 1, 0),
+    ('novice-village', 'tiandou-imperial-city', 'teleport', NULL, 1, 1, 0),
+    ('novice-village', 'sunset-forest', 'teleport', NULL, 1, 1, 0),
+    ('silves', 'holy-soul-village', 'teleport', NULL, 1, 1, 0),
+    ('silves', 'novice-village', 'teleport', NULL, 1, 1, 0),
+    ('silves', 'tiandou-imperial-city', 'teleport', NULL, 1, 1, 0),
+    ('silves', 'sunset-forest', 'teleport', NULL, 1, 1, 0),
+    ('tiandou-imperial-city', 'holy-soul-village', 'teleport', NULL, 1, 1, 0),
+    ('tiandou-imperial-city', 'novice-village', 'teleport', NULL, 1, 1, 0),
+    ('tiandou-imperial-city', 'silves', 'teleport', NULL, 1, 1, 0),
+    ('tiandou-imperial-city', 'sunset-forest', 'teleport', NULL, 1, 1, 0),
+    ('sunset-forest', 'holy-soul-village', 'teleport', NULL, 1, 1, 0),
+    ('sunset-forest', 'novice-village', 'teleport', NULL, 1, 1, 0),
+    ('sunset-forest', 'silves', 'teleport', NULL, 1, 1, 0),
+    ('sunset-forest', 'tiandou-imperial-city', 'teleport', NULL, 1, 1, 0);
+
+INSERT INTO player_map(player_id, map_key, updated_at)
+SELECT p.id, m.map_key, p.updated_at
+  FROM player p
+  JOIN map m ON m.name = p.map_name;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -367,6 +519,42 @@ pub struct PlayerStatus {
     pub state: String,
     pub wuhun_name: Option<String>,
     pub wuhun_category: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MapRecord {
+    pub map_key: String,
+    pub name: String,
+    pub description: String,
+    pub level_required: i64,
+    pub safe: bool,
+    pub pvp_enabled: bool,
+    pub teleport_enabled: bool,
+    pub sort_order: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MapExit {
+    pub direction: Option<String>,
+    pub travel_kind: String,
+    pub target: MapRecord,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MapPage {
+    pub entries: Vec<MapRecord>,
+    pub page: usize,
+    pub page_count: usize,
+    pub total: usize,
+    pub next_after_key: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MapTravelReceipt {
+    pub from: MapRecord,
+    pub to: MapRecord,
+    pub travel_kind: String,
+    pub direction: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -450,6 +638,10 @@ pub struct DailyCheckinReceipt {
     pub streak_days: i64,
     pub cycle_day: i64,
     pub exp_reward: i64,
+    pub level_before: i64,
+    pub level_after: i64,
+    pub levels_gained: i64,
+    pub title_after: String,
     pub currency_code: String,
     pub currency_reward: i64,
     pub exp_after: i64,
@@ -460,6 +652,259 @@ pub struct DailyCheckinReceipt {
 pub enum DailyCheckinResult {
     Claimed(DailyCheckinReceipt),
     AlreadyClaimed(DailyCheckinReceipt),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExperienceGrantReceipt {
+    pub amount: i64,
+    pub exp_before: i64,
+    pub exp_after: i64,
+    pub level_before: i64,
+    pub level_after: i64,
+    pub levels_gained: i64,
+    pub title_before: String,
+    pub title_after: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExperienceProgress {
+    pub level: i64,
+    pub title: &'static str,
+    pub total_exp: i64,
+    pub exp_in_level: i64,
+    pub exp_for_next: Option<i64>,
+    pub total_exp_for_next: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LevelTier {
+    min_level: i64,
+    max_level: i64,
+    title: &'static str,
+    base_exp: i64,
+}
+
+pub const MAX_PLAYER_LEVEL: i64 = 120;
+
+const LEVEL_TIERS: [LevelTier; 14] = [
+    LevelTier {
+        min_level: 1,
+        max_level: 10,
+        title: "魂士",
+        base_exp: 100,
+    },
+    LevelTier {
+        min_level: 11,
+        max_level: 20,
+        title: "魂师",
+        base_exp: 500,
+    },
+    LevelTier {
+        min_level: 21,
+        max_level: 30,
+        title: "大魂师",
+        base_exp: 1_500,
+    },
+    LevelTier {
+        min_level: 31,
+        max_level: 40,
+        title: "魂尊",
+        base_exp: 4_000,
+    },
+    LevelTier {
+        min_level: 41,
+        max_level: 50,
+        title: "魂宗",
+        base_exp: 10_000,
+    },
+    LevelTier {
+        min_level: 51,
+        max_level: 60,
+        title: "魂王",
+        base_exp: 25_000,
+    },
+    LevelTier {
+        min_level: 61,
+        max_level: 70,
+        title: "魂帝",
+        base_exp: 60_000,
+    },
+    LevelTier {
+        min_level: 71,
+        max_level: 80,
+        title: "魂圣",
+        base_exp: 150_000,
+    },
+    LevelTier {
+        min_level: 81,
+        max_level: 90,
+        title: "魂斗罗",
+        base_exp: 400_000,
+    },
+    LevelTier {
+        min_level: 91,
+        max_level: 99,
+        title: "封号斗罗",
+        base_exp: 1_000_000,
+    },
+    LevelTier {
+        min_level: 100,
+        max_level: 100,
+        title: "半神",
+        base_exp: 3_000_000,
+    },
+    LevelTier {
+        min_level: 101,
+        max_level: 105,
+        title: "一级神祇",
+        base_exp: 10_000_000,
+    },
+    LevelTier {
+        min_level: 106,
+        max_level: 110,
+        title: "神王",
+        base_exp: 50_000_000,
+    },
+    LevelTier {
+        min_level: 111,
+        max_level: 120,
+        title: "至高神",
+        base_exp: 200_000_000,
+    },
+];
+
+fn level_tier(level: i64) -> Result<LevelTier, String> {
+    LEVEL_TIERS
+        .iter()
+        .copied()
+        .find(|tier| (tier.min_level..=tier.max_level).contains(&level))
+        .ok_or_else(|| format!("角色等级必须在 1 到 {MAX_PLAYER_LEVEL} 之间"))
+}
+
+/// 返回某一级升到下一级所需的经验；经验字段采用累计经验语义。
+pub fn level_exp_required(level: i64) -> Result<Option<i64>, String> {
+    if level == MAX_PLAYER_LEVEL {
+        return Ok(None);
+    }
+    let tier = level_tier(level)?;
+    let offset = level
+        .checked_sub(tier.min_level)
+        .ok_or_else(|| "等级经验计算溢出".to_string())?;
+    let multiplier = 10_i64
+        .checked_add(offset)
+        .ok_or_else(|| "等级经验计算溢出".to_string())?;
+    let scaled = tier
+        .base_exp
+        .checked_mul(multiplier)
+        .ok_or_else(|| "等级经验计算溢出".to_string())?;
+    Ok(Some(scaled / 10))
+}
+
+/// 返回达到指定等级所需的累计经验（1 级角色为 0）。
+pub fn total_exp_for_level(level: i64) -> Result<i64, String> {
+    if !(1..=MAX_PLAYER_LEVEL).contains(&level) {
+        return Err(format!("角色等级必须在 1 到 {MAX_PLAYER_LEVEL} 之间"));
+    }
+    let mut total = 0_i64;
+    for current in 1..level {
+        total = total
+            .checked_add(
+                level_exp_required(current)?.ok_or_else(|| "满级不应存在下一级经验".to_string())?,
+            )
+            .ok_or_else(|| "等级累计经验计算溢出".to_string())?;
+    }
+    Ok(total)
+}
+
+/// 根据累计经验计算最高可达到的等级；达到 120 级后不再继续升级。
+pub fn level_for_total_exp(total_exp: i64) -> Result<i64, String> {
+    if total_exp < 0 {
+        return Err("累计经验不能为负数".to_string());
+    }
+    let mut level = 1_i64;
+    while level < MAX_PLAYER_LEVEL {
+        let next_total = total_exp_for_level(level + 1)?;
+        if total_exp < next_total {
+            break;
+        }
+        level += 1;
+    }
+    Ok(level)
+}
+
+pub fn level_title(level: i64) -> Result<&'static str, String> {
+    Ok(level_tier(level)?.title)
+}
+
+pub fn full_level_title(level: i64) -> Result<String, String> {
+    Ok(format!("{level}级{}", level_title(level)?))
+}
+
+pub fn experience_progress(level: i64, total_exp: i64) -> Result<ExperienceProgress, String> {
+    if total_exp < 0 {
+        return Err("累计经验不能为负数".to_string());
+    }
+    let derived_level = level_for_total_exp(total_exp)?;
+    let effective_level = level.max(derived_level).min(MAX_PLAYER_LEVEL);
+    let level_start = total_exp_for_level(effective_level)?;
+    let exp_in_level = total_exp.saturating_sub(level_start);
+    let exp_for_next = level_exp_required(effective_level)?;
+    let total_exp_for_next = effective_level
+        .checked_add(1)
+        .filter(|next| *next <= MAX_PLAYER_LEVEL)
+        .map(total_exp_for_level)
+        .transpose()?;
+    Ok(ExperienceProgress {
+        level: effective_level,
+        title: level_title(effective_level)?,
+        total_exp,
+        exp_in_level,
+        exp_for_next,
+        total_exp_for_next,
+    })
+}
+
+fn apply_experience_in_transaction(
+    transaction: &Transaction<'_>,
+    player_id: i64,
+    level_before: i64,
+    exp_before: i64,
+    amount: i64,
+    timestamp: i64,
+) -> Result<ExperienceGrantReceipt, String> {
+    if amount < 0 {
+        return Err("获得经验不能为负数".to_string());
+    }
+    if exp_before < 0 {
+        return Err("角色累计经验不能为负数".to_string());
+    }
+    level_tier(level_before)?;
+    let exp_after = exp_before
+        .checked_add(amount)
+        .ok_or_else(|| "经验累加溢出".to_string())?;
+    let level_after = level_before.max(level_for_total_exp(exp_after)?);
+    let levels_gained = level_after
+        .checked_sub(level_before)
+        .ok_or_else(|| "角色等级计算溢出".to_string())?;
+    let player_updates = transaction
+        .execute(
+            "UPDATE player SET level = ?1, exp = ?2, updated_at = ?3 WHERE id = ?4",
+            params![level_after, exp_after, timestamp, player_id],
+        )
+        .map_err(|error| format!("更新角色经验失败：{error}"))?;
+    if player_updates != 1 {
+        return Err("更新角色经验时角色状态发生变化".to_string());
+    }
+    Ok(ExperienceGrantReceipt {
+        amount,
+        exp_before,
+        exp_after,
+        level_before,
+        level_after,
+        levels_gained,
+        title_before: full_level_title(level_before)?,
+        title_after: full_level_title(level_after)?,
+    })
 }
 
 impl Store {
@@ -531,7 +976,7 @@ impl Store {
         let migration_result = (|| -> Result<(), String> {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|error| format!("开始数据库迁移 v2/v3/v4/v5 失败：{error}"))?;
+                .map_err(|error| format!("开始数据库迁移 v2/v3/v4/v5/v6/v7 失败：{error}"))?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
             if !migration_applied(&transaction, 2)? {
                 let old_identity_sequence = transaction
@@ -604,10 +1049,52 @@ impl Store {
                 validate_v5_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 6)? {
+                validate_v6_source_player_schema(&transaction)?;
+                let old_player_sequence = transaction
+                    .query_row(
+                        "SELECT seq FROM sqlite_sequence WHERE name = 'player'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(|error| format!("读取旧角色序列失败：{error}"))?;
+                transaction
+                    .execute_batch(MIGRATION_V6)
+                    .map_err(|error| format!("执行数据库迁移 v6 失败：{error}"))?;
+                if let Some(sequence) = old_player_sequence {
+                    restore_player_sequence(&transaction, sequence)?;
+                }
+                validate_v6_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(6, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v6 失败：{error}"))?;
+            } else {
+                validate_v6_schema(&transaction)?;
+            }
+
+            if !migration_applied(&transaction, 7)? {
+                transaction
+                    .execute_batch(MIGRATION_V7)
+                    .map_err(|error| format!("执行数据库迁移 v7 失败：{error}"))?;
+                validate_v7_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(7, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v7 失败：{error}"))?;
+            } else {
+                validate_v7_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction
                 .commit()
-                .map_err(|error| format!("提交数据库迁移 v2/v3/v4/v5 失败：{error}"))?;
+                .map_err(|error| format!("提交数据库迁移 v2/v3/v4/v5/v6/v7 失败：{error}"))?;
             Ok(())
         })();
         let restore_result = set_foreign_keys(connection, true);
@@ -618,6 +1105,8 @@ impl Store {
                 validate_v3_schema(connection)?;
                 validate_v4_schema(connection)?;
                 validate_v5_schema(connection)?;
+                validate_v6_schema(connection)?;
+                validate_v7_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -669,6 +1158,13 @@ impl Store {
                 params![identity_id, name, gender, timestamp],
             )
             .map_err(|error| format!("创建角色失败：{error}"))?;
+        let player_id = transaction.last_insert_rowid();
+        transaction
+            .execute(
+                "INSERT INTO player_map(player_id, map_key, updated_at) VALUES(?1, 'holy-soul-village', ?2)",
+                params![player_id, timestamp],
+            )
+            .map_err(|error| format!("设置角色初始地图失败：{error}"))?;
         if let Some(operation) = operation {
             insert_operation_log(&transaction, key, operation)?;
         }
@@ -687,10 +1183,13 @@ impl Store {
             .query_row(
                 r#"
                 SELECT p.name, p.gender, p.level, p.exp, p.hp, p.max_hp,
-                       p.soul_power, p.max_soul_power, p.map_name, p.life_count, p.state,
+                       p.soul_power, p.max_soul_power, COALESCE(m.name, p.map_name),
+                       p.life_count, p.state,
                        w.name, w.category
                   FROM identity i
                   JOIN player p ON p.identity_id = i.id
+             LEFT JOIN player_map pm ON pm.player_id = p.id
+             LEFT JOIN map m ON m.map_key = pm.map_key
              LEFT JOIN player_wuhun pw ON pw.player_id = p.id AND pw.slot = 1
              LEFT JOIN wuhun w ON w.id = pw.wuhun_id
                  WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
@@ -725,6 +1224,281 @@ impl Store {
             .map_err(|error| format!("查询角色状态失败：{error}"))
     }
 
+    pub fn current_map(&self, key: &IdentityKey<'_>) -> Result<Option<MapRecord>, String> {
+        validate_identity_key(key)?;
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        connection
+            .query_row(
+                r#"
+                SELECT m.map_key, m.name, m.description, m.level_required,
+                       m.safe, m.pvp_enabled, m.teleport_enabled, m.sort_order
+                  FROM identity i
+                  JOIN player p ON p.identity_id = i.id
+                  JOIN player_map pm ON pm.player_id = p.id
+                  JOIN map m ON m.map_key = pm.map_key
+                 WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+                   AND i.subject_kind = ?4 AND i.subject_id = ?5
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind,
+                    key.subject_id
+                ],
+                map_record_from_row,
+            )
+            .optional()
+            .map_err(|error| format!("查询当前地图失败：{error}"))
+    }
+
+    pub fn map_exits(&self, key: &IdentityKey<'_>) -> Result<Vec<MapExit>, String> {
+        validate_identity_key(key)?;
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT e.direction, e.travel_kind,
+                       m.map_key, m.name, m.description, m.level_required,
+                       m.safe, m.pvp_enabled, m.teleport_enabled, m.sort_order
+                  FROM identity i
+                  JOIN player p ON p.identity_id = i.id
+                  JOIN player_map pm ON pm.player_id = p.id
+                  JOIN map_edge e
+                    ON e.from_map_key = pm.map_key AND e.enabled = 1
+                  JOIN map m ON m.map_key = e.to_map_key
+                 WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+                   AND i.subject_kind = ?4 AND i.subject_id = ?5
+                 ORDER BY CASE e.travel_kind WHEN 'walk' THEN 0 ELSE 1 END,
+                          CASE e.direction
+                              WHEN 'north' THEN 0 WHEN 'south' THEN 1
+                              WHEN 'west' THEN 2 WHEN 'east' THEN 3 ELSE 4 END,
+                          m.sort_order, m.map_key
+                "#,
+            )
+            .map_err(|error| format!("准备地图出口查询失败：{error}"))?;
+        statement
+            .query_map(
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind,
+                    key.subject_id
+                ],
+                |row| {
+                    Ok(MapExit {
+                        direction: row.get(0)?,
+                        travel_kind: row.get(1)?,
+                        target: MapRecord {
+                            map_key: row.get(2)?,
+                            name: row.get(3)?,
+                            description: row.get(4)?,
+                            level_required: row.get(5)?,
+                            safe: row.get(6)?,
+                            pvp_enabled: row.get(7)?,
+                            teleport_enabled: row.get(8)?,
+                            sort_order: row.get(9)?,
+                        },
+                    })
+                },
+            )
+            .map_err(|error| format!("查询地图出口失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析地图出口失败：{error}"))
+    }
+
+    pub fn list_maps_page(&self, page: usize, limit: usize) -> Result<MapPage, String> {
+        validate_map_page(page, limit)?;
+        let connection = self.open()?;
+        let total = connection
+            .query_row("SELECT COUNT(*) FROM map", [], |row| row.get::<_, i64>(0))
+            .map_err(|error| format!("统计地图数量失败：{error}"))?;
+        let total = usize::try_from(total).map_err(|_| "地图数量超出可分页范围".to_string())?;
+        let page_count = total.div_ceil(limit).max(1);
+        if page > page_count {
+            return Err(format!("地图页码必须在 1 到 {page_count} 之间"));
+        }
+        let offset = page
+            .checked_sub(1)
+            .and_then(|page| page.checked_mul(limit))
+            .ok_or_else(|| "地图分页偏移量溢出".to_string())?;
+        let fetch_limit = i64::try_from(limit).map_err(|_| "地图分页数量无法转换".to_string())?;
+        let offset = i64::try_from(offset).map_err(|_| "地图分页偏移量无法转换".to_string())?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT map_key, name, description, level_required,
+                       safe, pvp_enabled, teleport_enabled, sort_order
+                  FROM map
+                 ORDER BY sort_order, map_key
+                 LIMIT ?1 OFFSET ?2
+                "#,
+            )
+            .map_err(|error| format!("准备地图分页查询失败：{error}"))?;
+        let entries = statement
+            .query_map(params![fetch_limit, offset], map_record_from_row)
+            .map_err(|error| format!("查询地图分页失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析地图分页失败：{error}"))?;
+        let next_after_key = (page < page_count)
+            .then(|| entries.last().map(|entry| entry.map_key.clone()))
+            .flatten();
+        Ok(MapPage {
+            entries,
+            page,
+            page_count,
+            total,
+            next_after_key,
+        })
+    }
+
+    pub fn move_direction_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        direction: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<MapTravelReceipt, String> {
+        let direction = normalize_map_direction(direction)?;
+        validate_identity_key(key)?;
+        validate_operation_input(operation)?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始移动事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let (player_id, level, from) = load_player_map_for_identity(&transaction, key)?;
+        let (to, edge_level) = transaction
+            .query_row(
+                r#"
+                SELECT m.map_key, m.name, m.description, m.level_required,
+                       m.safe, m.pvp_enabled, m.teleport_enabled, m.sort_order,
+                       e.level_required
+                  FROM map_edge e
+                  JOIN map m ON m.map_key = e.to_map_key
+                 WHERE e.from_map_key = ?1 AND e.travel_kind = 'walk'
+                   AND e.direction = ?2 AND e.enabled = 1
+                "#,
+                params![from.map_key, direction],
+                |row| {
+                    Ok((
+                        MapRecord {
+                            map_key: row.get(0)?,
+                            name: row.get(1)?,
+                            description: row.get(2)?,
+                            level_required: row.get(3)?,
+                            safe: row.get(4)?,
+                            pvp_enabled: row.get(5)?,
+                            teleport_enabled: row.get(6)?,
+                            sort_order: row.get(7)?,
+                        },
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("查询地图方向出口失败：{error}"))?
+            .ok_or_else(|| format!("当前地图没有向{}的道路", direction_name(direction)))?;
+        let required_level = to.level_required.max(edge_level);
+        if level < required_level {
+            return Err(format!(
+                "前往{}需要{}级，当前为{}级",
+                to.name, required_level, level
+            ));
+        }
+        update_player_map(&transaction, player_id, &to)?;
+        insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交移动事务失败：{error}"))?;
+        Ok(MapTravelReceipt {
+            from,
+            to,
+            travel_kind: "walk".to_string(),
+            direction: Some(direction.to_string()),
+        })
+    }
+
+    pub fn teleport_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        target_name: Option<&str>,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<MapTravelReceipt, String> {
+        validate_identity_key(key)?;
+        validate_operation_input(operation)?;
+        let target_name = target_name.map(str::trim).filter(|name| !name.is_empty());
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始传送事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let (player_id, level, from) = load_player_map_for_identity(&transaction, key)?;
+        if !from.teleport_enabled {
+            return Err("当前地图没有传送阵，无法传送".to_string());
+        }
+        let (to, edge_level) = if let Some(target_name) = target_name {
+            transaction
+                .query_row(
+                    r#"
+                    SELECT m.map_key, m.name, m.description, m.level_required,
+                           m.safe, m.pvp_enabled, m.teleport_enabled, m.sort_order,
+                           e.level_required
+                      FROM map_edge e
+                     JOIN map m ON m.map_key = e.to_map_key
+                     WHERE e.from_map_key = ?1 AND e.travel_kind = 'teleport'
+                       AND e.enabled = 1 AND m.teleport_enabled = 1
+                       AND (m.name = ?2 OR m.map_key = ?2)
+                    "#,
+                    params![from.map_key, target_name],
+                    |row| Ok((map_record_from_row(row)?, row.get::<_, i64>(8)?)),
+                )
+                .optional()
+                .map_err(|error| format!("查询传送目标失败：{error}"))?
+                .ok_or_else(|| "目标地图不在当前传送阵范围内".to_string())?
+        } else {
+            transaction
+                .query_row(
+                    r#"
+                    SELECT m.map_key, m.name, m.description, m.level_required,
+                           m.safe, m.pvp_enabled, m.teleport_enabled, m.sort_order,
+                           e.level_required
+                      FROM map_edge e
+                     JOIN map m ON m.map_key = e.to_map_key
+                     WHERE e.from_map_key = ?1 AND e.travel_kind = 'teleport'
+                       AND e.enabled = 1 AND m.teleport_enabled = 1
+                     ORDER BY random()
+                     LIMIT 1
+                    "#,
+                    [from.map_key.as_str()],
+                    |row| Ok((map_record_from_row(row)?, row.get::<_, i64>(8)?)),
+                )
+                .optional()
+                .map_err(|error| format!("选择随机传送目标失败：{error}"))?
+                .ok_or_else(|| "当前传送阵没有可用目标".to_string())?
+        };
+        let required_level = to.level_required.max(edge_level);
+        if level < required_level {
+            return Err(format!(
+                "前往{}需要{}级，当前为{}级",
+                to.name, required_level, level
+            ));
+        }
+        update_player_map(&transaction, player_id, &to)?;
+        insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交传送事务失败：{error}"))?;
+        Ok(MapTravelReceipt {
+            from,
+            to,
+            travel_kind: "teleport".to_string(),
+            direction: None,
+        })
+    }
+
     pub fn wallet_balance(
         &self,
         key: &IdentityKey<'_>,
@@ -757,6 +1531,66 @@ impl Store {
             )
             .optional()
             .map_err(|error| format!("查询钱包余额失败：{error}"))
+    }
+
+    /// 在单个 SQLite 事务内增加累计经验并推进等级，供签到和后续 PVE/任务奖励复用。
+    #[allow(dead_code)]
+    pub fn grant_experience(
+        &self,
+        key: &IdentityKey<'_>,
+        amount: i64,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<ExperienceGrantReceipt, String> {
+        validate_identity_key(key)?;
+        validate_operation_input(operation)?;
+        if amount < 0 {
+            return Err("获得经验不能为负数".to_string());
+        }
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始经验事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let (player_id, level_before, exp_before) = transaction
+            .query_row(
+                r#"
+                SELECT p.id, p.level, p.exp
+                  FROM identity i
+                  JOIN player p ON p.identity_id = i.id
+                 WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+                   AND i.subject_kind = ?4 AND i.subject_id = ?5
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind,
+                    key.subject_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("读取经验角色失败：{error}"))?
+            .ok_or_else(|| "你还没有角色，请先使用“开始穿越 <角色名> <性别>”".to_string())?;
+        let receipt = apply_experience_in_transaction(
+            &transaction,
+            player_id,
+            level_before,
+            exp_before,
+            amount,
+            now_timestamp()?,
+        )?;
+        insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交经验事务失败：{error}"))?;
+        Ok(receipt)
     }
 
     #[allow(dead_code)]
@@ -1310,10 +2144,10 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("开始签到事务失败：{error}"))?;
         ensure_no_legacy_identity(&transaction, key)?;
-        let (player_id, current_exp) = transaction
+        let (player_id, current_level, current_exp) = transaction
             .query_row(
                 r#"
-                SELECT p.id, p.exp
+                SELECT p.id, p.level, p.exp
                   FROM identity i
                   JOIN player p ON p.identity_id = i.id
                  WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
@@ -1326,7 +2160,13 @@ impl Store {
                     key.subject_kind,
                     key.subject_id
                 ],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|error| format!("读取签到角色失败：{error}"))?
@@ -1385,22 +2225,17 @@ impl Store {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|error| format!("读取签到钱包余额失败：{error}"))?;
-        let exp_after = current_exp
-            .checked_add(exp_reward)
-            .ok_or_else(|| "签到经验累加溢出".to_string())?;
         let currency_balance_after = current_balance
             .checked_add(currency_reward)
             .ok_or_else(|| "签到钱包余额累加溢出".to_string())?;
-
-        let player_updates = transaction
-            .execute(
-                "UPDATE player SET exp = ?1, updated_at = ?2 WHERE id = ?3",
-                params![exp_after, timestamp, player_id],
-            )
-            .map_err(|error| format!("更新签到经验失败：{error}"))?;
-        if player_updates != 1 {
-            return Err("更新签到经验时角色状态发生变化".to_string());
-        }
+        let experience = apply_experience_in_transaction(
+            &transaction,
+            player_id,
+            current_level,
+            current_exp,
+            exp_reward,
+            timestamp,
+        )?;
         let wallet_updates = transaction
             .execute(
                 r#"
@@ -1437,7 +2272,7 @@ impl Store {
                     exp_reward,
                     input.currency_code,
                     currency_reward,
-                    exp_after,
+                    experience.exp_after,
                     currency_balance_after,
                     timestamp
                 ],
@@ -1454,9 +2289,13 @@ impl Store {
             streak_days,
             cycle_day,
             exp_reward,
+            level_before: experience.level_before,
+            level_after: experience.level_after,
+            levels_gained: experience.levels_gained,
+            title_after: experience.title_after,
             currency_code: input.currency_code.to_string(),
             currency_reward,
-            exp_after,
+            exp_after: experience.exp_after,
             currency_balance_after,
         }))
     }
@@ -1479,6 +2318,122 @@ fn validate_daily_checkin_input(input: &DailyCheckinInput<'_>) -> Result<(), Str
         .is_some_and(|reward| !(100..=199).contains(&reward))
     {
         return Err("签到货币奖励覆盖值必须在 100 到 199 之间".to_string());
+    }
+    Ok(())
+}
+
+fn map_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MapRecord> {
+    Ok(MapRecord {
+        map_key: row.get(0)?,
+        name: row.get(1)?,
+        description: row.get(2)?,
+        level_required: row.get(3)?,
+        safe: row.get(4)?,
+        pvp_enabled: row.get(5)?,
+        teleport_enabled: row.get(6)?,
+        sort_order: row.get(7)?,
+    })
+}
+
+fn load_player_map_for_identity(
+    connection: &Connection,
+    key: &IdentityKey<'_>,
+) -> Result<(i64, i64, MapRecord), String> {
+    connection
+        .query_row(
+            r#"
+            SELECT p.id, p.level,
+                   m.map_key, m.name, m.description, m.level_required,
+                   m.safe, m.pvp_enabled, m.teleport_enabled, m.sort_order
+              FROM identity i
+              JOIN player p ON p.identity_id = i.id
+              JOIN player_map pm ON pm.player_id = p.id
+              JOIN map m ON m.map_key = pm.map_key
+             WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+               AND i.subject_kind = ?4 AND i.subject_id = ?5
+            "#,
+            params![
+                key.protocol.as_str(),
+                key.account_id,
+                key.namespace,
+                key.subject_kind,
+                key.subject_id
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    MapRecord {
+                        map_key: row.get(2)?,
+                        name: row.get(3)?,
+                        description: row.get(4)?,
+                        level_required: row.get(5)?,
+                        safe: row.get(6)?,
+                        pvp_enabled: row.get(7)?,
+                        teleport_enabled: row.get(8)?,
+                        sort_order: row.get(9)?,
+                    },
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取角色地图失败：{error}"))?
+        .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())
+}
+
+fn update_player_map(
+    connection: &Connection,
+    player_id: i64,
+    target: &MapRecord,
+) -> Result<(), String> {
+    let timestamp = now_timestamp()?;
+    let map_updates = connection
+        .execute(
+            "UPDATE player_map SET map_key = ?1, updated_at = ?2 WHERE player_id = ?3",
+            params![target.map_key, timestamp, player_id],
+        )
+        .map_err(|error| format!("更新角色地图失败：{error}"))?;
+    if map_updates != 1 {
+        return Err("更新角色地图时角色状态发生变化".to_string());
+    }
+    let player_updates = connection
+        .execute(
+            "UPDATE player SET map_name = ?1, updated_at = ?2 WHERE id = ?3",
+            params![target.name, timestamp, player_id],
+        )
+        .map_err(|error| format!("同步角色地图名称失败：{error}"))?;
+    if player_updates != 1 {
+        return Err("同步角色地图名称时角色状态发生变化".to_string());
+    }
+    Ok(())
+}
+
+fn normalize_map_direction(direction: &str) -> Result<&'static str, String> {
+    match direction.trim() {
+        "上" | "北" | "north" => Ok("north"),
+        "下" | "南" | "south" => Ok("south"),
+        "左" | "西" | "west" => Ok("west"),
+        "右" | "东" | "east" => Ok("east"),
+        _ => Err("方向只能是上、下、左或右".to_string()),
+    }
+}
+
+fn direction_name(direction: &str) -> &'static str {
+    match direction {
+        "north" => "上",
+        "south" => "下",
+        "west" => "左",
+        "east" => "右",
+        _ => "未知",
+    }
+}
+
+fn validate_map_page(page: usize, limit: usize) -> Result<(), String> {
+    if page == 0 || page > 100 {
+        return Err("地图页码必须在 1 到 100 之间".to_string());
+    }
+    if !(1..=50).contains(&limit) {
+        return Err("地图分页数量必须在 1 到 50 之间".to_string());
     }
     Ok(())
 }
@@ -1534,7 +2489,7 @@ fn load_daily_checkin_receipt(
     player_id: i64,
     game_day: i64,
 ) -> Result<Option<DailyCheckinReceipt>, String> {
-    connection
+    let receipt = connection
         .query_row(
             r#"
             SELECT game_day, total_claims, streak_days, cycle_day, exp_reward,
@@ -1550,6 +2505,10 @@ fn load_daily_checkin_receipt(
                     streak_days: row.get(2)?,
                     cycle_day: row.get(3)?,
                     exp_reward: row.get(4)?,
+                    level_before: 1,
+                    level_after: 1,
+                    levels_gained: 0,
+                    title_after: "1级魂士".to_string(),
                     currency_code: row.get(5)?,
                     currency_reward: row.get(6)?,
                     exp_after: row.get(7)?,
@@ -1558,7 +2517,16 @@ fn load_daily_checkin_receipt(
             },
         )
         .optional()
-        .map_err(|error| format!("读取当日签到记录失败：{error}"))
+        .map_err(|error| format!("读取当日签到记录失败：{error}"))?;
+    receipt
+        .map(|mut receipt| {
+            let level_after = level_for_total_exp(receipt.exp_after)?;
+            receipt.level_before = level_after;
+            receipt.level_after = level_after;
+            receipt.title_after = full_level_title(level_after)?;
+            Ok(receipt)
+        })
+        .transpose()
 }
 
 fn migration_applied(connection: &Connection, version: i64) -> Result<bool, String> {
@@ -1606,6 +2574,33 @@ fn restore_identity_sequence(transaction: &Transaction<'_>, sequence: i64) -> Re
     transaction
         .execute("DELETE FROM sqlite_sequence WHERE name = 'identity_v2'", [])
         .map_err(|error| format!("清理临时身份序列失败：{error}"))?;
+    Ok(())
+}
+
+fn restore_player_sequence(transaction: &Transaction<'_>, sequence: i64) -> Result<(), String> {
+    let current = transaction
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'player'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取迁移后角色序列失败：{error}"))?;
+    let sequence = current.map_or(sequence, |current| current.max(sequence));
+    let changed = transaction
+        .execute(
+            "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'player'",
+            [sequence],
+        )
+        .map_err(|error| format!("恢复角色序列失败：{error}"))?;
+    if changed == 0 {
+        transaction
+            .execute(
+                "INSERT INTO sqlite_sequence(name, seq) VALUES('player', ?1)",
+                [sequence],
+            )
+            .map_err(|error| format!("写入角色序列失败：{error}"))?;
+    }
     Ok(())
 }
 
@@ -3116,6 +4111,796 @@ fn validate_v5_table_sql(
     Ok(())
 }
 
+// v6 会重建 player，迁移前必须确认旧表结构完全来自受支持的 v1 schema。
+// 任何额外列、索引或触发器都拒绝迁移，避免重建时静默丢失用户数据结构。
+fn validate_v6_source_player_schema(connection: &Connection) -> Result<(), String> {
+    let columns = table_columns_with_type(connection, "player")?;
+    let expected_columns = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("identity_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("name", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("gender", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("level", "INTEGER", true, false, Some("1"), 0),
+        TableColumnInfo::new("exp", "INTEGER", true, false, Some("0"), 0),
+        TableColumnInfo::new("hp", "INTEGER", true, false, Some("100"), 0),
+        TableColumnInfo::new("max_hp", "INTEGER", true, false, Some("100"), 0),
+        TableColumnInfo::new("soul_power", "INTEGER", true, false, Some("50"), 0),
+        TableColumnInfo::new("max_soul_power", "INTEGER", true, false, Some("50"), 0),
+        TableColumnInfo::new("strength", "INTEGER", true, false, Some("10"), 0),
+        TableColumnInfo::new("agility", "INTEGER", true, false, Some("10"), 0),
+        TableColumnInfo::new("spirit", "INTEGER", true, false, Some("10"), 0),
+        TableColumnInfo::new("endurance", "INTEGER", true, false, Some("10"), 0),
+        TableColumnInfo::new("perception", "INTEGER", true, false, Some("10"), 0),
+        TableColumnInfo::new("luck", "INTEGER", true, false, Some("10"), 0),
+        TableColumnInfo::new("life_count", "INTEGER", true, false, Some("1"), 0),
+        TableColumnInfo::new("state", "TEXT", true, false, Some("'alive'"), 0),
+        TableColumnInfo::new("map_name", "TEXT", true, false, Some("'圣魂村'"), 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("updated_at", "INTEGER", true, false, None, 0),
+    ];
+    if columns != expected_columns {
+        return Err(format!("v6 迁移前角色字段不匹配，已拒绝重建：{columns:?}"));
+    }
+
+    let table_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'player'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v6 迁移前角色建表语句失败：{error}"))?
+        .ok_or_else(|| "v6 迁移前缺少 player 表，已拒绝重建".to_string())?
+        .to_ascii_uppercase();
+    for marker in [
+        "AUTOINCREMENT",
+        "IDENTITY_ID INTEGER NOT NULL UNIQUE REFERENCES IDENTITY(ID) ON DELETE CASCADE",
+        "GENDER TEXT NOT NULL CHECK(GENDER IN ('男', '女'))",
+        "LEVEL INTEGER NOT NULL DEFAULT 1 CHECK(LEVEL BETWEEN 1 AND 100)",
+        "EXP INTEGER NOT NULL DEFAULT 0 CHECK(EXP >= 0)",
+        "LIFE_COUNT INTEGER NOT NULL DEFAULT 1 CHECK(LIFE_COUNT BETWEEN 1 AND 3)",
+        "STATE TEXT NOT NULL DEFAULT 'ALIVE' CHECK(STATE IN ('ALIVE', 'DEAD', 'REVIVING', 'DELETED'))",
+    ] {
+        if !table_sql.contains(marker) {
+            return Err(format!("v6 迁移前角色表缺少旧版约束，已拒绝重建：{marker}"));
+        }
+    }
+
+    let foreign_keys = connection
+        .prepare("PRAGMA foreign_key_list(player)")
+        .map_err(|error| format!("读取 v6 迁移前角色外键失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v6 迁移前角色外键失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v6 迁移前角色外键失败：{error}"))?;
+    if foreign_keys
+        != [(
+            "identity".to_string(),
+            "identity_id".to_string(),
+            "id".to_string(),
+            "NO ACTION".to_string(),
+            "CASCADE".to_string(),
+            "NONE".to_string(),
+        )]
+    {
+        return Err(format!(
+            "v6 迁移前角色外键不匹配，已拒绝重建：{foreign_keys:?}"
+        ));
+    }
+
+    let indexes = connection
+        .prepare("PRAGMA index_list(player)")
+        .map_err(|error| format!("读取 v6 迁移前角色索引失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, bool>(4)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v6 迁移前角色索引失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v6 迁移前角色索引失败：{error}"))?;
+    if indexes.len() != 1 || !indexes[0].1 || indexes[0].3 || indexes[0].2 != "u" {
+        return Err(format!(
+            "v6 迁移前角色索引集合不匹配，已拒绝重建：{indexes:?}"
+        ));
+    }
+    let index_name = &indexes[0].0;
+    let escaped_index = index_name.replace('"', "\"\"");
+    let index_columns = connection
+        .prepare(&format!("PRAGMA index_info(\"{escaped_index}\")"))
+        .map_err(|error| format!("读取 v6 迁移前角色索引字段失败：{error}"))?
+        .query_map([], |row| row.get::<_, String>(2))
+        .map_err(|error| format!("查询 v6 迁移前角色索引字段失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v6 迁移前角色索引字段失败：{error}"))?;
+    if index_columns != ["identity_id"] {
+        return Err(format!(
+            "v6 迁移前角色唯一索引字段不匹配，已拒绝重建：{index_columns:?}"
+        ));
+    }
+
+    let trigger_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'player'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("检查 v6 迁移前角色触发器失败：{error}"))?;
+    if trigger_count != 0 {
+        return Err("v6 迁移前角色存在未声明触发器，已拒绝重建".to_string());
+    }
+    Ok(())
+}
+
+fn validate_v6_schema(connection: &Connection) -> Result<(), String> {
+    let columns = table_columns_with_type(connection, "player")?;
+    let expected_columns = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("identity_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("name", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("gender", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("level", "INTEGER", true, false, Some("1"), 0),
+        TableColumnInfo::new("exp", "INTEGER", true, false, Some("0"), 0),
+        TableColumnInfo::new("hp", "INTEGER", true, false, Some("100"), 0),
+        TableColumnInfo::new("max_hp", "INTEGER", true, false, Some("100"), 0),
+        TableColumnInfo::new("soul_power", "INTEGER", true, false, Some("50"), 0),
+        TableColumnInfo::new("max_soul_power", "INTEGER", true, false, Some("50"), 0),
+        TableColumnInfo::new("strength", "INTEGER", true, false, Some("10"), 0),
+        TableColumnInfo::new("agility", "INTEGER", true, false, Some("10"), 0),
+        TableColumnInfo::new("spirit", "INTEGER", true, false, Some("10"), 0),
+        TableColumnInfo::new("endurance", "INTEGER", true, false, Some("10"), 0),
+        TableColumnInfo::new("perception", "INTEGER", true, false, Some("10"), 0),
+        TableColumnInfo::new("luck", "INTEGER", true, false, Some("10"), 0),
+        TableColumnInfo::new("life_count", "INTEGER", true, false, Some("1"), 0),
+        TableColumnInfo::new("state", "TEXT", true, false, Some("'alive'"), 0),
+        TableColumnInfo::new("map_name", "TEXT", true, false, Some("'圣魂村'"), 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("updated_at", "INTEGER", true, false, None, 0),
+    ];
+    if columns != expected_columns {
+        return Err(format!(
+            "数据库已标记迁移 v6，但角色字段不匹配：{columns:?}"
+        ));
+    }
+
+    let table_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'player'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v6 角色建表语句失败：{error}"))?
+        .ok_or_else(|| "数据库已标记迁移 v6，但缺少 player 表".to_string())?
+        .to_ascii_uppercase();
+    for marker in [
+        "AUTOINCREMENT",
+        "IDENTITY_ID INTEGER NOT NULL UNIQUE REFERENCES IDENTITY(ID) ON DELETE CASCADE",
+        "GENDER TEXT NOT NULL CHECK(GENDER IN ('男', '女'))",
+        "LEVEL INTEGER NOT NULL DEFAULT 1 CHECK(LEVEL BETWEEN 1 AND 120)",
+        "EXP INTEGER NOT NULL DEFAULT 0 CHECK(EXP >= 0)",
+        "LIFE_COUNT INTEGER NOT NULL DEFAULT 1 CHECK(LIFE_COUNT BETWEEN 1 AND 3)",
+        "STATE TEXT NOT NULL DEFAULT 'ALIVE' CHECK(STATE IN ('ALIVE', 'DEAD', 'REVIVING', 'DELETED'))",
+    ] {
+        if !table_sql.contains(marker) {
+            return Err(format!("数据库已标记迁移 v6，但角色表缺少约束：{marker}"));
+        }
+    }
+
+    let mut foreign_keys = connection
+        .prepare("PRAGMA foreign_key_list(player)")
+        .map_err(|error| format!("读取 v6 角色外键失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v6 角色外键失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v6 角色外键失败：{error}"))?;
+    foreign_keys.sort();
+    if foreign_keys
+        != [(
+            "identity".to_string(),
+            "identity_id".to_string(),
+            "id".to_string(),
+            "NO ACTION".to_string(),
+            "CASCADE".to_string(),
+            "NONE".to_string(),
+        )]
+    {
+        return Err(format!(
+            "数据库已标记迁移 v6，但角色外键不匹配：{foreign_keys:?}"
+        ));
+    }
+
+    let indexes = connection
+        .prepare("PRAGMA index_list(player)")
+        .map_err(|error| format!("读取 v6 角色索引失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, bool>(4)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v6 角色索引失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v6 角色索引失败：{error}"))?;
+    if indexes.len() != 1 || !indexes[0].1 || indexes[0].3 || indexes[0].2 != "u" {
+        return Err(format!(
+            "数据库已标记迁移 v6，但角色索引集合不匹配：{indexes:?}"
+        ));
+    }
+    let index_name = &indexes[0].0;
+    let escaped_index = index_name.replace('"', "\"\"");
+    let index_columns = connection
+        .prepare(&format!("PRAGMA index_info(\"{escaped_index}\")"))
+        .map_err(|error| format!("读取 v6 角色索引字段失败：{error}"))?
+        .query_map([], |row| row.get::<_, String>(2))
+        .map_err(|error| format!("查询 v6 角色索引字段失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v6 角色索引字段失败：{error}"))?;
+    if index_columns != ["identity_id"] {
+        return Err(format!(
+            "数据库已标记迁移 v6，但角色唯一索引字段不匹配：{index_columns:?}"
+        ));
+    }
+
+    let trigger_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'player'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("检查 v6 角色触发器失败：{error}"))?;
+    if trigger_count != 0 {
+        return Err("数据库已标记迁移 v6，但角色表存在未声明触发器".to_string());
+    }
+    let stale_table = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'player_v6')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v6 临时角色表失败：{error}"))?;
+    if stale_table {
+        return Err("数据库已标记迁移 v6，但残留 player_v6 临时表".to_string());
+    }
+
+    probe_v6_player_level_guard(connection)
+}
+
+fn probe_v6_player_level_guard(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch("SAVEPOINT qimen_v6_level_probe;")
+        .map_err(|error| format!("开始 v6 等级约束探针失败：{error}"))?;
+    let probe_result = (|| -> Result<(), String> {
+        let token = connection
+            .query_row("SELECT lower(hex(randomblob(16)))", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("生成 v6 等级探针标识失败：{error}"))?;
+        let account_id = format!("v6-level-probe-{token}");
+        connection
+            .execute(
+                r#"
+                INSERT INTO identity(
+                    protocol, account_id, namespace, subject_kind, subject_id, created_at
+                ) VALUES('onebot11', ?1, 'v6-level-probe', 'user', ?1, 0)
+                "#,
+                [&account_id],
+            )
+            .map_err(|error| format!("v6 等级探针无法创建临时身份：{error}"))?;
+        let identity_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO player(identity_id, name, gender, level, created_at, updated_at) VALUES(?1, 'v6-level-probe', '男', 120, 0, 0)",
+                [identity_id],
+            )
+            .map_err(|error| format!("v6 等级探针无法插入 120 级角色：{error}"))?;
+
+        let invalid_account = format!("{account_id}-invalid");
+        connection
+            .execute(
+                r#"
+                INSERT INTO identity(
+                    protocol, account_id, namespace, subject_kind, subject_id, created_at
+                ) VALUES('onebot11', ?1, 'v6-level-probe', 'user', ?1, 0)
+                "#,
+                [&invalid_account],
+            )
+            .map_err(|error| format!("v6 等级探针无法创建边界身份：{error}"))?;
+        let invalid_identity_id = connection.last_insert_rowid();
+        if connection
+            .execute(
+                "INSERT INTO player(identity_id, name, gender, level, created_at, updated_at) VALUES(?1, 'v6-level-invalid', '男', 121, 0, 0)",
+                [invalid_identity_id],
+            )
+            .is_ok()
+        {
+            return Err("v6 角色等级上限约束探针被绕过".to_string());
+        }
+        Ok(())
+    })();
+    let rollback_result = connection
+        .execute_batch("ROLLBACK TO qimen_v6_level_probe; RELEASE qimen_v6_level_probe;")
+        .map_err(|error| format!("回滚 v6 等级约束探针失败：{error}"));
+    match (probe_result, rollback_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(probe_error), Err(rollback_error)) => Err(format!("{probe_error}；{rollback_error}")),
+    }
+}
+
+fn validate_v7_schema(connection: &Connection) -> Result<(), String> {
+    let map_columns = table_columns_with_type(connection, "map")?;
+    let expected_map_columns = [
+        ("map_key", "TEXT"),
+        ("name", "TEXT"),
+        ("description", "TEXT"),
+        ("level_required", "INTEGER"),
+        ("safe", "INTEGER"),
+        ("pvp_enabled", "INTEGER"),
+        ("teleport_enabled", "INTEGER"),
+        ("sort_order", "INTEGER"),
+        ("created_at", "INTEGER"),
+        ("updated_at", "INTEGER"),
+    ];
+    validate_column_names_and_types("map", &map_columns, &expected_map_columns)?;
+    let edge_columns = table_columns_with_type(connection, "map_edge")?;
+    let expected_edge_columns = [
+        ("id", "INTEGER"),
+        ("from_map_key", "TEXT"),
+        ("to_map_key", "TEXT"),
+        ("travel_kind", "TEXT"),
+        ("direction", "TEXT"),
+        ("level_required", "INTEGER"),
+        ("enabled", "INTEGER"),
+        ("created_at", "INTEGER"),
+    ];
+    validate_column_names_and_types("map_edge", &edge_columns, &expected_edge_columns)?;
+    let player_map_columns = table_columns_with_type(connection, "player_map")?;
+    let expected_player_map_columns = [
+        ("player_id", "INTEGER"),
+        ("map_key", "TEXT"),
+        ("updated_at", "INTEGER"),
+    ];
+    validate_column_names_and_types(
+        "player_map",
+        &player_map_columns,
+        &expected_player_map_columns,
+    )?;
+
+    validate_v7_table_sql(
+        connection,
+        "map",
+        &[
+            ") STRICT",
+            "MAP_KEY TEXT PRIMARY KEY",
+            "LENGTH(MAP_KEY) BETWEEN 1 AND 96",
+            "MAP_KEY = TRIM(MAP_KEY)",
+            "MAP_KEY GLOB",
+            "LEVEL_REQUIRED BETWEEN 1 AND 120",
+            "SAFE IN (0, 1)",
+            "PVP_ENABLED IN (0, 1)",
+            "TELEPORT_ENABLED IN (0, 1)",
+            "SORT_ORDER >= 0",
+        ],
+    )?;
+    validate_v7_table_sql(
+        connection,
+        "map_edge",
+        &[
+            ") STRICT",
+            "FROM_MAP_KEY TEXT NOT NULL REFERENCES MAP(MAP_KEY) ON DELETE CASCADE",
+            "TO_MAP_KEY TEXT NOT NULL REFERENCES MAP(MAP_KEY) ON DELETE RESTRICT",
+            "TRAVEL_KIND IN ('WALK', 'TELEPORT')",
+            "TRAVEL_KIND = 'WALK' AND DIRECTION IN",
+            "TRAVEL_KIND = 'TELEPORT' AND DIRECTION IS NULL",
+            "FROM_MAP_KEY <> TO_MAP_KEY",
+        ],
+    )?;
+    validate_v7_table_sql(
+        connection,
+        "player_map",
+        &[
+            ") STRICT",
+            "PLAYER_ID INTEGER PRIMARY KEY REFERENCES PLAYER(ID) ON DELETE CASCADE",
+            "MAP_KEY TEXT NOT NULL REFERENCES MAP(MAP_KEY) ON DELETE RESTRICT",
+            "UPDATED_AT >= 0",
+        ],
+    )?;
+
+    validate_v7_foreign_keys(
+        connection,
+        "map_edge",
+        &[
+            ("map", "from_map_key", "map_key", "NO ACTION", "CASCADE"),
+            ("map", "to_map_key", "map_key", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+    validate_v7_foreign_keys(
+        connection,
+        "player_map",
+        &[
+            ("map", "map_key", "map_key", "NO ACTION", "RESTRICT"),
+            ("player", "player_id", "id", "NO ACTION", "CASCADE"),
+        ],
+    )?;
+    validate_v7_index(connection, "map_name_unique", true, &["name"], false)?;
+    validate_v7_index(
+        connection,
+        "map_sort_order_unique",
+        true,
+        &["sort_order"],
+        false,
+    )?;
+    validate_v7_index(
+        connection,
+        "map_page",
+        false,
+        &["sort_order", "map_key"],
+        false,
+    )?;
+    validate_v7_index(
+        connection,
+        "map_edge_walk_direction",
+        true,
+        &["from_map_key", "direction"],
+        true,
+    )?;
+    validate_v7_index(
+        connection,
+        "map_edge_teleport_target",
+        true,
+        &["from_map_key", "to_map_key"],
+        true,
+    )?;
+    validate_v7_index(
+        connection,
+        "map_edge_from_kind",
+        false,
+        &["from_map_key", "travel_kind", "enabled", "id"],
+        false,
+    )?;
+    validate_v7_custom_index_set(
+        connection,
+        "map",
+        &["map_name_unique", "map_page", "map_sort_order_unique"],
+    )?;
+    validate_v7_custom_index_set(
+        connection,
+        "map_edge",
+        &[
+            "map_edge_from_kind",
+            "map_edge_teleport_target",
+            "map_edge_walk_direction",
+        ],
+    )?;
+    validate_v7_custom_index_set(connection, "player_map", &[])?;
+    validate_v7_triggers(connection)?;
+
+    let map_count = connection
+        .query_row("SELECT COUNT(*) FROM map", [], |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("统计 v7 地图种子失败：{error}"))?;
+    if map_count < 7 {
+        return Err(format!(
+            "数据库已标记迁移 v7，但地图种子数量不足：{map_count}"
+        ));
+    }
+    let mismatched_player_maps = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM player p
+                 LEFT JOIN player_map pm ON pm.player_id = p.id
+                 LEFT JOIN map m ON m.map_key = pm.map_key
+                WHERE pm.player_id IS NULL OR m.name IS NULL OR m.name <> p.map_name
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查角色地图绑定失败：{error}"))?;
+    if mismatched_player_maps {
+        return Err("数据库已标记迁移 v7，但存在未绑定或名称不一致的角色地图".to_string());
+    }
+    probe_v7_map_guards(connection)
+}
+
+fn validate_column_names_and_types(
+    table: &str,
+    actual: &[TableColumnInfo],
+    expected: &[(&str, &str)],
+) -> Result<(), String> {
+    if actual.len() != expected.len()
+        || actual
+            .iter()
+            .zip(expected)
+            .any(|(actual, (name, sql_type))| actual.name != *name || actual.sql_type != *sql_type)
+    {
+        let expected = expected
+            .iter()
+            .map(|(name, sql_type)| format!("{name}:{sql_type}"))
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "数据库已标记迁移 v7，但表 {table} 字段不匹配：实际 {actual:?}，期望 {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v7_table_sql(
+    connection: &Connection,
+    table: &str,
+    markers: &[&str],
+) -> Result<(), String> {
+    let sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v7 表 {table} 建表语句失败：{error}"))?
+        .ok_or_else(|| format!("数据库已标记迁移 v7，但缺少表 {table}"))?
+        .to_ascii_uppercase();
+    for marker in markers {
+        if !sql.contains(marker) {
+            return Err(format!(
+                "数据库已标记迁移 v7，但表 {table} 缺少约束：{marker}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v7_foreign_keys(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, &str, &str, &str)],
+) -> Result<(), String> {
+    let escaped_table = table.replace('"', "\"\"");
+    let mut actual = connection
+        .prepare(&format!("PRAGMA foreign_key_list(\"{escaped_table}\")"))
+        .map_err(|error| format!("读取 v7 表 {table} 外键失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v7 表 {table} 外键失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v7 表 {table} 外键失败：{error}"))?;
+    let mut expected = expected
+        .iter()
+        .map(|(parent, from, to, update, delete)| {
+            (
+                (*parent).to_string(),
+                (*from).to_string(),
+                (*to).to_string(),
+                (*update).to_string(),
+                (*delete).to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    actual.sort();
+    expected.sort();
+    if actual != expected {
+        return Err(format!(
+            "数据库已标记迁移 v7，但表 {table} 外键不匹配：实际 {actual:?}，期望 {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v7_index(
+    connection: &Connection,
+    index_name: &str,
+    unique: bool,
+    expected_columns: &[&str],
+    partial: bool,
+) -> Result<(), String> {
+    let (table, _sql) = connection
+        .query_row(
+            "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [index_name],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v7 索引 {index_name} 失败：{error}"))?
+        .ok_or_else(|| format!("数据库已标记迁移 v7，但缺少索引 {index_name}"))?;
+    let escaped_index = index_name.replace('"', "\"\"");
+    let mut info = connection
+        .prepare(&format!(
+            "PRAGMA index_list(\"{}\")",
+            table.replace('"', "\"\"")
+        ))
+        .map_err(|error| format!("读取 v7 索引 {index_name} 元数据失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, bool>(4)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v7 索引 {index_name} 元数据失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v7 索引 {index_name} 元数据失败：{error}"))?;
+    let (_, actual_unique, origin, actual_partial) = info
+        .drain(..)
+        .find(|(name, _, _, _)| name == index_name)
+        .ok_or_else(|| format!("数据库已标记迁移 v7，但索引 {index_name} 不在表索引集合中"))?;
+    if actual_unique != unique || origin != "c" || actual_partial != partial {
+        return Err(format!(
+            "数据库已标记迁移 v7，但索引 {index_name} 的 unique/origin/partial 不匹配"
+        ));
+    }
+    let columns = connection
+        .prepare(&format!("PRAGMA index_info(\"{escaped_index}\")"))
+        .map_err(|error| format!("读取 v7 索引 {index_name} 字段失败：{error}"))?
+        .query_map([], |row| row.get::<_, String>(2))
+        .map_err(|error| format!("查询 v7 索引 {index_name} 字段失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v7 索引 {index_name} 字段失败：{error}"))?;
+    if columns != expected_columns {
+        return Err(format!(
+            "数据库已标记迁移 v7，但索引 {index_name} 字段不匹配：实际 {columns:?}，期望 {expected_columns:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v7_custom_index_set(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), String> {
+    let escaped_table = table.replace('"', "\"\"");
+    let mut actual = connection
+        .prepare(&format!("PRAGMA index_list(\"{escaped_table}\")"))
+        .map_err(|error| format!("读取 v7 表 {table} 索引集合失败：{error}"))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, String>(3)?))
+        })
+        .map_err(|error| format!("查询 v7 表 {table} 索引集合失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v7 表 {table} 索引集合失败：{error}"))?
+        .into_iter()
+        .filter_map(|(name, origin)| (origin == "c").then_some(name))
+        .collect::<Vec<_>>();
+    let mut expected = expected
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    actual.sort();
+    expected.sort();
+    if actual != expected {
+        return Err(format!(
+            "数据库已标记迁移 v7，但表 {table} 自定义索引集合不匹配：实际 {actual:?}，期望 {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v7_triggers(connection: &Connection) -> Result<(), String> {
+    let triggers = connection
+        .prepare(
+            "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name",
+        )
+        .map_err(|error| format!("读取 v7 触发器集合失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v7 触发器集合失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v7 触发器集合失败：{error}"))?;
+    for (name, table, sql) in triggers {
+        if matches!(table.as_str(), "map" | "map_edge" | "player_map")
+            || sql_mentions_identifier(&sql, "map")
+            || sql_mentions_identifier(&sql, "map_edge")
+            || sql_mentions_identifier(&sql, "player_map")
+        {
+            return Err(format!(
+                "数据库已标记迁移 v7，但触发器 {name}（目标表 {table}）引用了世界数据表"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn probe_v7_map_guards(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch("SAVEPOINT qimen_v7_map_probe;")
+        .map_err(|error| format!("开始 v7 地图约束探针失败：{error}"))?;
+    let probe_result = (|| -> Result<(), String> {
+        let valid_map = |key: &str, name: &str, sort_order: i64| {
+            connection.execute(
+                r#"
+                INSERT INTO map(
+                    map_key, name, description, level_required, safe, pvp_enabled,
+                    teleport_enabled, sort_order, created_at, updated_at
+                ) VALUES(?1, ?2, '', 1, 0, 1, 0, ?3, 0, 0)
+                "#,
+                params![key, name, sort_order],
+            )
+        };
+        if valid_map("v7-probe", "v7-probe", 100_000).is_err() {
+            return Err("v7 地图探针无法插入合法地图".to_string());
+        }
+        if valid_map("Bad-Key", "v7-probe-bad-key", 100_001).is_ok() {
+            return Err("v7 地图 key 约束探针被绕过".to_string());
+        }
+        if valid_map("v7-probe-2", "v7-probe", 100_002).is_ok() {
+            return Err("v7 地图名称唯一约束探针被绕过".to_string());
+        }
+        if connection
+            .execute(
+                r#"
+                INSERT INTO map_edge(
+                    from_map_key, to_map_key, travel_kind, direction,
+                    level_required, enabled, created_at
+                ) VALUES('v7-probe', 'holy-soul-village', 'walk', 'teleport', 1, 1, 0)
+                "#,
+                [],
+            )
+            .is_ok()
+        {
+            return Err("v7 地图方向约束探针被绕过".to_string());
+        }
+        let foreign_keys_enabled = connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, bool>(0))
+            .map_err(|error| format!("读取 v7 地图探针外键状态失败：{error}"))?;
+        if foreign_keys_enabled
+            && connection
+                .execute(
+                    "INSERT INTO map_edge(from_map_key,to_map_key,travel_kind,direction,level_required,enabled,created_at) VALUES('v7-probe','missing-map','teleport',NULL,1,1,0)",
+                    [],
+                )
+                .is_ok()
+        {
+            return Err("v7 地图外键约束探针被绕过".to_string());
+        }
+        Ok(())
+    })();
+    let rollback_result = connection
+        .execute_batch("ROLLBACK TO qimen_v7_map_probe; RELEASE qimen_v7_map_probe;")
+        .map_err(|error| format!("回滚 v7 地图约束探针失败：{error}"));
+    match (probe_result, rollback_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(probe_error), Err(rollback_error)) => Err(format!("{probe_error}；{rollback_error}")),
+    }
+}
+
 fn validate_identity_key(key: &IdentityKey<'_>) -> Result<(), String> {
     validate_account_id(key.account_id)?;
     if key.namespace.is_empty()
@@ -3441,6 +5226,15 @@ mod tests {
         }
     }
 
+    fn map_operation<'a>(command: &'a str, message_id: &'a str) -> OperationLogInput<'a> {
+        OperationLogInput {
+            command,
+            outcome: "ok",
+            source_message_id: message_id,
+            details_json: r#"{"context":"private","has_args":true}"#,
+        }
+    }
+
     fn create_v1_database(directory: &Path, subject_id: &str) -> PathBuf {
         let relative_path = &DatabaseConfig::default().relative_path;
         let path = directory.join(relative_path);
@@ -3484,6 +5278,32 @@ mod tests {
                 [],
             )
             .expect("应提高旧序列水位");
+        path
+    }
+
+    fn create_v5_database(directory: &Path, subject_id: &str) -> PathBuf {
+        let path = create_v1_database(directory, subject_id);
+        let connection = Connection::open(&path).expect("应打开 v1 数据库");
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("应关闭迁移测试外键");
+        connection
+            .execute_batch(MIGRATION_V2)
+            .expect("应创建 v2 测试结构");
+        connection
+            .execute_batch(MIGRATION_V3)
+            .expect("应创建 v3 测试结构");
+        connection
+            .execute_batch(MIGRATION_V4)
+            .expect("应创建 v4 测试结构");
+        connection
+            .execute_batch(MIGRATION_V5)
+            .expect("应创建 v5 测试结构");
+        connection
+            .execute_batch(
+                "INSERT INTO schema_migration(version, applied_at) VALUES(2, 1), (3, 1), (4, 1), (5, 1)",
+            )
+            .expect("应记录 v2-v5 测试版本");
         path
     }
 
@@ -3566,6 +5386,14 @@ mod tests {
     fn migrates_v1_without_rekeying_relations_or_sequence() {
         let directory = tempdir().expect("应创建测试目录");
         let path = create_v1_database(directory.path(), "legacy-user");
+        let sequence_connection = Connection::open(&path).expect("应打开 v1 数据库");
+        sequence_connection
+            .execute(
+                "UPDATE sqlite_sequence SET seq = 77 WHERE name = 'player'",
+                [],
+            )
+            .expect("应提升旧角色序列水位");
+        drop(sequence_connection);
         let store = Store::initialize(directory.path(), &DatabaseConfig::default())
             .expect("v1 应迁移到 v2");
         let connection = store.open().expect("应重开数据库");
@@ -3615,6 +5443,14 @@ mod tests {
             )
             .expect("应找到新身份");
         assert!(new_id > 99);
+        let new_player_id = connection
+            .query_row(
+                "SELECT p.id FROM identity i JOIN player p ON p.identity_id = i.id WHERE i.account_id = '10001' AND i.subject_id = 'new-user'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("应找到新角色");
+        assert!(new_player_id > 77);
     }
 
     #[test]
@@ -3628,12 +5464,12 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT COUNT(*) FROM schema_migration WHERE version IN (2, 3, 4, 5)",
+                    "SELECT COUNT(*) FROM schema_migration WHERE version IN (2, 3, 4, 5, 6)",
                     [],
                     |row| row.get::<_, i64>(0)
                 )
                 .expect("应读取迁移记录"),
-            4
+            5
         );
 
         let broken_directory = tempdir().expect("应创建损坏测试目录");
@@ -3649,6 +5485,66 @@ mod tests {
         let error = Store::initialize(broken_directory.path(), &DatabaseConfig::default())
             .expect_err("已记录但结构错误的 v2 必须失败");
         assert!(error.contains("结构不匹配"));
+    }
+
+    #[test]
+    fn v6_source_preflight_rejects_extra_player_structures_without_mutating_database() {
+        for (label, mutation, marker_query) in [
+            (
+                "extra column",
+                "ALTER TABLE player ADD COLUMN migration_shadow TEXT",
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_xinfo('player') WHERE name = 'migration_shadow')",
+            ),
+            (
+                "extra index",
+                "CREATE INDEX player_migration_extra ON player(name)",
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'player_migration_extra')",
+            ),
+            (
+                "extra trigger",
+                "CREATE TRIGGER player_migration_extra AFTER UPDATE OF exp ON player BEGIN SELECT 1; END",
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'player_migration_extra')",
+            ),
+        ] {
+            let directory = tempdir().expect("应创建 v6 预检测试目录");
+            let path = create_v5_database(directory.path(), &format!("v6-{label}"));
+            let connection = Connection::open(&path).expect("应打开 v5 预检数据库");
+            connection
+                .execute_batch(mutation)
+                .unwrap_or_else(|error| panic!("{label} 结构应可注入：{error}"));
+            drop(connection);
+
+            let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+                .expect_err("v6 源表异常必须拒绝迁移");
+            assert!(error.contains("v6"), "{label} 错误应指出 v6：{error}");
+
+            let connection = Connection::open(path).expect("应重新打开未迁移数据库");
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM schema_migration WHERE version = 6",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("应读取 v6 迁移记录"),
+                0
+            );
+            assert!(
+                connection
+                    .query_row(marker_query, [], |row| row.get::<_, bool>(0))
+                    .expect("原异常结构应保留")
+            );
+            assert!(
+                connection
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'player'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .expect("原 player 表应保留")
+                    .contains("level BETWEEN 1 AND 100")
+            );
+        }
     }
 
     #[test]
@@ -3678,12 +5574,12 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT COUNT(*) FROM schema_migration WHERE version IN (2, 3, 4, 5)",
+                    "SELECT COUNT(*) FROM schema_migration WHERE version IN (2, 3, 4, 5, 6)",
                     [],
                     |row| row.get::<_, i64>(0)
                 )
                 .expect("应读取迁移记录"),
-            4
+            5
         );
     }
 
@@ -4544,6 +6440,100 @@ mod tests {
     }
 
     #[test]
+    fn legacy_level_tiers_use_cumulative_exp_and_cap_at_120() {
+        for (level, title) in [
+            (1, "魂士"),
+            (10, "魂士"),
+            (11, "魂师"),
+            (20, "魂师"),
+            (21, "大魂师"),
+            (31, "魂尊"),
+            (41, "魂宗"),
+            (51, "魂王"),
+            (61, "魂帝"),
+            (71, "魂圣"),
+            (81, "魂斗罗"),
+            (91, "封号斗罗"),
+            (100, "半神"),
+            (101, "一级神祇"),
+            (106, "神王"),
+            (111, "至高神"),
+            (120, "至高神"),
+        ] {
+            assert_eq!(level_title(level), Ok(title));
+            assert_eq!(full_level_title(level), Ok(format!("{level}级{title}")));
+        }
+        assert_eq!(level_exp_required(1), Ok(Some(100)));
+        assert_eq!(level_exp_required(10), Ok(Some(190)));
+        assert_eq!(level_exp_required(11), Ok(Some(500)));
+        assert_eq!(level_exp_required(120), Ok(None));
+
+        let level_two_total = total_exp_for_level(2).expect("2 级累计经验应可计算");
+        assert_eq!(level_two_total, 100);
+        assert_eq!(level_for_total_exp(99), Ok(1));
+        assert_eq!(level_for_total_exp(level_two_total), Ok(2));
+        assert_eq!(level_for_total_exp(i64::MAX), Ok(MAX_PLAYER_LEVEL));
+        assert!(level_title(0).is_err());
+        assert!(level_for_total_exp(-1).is_err());
+
+        let progress = experience_progress(2, 130).expect("累计经验进度应可计算");
+        assert_eq!(progress.level, 2);
+        assert_eq!(progress.title, "魂士");
+        assert_eq!(progress.exp_in_level, 30);
+        assert_eq!(progress.exp_for_next, Some(110));
+    }
+
+    #[test]
+    fn grant_experience_atomically_advances_level_and_records_operation() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "经验角色", "男")
+            .expect("应创建经验测试角色");
+        fn experience_operation<'a>(message_id: &'a str) -> OperationLogInput<'a> {
+            OperationLogInput {
+                command: "获得经验",
+                outcome: "ok",
+                source_message_id: message_id,
+                details_json: r#"{"context":"private","has_args":true}"#,
+            }
+        }
+
+        let first = store
+            .grant_experience(&identity(), 99, &experience_operation("exp-1"))
+            .expect("首次经验奖励应成功");
+        assert_eq!(
+            (first.level_before, first.level_after, first.exp_after),
+            (1, 1, 99)
+        );
+        assert_eq!(first.levels_gained, 0);
+
+        let second = store
+            .grant_experience(&identity(), 1, &experience_operation("exp-2"))
+            .expect("达到阈值应成功升级");
+        assert_eq!(
+            (second.level_before, second.level_after, second.exp_after),
+            (1, 2, 100)
+        );
+        assert_eq!(second.levels_gained, 1);
+        assert_eq!(second.title_after, "2级魂士");
+        let player = store
+            .player_status(&identity())
+            .expect("应读取经验角色")
+            .expect("经验角色应存在");
+        assert_eq!((player.level, player.exp), (2, 100));
+        assert_eq!(
+            store
+                .list_operation_logs(&identity(), None, 10)
+                .expect("应读取经验操作日志")
+                .entries
+                .iter()
+                .filter(|entry| entry.command == "获得经验")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn concurrent_daily_checkin_grants_exactly_once() {
         let (_directory, store) = test_store();
         store
@@ -4819,5 +6809,157 @@ mod tests {
             .expect("应弱化 target 类型约束");
         drop(connection);
         assert!(Store::initialize(trigger_directory.path(), &DatabaseConfig::default()).is_err());
+    }
+
+    #[test]
+    fn map_contract_binds_new_players_and_pages_seeded_world_data() {
+        let (_directory, store) = test_store();
+        let first = store.list_maps_page(1, 5).expect("地图第一页应可查询");
+        assert_eq!((first.page, first.page_count, first.total), (1, 2, 7));
+        assert_eq!(first.entries.len(), 5);
+        assert_eq!(first.entries[0].map_key, "holy-soul-village");
+        assert_eq!(first.next_after_key.as_deref(), Some("sunset-forest"));
+        let second = store.list_maps_page(2, 5).expect("地图第二页应可查询");
+        assert_eq!(second.entries.len(), 2);
+        assert!(second.next_after_key.is_none());
+        assert!(store.list_maps_page(0, 5).is_err());
+        assert!(store.list_maps_page(3, 5).is_err());
+
+        store
+            .register_player(&identity(), "地图角色", "男")
+            .expect("应创建地图测试角色");
+        let current = store
+            .current_map(&identity())
+            .expect("当前地图查询应成功")
+            .expect("新角色应有地图绑定");
+        assert_eq!(
+            (current.map_key.as_str(), current.name.as_str()),
+            ("holy-soul-village", "圣魂村")
+        );
+        let exits = store.map_exits(&identity()).expect("出口应可查询");
+        assert_eq!(
+            exits
+                .iter()
+                .filter(|exit| exit.travel_kind == "walk")
+                .count(),
+            4
+        );
+        assert_eq!(
+            exits
+                .iter()
+                .filter(|exit| exit.travel_kind == "teleport")
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn movement_and_teleport_are_atomic_and_respect_edge_requirements() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "旅行角色", "女")
+            .expect("应创建旅行角色");
+
+        let north = store
+            .move_direction_with_operation(&identity(), "上", &map_operation("向", "move-1"))
+            .expect("圣魂村向上应到达天斗帝国主城");
+        assert_eq!(
+            (north.from.name.as_str(), north.to.name.as_str()),
+            ("圣魂村", "天斗帝国主城")
+        );
+        assert_eq!(north.direction.as_deref(), Some("north"));
+        assert_eq!(
+            store.player_status(&identity()).unwrap().unwrap().map_name,
+            "天斗帝国主城"
+        );
+
+        let back = store
+            .teleport_with_operation(
+                &identity(),
+                Some("圣魂村"),
+                &map_operation("传送", "teleport-1"),
+            )
+            .expect("主城传送阵应可返回圣魂村");
+        assert_eq!(
+            (back.from.name.as_str(), back.to.name.as_str()),
+            ("天斗帝国主城", "圣魂村")
+        );
+        assert_eq!(back.travel_kind, "teleport");
+        assert!(back.direction.is_none());
+
+        store
+            .move_direction_with_operation(&identity(), "右", &map_operation("向", "move-2"))
+            .expect("圣魂村向右应到达新手村");
+        store
+            .move_direction_with_operation(&identity(), "下", &map_operation("向", "move-3"))
+            .expect("新手村向下应到达星斗外围");
+        let locked = store
+            .move_direction_with_operation(&identity(), "下", &map_operation("向", "move-4"))
+            .expect_err("一级角色不能进入星斗中心");
+        assert!(locked.contains("需要20级"));
+        assert_eq!(
+            store.player_status(&identity()).unwrap().unwrap().map_name,
+            "星斗外围"
+        );
+        assert!(
+            store
+                .teleport_with_operation(
+                    &identity(),
+                    Some("圣魂村"),
+                    &map_operation("传送", "teleport-no-array"),
+                )
+                .expect_err("无传送阵区域必须拒绝传送")
+                .contains("没有传送阵")
+        );
+    }
+
+    #[test]
+    fn movement_rolls_back_when_atomic_audit_fails() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "回滚旅行", "男")
+            .expect("应创建旅行角色");
+        let connection = store.open().expect("应打开数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER operation_log_move_abort
+                BEFORE INSERT ON operation_log
+                WHEN NEW.command = '向'
+                BEGIN SELECT RAISE(ABORT, 'test move audit failure'); END;
+                "#,
+            )
+            .expect("应安装移动审计失败触发器");
+        drop(connection);
+        assert!(
+            store
+                .move_direction_with_operation(
+                    &identity(),
+                    "上",
+                    &map_operation("向", "move-rollback"),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.current_map(&identity()).unwrap().unwrap().name,
+            "圣魂村"
+        );
+    }
+
+    #[test]
+    fn recorded_v7_with_damaged_world_schema_fails_closed() {
+        let directory = tempdir().expect("应创建测试目录");
+        let store =
+            Store::initialize(directory.path(), &DatabaseConfig::default()).expect("v7 迁移应成功");
+        let connection = store.open().expect("应打开数据库");
+        connection
+            .execute("DROP INDEX map_edge_walk_direction", [])
+            .expect("应破坏地图方向唯一索引");
+        drop(connection);
+        assert!(
+            Store::initialize(directory.path(), &DatabaseConfig::default())
+                .expect_err("记录 v7 后损坏地图 schema 必须拒绝")
+                .contains("v7")
+        );
     }
 }

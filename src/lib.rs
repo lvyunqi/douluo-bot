@@ -221,6 +221,37 @@ mod plugin {
     }
 
     #[command(
+        name = "地图列表",
+        description = "分页查看地图、等级要求和传送阵",
+        aliases = "地图清单",
+        category = "斗罗大陆·世界",
+        scope = "all"
+    )]
+    fn map_list(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.map_list(req))
+    }
+
+    #[command(
+        name = "向",
+        description = "沿当前地图出口移动：向 <上|下|左|右>",
+        category = "斗罗大陆·世界",
+        scope = "all"
+    )]
+    fn move_direction(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.move_direction(req))
+    }
+
+    #[command(
+        name = "传送",
+        description = "使用传送阵：传送 [地图名称]",
+        category = "斗罗大陆·世界",
+        scope = "all"
+    )]
+    fn teleport(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.teleport(req))
+    }
+
+    #[command(
         name = "旧档检查",
         description = "检查指定用户的旧版存档认领状态",
         category = "斗罗大陆·管理",
