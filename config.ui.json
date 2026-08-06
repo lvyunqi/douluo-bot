@@ -1,6 +1,6 @@
 {
   "": {
-    "ui:order": ["database", "identity", "illustrations", "messages"]
+    "ui:order": ["database", "identity", "authorization", "illustrations", "messages"]
   },
   "/database/busy_timeout_ms": {
     "ui:widget": "slider",
@@ -15,6 +15,13 @@
   "/identity/qq_official_account_id": {
     "placeholder": "QQ 官方机器人 AppID（旧 Host 单 Bot 回退）",
     "width": "full"
+  },
+  "/authorization/mode": {
+    "ui:widget": "badges",
+    "labels": {
+      "allow_all": "允许所有群/频道",
+      "allowlist": "仅允许已授权上下文"
+    }
   },
   "/illustrations/mode": {
     "ui:widget": "badges",

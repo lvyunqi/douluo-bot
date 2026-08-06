@@ -3,6 +3,7 @@
 mod assets;
 mod catalog;
 pub mod config;
+mod context;
 mod game;
 mod identity;
 pub mod message;
@@ -56,6 +57,7 @@ fn shutdown_runtime() {
 fn with_service(
     req: &CommandRequest,
     audit_success: bool,
+    require_authorized_context: bool,
     operation: impl FnOnce(&GameService) -> Result<GameDocument, String>,
 ) -> CommandResponse {
     let service = match runtime_slot().read() {
@@ -65,10 +67,21 @@ fn with_service(
     let Some(service) = service else {
         return CommandResponse::text("斗罗大陆插件尚未完成初始化，请联系管理员");
     };
-    let result = operation(&service);
-    let outcome = if result.is_ok() { "ok" } else { "error" };
-    // Successful mutations write their audit row in the same SQLite
-    // transaction. Read-only commands and failed attempts are best-effort.
+    let authorization = if require_authorized_context {
+        service.ensure_context_authorized(req)
+    } else {
+        Ok(())
+    };
+    let denied = authorization.is_err();
+    let result = authorization.and_then(|()| operation(&service));
+    let outcome = if denied {
+        "denied"
+    } else if result.is_ok() {
+        "ok"
+    } else {
+        "error"
+    };
+    // 成功写操作在业务事务内审计；只读命令与失败尝试使用尽力写入。
     if audit_success || result.is_err() {
         drop(service.record_operation(req, outcome));
     }
@@ -90,7 +103,7 @@ fn with_service(
     api = "0.6",
     config_schema = "../config.schema.json",
     config_ui = "../config.ui.json",
-    config_version = 3,
+    config_version = 4,
     config_apply = "reload"
 )]
 mod plugin {
@@ -127,7 +140,7 @@ mod plugin {
         scope = "all"
     )]
     fn menu(req: &CommandRequest) -> CommandResponse {
-        with_service(req, true, |service| service.menu(req.args.as_str()))
+        with_service(req, true, true, |service| service.menu(req.args.as_str()))
     }
 
     #[command(
@@ -138,7 +151,7 @@ mod plugin {
         scope = "all"
     )]
     fn register(req: &CommandRequest) -> CommandResponse {
-        with_service(req, false, |service| service.register(req))
+        with_service(req, false, true, |service| service.register(req))
     }
 
     #[command(
@@ -149,7 +162,7 @@ mod plugin {
         scope = "all"
     )]
     fn awaken(req: &CommandRequest) -> CommandResponse {
-        with_service(req, false, |service| service.awaken(req))
+        with_service(req, false, true, |service| service.awaken(req))
     }
 
     #[command(
@@ -160,7 +173,7 @@ mod plugin {
         scope = "all"
     )]
     fn status(req: &CommandRequest) -> CommandResponse {
-        with_service(req, true, |service| service.status(req))
+        with_service(req, true, true, |service| service.status(req))
     }
 
     #[command(
@@ -171,7 +184,7 @@ mod plugin {
         scope = "all"
     )]
     fn location(req: &CommandRequest) -> CommandResponse {
-        with_service(req, true, |service| service.location(req))
+        with_service(req, true, true, |service| service.location(req))
     }
 
     #[command(
@@ -182,7 +195,7 @@ mod plugin {
         scope = "private"
     )]
     fn inspect_legacy(req: &CommandRequest) -> CommandResponse {
-        with_service(req, true, |service| service.inspect_legacy(req))
+        with_service(req, true, false, |service| service.inspect_legacy(req))
     }
 
     #[command(
@@ -193,6 +206,42 @@ mod plugin {
         scope = "private"
     )]
     fn claim_legacy(req: &CommandRequest) -> CommandResponse {
-        with_service(req, false, |service| service.claim_legacy(req))
+        with_service(req, false, false, |service| service.claim_legacy(req))
+    }
+
+    #[command(
+        name = "授权上下文",
+        description = "授权群或频道：授权上下文 <group|channel> <上下文ID> [标签]",
+        aliases = "新增授权,授权群",
+        category = "斗罗大陆·管理",
+        role = "owner",
+        scope = "private"
+    )]
+    fn grant_context(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, false, |service| service.grant_context(req))
+    }
+
+    #[command(
+        name = "取消授权",
+        description = "撤销群或频道授权：取消授权 <group|channel> <上下文ID> 确认",
+        aliases = "撤销授权,删除授权",
+        category = "斗罗大陆·管理",
+        role = "owner",
+        scope = "private"
+    )]
+    fn revoke_context(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, false, |service| service.revoke_context(req))
+    }
+
+    #[command(
+        name = "查看授权",
+        description = "查看当前 Bot 的授权上下文列表",
+        aliases = "授权列表",
+        category = "斗罗大陆·管理",
+        role = "owner",
+        scope = "private"
+    )]
+    fn list_contexts(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, false, |service| service.list_contexts(req))
     }
 }

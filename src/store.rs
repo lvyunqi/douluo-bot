@@ -193,9 +193,61 @@ END;
 
 CREATE TRIGGER operation_log_safe_details
 BEFORE INSERT ON operation_log
-WHEN EXISTS(
+WHEN json_type(NEW.details_json) != 'object'
+OR EXISTS(
     SELECT 1 FROM json_each(NEW.details_json)
      WHERE key NOT IN ('context', 'has_args', 'reason', 'duration_ms')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'operation log details field is not allowed');
+END;
+"#;
+
+const MIGRATION_V4: &str = r#"
+CREATE TABLE authorized_context (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    protocol TEXT NOT NULL CHECK(protocol IN ('onebot11', 'qq-official')),
+    account_id TEXT NOT NULL CHECK(
+        length(account_id) BETWEEN 1 AND 128 AND account_id = trim(account_id)
+    ),
+    namespace TEXT NOT NULL CHECK(length(namespace) BETWEEN 1 AND 64),
+    context_kind TEXT NOT NULL CHECK(context_kind IN ('group', 'channel')),
+    context_id TEXT NOT NULL CHECK(length(context_id) BETWEEN 1 AND 256),
+    label TEXT NOT NULL CHECK(length(label) <= 80),
+    granted_by_subject_id TEXT NOT NULL CHECK(length(granted_by_subject_id) BETWEEN 1 AND 256),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    UNIQUE(protocol, account_id, namespace, context_kind, context_id)
+);
+
+CREATE INDEX authorized_context_bot_page
+    ON authorized_context(protocol, account_id, namespace, id);
+
+DROP TRIGGER operation_log_safe_details;
+CREATE TRIGGER operation_log_safe_details
+BEFORE INSERT ON operation_log
+WHEN json_type(NEW.details_json) != 'object'
+OR EXISTS(
+    SELECT 1 FROM json_each(NEW.details_json)
+     WHERE key NOT IN (
+         'context', 'has_args', 'reason', 'duration_ms', 'target_kind', 'target_id'
+     )
+)
+OR (
+    json_type(NEW.details_json, '$.target_kind') IS NOT NULL
+    AND (
+        json_type(NEW.details_json, '$.target_kind') != 'text'
+        OR json_extract(NEW.details_json, '$.target_kind') NOT IN ('group', 'channel')
+    )
+)
+OR (
+    json_type(NEW.details_json, '$.target_id') IS NOT NULL
+    AND (
+        json_type(NEW.details_json, '$.target_id') != 'text'
+        OR length(json_extract(NEW.details_json, '$.target_id')) NOT BETWEEN 1 AND 256
+        OR instr(json_extract(NEW.details_json, '$.target_id'), char(0)) > 0
+        OR json_extract(NEW.details_json, '$.target_id')
+           GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    )
 )
 BEGIN
     SELECT RAISE(ABORT, 'operation log details field is not allowed');
@@ -270,7 +322,7 @@ pub struct AwakenedWuhun {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // Foundation API; chat commands are wired in a later slice.
+#[allow(dead_code)] // 为后续只读管理查询保留完整审计字段。
 pub struct OperationLogEntry {
     pub id: i64,
     pub protocol: Protocol,
@@ -286,7 +338,7 @@ pub struct OperationLogEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // Foundation API; chat commands are wired in a later slice.
+#[allow(dead_code)] // 为后续只读管理查询保留分页结构。
 pub struct OperationLogPage {
     pub entries: Vec<OperationLogEntry>,
     pub next_after_id: Option<i64>,
@@ -298,6 +350,34 @@ pub struct OperationLogInput<'a> {
     pub outcome: &'a str,
     pub source_message_id: &'a str,
     pub details_json: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // 聊天列表只展示部分字段，存储层仍返回完整归属与审计信息。
+pub struct AuthorizedContextEntry {
+    pub id: i64,
+    pub protocol: Protocol,
+    pub account_id: String,
+    pub namespace: String,
+    pub context_kind: String,
+    pub context_id: String,
+    pub label: String,
+    pub granted_by_subject_id: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedContextPage {
+    pub entries: Vec<AuthorizedContextEntry>,
+    pub next_after_id: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorizedContextChange {
+    Granted { id: i64 },
+    AlreadyGranted { id: i64 },
+    Revoked { id: i64 },
+    AlreadyRevoked,
 }
 
 impl Store {
@@ -352,10 +432,8 @@ impl Store {
         let migration_result = (|| -> Result<(), String> {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|error| format!("开始数据库迁移 v2/v3 失败：{error}"))?;
-            // Both version checks stay behind the same write lock. A second
-            // initializer therefore observes the committed version and only
-            // validates it; it never reruns CREATE TABLE statements.
+                .map_err(|error| format!("开始数据库迁移 v2/v3/v4 失败：{error}"))?;
+            // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
             if !migration_applied(&transaction, 2)? {
                 let old_identity_sequence = transaction
                     .query_row(
@@ -397,10 +475,25 @@ impl Store {
                 validate_v3_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 4)? {
+                transaction
+                    .execute_batch(MIGRATION_V4)
+                    .map_err(|error| format!("执行数据库迁移 v4 失败：{error}"))?;
+                validate_v4_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(4, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v4 失败：{error}"))?;
+            } else {
+                validate_v4_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction
                 .commit()
-                .map_err(|error| format!("提交数据库迁移 v2/v3 失败：{error}"))?;
+                .map_err(|error| format!("提交数据库迁移 v2/v3/v4 失败：{error}"))?;
             Ok(())
         })();
         let restore_result = set_foreign_keys(connection, true);
@@ -409,6 +502,7 @@ impl Store {
             (Ok(()), Ok(())) => {
                 validate_v2_schema(connection)?;
                 validate_v3_schema(connection)?;
+                validate_v4_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -841,6 +935,216 @@ impl Store {
             entries,
             next_after_id,
         })
+    }
+
+    pub fn grant_authorized_context(
+        &self,
+        key: &IdentityKey<'_>,
+        context_kind: &str,
+        context_id: &str,
+        label: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<AuthorizedContextChange, String> {
+        validate_identity_key(key)?;
+        validate_context_fields(context_kind, context_id, label, key.subject_id)?;
+        validate_context_operation(operation, context_kind, context_id)?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始授权上下文事务失败：{error}"))?;
+        let changed = transaction
+            .execute(
+                r#"
+                INSERT OR IGNORE INTO authorized_context(
+                    protocol, account_id, namespace, context_kind, context_id,
+                    label, granted_by_subject_id, created_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    context_kind,
+                    context_id,
+                    label,
+                    key.subject_id,
+                    now_timestamp()?
+                ],
+            )
+            .map_err(|error| format!("写入授权上下文失败：{error}"))?;
+        let id = transaction
+            .query_row(
+                r#"
+                SELECT id FROM authorized_context
+                 WHERE protocol = ?1 AND account_id = ?2 AND namespace = ?3
+                   AND context_kind = ?4 AND context_id = ?5
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    context_kind,
+                    context_id
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("读取授权上下文失败：{error}"))?;
+        let result = if changed == 1 {
+            AuthorizedContextChange::Granted { id }
+        } else {
+            AuthorizedContextChange::AlreadyGranted { id }
+        };
+        insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交授权上下文事务失败：{error}"))?;
+        Ok(result)
+    }
+
+    pub fn revoke_authorized_context(
+        &self,
+        key: &IdentityKey<'_>,
+        context_kind: &str,
+        context_id: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<AuthorizedContextChange, String> {
+        validate_identity_key(key)?;
+        validate_context_fields(context_kind, context_id, "", key.subject_id)?;
+        validate_context_operation(operation, context_kind, context_id)?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始撤销授权上下文事务失败：{error}"))?;
+        let id = transaction
+            .query_row(
+                r#"
+                SELECT id FROM authorized_context
+                 WHERE protocol = ?1 AND account_id = ?2 AND namespace = ?3
+                   AND context_kind = ?4 AND context_id = ?5
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    context_kind,
+                    context_id
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("查询授权上下文失败：{error}"))?;
+        let result = match id {
+            Some(id) => {
+                let changed = transaction
+                    .execute("DELETE FROM authorized_context WHERE id = ?1", [id])
+                    .map_err(|error| format!("撤销授权上下文失败：{error}"))?;
+                if changed != 1 {
+                    return Err("撤销授权上下文时记录状态发生变化".to_string());
+                }
+                AuthorizedContextChange::Revoked { id }
+            }
+            None => AuthorizedContextChange::AlreadyRevoked,
+        };
+        insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交撤销授权上下文事务失败：{error}"))?;
+        Ok(result)
+    }
+
+    pub fn list_authorized_contexts(
+        &self,
+        key: &IdentityKey<'_>,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> Result<AuthorizedContextPage, String> {
+        validate_identity_key(key)?;
+        validate_context_page(after_id, limit)?;
+        let after_id = after_id.unwrap_or(0);
+        let fetch_limit =
+            i64::try_from(limit + 1).map_err(|_| "授权上下文分页数量无法转换".to_string())?;
+        let connection = self.open()?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT id, protocol, account_id, namespace, context_kind, context_id,
+                       label, granted_by_subject_id, created_at
+                  FROM authorized_context
+                 WHERE protocol = ?1 AND account_id = ?2 AND namespace = ?3 AND id > ?4
+                 ORDER BY id ASC
+                 LIMIT ?5
+                "#,
+            )
+            .map_err(|error| format!("准备授权上下文分页查询失败：{error}"))?;
+        let mut entries = statement
+            .query_map(
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    after_id,
+                    fetch_limit
+                ],
+                |row| {
+                    Ok(AuthorizedContextEntry {
+                        id: row.get(0)?,
+                        protocol: match row.get::<_, String>(1)?.as_str() {
+                            "onebot11" => Protocol::OneBot11,
+                            "qq-official" => Protocol::QqOfficial,
+                            _ => return Err(rusqlite::Error::InvalidQuery),
+                        },
+                        account_id: row.get(2)?,
+                        namespace: row.get(3)?,
+                        context_kind: row.get(4)?,
+                        context_id: row.get(5)?,
+                        label: row.get(6)?,
+                        granted_by_subject_id: row.get(7)?,
+                        created_at: row.get(8)?,
+                    })
+                },
+            )
+            .map_err(|error| format!("查询授权上下文失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析授权上下文失败：{error}"))?;
+        let has_more = entries.len() > limit;
+        entries.truncate(limit);
+        let next_after_id = has_more
+            .then(|| entries.last().map(|entry| entry.id))
+            .flatten();
+        Ok(AuthorizedContextPage {
+            entries,
+            next_after_id,
+        })
+    }
+
+    pub fn is_authorized(
+        &self,
+        key: &IdentityKey<'_>,
+        context_kind: &str,
+        context_id: &str,
+    ) -> Result<bool, String> {
+        validate_identity_key(key)?;
+        validate_context_fields(context_kind, context_id, "", key.subject_id)?;
+        let connection = self.open()?;
+        connection
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM authorized_context
+                     WHERE protocol = ?1 AND account_id = ?2 AND namespace = ?3
+                       AND context_kind = ?4 AND context_id = ?5
+                )
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    context_kind,
+                    context_id
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("查询授权上下文状态失败：{error}"))
     }
 }
 
@@ -1279,12 +1583,15 @@ fn validate_v3_schema(connection: &Connection) -> Result<(), String> {
         if name == "operation_log_no_reinsert" && !normalized_sql.contains("EXISTS") {
             return Err("数据库已标记迁移 v3，但操作日志禁止重插入触发器不完整".to_string());
         }
-        if name == "operation_log_safe_details"
-            && (!normalized_sql.contains("JSON_EACH")
-                || !normalized_sql
-                    .contains("NOT IN ('CONTEXT', 'HAS_ARGS', 'REASON', 'DURATION_MS')"))
-        {
-            return Err("数据库已标记迁移 v3，但操作日志详情白名单触发器不完整".to_string());
+        if name == "operation_log_safe_details" {
+            let legacy_whitelist =
+                normalized_sql.contains("NOT IN ('CONTEXT', 'HAS_ARGS', 'REASON', 'DURATION_MS')");
+            let v4_whitelist = normalized_sql.contains(
+                "'CONTEXT', 'HAS_ARGS', 'REASON', 'DURATION_MS', 'TARGET_KIND', 'TARGET_ID'",
+            );
+            if !normalized_sql.contains("JSON_EACH") || (!legacy_whitelist && !v4_whitelist) {
+                return Err("数据库已标记迁移 v3，但操作日志详情白名单触发器不完整".to_string());
+            }
         }
     }
     probe_operation_log_guards(connection)
@@ -1352,6 +1659,489 @@ fn probe_operation_log_guards(connection: &Connection) -> Result<(), String> {
             "ROLLBACK TO qimen_operation_log_guard_probe; RELEASE qimen_operation_log_guard_probe;",
         )
         .map_err(|error| format!("回滚操作日志保护探针失败：{error}"));
+    match (probe_result, rollback_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(probe_error), Err(rollback_error)) => Err(format!("{probe_error}；{rollback_error}")),
+    }
+}
+
+fn validate_v4_schema(connection: &Connection) -> Result<(), String> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(authorized_context)")
+        .map_err(|error| format!("读取授权上下文表结构失败：{error}"))?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, bool>(5)?,
+            ))
+        })
+        .map_err(|error| format!("查询授权上下文字段失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析授权上下文字段失败：{error}"))?;
+    let expected_columns = vec![
+        ("id".to_string(), "INTEGER".to_string(), false, true),
+        ("protocol".to_string(), "TEXT".to_string(), true, false),
+        ("account_id".to_string(), "TEXT".to_string(), true, false),
+        ("namespace".to_string(), "TEXT".to_string(), true, false),
+        ("context_kind".to_string(), "TEXT".to_string(), true, false),
+        ("context_id".to_string(), "TEXT".to_string(), true, false),
+        ("label".to_string(), "TEXT".to_string(), true, false),
+        (
+            "granted_by_subject_id".to_string(),
+            "TEXT".to_string(),
+            true,
+            false,
+        ),
+        ("created_at".to_string(), "INTEGER".to_string(), true, false),
+    ];
+    if columns != expected_columns {
+        return Err(format!(
+            "数据库已标记迁移 v4，但授权上下文字段不匹配：{columns:?}"
+        ));
+    }
+
+    let table_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'authorized_context'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取授权上下文建表语句失败：{error}"))?
+        .ok_or_else(|| "数据库已标记迁移 v4，但缺少 authorized_context 表".to_string())?;
+    let normalized_table_sql = table_sql.to_ascii_uppercase();
+    for marker in [
+        "AUTOINCREMENT",
+        "PROTOCOL IN ('ONEBOT11', 'QQ-OFFICIAL')",
+        "LENGTH(ACCOUNT_ID) BETWEEN 1 AND 128",
+        "ACCOUNT_ID = TRIM(ACCOUNT_ID)",
+        "LENGTH(NAMESPACE) BETWEEN 1 AND 64",
+        "CONTEXT_KIND IN ('GROUP', 'CHANNEL')",
+        "LENGTH(CONTEXT_ID) BETWEEN 1 AND 256",
+        "LENGTH(LABEL) <= 80",
+        "LENGTH(GRANTED_BY_SUBJECT_ID) BETWEEN 1 AND 256",
+        "CREATED_AT >= 0",
+        "UNIQUE(PROTOCOL, ACCOUNT_ID, NAMESPACE, CONTEXT_KIND, CONTEXT_ID)",
+    ] {
+        if !normalized_table_sql.contains(marker) {
+            return Err(format!(
+                "数据库已标记迁移 v4，但授权上下文约束缺少：{marker}"
+            ));
+        }
+    }
+
+    let mut unique_columns = Vec::new();
+    let mut page_index_found = false;
+    let mut indexes = connection
+        .prepare("PRAGMA index_list(authorized_context)")
+        .map_err(|error| format!("读取授权上下文索引失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, bool>(4)?,
+            ))
+        })
+        .map_err(|error| format!("查询授权上下文索引失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析授权上下文索引失败：{error}"))?;
+    indexes.sort();
+    for (name, unique, origin, partial) in indexes {
+        let escaped_name = name.replace('"', "\"\"");
+        let columns = connection
+            .prepare(&format!("PRAGMA index_info(\"{escaped_name}\")"))
+            .map_err(|error| format!("读取授权上下文索引 {name} 失败：{error}"))?
+            .query_map([], |row| row.get::<_, String>(2))
+            .map_err(|error| format!("查询授权上下文索引 {name} 失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析授权上下文索引 {name} 失败：{error}"))?;
+        if unique {
+            if partial || origin != "u" {
+                return Err(format!(
+                    "数据库已标记迁移 v4，但授权上下文唯一索引来源或范围不匹配：{name}"
+                ));
+            }
+            unique_columns.push(columns);
+        } else if name == "authorized_context_bot_page" {
+            if partial || origin != "c" || columns != ["protocol", "account_id", "namespace", "id"]
+            {
+                return Err("数据库已标记迁移 v4，但授权上下文分页索引定义不匹配".to_string());
+            }
+            page_index_found = true;
+        }
+    }
+    if unique_columns
+        != [vec![
+            "protocol".to_string(),
+            "account_id".to_string(),
+            "namespace".to_string(),
+            "context_kind".to_string(),
+            "context_id".to_string(),
+        ]]
+    {
+        return Err(format!(
+            "数据库已标记迁移 v4，但授权上下文唯一约束不匹配：{unique_columns:?}"
+        ));
+    }
+    if !page_index_found {
+        return Err("数据库已标记迁移 v4，但缺少授权上下文分页索引".to_string());
+    }
+
+    let mut trigger_statement = connection
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'authorized_context' ORDER BY name",
+        )
+        .map_err(|error| format!("读取授权上下文触发器失败：{error}"))?;
+    let table_triggers = trigger_statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("查询授权上下文触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析授权上下文触发器失败：{error}"))?;
+    if !table_triggers.is_empty() {
+        return Err(format!(
+            "数据库已标记迁移 v4，但授权上下文表存在未声明触发器：{table_triggers:?}"
+        ));
+    }
+
+    let safe_details_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'operation_log_safe_details' AND tbl_name = 'operation_log'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v4 操作日志详情触发器失败：{error}"))?
+        .ok_or_else(|| "数据库已标记迁移 v4，但缺少操作日志详情触发器".to_string())?;
+    let safe_details_sql = safe_details_sql.to_ascii_uppercase();
+    for marker in [
+        "'TARGET_KIND'",
+        "'TARGET_ID'",
+        "JSON_TYPE(NEW.DETAILS_JSON) != 'OBJECT'",
+        "JSON_TYPE",
+        "JSON_EXTRACT",
+        "NOT IN ('GROUP', 'CHANNEL')",
+        "BETWEEN 1 AND 256",
+        "CHAR(0)",
+        "CHAR(31)",
+        "CHAR(127)",
+        "RAISE(ABORT",
+    ] {
+        if !safe_details_sql.contains(marker) {
+            return Err(format!(
+                "数据库已标记迁移 v4，但操作日志目标详情约束缺少：{marker}"
+            ));
+        }
+    }
+    probe_authorized_context_guards(connection)?;
+    probe_v4_details_guard(connection)
+}
+
+fn probe_authorized_context_guards(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch("SAVEPOINT qimen_authorized_context_guard_probe;")
+        .map_err(|error| format!("开始授权上下文约束探针失败：{error}"))?;
+    let probe_result = (|| -> Result<(), String> {
+        let token = connection
+            .query_row("SELECT lower(hex(randomblob(16)))", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("生成授权上下文探针标识失败：{error}"))?;
+        let account_id = format!("v4-probe-{token}");
+        let namespace = "v4-probe";
+        let actor = "v4-probe";
+        let insert = |protocol: &str,
+                      account_id: &str,
+                      namespace: &str,
+                      context_kind: &str,
+                      context_id: &str,
+                      label: &str,
+                      actor: &str,
+                      created_at: i64| {
+            connection.execute(
+                r#"
+                INSERT INTO authorized_context(
+                    protocol, account_id, namespace, context_kind, context_id,
+                    label, granted_by_subject_id, created_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    protocol,
+                    account_id,
+                    namespace,
+                    context_kind,
+                    context_id,
+                    label,
+                    actor,
+                    created_at
+                ],
+            )
+        };
+
+        insert(
+            "onebot11",
+            &account_id,
+            namespace,
+            "channel",
+            "valid",
+            "",
+            actor,
+            0,
+        )
+        .map_err(|error| format!("授权上下文约束探针无法插入合法行：{error}"))?;
+        if insert(
+            "onebot11",
+            &account_id,
+            namespace,
+            "channel",
+            "valid",
+            "",
+            actor,
+            0,
+        )
+        .is_ok()
+        {
+            return Err("授权上下文唯一约束探针被绕过".to_string());
+        }
+
+        let long_account_id = "a".repeat(129);
+        let long_namespace = "n".repeat(65);
+        let long_context_id = "c".repeat(257);
+        let long_label = "标".repeat(81);
+        let long_actor = "u".repeat(257);
+        for (
+            label,
+            protocol,
+            candidate_account,
+            candidate_namespace,
+            kind,
+            id,
+            entry_label,
+            candidate_actor,
+            created_at,
+        ) in [
+            (
+                "protocol",
+                "unknown",
+                account_id.as_str(),
+                namespace,
+                "group",
+                "invalid-protocol",
+                "",
+                actor,
+                0,
+            ),
+            (
+                "empty account_id",
+                "onebot11",
+                "",
+                namespace,
+                "group",
+                "invalid-account-empty",
+                "",
+                actor,
+                0,
+            ),
+            (
+                "trimmed account_id",
+                "onebot11",
+                " account",
+                namespace,
+                "group",
+                "invalid-account-trim",
+                "",
+                actor,
+                0,
+            ),
+            (
+                "long account_id",
+                "onebot11",
+                long_account_id.as_str(),
+                namespace,
+                "group",
+                "invalid-account-long",
+                "",
+                actor,
+                0,
+            ),
+            (
+                "empty namespace",
+                "onebot11",
+                account_id.as_str(),
+                "",
+                "group",
+                "invalid-namespace-empty",
+                "",
+                actor,
+                0,
+            ),
+            (
+                "long namespace",
+                "onebot11",
+                account_id.as_str(),
+                long_namespace.as_str(),
+                "group",
+                "invalid-namespace-long",
+                "",
+                actor,
+                0,
+            ),
+            (
+                "context kind",
+                "onebot11",
+                account_id.as_str(),
+                namespace,
+                "private",
+                "invalid-kind",
+                "",
+                actor,
+                0,
+            ),
+            (
+                "empty context_id",
+                "onebot11",
+                account_id.as_str(),
+                namespace,
+                "group",
+                "",
+                "",
+                actor,
+                0,
+            ),
+            (
+                "long context_id",
+                "onebot11",
+                account_id.as_str(),
+                namespace,
+                "group",
+                long_context_id.as_str(),
+                "",
+                actor,
+                0,
+            ),
+            (
+                "long label",
+                "onebot11",
+                account_id.as_str(),
+                namespace,
+                "group",
+                "invalid-label",
+                long_label.as_str(),
+                actor,
+                0,
+            ),
+            (
+                "empty actor",
+                "onebot11",
+                account_id.as_str(),
+                namespace,
+                "group",
+                "invalid-actor-empty",
+                "",
+                "",
+                0,
+            ),
+            (
+                "long actor",
+                "onebot11",
+                account_id.as_str(),
+                namespace,
+                "group",
+                "invalid-actor-long",
+                "",
+                long_actor.as_str(),
+                0,
+            ),
+            (
+                "created_at",
+                "onebot11",
+                account_id.as_str(),
+                namespace,
+                "group",
+                "invalid-created-at",
+                "",
+                actor,
+                -1,
+            ),
+        ] {
+            if insert(
+                protocol,
+                candidate_account,
+                candidate_namespace,
+                kind,
+                id,
+                entry_label,
+                candidate_actor,
+                created_at,
+            )
+            .is_ok()
+            {
+                return Err(format!("授权上下文 {label} 约束探针被绕过"));
+            }
+        }
+        Ok(())
+    })();
+    let rollback_result = connection
+        .execute_batch(
+            "ROLLBACK TO qimen_authorized_context_guard_probe; RELEASE qimen_authorized_context_guard_probe;",
+        )
+        .map_err(|error| format!("回滚授权上下文约束探针失败：{error}"));
+    match (probe_result, rollback_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(probe_error), Err(rollback_error)) => Err(format!("{probe_error}；{rollback_error}")),
+    }
+}
+
+fn probe_v4_details_guard(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch("SAVEPOINT qimen_v4_details_probe;")
+        .map_err(|error| format!("开始 v4 操作日志详情探针失败：{error}"))?;
+    let probe_result = (|| -> Result<(), String> {
+        connection
+            .execute(
+                r#"
+                INSERT INTO operation_log(
+                    protocol, account_id, namespace, subject_kind, subject_id,
+                    command, outcome, source_message_id, details_json, created_at
+                ) VALUES('onebot11', 'v4-probe', 'v4-probe', 'user', 'v4-probe',
+                         'v4-probe', 'ok', '',
+                         '{"target_kind":"group","target_id":"group-1"}', 0)
+                "#,
+                [],
+            )
+            .map_err(|error| format!("v4 操作日志详情探针无法插入合法行：{error}"))?;
+        for details_expression in [
+            r#"'\"secret\"'"#,
+            "'null'",
+            "'123'",
+            r#"'{"target_kind":"private","target_id":"group-1"}'"#,
+            r#"'{"target_kind":"group","target_id":123}'"#,
+            "json_object('target_kind', 'group', 'target_id', printf('%0257d', 0))",
+            "json_object('target_kind', 'group', 'target_id', char(10))",
+        ] {
+            let sql = format!(
+                r#"
+                INSERT INTO operation_log(
+                    protocol, account_id, namespace, subject_kind, subject_id,
+                    command, outcome, source_message_id, details_json, created_at
+                ) VALUES('onebot11', 'v4-probe', 'v4-probe', 'user', 'v4-probe-invalid',
+                         'v4-probe', 'ok', '', {details_expression}, 0)
+                "#
+            );
+            if connection.execute(&sql, []).is_ok() {
+                return Err("v4 操作日志目标详情保护探针被绕过".to_string());
+            }
+        }
+        Ok(())
+    })();
+    let rollback_result = connection
+        .execute_batch("ROLLBACK TO qimen_v4_details_probe; RELEASE qimen_v4_details_probe;")
+        .map_err(|error| format!("回滚 v4 操作日志详情探针失败：{error}"));
     match (probe_result, rollback_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -1469,8 +2259,79 @@ fn validate_operation_input(operation: &OperationLogInput<'_>) -> Result<(), Str
                     return Err("操作日志 duration_ms 不能超过 600000".to_string());
                 }
             }
+            "target_kind" => {
+                let target_kind = value
+                    .as_str()
+                    .ok_or_else(|| "操作日志 target_kind 必须是字符串".to_string())?;
+                if !matches!(target_kind, "group" | "channel") {
+                    return Err("操作日志 target_kind 只能是 group 或 channel".to_string());
+                }
+            }
+            "target_id" => {
+                let target_id = value
+                    .as_str()
+                    .ok_or_else(|| "操作日志 target_id 必须是字符串".to_string())?;
+                if !valid_audit_value(target_id, 256) {
+                    return Err(
+                        "操作日志 target_id 必须是 1 到 256 个无控制字符的字符串".to_string()
+                    );
+                }
+            }
             _ => return Err(format!("操作日志 details 字段不允许：{key}")),
         }
+    }
+    Ok(())
+}
+
+fn validate_context_fields(
+    context_kind: &str,
+    context_id: &str,
+    label: &str,
+    granted_by_subject_id: &str,
+) -> Result<(), String> {
+    if !matches!(context_kind, "group" | "channel") {
+        return Err("授权上下文类型只能是 group 或 channel".to_string());
+    }
+    if !valid_audit_value(context_id, 256) {
+        return Err("授权上下文 ID 必须是 1 到 256 个无控制字符的字符串".to_string());
+    }
+    if label.chars().count() > 80 || label.chars().any(char::is_control) {
+        return Err("授权上下文标签必须是不超过 80 个字符且无控制字符的字符串".to_string());
+    }
+    if !valid_audit_value(granted_by_subject_id, 256) {
+        return Err("授权操作者 ID 必须是 1 到 256 个无控制字符的字符串".to_string());
+    }
+    Ok(())
+}
+
+fn validate_context_operation(
+    operation: &OperationLogInput<'_>,
+    context_kind: &str,
+    context_id: &str,
+) -> Result<(), String> {
+    validate_operation_input(operation)?;
+    let details: serde_json::Value = serde_json::from_str(operation.details_json)
+        .map_err(|error| format!("操作日志 details_json 不是有效 JSON：{error}"))?;
+    let object = details
+        .as_object()
+        .ok_or_else(|| "操作日志 details_json 必须是对象".to_string())?;
+    if object
+        .get("target_kind")
+        .and_then(serde_json::Value::as_str)
+        != Some(context_kind)
+        || object.get("target_id").and_then(serde_json::Value::as_str) != Some(context_id)
+    {
+        return Err("授权操作日志的 target_kind/target_id 与目标上下文不一致".to_string());
+    }
+    Ok(())
+}
+
+fn validate_context_page(after_id: Option<i64>, limit: usize) -> Result<(), String> {
+    if !(1..=100).contains(&limit) {
+        return Err("授权上下文分页数量必须在 1 到 100 之间".to_string());
+    }
+    if after_id.is_some_and(|after_id| after_id < 0) {
+        return Err("授权上下文分页游标不能为负数".to_string());
     }
     Ok(())
 }
@@ -1791,12 +2652,12 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT COUNT(*) FROM schema_migration WHERE version IN (2, 3)",
+                    "SELECT COUNT(*) FROM schema_migration WHERE version IN (2, 3, 4)",
                     [],
                     |row| row.get::<_, i64>(0)
                 )
                 .expect("应读取迁移记录"),
-            2
+            3
         );
 
         let broken_directory = tempdir().expect("应创建损坏测试目录");
@@ -1841,12 +2702,12 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT COUNT(*) FROM schema_migration WHERE version IN (2, 3)",
+                    "SELECT COUNT(*) FROM schema_migration WHERE version IN (2, 3, 4)",
                     [],
                     |row| row.get::<_, i64>(0)
                 )
                 .expect("应读取迁移记录"),
-            2
+            3
         );
     }
 
@@ -2311,5 +3172,301 @@ mod tests {
         let error = Store::initialize(directory.path(), &DatabaseConfig::default())
             .expect_err("弱化触发器必须被行为探针拒绝");
         assert!(error.contains("探针") || error.contains("UPDATE"));
+    }
+
+    #[test]
+    fn authorized_context_crud_is_idempotent_paged_and_isolated() {
+        let (_directory, store) = test_store();
+        let grant_group = OperationLogInput {
+            command: "授权上下文",
+            outcome: "ok",
+            source_message_id: "message-1",
+            details_json: r#"{"target_kind":"group","target_id":"group-1"}"#,
+        };
+        let granted = store
+            .grant_authorized_context(&identity(), "group", "group-1", "测试群", &grant_group)
+            .expect("群授权应成功");
+        let id = match granted {
+            AuthorizedContextChange::Granted { id } => id,
+            other => panic!("首次授权结果错误：{other:?}"),
+        };
+        assert_eq!(
+            store
+                .grant_authorized_context(&identity(), "group", "group-1", "新标签", &grant_group)
+                .expect("重复授权应幂等"),
+            AuthorizedContextChange::AlreadyGranted { id }
+        );
+        assert!(
+            store
+                .is_authorized(&identity(), "group", "group-1")
+                .expect("应查询授权")
+        );
+
+        let grant_channel = OperationLogInput {
+            command: "授权上下文",
+            outcome: "ok",
+            source_message_id: "message-2",
+            details_json: r#"{"target_kind":"channel","target_id":"channel-1"}"#,
+        };
+        store
+            .grant_authorized_context(
+                &identity(),
+                "channel",
+                "channel-1",
+                "测试频道",
+                &grant_channel,
+            )
+            .expect("频道授权应成功");
+        let first_page = store
+            .list_authorized_contexts(&identity(), None, 1)
+            .expect("第一页应读取");
+        assert_eq!(first_page.entries.len(), 1);
+        assert_eq!(first_page.entries[0].label, "测试群");
+        assert_eq!(
+            first_page.entries[0].granted_by_subject_id,
+            identity().subject_id
+        );
+        assert!(first_page.next_after_id.is_some());
+        let second_page = store
+            .list_authorized_contexts(&identity(), first_page.next_after_id, 1)
+            .expect("第二页应读取");
+        assert_eq!(second_page.entries.len(), 1);
+        assert_eq!(second_page.entries[0].context_kind, "channel");
+        assert_eq!(second_page.next_after_id, None);
+
+        let other_account = IdentityKey {
+            account_id: "10002",
+            ..identity()
+        };
+        let other_namespace = IdentityKey {
+            namespace: "other",
+            ..identity()
+        };
+        assert!(
+            !store
+                .is_authorized(&other_account, "group", "group-1")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .is_authorized(&other_namespace, "group", "group-1")
+                .unwrap()
+        );
+        assert!(
+            store
+                .list_authorized_contexts(&other_account, None, 100)
+                .expect("另一账号查询应成功")
+                .entries
+                .is_empty()
+        );
+
+        let revoke = OperationLogInput {
+            command: "撤销授权上下文",
+            outcome: "ok",
+            source_message_id: "message-3",
+            details_json: r#"{"target_kind":"group","target_id":"group-1"}"#,
+        };
+        assert_eq!(
+            store
+                .revoke_authorized_context(&identity(), "group", "group-1", &revoke)
+                .expect("撤销应成功"),
+            AuthorizedContextChange::Revoked { id }
+        );
+        assert_eq!(
+            store
+                .revoke_authorized_context(&identity(), "group", "group-1", &revoke)
+                .expect("重复撤销应幂等"),
+            AuthorizedContextChange::AlreadyRevoked
+        );
+        assert!(
+            !store
+                .is_authorized(&identity(), "group", "group-1")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn authorized_context_validates_fields_and_operation_targets() {
+        let (_directory, store) = test_store();
+        let valid = OperationLogInput {
+            command: "授权上下文",
+            outcome: "ok",
+            source_message_id: "message",
+            details_json: r#"{"target_kind":"group","target_id":"group-1"}"#,
+        };
+        for (kind, context_id, label) in [
+            ("private", "group-1", "标签"),
+            ("group", "", "标签"),
+            ("group", "bad\nid", "标签"),
+            ("group", "group-1", "bad\nlabel"),
+        ] {
+            assert!(
+                store
+                    .grant_authorized_context(&identity(), kind, context_id, label, &valid)
+                    .is_err()
+            );
+        }
+        assert!(
+            store
+                .grant_authorized_context(&identity(), "group", &"g".repeat(257), "标签", &valid,)
+                .is_err()
+        );
+        assert!(
+            store
+                .grant_authorized_context(
+                    &identity(),
+                    "group",
+                    "group-1",
+                    &"标".repeat(81),
+                    &valid,
+                )
+                .is_err()
+        );
+        let mismatched = OperationLogInput {
+            details_json: r#"{"target_kind":"channel","target_id":"group-1"}"#,
+            ..valid
+        };
+        assert!(
+            store
+                .grant_authorized_context(&identity(), "group", "group-1", "标签", &mismatched,)
+                .is_err()
+        );
+        for details_json in [
+            r#"{"target_kind":1,"target_id":"group-1"}"#,
+            r#"{"target_kind":"group","target_id":1}"#,
+            r#"{"target_kind":"group","target_id":"bad\nvalue"}"#,
+        ] {
+            assert!(
+                store
+                    .append_operation(&identity(), "授权上下文", "ok", "message", details_json)
+                    .is_err()
+            );
+        }
+        assert!(
+            store
+                .list_authorized_contexts(&identity(), None, 0)
+                .is_err()
+        );
+        assert!(
+            store
+                .list_authorized_contexts(&identity(), None, 101)
+                .is_err()
+        );
+        assert!(
+            store
+                .list_authorized_contexts(&identity(), Some(-1), 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn authorized_context_and_operation_log_are_atomic() {
+        let (_directory, store) = test_store();
+        let connection = store.open().expect("应打开数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER operation_log_test_abort
+                BEFORE INSERT ON operation_log
+                WHEN NEW.command IN ('授权上下文', '撤销授权上下文')
+                BEGIN SELECT RAISE(ABORT, 'test operation failure'); END;
+                "#,
+            )
+            .expect("应安装测试失败触发器");
+        drop(connection);
+        let grant = OperationLogInput {
+            command: "授权上下文",
+            outcome: "ok",
+            source_message_id: "message-1",
+            details_json: r#"{"target_kind":"group","target_id":"group-atomic"}"#,
+        };
+        assert!(
+            store
+                .grant_authorized_context(&identity(), "group", "group-atomic", "原子测试", &grant,)
+                .is_err()
+        );
+        assert!(
+            !store
+                .is_authorized(&identity(), "group", "group-atomic")
+                .unwrap()
+        );
+
+        let connection = store.open().expect("应重开数据库");
+        connection
+            .execute("DROP TRIGGER operation_log_test_abort", [])
+            .expect("应移除测试失败触发器");
+        drop(connection);
+        store
+            .grant_authorized_context(&identity(), "group", "group-atomic", "原子测试", &grant)
+            .expect("移除失败触发器后应授权");
+        let connection = store.open().expect("应重开数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER operation_log_test_abort
+                BEFORE INSERT ON operation_log
+                WHEN NEW.command = '撤销授权上下文'
+                BEGIN SELECT RAISE(ABORT, 'test operation failure'); END;
+                "#,
+            )
+            .expect("应再次安装测试失败触发器");
+        drop(connection);
+        let revoke = OperationLogInput {
+            command: "撤销授权上下文",
+            outcome: "ok",
+            source_message_id: "message-2",
+            details_json: r#"{"target_kind":"group","target_id":"group-atomic"}"#,
+        };
+        assert!(
+            store
+                .revoke_authorized_context(&identity(), "group", "group-atomic", &revoke)
+                .is_err()
+        );
+        assert!(
+            store
+                .is_authorized(&identity(), "group", "group-atomic")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn recorded_v4_with_bad_schema_or_safe_details_fails_closed() {
+        let directory = tempdir().expect("应创建测试目录");
+        let store =
+            Store::initialize(directory.path(), &DatabaseConfig::default()).expect("迁移应成功");
+        let connection = store.open().expect("应打开数据库");
+        connection
+            .execute("DROP INDEX authorized_context_bot_page", [])
+            .expect("应破坏 v4 分页索引");
+        drop(connection);
+        assert!(
+            Store::initialize(directory.path(), &DatabaseConfig::default())
+                .expect_err("v4 坏 schema 必须拒绝")
+                .contains("v4")
+        );
+
+        let trigger_directory = tempdir().expect("应创建第二测试目录");
+        let trigger_store = Store::initialize(trigger_directory.path(), &DatabaseConfig::default())
+            .expect("迁移应成功");
+        let connection = trigger_store.open().expect("应打开数据库");
+        connection
+            .execute_batch(
+                r#"
+                DROP TRIGGER operation_log_safe_details;
+                CREATE TRIGGER operation_log_safe_details
+                BEFORE INSERT ON operation_log
+                WHEN EXISTS(
+                    SELECT 1 FROM json_each(NEW.details_json)
+                     WHERE key NOT IN (
+                         'context', 'has_args', 'reason', 'duration_ms',
+                         'target_kind', 'target_id'
+                     )
+                )
+                BEGIN SELECT RAISE(ABORT, 'operation log details field is not allowed'); END;
+                "#,
+            )
+            .expect("应弱化 target 类型约束");
+        drop(connection);
+        assert!(Store::initialize(trigger_directory.path(), &DatabaseConfig::default()).is_err());
     }
 }

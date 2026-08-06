@@ -9,6 +9,7 @@ use url::{Host, Url};
 pub struct PluginConfig {
     pub database: DatabaseConfig,
     pub identity: IdentityConfig,
+    pub authorization: AuthorizationConfig,
     pub illustrations: IllustrationConfig,
     pub messages: MessageConfig,
 }
@@ -43,6 +44,28 @@ impl Default for IdentityConfig {
             namespace: "default".to_string(),
             qq_official_account_id: String::new(),
             max_character_name_chars: 6,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorizationMode {
+    #[default]
+    AllowAll,
+    Allowlist,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthorizationConfig {
+    pub mode: AuthorizationMode,
+}
+
+impl Default for AuthorizationConfig {
+    fn default() -> Self {
+        Self {
+            mode: AuthorizationMode::AllowAll,
         }
     }
 }
@@ -213,11 +236,10 @@ fn validate_remote_base_url(value: &str) -> Result<(), String> {
         .map_err(|_| "illustrations.remote_base_url 必须是公网 HTTPS 地址".to_string())
 }
 
-/// Validates a URL that may be handed to a platform or a OneBot adapter.
+/// 校验可能交给平台或 OneBot 适配器的 URL。
 ///
-/// This is deliberately a syntactic/public-address check. It does not resolve
-/// DNS and therefore cannot prevent a later DNS rebinding; components that
-/// fetch remote media must apply their own DNS, redirect and timeout policy.
+/// 此处只做语法与公网地址检查，不解析 DNS，因此不能阻止后续 DNS 重绑定；真正拉取远程
+/// 媒体的组件仍须独立限制 DNS、重定向和超时。
 pub(crate) fn validate_public_https_url(value: &str, allow_query: bool) -> Result<(), String> {
     if value.is_empty()
         || value.len() > 2_048
@@ -334,6 +356,19 @@ mod tests {
         assert_eq!(config.illustrations.mode, IllustrationMode::Direct);
         assert_eq!(config.illustrations.direct_asset_root, "douluo-game/assets");
         assert!(config.identity.qq_official_account_id.is_empty());
+        assert_eq!(config.authorization.mode, AuthorizationMode::AllowAll);
+    }
+
+    #[test]
+    fn authorization_mode_is_explicit_and_backward_compatible() {
+        assert_eq!(
+            parse_config(r#"{"authorization":{"mode":"allowlist"}}"#)
+                .expect("allowlist 应有效")
+                .authorization
+                .mode,
+            AuthorizationMode::Allowlist
+        );
+        assert!(parse_config(r#"{"authorization":{"mode":"implicit"}}"#).is_err());
     }
 
     #[test]

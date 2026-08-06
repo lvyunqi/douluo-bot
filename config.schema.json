@@ -61,6 +61,22 @@
         }
       }
     },
+    "authorization": {
+      "title": "授权上下文",
+      "description": "控制群聊和频道是否需要显式授权；私聊始终允许。",
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "mode": {
+          "title": "上下文策略",
+          "description": "allow_all 保持兼容并允许所有群/频道；allowlist 只允许 owner 已授权的上下文。",
+          "type": "string",
+          "enum": ["allow_all", "allowlist"],
+          "default": "allow_all"
+        }
+      }
+    },
     "illustrations": {
       "title": "插图",
       "type": "object",

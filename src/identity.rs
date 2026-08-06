@@ -16,6 +16,41 @@ pub struct ResolvedIdentity {
     pub subject_id: String,
 }
 
+/// 只解析当前命令所属协议，不要求有状态命令所需的稳定机器人账号。
+///
+/// 授权层用它先识别私聊；群聊和频道仍会在查询授权记录前调用 `resolve_identity`，
+/// 因而不会用部署别名或未知账号访问持久化数据。
+pub fn resolve_protocol(request: &CommandRequest) -> Result<Protocol, String> {
+    let raw_event: Value = serde_json::from_str(request.raw_event_json.as_str())
+        .map_err(|_| "原始事件不是有效 JSON，无法确认消息协议".to_string())?;
+    let root = raw_event
+        .as_object()
+        .ok_or_else(|| "原始事件必须是 JSON 对象，无法确认消息协议".to_string())?;
+    let context = root
+        .get("qimen_context")
+        .map(parse_qimen_context)
+        .transpose()?;
+
+    match context.map(|context| context.protocol) {
+        Some(Protocol::OneBot11) if root.contains_key("qqbot_payload") => {
+            Err("qimen_context 协议与 QQ 原始事件不一致".to_string())
+        }
+        Some(Protocol::QqOfficial) if root.contains_key("self_id") => {
+            Err("qimen_context 协议与 OneBot 原始事件不一致".to_string())
+        }
+        Some(protocol) => Ok(protocol),
+        None => match (
+            root.contains_key("self_id"),
+            root.get("qqbot_payload").is_some_and(Value::is_object),
+        ) {
+            (true, false) => Ok(Protocol::OneBot11),
+            (false, true) => Ok(Protocol::QqOfficial),
+            (true, true) => Err("原始事件同时包含 OneBot 与 QQ 官方协议标记".to_string()),
+            (false, false) => Err("原始事件缺少可验证的消息协议标记".to_string()),
+        },
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct QimenContext {
     protocol: Protocol,
@@ -230,6 +265,35 @@ mod tests {
             qq_official_account_id: account_id.to_string(),
             ..IdentityConfig::default()
         }
+    }
+
+    #[test]
+    fn resolves_protocol_without_requiring_a_stable_account() {
+        assert_eq!(
+            resolve_protocol(&request(
+                "user",
+                json!({
+                    "event_type": "C2C_MESSAGE_CREATE",
+                    "qqbot_payload": {},
+                    "qimen_context": {"version": 1, "protocol": "qq-official"}
+                })
+            )),
+            Ok(Protocol::QqOfficial)
+        );
+        assert_eq!(
+            resolve_protocol(&request("user", json!({"qqbot_payload": {}}))),
+            Ok(Protocol::QqOfficial)
+        );
+        assert_eq!(
+            resolve_protocol(&request(
+                "user",
+                json!({
+                    "self_id": 10001,
+                    "qimen_context": {"version": 1, "protocol": "onebot11"}
+                })
+            )),
+            Ok(Protocol::OneBot11)
+        );
     }
 
     #[test]

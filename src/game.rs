@@ -2,12 +2,13 @@ use abi_stable_host_api::CommandRequest;
 
 use crate::assets::IllustrationAssets;
 use crate::catalog;
-use crate::config::{IllustrationMode, PluginConfig};
-use crate::identity::{ResolvedIdentity, resolve_identity};
+use crate::config::{AuthorizationMode, IllustrationMode, PluginConfig};
+use crate::context::resolve_conversation_context;
+use crate::identity::{ResolvedIdentity, resolve_identity, resolve_protocol};
 use crate::message::{GameDocument, Illustration};
 use crate::store::{
-    IdentityKey, LegacyClaimActor, LegacyClaimResult, LegacyIdentityState, OperationLogInput,
-    PlayerStatus, Store,
+    AuthorizedContextChange, IdentityKey, LegacyClaimActor, LegacyClaimResult, LegacyIdentityState,
+    OperationLogInput, PlayerStatus, Store,
 };
 
 const MENU_PAGES: &[MenuPage] = &[
@@ -87,7 +88,7 @@ impl GameService {
     pub fn record_operation(&self, req: &CommandRequest, outcome: &str) -> Result<(), String> {
         let identity = resolve_identity(req, &self.config.identity)?;
         let key = self.identity_key(&identity, &identity.subject_id);
-        let details = operation_details(req);
+        let details = operation_details(req, identity.protocol);
         self.store
             .append_operation(
                 &key,
@@ -97,6 +98,31 @@ impl GameService {
                 &details,
             )
             .map(|_| ())
+    }
+
+    pub fn ensure_context_authorized(&self, req: &CommandRequest) -> Result<(), String> {
+        if self.config.authorization.mode == AuthorizationMode::AllowAll {
+            return Ok(());
+        }
+        let protocol = resolve_protocol(req)?;
+        let context = resolve_conversation_context(req, protocol)?;
+        let Some((context_kind, context_id)) = context.authorization_target() else {
+            return Ok(());
+        };
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        if self.store.is_authorized(&key, context_kind, context_id)? {
+            Ok(())
+        } else {
+            Err(format!(
+                "当前{}尚未授权使用斗罗大陆游戏，请联系机器人所有者",
+                if context_kind == "channel" {
+                    "频道"
+                } else {
+                    "群聊"
+                }
+            ))
+        }
     }
 
     pub fn menu(&self, args: &str) -> Result<GameDocument, String> {
@@ -144,7 +170,7 @@ impl GameService {
         }
         let identity = resolve_identity(req, &self.config.identity)?;
         let key = self.identity_key(&identity, &identity.subject_id);
-        let details = operation_details(req);
+        let details = operation_details(req, identity.protocol);
         let operation = successful_operation(req, &details);
         let player =
             self.store
@@ -166,7 +192,7 @@ impl GameService {
     pub fn awaken(&self, req: &CommandRequest) -> Result<GameDocument, String> {
         let identity = resolve_identity(req, &self.config.identity)?;
         let key = self.identity_key(&identity, &identity.subject_id);
-        let details = operation_details(req);
+        let details = operation_details(req, identity.protocol);
         let operation = successful_operation(req, &details);
         let wuhun = self
             .store
@@ -257,7 +283,7 @@ impl GameService {
             message_id: req.message_id.as_str(),
             reason: "owner-explicit-legacy-claim",
         };
-        let details = operation_details(req);
+        let details = operation_details(req, identity.protocol);
         let operation = successful_operation(req, &details);
         let result =
             self.store
@@ -284,6 +310,109 @@ impl GameService {
             .field("目标用户", target_subject_id)
             .field("结果", status)
             .notice(notice))
+    }
+
+    pub fn grant_context(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let (context_kind, context_id, label) = parse_grant_context_args(req.args.as_str())?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        validate_context_kind_for_protocol(identity.protocol, &context_kind)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = context_operation_details(req, identity.protocol, &context_kind, &context_id);
+        let operation = successful_operation(req, &details);
+        let result = self.store.grant_authorized_context(
+            &key,
+            &context_kind,
+            &context_id,
+            &label,
+            &operation,
+        )?;
+        let (status, duplicate) = match result {
+            AuthorizedContextChange::Granted { .. } => ("授权成功", false),
+            AuthorizedContextChange::AlreadyGranted { .. } => ("已授权", true),
+            AuthorizedContextChange::Revoked { .. } | AuthorizedContextChange::AlreadyRevoked => {
+                return Err("授权上下文返回了不一致的状态".to_string());
+            }
+        };
+        let mut document = GameDocument::new("授权上下文")
+            .field("类型", &context_kind)
+            .field("上下文 ID", &context_id)
+            .field("结果", status);
+        if duplicate {
+            document =
+                document.notice("该上下文已存在，原标签未修改；请使用“查看授权”确认当前标签");
+        } else {
+            document = document
+                .field(
+                    "标签",
+                    if label.is_empty() {
+                        "未设置"
+                    } else {
+                        &label
+                    },
+                )
+                .notice("allowlist 模式下，该上下文现在可以执行游戏命令");
+        }
+        Ok(document)
+    }
+
+    pub fn revoke_context(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let (context_kind, context_id) = parse_revoke_context_args(req.args.as_str())?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        validate_context_kind_for_protocol(identity.protocol, &context_kind)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = context_operation_details(req, identity.protocol, &context_kind, &context_id);
+        let operation = successful_operation(req, &details);
+        let result =
+            self.store
+                .revoke_authorized_context(&key, &context_kind, &context_id, &operation)?;
+        let status = match result {
+            AuthorizedContextChange::Revoked { .. } => "已撤销",
+            AuthorizedContextChange::AlreadyRevoked => "此前未授权",
+            AuthorizedContextChange::Granted { .. }
+            | AuthorizedContextChange::AlreadyGranted { .. } => {
+                return Err("撤销授权上下文返回了不一致的状态".to_string());
+            }
+        };
+        Ok(GameDocument::new("取消授权")
+            .field("类型", &context_kind)
+            .field("上下文 ID", &context_id)
+            .field("结果", status)
+            .notice("撤销不会删除操作日志；allowlist 模式会立即拒绝该上下文的游戏命令"))
+    }
+
+    pub fn list_contexts(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let after_id = parse_context_cursor(req.args.as_str())?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let page = self.store.list_authorized_contexts(&key, after_id, 10)?;
+        let mut document = GameDocument::new("授权上下文列表")
+            .field(
+                "策略",
+                match self.config.authorization.mode {
+                    AuthorizationMode::AllowAll => "allow_all",
+                    AuthorizationMode::Allowlist => "allowlist",
+                },
+            )
+            .field("数量", page.entries.len().to_string());
+        if page.entries.is_empty() {
+            document = document.line("当前账号尚未登记授权上下文。")
+        } else {
+            for entry in page.entries {
+                let label = if entry.label.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", entry.label)
+                };
+                document = document.line(format!(
+                    "#{} · {} · {}{}",
+                    entry.id, entry.context_kind, entry.context_id, label
+                ));
+            }
+        }
+        if let Some(cursor) = page.next_after_id {
+            document = document.command(format!("查看授权 {cursor}"));
+        }
+        Ok(document.notice("列表按当前协议、Bot account_id 和 namespace 隔离"))
     }
 
     fn identity_key<'a>(
@@ -360,14 +489,31 @@ impl GameService {
     }
 }
 
-fn operation_details(req: &CommandRequest) -> String {
+fn operation_details(req: &CommandRequest, protocol: crate::message::Protocol) -> String {
+    let context = resolve_conversation_context(req, protocol)
+        .map(|context| context.audit_kind())
+        .unwrap_or("system");
     serde_json::json!({
-        "context": if req.group_id.as_str().is_empty() {
-            "private"
-        } else {
-            "group"
-        },
+        "context": context,
         "has_args": !req.args.as_str().trim().is_empty(),
+    })
+    .to_string()
+}
+
+fn context_operation_details(
+    req: &CommandRequest,
+    protocol: crate::message::Protocol,
+    context_kind: &str,
+    context_id: &str,
+) -> String {
+    let context = resolve_conversation_context(req, protocol)
+        .map(|context| context.audit_kind())
+        .unwrap_or("system");
+    serde_json::json!({
+        "context": context,
+        "has_args": !req.args.as_str().trim().is_empty(),
+        "target_kind": context_kind,
+        "target_id": context_id,
     })
     .to_string()
 }
@@ -398,6 +544,67 @@ fn parse_registration_args(args: &str, legacy_hyphen: bool) -> Result<(&str, &st
         return Ok((name.trim(), gender.trim()));
     }
     Err("用法：开始穿越 <角色名> <男|女>；也兼容旧格式“角色名-性别”".to_string())
+}
+
+fn parse_grant_context_args(args: &str) -> Result<(String, String, String), String> {
+    let parts = args.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        [context_id] => Ok((
+            "group".to_string(),
+            (*context_id).to_string(),
+            String::new(),
+        )),
+        [context_kind, context_id, rest @ ..] if !rest.is_empty() => Ok((
+            (*context_kind).to_string(),
+            (*context_id).to_string(),
+            rest.join(" "),
+        )),
+        [context_kind, context_id] => Ok((
+            (*context_kind).to_string(),
+            (*context_id).to_string(),
+            String::new(),
+        )),
+        _ => {
+            Err("用法：授权上下文 <group|channel> <上下文ID> [标签]；旧格式可只填群号".to_string())
+        }
+    }
+}
+
+fn parse_revoke_context_args(args: &str) -> Result<(String, String), String> {
+    let parts = args.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        [context_kind, context_id, "确认"] => {
+            Ok(((*context_kind).to_string(), (*context_id).to_string()))
+        }
+        _ => Err("用法：取消授权 <group|channel> <上下文ID> 确认".to_string()),
+    }
+}
+
+fn parse_context_cursor(args: &str) -> Result<Option<i64>, String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Ok(None);
+    }
+    let cursor = args
+        .parse::<i64>()
+        .map_err(|_| "用法：查看授权 [下一页游标]".to_string())?;
+    if cursor < 0 {
+        return Err("授权列表游标不能为负数".to_string());
+    }
+    Ok(Some(cursor))
+}
+
+fn validate_context_kind_for_protocol(
+    protocol: crate::message::Protocol,
+    context_kind: &str,
+) -> Result<(), String> {
+    match (protocol, context_kind) {
+        (_, "group") | (crate::message::Protocol::QqOfficial, "channel") => Ok(()),
+        (crate::message::Protocol::OneBot11, "channel") => {
+            Err("OneBot 11 当前只支持授权 group 上下文".to_string())
+        }
+        _ => Err("上下文类型只能是 group 或 channel".to_string()),
+    }
 }
 
 fn parse_legacy_inspect_args(args: &str) -> Result<&str, String> {
@@ -484,6 +691,74 @@ mod tests {
         ] {
             assert!(parse_legacy_claim_args(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn authorized_context_arguments_keep_legacy_group_shape_but_require_revoke_confirmation() {
+        assert_eq!(
+            parse_grant_context_args("746339543"),
+            Ok(("group".to_string(), "746339543".to_string(), String::new()))
+        );
+        assert_eq!(
+            parse_grant_context_args("channel channel-1 史莱克学院"),
+            Ok((
+                "channel".to_string(),
+                "channel-1".to_string(),
+                "史莱克学院".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_revoke_context_args("group 746339543 确认"),
+            Ok(("group".to_string(), "746339543".to_string()))
+        );
+        assert!(parse_revoke_context_args("group 746339543").is_err());
+        assert_eq!(parse_context_cursor(""), Ok(None));
+        assert_eq!(parse_context_cursor("12"), Ok(Some(12)));
+        assert!(parse_context_cursor("-1").is_err());
+    }
+
+    #[test]
+    fn allowlist_gates_game_commands_per_bot_context_but_not_private_chat() {
+        let directory = tempfile::tempdir().expect("临时目录应创建");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("数据库应初始化");
+        let mut config = PluginConfig::default();
+        config.authorization.mode = AuthorizationMode::Allowlist;
+        let service = GameService::with_assets(store, config, IllustrationAssets::default());
+        let request = |command: &str, args: &str, group_id: &str, sender_id: &str| CommandRequest {
+            args: abi_stable::std_types::RString::from(args),
+            command_name: abi_stable::std_types::RString::from(command),
+            sender_id: abi_stable::std_types::RString::from(sender_id),
+            group_id: abi_stable::std_types::RString::from(group_id),
+            raw_event_json: abi_stable::std_types::RString::from(
+                r#"{"self_id":10001,"qimen_context":{"version":1,"protocol":"onebot11","account_id":"10001"}}"#,
+            ),
+            sender_nickname: abi_stable::std_types::RString::new(),
+            message_id: abi_stable::std_types::RString::from("message-auth"),
+            timestamp: 0,
+        };
+        let group_request = request("状态", "", "group-1", "player-user");
+        assert!(service.ensure_context_authorized(&group_request).is_err());
+        assert!(
+            service
+                .ensure_context_authorized(&request("状态", "", "", "player-user"))
+                .is_ok()
+        );
+
+        let grant = request("授权上下文", "group group-1 测试群", "", "owner-user");
+        assert!(service.grant_context(&grant).is_ok());
+        assert!(service.ensure_context_authorized(&group_request).is_ok());
+        let listed = crate::message::render_text(
+            &service
+                .list_contexts(&request("查看授权", "", "", "owner-user"))
+                .expect("应列出授权上下文"),
+        );
+        assert!(listed.contains("group-1"));
+        assert!(listed.contains("测试群"));
+
+        let revoke = request("取消授权", "group group-1 确认", "", "owner-user");
+        assert!(service.revoke_context(&revoke).is_ok());
+        assert!(service.ensure_context_authorized(&group_request).is_err());
     }
 
     #[test]
