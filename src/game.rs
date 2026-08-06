@@ -5,11 +5,14 @@ use crate::assets::IllustrationAssets;
 use crate::catalog;
 use crate::config::{AuthorizationMode, IllustrationMode, PluginConfig};
 use crate::context::resolve_conversation_context;
-use crate::identity::{ResolvedIdentity, resolve_identity, resolve_protocol};
+use crate::identity::{
+    ResolvedIdentity, parse_target_subject_id, resolve_identity, resolve_protocol,
+    resolve_target_mention,
+};
 use crate::message::{GameDocument, Illustration};
 use crate::store::{
-    AuthorizedContextChange, DailyCheckinInput, DailyCheckinResult, IdentityKey, LegacyClaimActor,
-    LegacyClaimResult, LegacyIdentityState, MapExit, MapRecord, MapTravelReceipt,
+    AuthorizedContextChange, DailyCheckinInput, DailyCheckinResult, GOLD_SOUL_COIN, IdentityKey,
+    LegacyClaimActor, LegacyClaimResult, LegacyIdentityState, MapExit, MapRecord, MapTravelReceipt,
     OperationLogInput, PlayerStatus, Store, experience_progress,
 };
 
@@ -98,14 +101,25 @@ const MENU_PAGES: &[MenuPage] = &[
                 command: "使用 <物品>",
                 description: "使用背包中的消耗品",
             },
+            MenuEntry {
+                command: "转账 <用户ID> <金额>",
+                description: "向同一 Bot 身份域的玩家转账",
+            },
+            MenuEntry {
+                command: "发送物品 <用户ID> <物品> [数量]",
+                description: "向同一 Bot 身份域的玩家赠送物品",
+            },
         ],
     },
 ];
 
 const MAP_PAGE_SIZE: usize = 5;
 
-const CHECKIN_CURRENCY_CODE: &str = "gold_soul_coin";
+const CHECKIN_CURRENCY_CODE: &str = GOLD_SOUL_COIN;
 const CHECKIN_CURRENCY_NAME: &str = "金魂币";
+const TRANSFER_USAGE: &str = "转账 <用户ID> <金额>；也可使用“转账 @用户 <金额>”";
+const GIFT_USAGE: &str =
+    "发送物品 <用户ID> <物品名> [数量]；也可使用“发送物品 @用户 <物品名> [数量]”";
 const CHECKIN_EXP_REWARDS: [i64; 7] = [60, 70, 80, 90, 100, 110, 150];
 const SECONDS_PER_DAY: i64 = 86_400;
 const BEIJING_04_OFFSET_SECONDS: i64 = 4 * 3_600;
@@ -359,6 +373,94 @@ impl GameService {
             .field(CHECKIN_CURRENCY_NAME, balance.to_string())
             .command("签到")
             .notice("当前展示签到使用的金魂币余额"))
+    }
+
+    pub fn transfer_gold(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let mention = resolve_target_mention(req, identity.protocol)?;
+        let (recipient_subject_id, amount) = parse_transfer_args(
+            req.args.as_str(),
+            mention,
+            self.config.messages.legacy_hyphen_arguments,
+        )?;
+        if recipient_subject_id == identity.subject_id {
+            return Err("不能向自己转账".to_string());
+        }
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self.store.transfer_gold_with_operation(
+            &key,
+            &recipient_subject_id,
+            amount,
+            &operation,
+        )?;
+        let notice = if receipt.replayed {
+            "检测到相同消息的重复请求，已返回原转账回执，未再次扣款"
+        } else {
+            "双方钱包、操作日志与不可变转移账本已在同一事务完成"
+        };
+        Ok(GameDocument::new(if receipt.replayed {
+            "转账回执"
+        } else {
+            "转账成功"
+        })
+        .field("收款用户", receipt.recipient_subject_id)
+        .field(
+            "转账金额",
+            format!("{} {CHECKIN_CURRENCY_NAME}", receipt.amount),
+        )
+        .field("我的余额", receipt.sender_balance_after.to_string())
+        .field("对方余额", receipt.recipient_balance_after.to_string())
+        .field("账本编号", receipt.transfer_id.to_string())
+        .notice(notice)
+        .command("钱包"))
+    }
+
+    pub fn gift_item(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let mention = resolve_target_mention(req, identity.protocol)?;
+        let (recipient_subject_id, item_name, quantity) = parse_gift_args(
+            req.args.as_str(),
+            mention,
+            self.config.messages.legacy_hyphen_arguments,
+        )?;
+        if recipient_subject_id == identity.subject_id {
+            return Err("不能向自己发送物品".to_string());
+        }
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self.store.gift_item_with_operation(
+            &key,
+            &recipient_subject_id,
+            &item_name,
+            quantity,
+            &operation,
+        )?;
+        let notice = if receipt.replayed {
+            "检测到相同消息的重复请求，已返回原赠送回执，未再次扣除物品"
+        } else {
+            "双方背包、操作日志与不可变转移账本已在同一事务完成"
+        };
+        Ok(GameDocument::new(if receipt.replayed {
+            "物品赠送回执"
+        } else {
+            "物品赠送成功"
+        })
+        .field("接收用户", receipt.recipient_subject_id)
+        .field(
+            "赠送物品",
+            format!("{} x{}", receipt.item.name, receipt.quantity),
+        )
+        .field("我的背包数量", receipt.sender_inventory_after.to_string())
+        .field(
+            "对方背包数量",
+            receipt.recipient_inventory_after.to_string(),
+        )
+        .field("账本编号", receipt.transfer_id.to_string())
+        .notice(notice)
+        .command("背包"))
     }
 
     pub fn npcs(&self, req: &CommandRequest) -> Result<GameDocument, String> {
@@ -1269,6 +1371,125 @@ fn parse_item_quantity<'a>(
     Ok((args, 1))
 }
 
+fn parse_transfer_args(
+    args: &str,
+    mention: Option<String>,
+    legacy_hyphen: bool,
+) -> Result<(String, i64), String> {
+    let args = args.trim();
+    if let Some(target) = mention {
+        let mut parts = args.split_whitespace();
+        let amount = parts
+            .next()
+            .ok_or_else(|| format!("用法：{TRANSFER_USAGE}"))?;
+        if parts.next().is_some() {
+            return Err("已使用 @ 目标时不能再填写用户ID；请只填写金额".to_string());
+        }
+        return Ok((target, parse_positive_transfer_amount(amount)?));
+    }
+
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    if let [target, amount] = parts.as_slice() {
+        return Ok((
+            parse_command_target_subject_id(target)?,
+            parse_positive_transfer_amount(amount)?,
+        ));
+    }
+    if legacy_hyphen
+        && let Some((target, amount)) = args.rsplit_once('-')
+        && !target.trim().is_empty()
+        && !amount.trim().is_empty()
+    {
+        return Ok((
+            parse_command_target_subject_id(target.trim())?,
+            parse_positive_transfer_amount(amount.trim())?,
+        ));
+    }
+    Err(format!(
+        "用法：{TRANSFER_USAGE}；旧格式为“转账 <用户ID>-<金额>”"
+    ))
+}
+
+fn parse_gift_args(
+    args: &str,
+    mention: Option<String>,
+    legacy_hyphen: bool,
+) -> Result<(String, String, i64), String> {
+    let args = args.trim();
+    if let Some(target) = mention {
+        if args.is_empty() {
+            return Err(format!("用法：{GIFT_USAGE}"));
+        }
+        if args.split_whitespace().next() == Some(target.as_str()) {
+            return Err("已使用 @ 目标时不能再填写用户ID；请删除重复目标".to_string());
+        }
+        let (item_name, quantity) = parse_item_quantity(args, legacy_hyphen, GIFT_USAGE)?;
+        return Ok((target, item_name.to_string(), quantity));
+    }
+
+    if let Some((target, item_args)) = split_first_argument(args) {
+        let target = parse_command_target_subject_id(target)?;
+        if item_args.is_empty() {
+            return Err(format!("用法：{GIFT_USAGE}"));
+        }
+        let (item_name, quantity) = parse_item_quantity(item_args, legacy_hyphen, GIFT_USAGE)?;
+        return Ok((target, item_name.to_string(), quantity));
+    }
+
+    if legacy_hyphen
+        && let Some((head, quantity_text)) = args.rsplit_once('-')
+        && let Ok(quantity) = quantity_text.trim().parse::<i64>()
+        && let Some((target, item_name)) = head.rsplit_once('-')
+        && !target.trim().is_empty()
+        && !item_name.trim().is_empty()
+    {
+        if !(1..=9999).contains(&quantity) {
+            return Err("数量必须在 1 到 9999 之间".to_string());
+        }
+        return Ok((
+            parse_command_target_subject_id(target.trim())?,
+            parse_required_catalog_name(item_name, GIFT_USAGE)?.to_string(),
+            quantity,
+        ));
+    }
+
+    Err(format!(
+        "用法：{GIFT_USAGE}；旧格式为“发送物品 <用户ID>-<物品名>-<数量>”"
+    ))
+}
+
+fn split_first_argument(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim();
+    let boundary = input
+        .char_indices()
+        .find(|(_, character)| character.is_whitespace())
+        .map(|(index, _)| index)?;
+    let target = &input[..boundary];
+    let rest = input[boundary..].trim();
+    (!target.is_empty()).then_some((target, rest))
+}
+
+fn parse_command_target_subject_id(value: &str) -> Result<String, String> {
+    if value.chars().any(char::is_whitespace) {
+        return Err("目标用户ID不能包含空白字符".to_string());
+    }
+    let value = parse_target_subject_id(value)?;
+    if value == "all" {
+        return Err("不能把 @全体 作为资产接收人".to_string());
+    }
+    Ok(value)
+}
+
+fn parse_positive_transfer_amount(value: &str) -> Result<i64, String> {
+    let amount = value
+        .parse::<i64>()
+        .map_err(|_| "金额必须是正整数".to_string())?;
+    if amount <= 0 {
+        return Err("金额必须是正整数".to_string());
+    }
+    Ok(amount)
+}
+
 fn item_quality_label(quality: i64) -> String {
     format!("品质 {}", quality)
 }
@@ -1871,6 +2092,57 @@ mod tests {
         assert_eq!(
             parse_required_catalog_name(" 村长 ", "对话 <NPC>"),
             Ok("村长")
+        );
+    }
+
+    #[test]
+    fn transfer_and_gift_arguments_preserve_string_ids_and_reject_ambiguity() {
+        assert_eq!(
+            parse_transfer_args("openid-with-dash 12", None, true),
+            Ok(("openid-with-dash".to_string(), 12))
+        );
+        assert_eq!(
+            parse_transfer_args("00123-7", None, true),
+            Ok(("00123".to_string(), 7))
+        );
+        assert_eq!(
+            parse_transfer_args("7", Some("member-openid".to_string()), true),
+            Ok(("member-openid".to_string(), 7))
+        );
+        assert!(parse_transfer_args("member-openid 7", Some("other".to_string()), true).is_err());
+        assert!(parse_transfer_args("member-openid 0", None, true).is_err());
+        assert!(parse_transfer_args("member-openid-7", None, false).is_err());
+
+        assert_eq!(
+            parse_gift_args("member-openid 小回复药 2", None, true),
+            Ok(("member-openid".to_string(), "小回复药".to_string(), 2))
+        );
+        assert_eq!(
+            parse_gift_args("member-openid-小回复药-2", None, true),
+            Ok(("member-openid".to_string(), "小回复药".to_string(), 2))
+        );
+        assert_eq!(
+            parse_gift_args("小回复药 1", Some("member-openid".to_string()), true),
+            Ok(("member-openid".to_string(), "小回复药".to_string(), 1))
+        );
+        assert!(
+            parse_gift_args(
+                "member-openid 小回复药",
+                Some("member-openid".to_string()),
+                true
+            )
+            .is_err()
+        );
+        assert!(parse_gift_args("member-openid-小回复药-0", None, true).is_err());
+    }
+
+    #[test]
+    fn command_target_ids_cannot_be_whitespace_or_all() {
+        assert!(parse_command_target_subject_id("member openid").is_err());
+        assert!(parse_command_target_subject_id("all").is_err());
+        assert_eq!(
+            parse_command_target_subject_id("00-member-id"),
+            Ok("00-member-id".to_string())
         );
     }
 

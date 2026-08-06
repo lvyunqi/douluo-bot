@@ -199,6 +199,17 @@ mod plugin {
     }
 
     #[command(
+        name = "转账",
+        description = "向同一协议、Bot account_id 和 namespace 内的玩家转账：转账 <用户ID> <金额>",
+        aliases = "转钱,汇款",
+        category = "斗罗大陆·经济",
+        scope = "all"
+    )]
+    fn transfer(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.transfer_gold(req))
+    }
+
+    #[command(
         name = "NPC",
         description = "查看当前地图的 NPC",
         aliases = "人物,当前NPC",
@@ -273,6 +284,17 @@ mod plugin {
     )]
     fn use_item(req: &CommandRequest) -> CommandResponse {
         with_service(req, false, true, |service| service.use_item(req))
+    }
+
+    #[command(
+        name = "发送物品",
+        description = "向同一协议、Bot account_id 和 namespace 内的玩家赠送物品：发送物品 <用户ID> <物品> [数量]",
+        aliases = "赠送,赠送物品",
+        category = "斗罗大陆·经济",
+        scope = "all"
+    )]
+    fn gift_item(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.gift_item(req))
     }
 
     #[command(

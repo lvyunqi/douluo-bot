@@ -51,6 +51,13 @@ function Receive-WebSocketText {
             $stream.Write($buffer, 0, $result.Count)
         } while (-not $result.EndOfMessage)
         return [System.Text.Encoding]::UTF8.GetString($stream.ToArray())
+    } catch {
+        $exception = $_.Exception
+        if ($exception -is [System.OperationCanceledException] -or
+            $exception.InnerException -is [System.OperationCanceledException]) {
+            return $null
+        }
+        throw
     } finally {
         $cts.Dispose()
         $stream.Dispose()
@@ -86,6 +93,8 @@ function Invoke-OneBotCommand {
         [string]$UserId = "20001",
         [string]$SelfId = "10001",
         [string]$GroupId = "",
+        [long]$MessageId = 0,
+        [switch]$AllowNoAction,
         [hashtable]$ExtraEvent = @{}
     )
     $socket = [System.Net.WebSockets.ClientWebSocket]::new()
@@ -101,7 +110,11 @@ function Invoke-OneBotCommand {
         }
         Send-WebSocketText $socket ($lifecycle | ConvertTo-Json -Compress -Depth 12)
 
-        $messageId = [int64](Get-Random -Minimum 100000 -Maximum 999999999)
+        $messageId = if ($MessageId -gt 0) {
+            $MessageId
+        } else {
+            [int64](Get-Random -Minimum 100000 -Maximum 999999999)
+        }
         $event = [ordered]@{
             time = $now
             self_id = [int64]$SelfId
@@ -169,6 +182,15 @@ function Invoke-OneBotCommand {
             # 一次命令的首个 Action 即可证明回调完成；避免等待第二个 Action。
             if ($actions.Count -ge 1) {
                 break
+            }
+        }
+        if ($actions.Count -eq 0 -and $AllowNoAction) {
+            return [pscustomobject]@{
+                Command = $Message
+                Action = $null
+                ActionName = "none"
+                Text = ""
+                ActionJson = ""
             }
         }
         Assert-Condition ($actions.Count -gt 0) "command '$Message' produced no OneBot Action"
@@ -362,7 +384,7 @@ $oldConfigPath = $env:QIMEN_CONFIG_PATH
 $env:QIMEN_CONFIG_PATH = "config/base.toml"
 $process = $null
 try {
-    $process = Start-Process -FilePath $HostBinary -WorkingDirectory $root -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog -PassThru
+    $process = Start-Process -FilePath $HostBinary -WorkingDirectory $root -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog -WindowStyle Hidden -PassThru
 } finally {
     if ($null -eq $oldConfigPath) { Remove-Item Env:QIMEN_CONFIG_PATH -ErrorAction SilentlyContinue }
     else { $env:QIMEN_CONFIG_PATH = $oldConfigPath }
@@ -380,7 +402,8 @@ try {
     $commands = @($plugin.commands | ForEach-Object { [string]$_ })
     foreach ($command in @(
         "斗罗系统", "开始穿越", "武魂觉醒", "签到", "钱包", "状态", "位置",
-        "地图列表", "向", "传送", "NPC", "对话", "商店", "背包", "购买", "出售", "使用"
+        "地图列表", "向", "传送", "NPC", "对话", "商店", "背包", "购买", "出售", "使用",
+        "转账", "发送物品"
     )) {
         $found = $commands | Where-Object { $_ -eq $command }
         Assert-Condition ($null -ne $found) "descriptor is missing command '$command' (commands=$($commands -join ', '))"
@@ -410,6 +433,34 @@ try {
         Write-Output ("onebot {0}: {1} [{2}]" -f $result.Command, $result.ActionName, $result.Text)
         Assert-Condition ($result.Text.Contains($check.Contains)) "response for '$($check.Message)' did not contain '$($check.Contains)': $($result.ActionJson)"
     }
+
+    $secondStart = Invoke-OneBotCommand $endpoint "开始穿越 协议接收方 女" -UserId "20002"
+    Write-Output ("onebot second player start: {0} [{1}]" -f $secondStart.ActionName, $secondStart.Text)
+    Assert-Condition ($secondStart.Text.Contains("穿越成功")) "second player did not register"
+    $secondAwaken = Invoke-OneBotCommand $endpoint "武魂觉醒" -UserId "20002"
+    Write-Output ("onebot second player awaken: {0} [{1}]" -f $secondAwaken.ActionName, $secondAwaken.Text)
+    Assert-Condition ($secondAwaken.Text.Contains("觉醒仪式完成")) "second player did not awaken"
+
+    $transfer = Invoke-OneBotCommand $endpoint "转账 20002 25" -MessageId 800001
+    Write-Output ("onebot transfer: {0} [{1}]" -f $transfer.ActionName, $transfer.Text)
+    Assert-Condition ($transfer.Text.Contains("转账成功")) "wallet transfer did not succeed"
+    $transferReplay = Invoke-OneBotCommand $endpoint "转账 20002 25" -MessageId 800001 -AllowNoAction
+    Write-Output ("onebot transfer replay: {0} [{1}]" -f $transferReplay.ActionName, $transferReplay.Text)
+    Assert-Condition ($transferReplay.ActionName -eq "none" -or $transferReplay.Text.Contains("重复请求")) "wallet transfer duplicate was neither suppressed by QimenBot nor reported by the plugin"
+    $recipientWallet = Invoke-OneBotCommand $endpoint "钱包" -UserId "20002"
+    Write-Output ("onebot recipient wallet: {0} [{1}]" -f $recipientWallet.ActionName, $recipientWallet.Text)
+    Assert-Condition ($recipientWallet.Text.Contains("25")) "recipient wallet did not show transferred balance"
+
+    $gift = Invoke-OneBotCommand $endpoint "发送物品 20002 小回复药 1" -MessageId 800002
+    Write-Output ("onebot item gift: {0} [{1}]" -f $gift.ActionName, $gift.Text)
+    Assert-Condition ($gift.Text.Contains("物品赠送成功")) "item gift did not succeed"
+    $giftReplay = Invoke-OneBotCommand $endpoint "发送物品 20002 小回复药 1" -MessageId 800002 -AllowNoAction
+    Write-Output ("onebot item gift replay: {0} [{1}]" -f $giftReplay.ActionName, $giftReplay.Text)
+    Assert-Condition ($giftReplay.ActionName -eq "none" -or $giftReplay.Text.Contains("重复请求")) "item gift duplicate was neither suppressed by QimenBot nor reported by the plugin"
+    $recipientInventory = Invoke-OneBotCommand $endpoint "背包" -UserId "20002"
+    Write-Output ("onebot recipient inventory: {0} [{1}]" -f $recipientInventory.ActionName, $recipientInventory.Text)
+    Assert-Condition ($recipientInventory.Text.Contains("小回复药 x1")) "recipient inventory did not show gifted item"
+
     $group = Invoke-OneBotCommand $endpoint "位置" -GroupId "40001"
     Write-Output ("onebot group 位置: {0} [{1}]" -f $group.ActionName, $group.Text)
     Assert-Condition ($group.Text.Contains("圣魂村")) "group command did not respond"
@@ -430,7 +481,7 @@ try {
     Assert-Condition ($null -ne $reload.data.message) "dynamic reload did not return a result"
     $afterReload = Invoke-OneBotCommand $endpoint "钱包"
     Assert-Condition ($afterReload.Text.Contains("金魂币")) "command failed after dynamic reload"
-    Write-Output "protocol smoke passed: OneBot private/group, synthetic QQ payload, descriptor, and reload"
+    Write-Output "protocol smoke passed: OneBot two-player economy, private/group, synthetic QQ payload, descriptor, and reload"
 } finally {
     if ($null -ne $process -and -not $process.HasExited) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue

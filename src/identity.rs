@@ -89,6 +89,160 @@ pub fn resolve_identity(
     })
 }
 
+/// 从协议原始事件中提取一个非 Bot 的目标提及。
+///
+/// `CommandRequest.args` 只包含纯文本，消息段中的 `@` 不会进入参数，因此资产转移
+/// 命令必须在这里按协议读取结构化数据。回复段不包含被回复者身份，不能作为目标。
+pub fn resolve_target_mention(
+    request: &CommandRequest,
+    protocol: Protocol,
+) -> Result<Option<String>, String> {
+    let raw_event: Value = serde_json::from_str(request.raw_event_json.as_str())
+        .map_err(|_| "原始事件不是有效 JSON，无法解析目标用户".to_string())?;
+    let root = raw_event
+        .as_object()
+        .ok_or_else(|| "原始事件必须是 JSON 对象，无法解析目标用户".to_string())?;
+    let targets = match protocol {
+        Protocol::OneBot11 => onebot_target_mentions(root)?,
+        Protocol::QqOfficial => qq_target_mentions(root)?,
+    };
+    match targets.as_slice() {
+        [] => Ok(None),
+        [target] => Ok(Some(target.clone())),
+        _ => Err("一次只能 @ 一名目标用户，请删除多余的提及".to_string()),
+    }
+}
+
+/// 校验命令参数中的平台用户 ID，并原样保留非数字 ID、前导零与连字符。
+pub fn parse_target_subject_id(value: &str) -> Result<String, String> {
+    parse_subject_id_with_label(value, "目标用户ID")
+}
+
+fn onebot_target_mentions(root: &Map<String, Value>) -> Result<Vec<String>, String> {
+    let Some(message) = root.get("message") else {
+        return Ok(Vec::new());
+    };
+    // OneBot 允许字符串消息；字符串中的 CQ 码不是结构化可信来源，显式 ID 仍可使用。
+    let Some(segments) = message.as_array() else {
+        return if message.is_string() {
+            Ok(Vec::new())
+        } else {
+            Err("OneBot message 必须是字符串或消息段数组".to_string())
+        };
+    };
+    let self_id = parse_onebot_self_id(root.get("self_id"))?;
+    let mut targets = Vec::new();
+    for segment in segments {
+        let segment = segment
+            .as_object()
+            .ok_or_else(|| "OneBot message 包含无效消息段".to_string())?;
+        if segment.get("type").and_then(Value::as_str) != Some("at") {
+            continue;
+        }
+        let data = segment
+            .get("data")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "OneBot at 消息段缺少 data".to_string())?;
+        let target = parse_lossless_subject_value(
+            data.get("qq")
+                .ok_or_else(|| "OneBot at 消息段缺少 qq".to_string())?,
+            "OneBot at.qq",
+        )?;
+        if target != "all" && target != self_id {
+            targets.push(target);
+        }
+    }
+    Ok(targets)
+}
+
+fn qq_target_mentions(root: &Map<String, Value>) -> Result<Vec<String>, String> {
+    let Some(payload) = root.get("qqbot_payload") else {
+        return Ok(Vec::new());
+    };
+    let payload = payload
+        .as_object()
+        .ok_or_else(|| "qqbot_payload 必须是 JSON 对象".to_string())?;
+    let Some(mentions) = payload.get("mentions") else {
+        return Ok(Vec::new());
+    };
+    let mentions = mentions
+        .as_array()
+        .ok_or_else(|| "qqbot_payload.mentions 必须是数组".to_string())?;
+    let event_type = root
+        .get("event_type")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("event_type").and_then(Value::as_str));
+
+    let mut targets = Vec::new();
+    for mention in mentions {
+        let mention = mention
+            .as_object()
+            .ok_or_else(|| "qqbot_payload.mentions 包含无效提及".to_string())?;
+        if optional_bool(mention, "is_you")? == Some(true)
+            || optional_bool(mention, "bot")? == Some(true)
+            || optional_string(mention, "scope")? == Some("all")
+        {
+            continue;
+        }
+        let target = match event_type {
+            Some("GROUP_AT_MESSAGE_CREATE" | "GROUP_MESSAGE_CREATE") => {
+                optional_string(mention, "member_openid")?.or(optional_string(mention, "id")?)
+            }
+            Some("C2C_MESSAGE_CREATE") => {
+                optional_string(mention, "user_openid")?.or(optional_string(mention, "id")?)
+            }
+            Some("AT_MESSAGE_CREATE" | "MESSAGE_CREATE" | "DIRECT_MESSAGE_CREATE") => {
+                optional_string(mention, "id")?
+            }
+            Some(_) => {
+                return Err("官方 QQ 事件类型无法确定提及用户的身份字段".to_string());
+            }
+            None if mentions.is_empty() => None,
+            None => return Err("官方 QQ 原始事件缺少 event_type，无法解析目标提及".to_string()),
+        };
+        if let Some(target) = target {
+            targets.push(parse_target_subject_id(target)?);
+        }
+    }
+    Ok(targets)
+}
+
+fn optional_bool(object: &Map<String, Value>, field: &str) -> Result<Option<bool>, String> {
+    object
+        .get(field)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| format!("QQ 提及字段 {field} 必须是布尔值"))
+        })
+        .transpose()
+}
+
+fn optional_string<'a>(
+    object: &'a Map<String, Value>,
+    field: &str,
+) -> Result<Option<&'a str>, String> {
+    object
+        .get(field)
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| format!("QQ 提及字段 {field} 必须是字符串"))
+        })
+        .transpose()
+}
+
+fn parse_lossless_subject_value(value: &Value, field: &str) -> Result<String, String> {
+    match value {
+        Value::String(value) => parse_subject_id_with_label(value, field),
+        Value::Number(value) => value
+            .as_u64()
+            .map(|value| value.to_string())
+            .ok_or_else(|| format!("{field} 数字必须是无符号整数")),
+        _ => Err(format!("{field} 必须是字符串或无符号整数")),
+    }
+}
+
 fn resolve_with_context(
     root: &Map<String, Value>,
     context: QimenContext,
@@ -228,14 +382,18 @@ fn parse_account_id(value: &str, field: &str) -> Result<String, String> {
 }
 
 fn parse_subject_id(value: &str) -> Result<String, String> {
+    parse_subject_id_with_label(value, "sender_id")
+}
+
+fn parse_subject_id_with_label(value: &str, field: &str) -> Result<String, String> {
     if value.is_empty() {
-        return Err("sender_id 不能为空".to_string());
+        return Err(format!("{field} 不能为空"));
     }
     if value.chars().count() > MAX_SUBJECT_ID_CHARS {
-        return Err(format!("sender_id 不能超过 {MAX_SUBJECT_ID_CHARS} 个字符"));
+        return Err(format!("{field} 不能超过 {MAX_SUBJECT_ID_CHARS} 个字符"));
     }
     if value.trim() != value || value.chars().any(char::is_control) {
-        return Err("sender_id 不能包含首尾空白或控制字符".to_string());
+        return Err(format!("{field} 不能包含首尾空白或控制字符"));
     }
     Ok(value.to_string())
 }
@@ -573,5 +731,128 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn target_subject_ids_are_lossless_strings_and_bounded() {
+        for value in ["00123", "openid-with-dash", "member_openid"] {
+            assert_eq!(parse_target_subject_id(value), Ok(value.to_string()));
+        }
+        for value in ["", " padded", "padded ", "line\nbreak"] {
+            assert!(parse_target_subject_id(value).is_err());
+        }
+        assert!(parse_target_subject_id(&"魂".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn onebot_target_mention_excludes_bot_and_preserves_string_id() {
+        let request = request(
+            "sender",
+            json!({
+                "self_id": "00100",
+                "message": [
+                    {"type": "text", "data": {"text": "转账 "}},
+                    {"type": "at", "data": {"qq": "00100"}},
+                    {"type": "at", "data": {"qq": "openid-with-dash"}},
+                    {"type": "text", "data": {"text": " 10"}}
+                ]
+            }),
+        );
+        assert_eq!(
+            resolve_target_mention(&request, Protocol::OneBot11).expect("应解析 OneBot 提及"),
+            Some("openid-with-dash".to_string())
+        );
+    }
+
+    #[test]
+    fn onebot_multiple_target_mentions_and_unstructured_cq_fail_closed() {
+        let multiple = request(
+            "sender",
+            json!({
+                "self_id": 100,
+                "message": [
+                    {"type": "at", "data": {"qq": 101}},
+                    {"type": "at", "data": {"qq": "102"}}
+                ]
+            }),
+        );
+        assert!(resolve_target_mention(&multiple, Protocol::OneBot11).is_err());
+
+        let cq = request(
+            "sender",
+            json!({"self_id": 100, "message": "[CQ:at,qq=101] 10"}),
+        );
+        assert_eq!(
+            resolve_target_mention(&cq, Protocol::OneBot11).expect("CQ 字符串应降级为显式 ID 模式"),
+            None
+        );
+    }
+
+    #[test]
+    fn qq_target_mention_uses_scene_specific_string_field() {
+        let group = request(
+            "sender",
+            json!({
+                "event_type": "GROUP_MESSAGE_CREATE",
+                "qqbot_payload": {
+                    "mentions": [
+                        {"is_you": true, "bot": true, "id": "bot-id", "member_openid": "bot-member"},
+                        {"id": "user-id", "member_openid": "member-openid"}
+                    ]
+                }
+            }),
+        );
+        assert_eq!(
+            resolve_target_mention(&group, Protocol::QqOfficial).expect("QQ 群提及应解析"),
+            Some("member-openid".to_string())
+        );
+
+        let c2c = request(
+            "sender",
+            json!({
+                "event_type": "C2C_MESSAGE_CREATE",
+                "qqbot_payload": {"mentions": [{"id": "user-id", "user_openid": "user-openid"}]}
+            }),
+        );
+        assert_eq!(
+            resolve_target_mention(&c2c, Protocol::QqOfficial).expect("QQ C2C 提及应解析"),
+            Some("user-openid".to_string())
+        );
+
+        let channel = request(
+            "sender",
+            json!({
+                "event_type": "AT_MESSAGE_CREATE",
+                "qqbot_payload": {"mentions": [{"id": "channel-member-id", "member_openid": "wrong-scene"}]}
+            }),
+        );
+        assert_eq!(
+            resolve_target_mention(&channel, Protocol::QqOfficial).expect("QQ 频道提及应保留 id"),
+            Some("channel-member-id".to_string())
+        );
+    }
+
+    #[test]
+    fn qq_target_mention_rejects_ambiguous_or_malformed_payload() {
+        let multiple = request(
+            "sender",
+            json!({
+                "event_type": "GROUP_AT_MESSAGE_CREATE",
+                "qqbot_payload": {"mentions": [
+                    {"member_openid": "member-a"},
+                    {"member_openid": "member-b"}
+                ]}
+            }),
+        );
+        assert!(resolve_target_mention(&multiple, Protocol::QqOfficial).is_err());
+
+        let malformed = request(
+            "sender",
+            json!({
+                "event_type": "GROUP_AT_MESSAGE_CREATE",
+                "qqbot_payload": {"mentions": [{"member_openid": 123}]}
+            }),
+        );
+        assert!(resolve_target_mention(&malformed, Protocol::QqOfficial).is_err());
     }
 }

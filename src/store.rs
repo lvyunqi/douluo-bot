@@ -661,6 +661,147 @@ VALUES
     ('holy-soul-village-grocer', 'soul-power-potion', 30, -1, 1, 0, 0);
 "#;
 
+// v9 为玩家间资产转移建立显式赠送策略和不可变双边账本。账本触发器只校验
+// 身份与审计快照，不直接读取钱包或背包，资产变更仍由 BEGIN IMMEDIATE 事务负责。
+const MIGRATION_V9: &str = r#"
+CREATE TABLE item_transfer_policy (
+    item_key TEXT PRIMARY KEY REFERENCES item(item_key) ON DELETE CASCADE,
+    transferable INTEGER NOT NULL DEFAULT 0 CHECK(transferable IN (0, 1)),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+) STRICT;
+
+CREATE TABLE asset_transfer (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    protocol TEXT NOT NULL CHECK(protocol IN ('onebot11', 'qq-official')),
+    account_id TEXT NOT NULL CHECK(
+        length(account_id) BETWEEN 1 AND 128
+        AND account_id = trim(account_id)
+        AND instr(account_id, char(0)) = 0
+        AND account_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    namespace TEXT NOT NULL CHECK(
+        length(namespace) BETWEEN 1 AND 64
+        AND namespace GLOB '[A-Za-z0-9][A-Za-z0-9._-]*'
+        AND namespace NOT GLOB '*[^A-Za-z0-9._-]*'
+    ),
+    sender_identity_id INTEGER NOT NULL REFERENCES identity(id) ON DELETE RESTRICT,
+    recipient_identity_id INTEGER NOT NULL REFERENCES identity(id) ON DELETE RESTRICT,
+    sender_subject_id TEXT NOT NULL CHECK(
+        length(sender_subject_id) BETWEEN 1 AND 256
+        AND instr(sender_subject_id, char(0)) = 0
+        AND sender_subject_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    recipient_subject_id TEXT NOT NULL CHECK(
+        length(recipient_subject_id) BETWEEN 1 AND 256
+        AND instr(recipient_subject_id, char(0)) = 0
+        AND recipient_subject_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    asset_kind TEXT NOT NULL CHECK(asset_kind IN ('currency', 'item')),
+    currency_code TEXT,
+    item_key TEXT REFERENCES item(item_key) ON DELETE RESTRICT,
+    amount INTEGER NOT NULL CHECK(amount > 0),
+    sender_before INTEGER NOT NULL CHECK(sender_before >= 0),
+    sender_after INTEGER NOT NULL CHECK(sender_after >= 0),
+    recipient_before INTEGER NOT NULL CHECK(recipient_before >= 0),
+    recipient_after INTEGER NOT NULL CHECK(recipient_after >= 0),
+    source_message_id TEXT NOT NULL CHECK(
+        length(source_message_id) BETWEEN 1 AND 256
+        AND instr(source_message_id, char(0)) = 0
+        AND source_message_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    operation_log_id INTEGER NOT NULL REFERENCES operation_log(id) ON DELETE RESTRICT,
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    CHECK(sender_identity_id <> recipient_identity_id),
+    CHECK(sender_subject_id <> recipient_subject_id),
+    CHECK(sender_before >= amount AND sender_after = sender_before - amount),
+    CHECK(recipient_after > recipient_before AND recipient_after - recipient_before = amount),
+    CHECK(
+        (asset_kind = 'currency' AND currency_code = 'gold_soul_coin' AND item_key IS NULL)
+        OR (asset_kind = 'item' AND currency_code IS NULL AND item_key IS NOT NULL)
+    )
+) STRICT;
+
+CREATE UNIQUE INDEX asset_transfer_sender_message
+    ON asset_transfer(sender_identity_id, source_message_id);
+CREATE UNIQUE INDEX asset_transfer_operation_log
+    ON asset_transfer(operation_log_id);
+CREATE INDEX asset_transfer_sender_page
+    ON asset_transfer(sender_identity_id, id);
+CREATE INDEX asset_transfer_recipient_page
+    ON asset_transfer(recipient_identity_id, id);
+
+CREATE TRIGGER asset_transfer_no_update
+BEFORE UPDATE ON asset_transfer
+BEGIN
+    SELECT RAISE(ABORT, 'asset transfer is immutable');
+END;
+
+CREATE TRIGGER asset_transfer_no_delete
+BEFORE DELETE ON asset_transfer
+BEGIN
+    SELECT RAISE(ABORT, 'asset transfer is immutable');
+END;
+
+CREATE TRIGGER asset_transfer_no_reinsert
+BEFORE INSERT ON asset_transfer
+WHEN EXISTS(
+    SELECT 1 FROM asset_transfer
+     WHERE sender_identity_id = NEW.sender_identity_id
+       AND source_message_id = NEW.source_message_id
+)
+OR EXISTS(
+    SELECT 1 FROM asset_transfer
+     WHERE operation_log_id = NEW.operation_log_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'asset transfer is immutable');
+END;
+
+CREATE TRIGGER asset_transfer_scope_guard
+BEFORE INSERT ON asset_transfer
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM identity sender
+      JOIN identity recipient
+      JOIN operation_log audit
+     WHERE sender.id = NEW.sender_identity_id
+       AND recipient.id = NEW.recipient_identity_id
+       AND sender.protocol = NEW.protocol
+       AND recipient.protocol = NEW.protocol
+       AND sender.account_id = NEW.account_id
+       AND recipient.account_id = NEW.account_id
+       AND sender.namespace = NEW.namespace
+       AND recipient.namespace = NEW.namespace
+       AND sender.subject_kind = 'user'
+       AND recipient.subject_kind = 'user'
+       AND sender.subject_id = NEW.sender_subject_id
+       AND recipient.subject_id = NEW.recipient_subject_id
+       AND audit.id = NEW.operation_log_id
+       AND audit.protocol = NEW.protocol
+       AND audit.account_id = NEW.account_id
+       AND audit.namespace = NEW.namespace
+       AND audit.subject_kind = 'user'
+       AND audit.subject_id = NEW.sender_subject_id
+       AND (
+           (NEW.asset_kind = 'currency' AND audit.command = '转账')
+           OR (NEW.asset_kind = 'item' AND audit.command = '发送物品')
+       )
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'asset transfer scope or audit mismatch');
+END;
+
+INSERT INTO item_transfer_policy(item_key, transferable, created_at, updated_at) VALUES
+    ('revival-grass', 0, 0, 0),
+    ('nine-leaf-zhi-grass', 0, 0, 0),
+    ('small-healing-potion', 1, 0, 0),
+    ('medium-healing-potion', 1, 0, 0),
+    ('soul-power-potion', 1, 0, 0);
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -863,6 +1004,64 @@ pub struct UseItemReceipt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CurrencyTransferReceipt {
+    pub transfer_id: i64,
+    pub recipient_subject_id: String,
+    pub currency_code: String,
+    pub amount: i64,
+    pub sender_balance_after: i64,
+    pub recipient_balance_after: i64,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemGiftReceipt {
+    pub transfer_id: i64,
+    pub recipient_subject_id: String,
+    pub item: ItemRecord,
+    pub quantity: i64,
+    pub sender_inventory_after: i64,
+    pub recipient_inventory_after: i64,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TransferParticipant {
+    identity_id: i64,
+    player_id: i64,
+    subject_id: String,
+    state: String,
+    awakened: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AssetTransferRecord {
+    id: i64,
+    recipient_subject_id: String,
+    asset_kind: String,
+    currency_code: Option<String>,
+    item_key: Option<String>,
+    amount: i64,
+    sender_after: i64,
+    recipient_after: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AssetTransferInsert<'a> {
+    asset_kind: &'a str,
+    currency_code: Option<&'a str>,
+    item_key: Option<&'a str>,
+    amount: i64,
+    sender_before: i64,
+    sender_after: i64,
+    recipient_before: i64,
+    recipient_after: i64,
+    source_message_id: &'a str,
+    operation_log_id: i64,
+    created_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AwakenedWuhun {
     pub name: String,
     pub category: String,
@@ -990,6 +1189,7 @@ struct LevelTier {
 }
 
 pub const MAX_PLAYER_LEVEL: i64 = 120;
+pub const GOLD_SOUL_COIN: &str = "gold_soul_coin";
 
 const LEVEL_TIERS: [LevelTier; 14] = [
     LevelTier {
@@ -1281,7 +1481,7 @@ impl Store {
         let migration_result = (|| -> Result<(), String> {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|error| format!("开始数据库迁移 v2/v3/v4/v5/v6/v7/v8 失败：{error}"))?;
+                .map_err(|error| format!("开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9 失败：{error}"))?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
             if !migration_applied(&transaction, 2)? {
                 let old_identity_sequence = transaction
@@ -1411,10 +1611,25 @@ impl Store {
                 validate_v8_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 9)? {
+                transaction
+                    .execute_batch(MIGRATION_V9)
+                    .map_err(|error| format!("执行数据库迁移 v9 失败：{error}"))?;
+                validate_v9_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(9, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v9 失败：{error}"))?;
+            } else {
+                validate_v9_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction
                 .commit()
-                .map_err(|error| format!("提交数据库迁移 v2/v3/v4/v5/v6/v7/v8 失败：{error}"))?;
+                .map_err(|error| format!("提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9 失败：{error}"))?;
             Ok(())
         })();
         let restore_result = set_foreign_keys(connection, true);
@@ -1428,6 +1643,7 @@ impl Store {
                 validate_v6_schema(connection)?;
                 validate_v7_schema(connection)?;
                 validate_v8_schema(connection)?;
+                validate_v9_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -1852,6 +2068,237 @@ impl Store {
             )
             .optional()
             .map_err(|error| format!("查询钱包余额失败：{error}"))
+    }
+
+    pub fn transfer_gold_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        recipient_subject_id: &str,
+        amount: i64,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<CurrencyTransferReceipt, String> {
+        validate_identity_key(key)?;
+        validate_transfer_recipient(key, recipient_subject_id)?;
+        validate_transfer_operation(operation, "转账")?;
+        if amount <= 0 {
+            return Err("转账金额必须大于 0".to_string());
+        }
+
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始钱包转账事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let sender = load_transfer_sender(&transaction, key)?;
+        if let Some(existing) = load_asset_transfer_by_message(
+            &transaction,
+            sender.identity_id,
+            operation.source_message_id,
+        )? {
+            if existing.asset_kind != "currency"
+                || existing.currency_code.as_deref() != Some(GOLD_SOUL_COIN)
+                || existing.item_key.is_some()
+                || existing.recipient_subject_id != recipient_subject_id
+                || existing.amount != amount
+            {
+                return Err("该消息 ID 已用于不同的资产转移请求，拒绝重复执行".to_string());
+            }
+            return Ok(CurrencyTransferReceipt {
+                transfer_id: existing.id,
+                recipient_subject_id: existing.recipient_subject_id,
+                currency_code: GOLD_SOUL_COIN.to_string(),
+                amount: existing.amount,
+                sender_balance_after: existing.sender_after,
+                recipient_balance_after: existing.recipient_after,
+                replayed: true,
+            });
+        }
+
+        ensure_transfer_participant_eligible(&sender, "你")?;
+        let recipient = load_transfer_recipient(&transaction, key, recipient_subject_id)?;
+        ensure_transfer_participant_eligible(&recipient, "对方")?;
+        let timestamp = now_timestamp()?;
+        ensure_wallet(&transaction, sender.player_id, GOLD_SOUL_COIN, timestamp)?;
+        ensure_wallet(&transaction, recipient.player_id, GOLD_SOUL_COIN, timestamp)?;
+        let sender_before =
+            wallet_balance_in_transaction(&transaction, sender.player_id, GOLD_SOUL_COIN)?;
+        if sender_before < amount {
+            return Err(format!(
+                "金魂币余额不足：需要 {amount}，当前 {sender_before}"
+            ));
+        }
+        let recipient_before =
+            wallet_balance_in_transaction(&transaction, recipient.player_id, GOLD_SOUL_COIN)?;
+        let sender_after = sender_before
+            .checked_sub(amount)
+            .ok_or_else(|| "转账后发送方余额下溢".to_string())?;
+        let recipient_after = recipient_before
+            .checked_add(amount)
+            .ok_or_else(|| "转账后接收方余额溢出".to_string())?;
+        update_wallet_balance(
+            &transaction,
+            sender.player_id,
+            GOLD_SOUL_COIN,
+            sender_after,
+            timestamp,
+        )?;
+        update_wallet_balance(
+            &transaction,
+            recipient.player_id,
+            GOLD_SOUL_COIN,
+            recipient_after,
+            timestamp,
+        )?;
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        let transfer_id = insert_asset_transfer(
+            &transaction,
+            key,
+            &sender,
+            &recipient,
+            AssetTransferInsert {
+                asset_kind: "currency",
+                currency_code: Some(GOLD_SOUL_COIN),
+                item_key: None,
+                amount,
+                sender_before,
+                sender_after,
+                recipient_before,
+                recipient_after,
+                source_message_id: operation.source_message_id,
+                operation_log_id,
+                created_at: timestamp,
+            },
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交钱包转账事务失败：{error}"))?;
+        Ok(CurrencyTransferReceipt {
+            transfer_id,
+            recipient_subject_id: recipient.subject_id,
+            currency_code: GOLD_SOUL_COIN.to_string(),
+            amount,
+            sender_balance_after: sender_after,
+            recipient_balance_after: recipient_after,
+            replayed: false,
+        })
+    }
+
+    pub fn gift_item_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        recipient_subject_id: &str,
+        item_name_or_key: &str,
+        quantity: i64,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<ItemGiftReceipt, String> {
+        validate_identity_key(key)?;
+        validate_transfer_recipient(key, recipient_subject_id)?;
+        validate_catalog_lookup(item_name_or_key, "物品名称")?;
+        validate_trade_quantity(quantity)?;
+        validate_transfer_operation(operation, "发送物品")?;
+
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始物品赠送事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let sender = load_transfer_sender(&transaction, key)?;
+        let item = load_transferable_item(&transaction, item_name_or_key)?;
+        if let Some(existing) = load_asset_transfer_by_message(
+            &transaction,
+            sender.identity_id,
+            operation.source_message_id,
+        )? {
+            if existing.asset_kind != "item"
+                || existing.currency_code.is_some()
+                || existing.item_key.as_deref() != Some(item.item_key.as_str())
+                || existing.recipient_subject_id != recipient_subject_id
+                || existing.amount != quantity
+            {
+                return Err("该消息 ID 已用于不同的资产转移请求，拒绝重复执行".to_string());
+            }
+            return Ok(ItemGiftReceipt {
+                transfer_id: existing.id,
+                recipient_subject_id: existing.recipient_subject_id,
+                item,
+                quantity: existing.amount,
+                sender_inventory_after: existing.sender_after,
+                recipient_inventory_after: existing.recipient_after,
+                replayed: true,
+            });
+        }
+
+        ensure_transfer_participant_eligible(&sender, "你")?;
+        let recipient = load_transfer_recipient(&transaction, key, recipient_subject_id)?;
+        ensure_transfer_participant_eligible(&recipient, "对方")?;
+        let sender_before = inventory_quantity(&transaction, sender.player_id, &item.item_key)?;
+        if sender_before < quantity {
+            return Err(format!(
+                "背包中的{}不足：需要{}件，当前{}件",
+                item.name, quantity, sender_before
+            ));
+        }
+        let recipient_before =
+            inventory_quantity(&transaction, recipient.player_id, &item.item_key)?;
+        let sender_after = sender_before
+            .checked_sub(quantity)
+            .ok_or_else(|| "赠送后发送方背包数量下溢".to_string())?;
+        let recipient_after = recipient_before
+            .checked_add(quantity)
+            .ok_or_else(|| "赠送后接收方背包数量溢出".to_string())?;
+        if recipient_after > item.max_stack {
+            return Err(format!(
+                "对方背包中的{}最多堆叠{}件，当前已有{}件",
+                item.name, item.max_stack, recipient_before
+            ));
+        }
+        let timestamp = now_timestamp()?;
+        set_inventory_quantity(
+            &transaction,
+            sender.player_id,
+            &item.item_key,
+            sender_after,
+            timestamp,
+        )?;
+        set_inventory_quantity(
+            &transaction,
+            recipient.player_id,
+            &item.item_key,
+            recipient_after,
+            timestamp,
+        )?;
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        let transfer_id = insert_asset_transfer(
+            &transaction,
+            key,
+            &sender,
+            &recipient,
+            AssetTransferInsert {
+                asset_kind: "item",
+                currency_code: None,
+                item_key: Some(&item.item_key),
+                amount: quantity,
+                sender_before,
+                sender_after,
+                recipient_before,
+                recipient_after,
+                source_message_id: operation.source_message_id,
+                operation_log_id,
+                created_at: timestamp,
+            },
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交物品赠送事务失败：{error}"))?;
+        Ok(ItemGiftReceipt {
+            transfer_id,
+            recipient_subject_id: recipient.subject_id,
+            item,
+            quantity,
+            sender_inventory_after: sender_after,
+            recipient_inventory_after: recipient_after,
+            replayed: false,
+        })
     }
 
     pub fn talk_to_npc_with_operation(
@@ -3383,6 +3830,198 @@ fn load_player_map_for_identity(
         .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())
 }
 
+fn load_transfer_sender(
+    connection: &Connection,
+    key: &IdentityKey<'_>,
+) -> Result<TransferParticipant, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT i.id, p.id, i.subject_id, p.state,
+                   EXISTS(SELECT 1 FROM player_wuhun pw WHERE pw.player_id = p.id)
+              FROM identity i
+              JOIN player p ON p.identity_id = i.id
+             WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+               AND i.subject_kind = ?4 AND i.subject_id = ?5
+            "#,
+            params![
+                key.protocol.as_str(),
+                key.account_id,
+                key.namespace,
+                key.subject_kind,
+                key.subject_id
+            ],
+            |row| {
+                Ok(TransferParticipant {
+                    identity_id: row.get(0)?,
+                    player_id: row.get(1)?,
+                    subject_id: row.get(2)?,
+                    state: row.get(3)?,
+                    awakened: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取资产转移发送方失败：{error}"))?
+        .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())
+}
+
+fn load_transfer_recipient(
+    connection: &Connection,
+    sender_key: &IdentityKey<'_>,
+    recipient_subject_id: &str,
+) -> Result<TransferParticipant, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT i.id, p.id, i.subject_id, p.state,
+                   EXISTS(SELECT 1 FROM player_wuhun pw WHERE pw.player_id = p.id)
+              FROM identity i
+              JOIN player p ON p.identity_id = i.id
+             WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+               AND i.subject_kind = 'user' AND i.subject_id = ?4
+            "#,
+            params![
+                sender_key.protocol.as_str(),
+                sender_key.account_id,
+                sender_key.namespace,
+                recipient_subject_id
+            ],
+            |row| {
+                Ok(TransferParticipant {
+                    identity_id: row.get(0)?,
+                    player_id: row.get(1)?,
+                    subject_id: row.get(2)?,
+                    state: row.get(3)?,
+                    awakened: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取资产转移接收方失败：{error}"))?
+        .ok_or_else(|| "当前身份范围内不存在该接收玩家，或对方尚未创建角色".to_string())
+}
+
+fn ensure_transfer_participant_eligible(
+    participant: &TransferParticipant,
+    label: &str,
+) -> Result<(), String> {
+    if participant.state != "alive" {
+        return Err(format!("{label}的角色当前状态不能进行资产转移"));
+    }
+    if !participant.awakened {
+        return Err(format!("{label}的角色尚未完成武魂觉醒"));
+    }
+    Ok(())
+}
+
+fn load_asset_transfer_by_message(
+    connection: &Connection,
+    sender_identity_id: i64,
+    source_message_id: &str,
+) -> Result<Option<AssetTransferRecord>, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT id, recipient_subject_id, asset_kind, currency_code, item_key,
+                   amount, sender_after, recipient_after
+              FROM asset_transfer
+             WHERE sender_identity_id = ?1 AND source_message_id = ?2
+            "#,
+            params![sender_identity_id, source_message_id],
+            |row| {
+                Ok(AssetTransferRecord {
+                    id: row.get(0)?,
+                    recipient_subject_id: row.get(1)?,
+                    asset_kind: row.get(2)?,
+                    currency_code: row.get(3)?,
+                    item_key: row.get(4)?,
+                    amount: row.get(5)?,
+                    sender_after: row.get(6)?,
+                    recipient_after: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取资产转移幂等回执失败：{error}"))
+}
+
+fn load_transferable_item(
+    connection: &Connection,
+    item_name_or_key: &str,
+) -> Result<ItemRecord, String> {
+    let (item, transferable) = connection
+        .query_row(
+            r#"
+            SELECT i.item_key, i.name, i.category, i.quality, i.stackable,
+                   i.max_stack, i.buy_price, i.sell_price, i.level_required,
+                   i.effect_kind, i.effect_amount, i.revive_hp_percent,
+                   i.purchasable, i.sellable, i.usable, i.description,
+                   COALESCE(policy.transferable, 0)
+              FROM item i
+         LEFT JOIN item_transfer_policy policy ON policy.item_key = i.item_key
+             WHERE i.name = ?1 OR i.item_key = ?1
+             LIMIT 1
+            "#,
+            [item_name_or_key],
+            |row| Ok((item_record_from_row(row, 0)?, row.get::<_, bool>(16)?)),
+        )
+        .optional()
+        .map_err(|error| format!("读取赠送物品定义失败：{error}"))?
+        .ok_or_else(|| "当前世界不存在该物品".to_string())?;
+    if !transferable || item.category != "consumable" || !item.stackable || !item.usable {
+        return Err(format!("{}当前不可赠送", item.name));
+    }
+    Ok(item)
+}
+
+fn insert_asset_transfer(
+    connection: &Connection,
+    key: &IdentityKey<'_>,
+    sender: &TransferParticipant,
+    recipient: &TransferParticipant,
+    input: AssetTransferInsert<'_>,
+) -> Result<i64, String> {
+    connection
+        .execute(
+            r#"
+            INSERT INTO asset_transfer(
+                protocol, account_id, namespace,
+                sender_identity_id, recipient_identity_id,
+                sender_subject_id, recipient_subject_id,
+                asset_kind, currency_code, item_key, amount,
+                sender_before, sender_after, recipient_before, recipient_after,
+                source_message_id, operation_log_id, created_at
+            ) VALUES(
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
+            )
+            "#,
+            params![
+                key.protocol.as_str(),
+                key.account_id,
+                key.namespace,
+                sender.identity_id,
+                recipient.identity_id,
+                sender.subject_id,
+                recipient.subject_id,
+                input.asset_kind,
+                input.currency_code,
+                input.item_key,
+                input.amount,
+                input.sender_before,
+                input.sender_after,
+                input.recipient_before,
+                input.recipient_after,
+                input.source_message_id,
+                input.operation_log_id,
+                input.created_at
+            ],
+        )
+        .map_err(|error| format!("写入不可变资产转移账本失败：{error}"))?;
+    Ok(connection.last_insert_rowid())
+}
+
 fn load_bound_npc_for_player(
     connection: &Connection,
     player_id: i64,
@@ -3637,6 +4276,40 @@ fn validate_catalog_lookup(value: &str, label: &str) -> Result<(), String> {
 fn validate_trade_quantity(quantity: i64) -> Result<(), String> {
     if !(1..=9999).contains(&quantity) {
         return Err("交易数量必须在 1 到 9999 之间".to_string());
+    }
+    Ok(())
+}
+
+fn validate_transfer_recipient(
+    sender: &IdentityKey<'_>,
+    recipient_subject_id: &str,
+) -> Result<(), String> {
+    if recipient_subject_id != recipient_subject_id.trim()
+        || !valid_audit_value(recipient_subject_id, 256)
+    {
+        return Err("目标用户 ID 必须是 1 到 256 个无控制字符且无首尾空白的字符串".to_string());
+    }
+    if recipient_subject_id == "all" {
+        return Err("不能把 @全体 作为资产接收人".to_string());
+    }
+    if recipient_subject_id == sender.subject_id {
+        return Err("不能向自己转移资产".to_string());
+    }
+    Ok(())
+}
+
+fn validate_transfer_operation(
+    operation: &OperationLogInput<'_>,
+    expected_command: &str,
+) -> Result<(), String> {
+    validate_operation_input(operation)?;
+    if operation.command != expected_command || operation.outcome != "ok" {
+        return Err(format!(
+            "资产转移成功审计必须使用规范命令“{expected_command}”和 ok 结果"
+        ));
+    }
+    if !valid_audit_value(operation.source_message_id, 256) {
+        return Err("资产转移要求 1 到 256 个无控制字符的非空消息 ID".to_string());
     }
     Ok(())
 }
@@ -6488,6 +7161,12 @@ fn validate_v8_triggers(connection: &Connection) -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("解析 v8 全库触发器集合失败：{error}"))?;
     for (name, table, sql) in triggers {
+        // v9 在后续迁移中新增自己的触发器；其中 asset_kind 的合法值“item”
+        // 不应被 v8 的简单标识扫描误判为 v8 的 item 表引用。旧表上的跨 v9
+        // 引用仍由 validate_v9_triggers 全库扫描拒绝。
+        if matches!(table.as_str(), "asset_transfer" | "item_transfer_policy") {
+            continue;
+        }
         let declared = expected.iter().any(|(expected_name, expected_table)| {
             name == *expected_name && table == *expected_table
         });
@@ -6635,6 +7314,531 @@ fn probe_v8_economy_guards(connection: &Connection) -> Result<(), String> {
     let rollback_result = connection
         .execute_batch("ROLLBACK TO qimen_v8_economy_probe; RELEASE qimen_v8_economy_probe;")
         .map_err(|error| format!("回滚 v8 经济约束探针失败：{error}"));
+    match (probe_result, rollback_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(probe_error), Err(rollback_error)) => Err(format!("{probe_error}；{rollback_error}")),
+    }
+}
+
+fn validate_v9_schema(connection: &Connection) -> Result<(), String> {
+    let policy_columns = table_columns_with_type(connection, "item_transfer_policy")?;
+    let expected_policy_columns = vec![
+        TableColumnInfo::new("item_key", "TEXT", true, true, None, 0),
+        TableColumnInfo::new("transferable", "INTEGER", true, false, Some("0"), 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("updated_at", "INTEGER", true, false, None, 0),
+    ];
+    if policy_columns != expected_policy_columns {
+        return Err(format!(
+            "数据库已标记迁移 v9，但物品转移策略字段不匹配：{policy_columns:?}"
+        ));
+    }
+
+    let transfer_columns = table_columns_with_type(connection, "asset_transfer")?;
+    let expected_transfer_columns = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("protocol", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("account_id", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("namespace", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("sender_identity_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("recipient_identity_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("sender_subject_id", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("recipient_subject_id", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("asset_kind", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("currency_code", "TEXT", false, false, None, 0),
+        TableColumnInfo::new("item_key", "TEXT", false, false, None, 0),
+        TableColumnInfo::new("amount", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("sender_before", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("sender_after", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("recipient_before", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("recipient_after", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("source_message_id", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("operation_log_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+    ];
+    if transfer_columns != expected_transfer_columns {
+        return Err(format!(
+            "数据库已标记迁移 v9，但资产转移账本字段不匹配：{transfer_columns:?}"
+        ));
+    }
+
+    validate_v9_table_sql(
+        connection,
+        "item_transfer_policy",
+        &[
+            ") STRICT",
+            "ITEM_KEY TEXT PRIMARY KEY REFERENCES ITEM(ITEM_KEY) ON DELETE CASCADE",
+            "TRANSFERABLE INTEGER NOT NULL DEFAULT 0 CHECK(TRANSFERABLE IN (0, 1))",
+            "CREATED_AT INTEGER NOT NULL CHECK(CREATED_AT >= 0)",
+            "UPDATED_AT INTEGER NOT NULL CHECK(UPDATED_AT >= 0)",
+        ],
+    )?;
+    validate_v9_table_sql(
+        connection,
+        "asset_transfer",
+        &[
+            "AUTOINCREMENT",
+            ") STRICT",
+            "PROTOCOL IN ('ONEBOT11', 'QQ-OFFICIAL')",
+            "SENDER_IDENTITY_ID INTEGER NOT NULL REFERENCES IDENTITY(ID) ON DELETE RESTRICT",
+            "RECIPIENT_IDENTITY_ID INTEGER NOT NULL REFERENCES IDENTITY(ID) ON DELETE RESTRICT",
+            "ITEM_KEY TEXT REFERENCES ITEM(ITEM_KEY) ON DELETE RESTRICT",
+            "OPERATION_LOG_ID INTEGER NOT NULL REFERENCES OPERATION_LOG(ID) ON DELETE RESTRICT",
+            "ASSET_KIND TEXT NOT NULL CHECK(ASSET_KIND IN ('CURRENCY', 'ITEM'))",
+            "SOURCE_MESSAGE_ID TEXT NOT NULL CHECK(",
+            "LENGTH(SOURCE_MESSAGE_ID) BETWEEN 1 AND 256",
+            "INSTR(SOURCE_MESSAGE_ID, CHAR(0)) = 0",
+            "SENDER_IDENTITY_ID <> RECIPIENT_IDENTITY_ID",
+            "SENDER_SUBJECT_ID <> RECIPIENT_SUBJECT_ID",
+            "SENDER_BEFORE >= AMOUNT AND SENDER_AFTER = SENDER_BEFORE - AMOUNT",
+            "RECIPIENT_AFTER > RECIPIENT_BEFORE AND RECIPIENT_AFTER - RECIPIENT_BEFORE = AMOUNT",
+            "CURRENCY_CODE = 'GOLD_SOUL_COIN' AND ITEM_KEY IS NULL",
+            "CURRENCY_CODE IS NULL AND ITEM_KEY IS NOT NULL",
+        ],
+    )?;
+
+    validate_v9_foreign_keys(
+        connection,
+        "item_transfer_policy",
+        &[("item", "item_key", "item_key", "NO ACTION", "CASCADE")],
+    )?;
+    validate_v9_foreign_keys(
+        connection,
+        "asset_transfer",
+        &[
+            (
+                "identity",
+                "recipient_identity_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            (
+                "identity",
+                "sender_identity_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("item", "item_key", "item_key", "NO ACTION", "RESTRICT"),
+            (
+                "operation_log",
+                "operation_log_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+        ],
+    )?;
+    validate_v9_custom_index_set(connection, "item_transfer_policy", &[])?;
+    validate_v9_custom_index_set(
+        connection,
+        "asset_transfer",
+        &[
+            "asset_transfer_operation_log",
+            "asset_transfer_recipient_page",
+            "asset_transfer_sender_message",
+            "asset_transfer_sender_page",
+        ],
+    )?;
+    validate_named_index(
+        connection,
+        "asset_transfer",
+        "asset_transfer_sender_message",
+        true,
+        &["sender_identity_id", "source_message_id"],
+    )?;
+    validate_named_index(
+        connection,
+        "asset_transfer",
+        "asset_transfer_operation_log",
+        true,
+        &["operation_log_id"],
+    )?;
+    validate_named_index(
+        connection,
+        "asset_transfer",
+        "asset_transfer_sender_page",
+        false,
+        &["sender_identity_id", "id"],
+    )?;
+    validate_named_index(
+        connection,
+        "asset_transfer",
+        "asset_transfer_recipient_page",
+        false,
+        &["recipient_identity_id", "id"],
+    )?;
+    validate_v9_triggers(connection)?;
+    validate_v9_policy_seeds(connection)?;
+    probe_v9_transfer_guards(connection)
+}
+
+fn validate_v9_table_sql(
+    connection: &Connection,
+    table: &str,
+    markers: &[&str],
+) -> Result<(), String> {
+    let sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v9 表 {table} 建表语句失败：{error}"))?
+        .ok_or_else(|| format!("数据库已标记迁移 v9，但缺少表 {table}"))?
+        .to_ascii_uppercase();
+    for marker in markers {
+        if !sql.contains(marker) {
+            return Err(format!(
+                "数据库已标记迁移 v9，但表 {table} 缺少约束：{marker}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v9_foreign_keys(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, &str, &str, &str)],
+) -> Result<(), String> {
+    let escaped_table = table.replace('"', "\"\"");
+    let mut actual = connection
+        .prepare(&format!("PRAGMA foreign_key_list(\"{escaped_table}\")"))
+        .map_err(|error| format!("读取 v9 表 {table} 外键失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v9 表 {table} 外键失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v9 表 {table} 外键失败：{error}"))?;
+    let mut expected = expected
+        .iter()
+        .map(|(parent, from, to, update, delete)| {
+            (
+                (*parent).to_string(),
+                (*from).to_string(),
+                (*to).to_string(),
+                (*update).to_string(),
+                (*delete).to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    actual.sort();
+    expected.sort();
+    if actual != expected {
+        return Err(format!(
+            "数据库已标记迁移 v9，但表 {table} 外键不匹配：实际 {actual:?}，期望 {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v9_custom_index_set(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), String> {
+    let escaped_table = table.replace('"', "\"\"");
+    let mut actual = connection
+        .prepare(&format!("PRAGMA index_list(\"{escaped_table}\")"))
+        .map_err(|error| format!("读取 v9 表 {table} 索引集合失败：{error}"))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, String>(3)?))
+        })
+        .map_err(|error| format!("查询 v9 表 {table} 索引集合失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v9 表 {table} 索引集合失败：{error}"))?
+        .into_iter()
+        .filter_map(|(name, origin)| (origin == "c").then_some(name))
+        .collect::<Vec<_>>();
+    let mut expected = expected
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    actual.sort();
+    expected.sort();
+    if actual != expected {
+        return Err(format!(
+            "数据库已标记迁移 v9，但表 {table} 自定义索引集合不匹配：实际 {actual:?}，期望 {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v9_triggers(connection: &Connection) -> Result<(), String> {
+    let expected = [
+        (
+            "asset_transfer_no_update",
+            "BEFORE UPDATE ON ASSET_TRANSFER",
+        ),
+        (
+            "asset_transfer_no_delete",
+            "BEFORE DELETE ON ASSET_TRANSFER",
+        ),
+        (
+            "asset_transfer_no_reinsert",
+            "BEFORE INSERT ON ASSET_TRANSFER",
+        ),
+        (
+            "asset_transfer_scope_guard",
+            "BEFORE INSERT ON ASSET_TRANSFER",
+        ),
+    ];
+    for (name, marker) in expected {
+        let (table, sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v9 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v9，但缺少触发器 {name}"))?;
+        let normalized = sql.to_ascii_uppercase();
+        if table != "asset_transfer"
+            || !normalized.contains(marker)
+            || !normalized.contains("RAISE(ABORT")
+        {
+            return Err(format!("数据库已标记迁移 v9，但触发器 {name} 契约不匹配"));
+        }
+        if name == "asset_transfer_no_reinsert"
+            && (!normalized.contains("SENDER_IDENTITY_ID = NEW.SENDER_IDENTITY_ID")
+                || !normalized.contains("SOURCE_MESSAGE_ID = NEW.SOURCE_MESSAGE_ID")
+                || !normalized.contains("OPERATION_LOG_ID = NEW.OPERATION_LOG_ID"))
+        {
+            return Err("数据库已标记迁移 v9，但资产转移禁止重插入触发器不完整".to_string());
+        }
+        if name == "asset_transfer_scope_guard"
+            && (!normalized.contains("FROM IDENTITY SENDER")
+                || !normalized.contains("JOIN IDENTITY RECIPIENT")
+                || !normalized.contains("JOIN OPERATION_LOG AUDIT")
+                || !normalized.contains("NEW.ASSET_KIND = 'CURRENCY' AND AUDIT.COMMAND = '转账'")
+                || !normalized.contains("NEW.ASSET_KIND = 'ITEM' AND AUDIT.COMMAND = '发送物品'")
+                || !normalized.contains("AUDIT.SOURCE_MESSAGE_ID = NEW.SOURCE_MESSAGE_ID"))
+        {
+            return Err("数据库已标记迁移 v9，但资产转移范围校验触发器不完整".to_string());
+        }
+    }
+
+    let triggers = connection
+        .prepare(
+            "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name",
+        )
+        .map_err(|error| format!("读取 v9 全库触发器集合失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v9 全库触发器集合失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v9 全库触发器集合失败：{error}"))?;
+    for (name, table, sql) in triggers {
+        let declared = expected
+            .iter()
+            .any(|(expected_name, _)| name == *expected_name && table == "asset_transfer");
+        let touches_v9 = matches!(table.as_str(), "asset_transfer" | "item_transfer_policy")
+            || ["asset_transfer", "item_transfer_policy"]
+                .iter()
+                .any(|identifier| sql_mentions_identifier(&sql, identifier));
+        if touches_v9 && !declared {
+            return Err(format!(
+                "数据库已标记迁移 v9，但触发器 {name}（目标表 {table}）未声明却引用了资产转移表"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v9_policy_seeds(connection: &Connection) -> Result<(), String> {
+    for (item_key, transferable) in [
+        ("revival-grass", 0),
+        ("nine-leaf-zhi-grass", 0),
+        ("small-healing-potion", 1),
+        ("medium-healing-potion", 1),
+        ("soul-power-potion", 1),
+    ] {
+        let matches_contract = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM item_transfer_policy WHERE item_key = ?1 AND transferable = ?2)",
+                params![item_key, transferable],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("读取 v9 物品转移策略种子失败：{error}"))?;
+        if !matches_contract {
+            return Err(format!(
+                "数据库已标记迁移 v9，但物品转移策略种子 {item_key} 不匹配"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn probe_v9_transfer_guards(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch("SAVEPOINT qimen_v9_transfer_probe;")
+        .map_err(|error| format!("开始 v9 资产转移约束探针失败：{error}"))?;
+    let probe_result = (|| -> Result<(), String> {
+        let token = connection
+            .query_row("SELECT lower(hex(randomblob(16)))", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("生成 v9 资产转移探针标识失败：{error}"))?;
+        let account_id = format!("v9-probe-{token}");
+        let sender_subject = format!("v9-sender-{token}");
+        let recipient_subject = format!("v9-recipient-{token}");
+        for subject in [&sender_subject, &recipient_subject] {
+            connection
+                .execute(
+                    "INSERT INTO identity(protocol, account_id, namespace, subject_kind, subject_id, created_at) VALUES('onebot11', ?1, 'v9-probe', 'user', ?2, 0)",
+                    params![account_id, subject],
+                )
+                .map_err(|error| format!("v9 资产转移探针无法创建身份：{error}"))?;
+        }
+        let sender_identity_id = connection
+            .query_row(
+                "SELECT id FROM identity WHERE protocol = 'onebot11' AND account_id = ?1 AND namespace = 'v9-probe' AND subject_id = ?2",
+                params![account_id, sender_subject],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("v9 资产转移探针无法读取发送身份：{error}"))?;
+        let recipient_identity_id = connection
+            .query_row(
+                "SELECT id FROM identity WHERE protocol = 'onebot11' AND account_id = ?1 AND namespace = 'v9-probe' AND subject_id = ?2",
+                params![account_id, recipient_subject],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("v9 资产转移探针无法读取接收身份：{error}"))?;
+        connection
+            .execute(
+                "INSERT INTO operation_log(protocol, account_id, namespace, subject_kind, subject_id, command, outcome, source_message_id, details_json, created_at) VALUES('onebot11', ?1, 'v9-probe', 'user', ?2, '转账', 'ok', 'v9-message', '{}', 0)",
+                params![account_id, sender_subject],
+            )
+            .map_err(|error| format!("v9 资产转移探针无法创建审计：{error}"))?;
+        let operation_log_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                r#"
+                INSERT INTO asset_transfer(
+                    protocol, account_id, namespace,
+                    sender_identity_id, recipient_identity_id,
+                    sender_subject_id, recipient_subject_id,
+                    asset_kind, currency_code, item_key, amount,
+                    sender_before, sender_after, recipient_before, recipient_after,
+                    source_message_id, operation_log_id, created_at
+                ) VALUES(
+                    'onebot11', ?1, 'v9-probe', ?2, ?3, ?4, ?5,
+                    'currency', 'gold_soul_coin', NULL, 10,
+                    20, 10, 0, 10, 'v9-message', ?6, 0
+                )
+                "#,
+                params![
+                    account_id,
+                    sender_identity_id,
+                    recipient_identity_id,
+                    sender_subject,
+                    recipient_subject,
+                    operation_log_id
+                ],
+            )
+            .map_err(|error| format!("v9 资产转移探针无法插入合法账本：{error}"))?;
+        let transfer_id = connection.last_insert_rowid();
+        for (label, sql) in [
+            (
+                "UPDATE",
+                "UPDATE asset_transfer SET amount = 1 WHERE id = ?1",
+            ),
+            ("DELETE", "DELETE FROM asset_transfer WHERE id = ?1"),
+            (
+                "REPLACE",
+                "INSERT OR REPLACE INTO asset_transfer SELECT * FROM asset_transfer WHERE id = ?1",
+            ),
+        ] {
+            if connection.execute(sql, [transfer_id]).is_ok() {
+                return Err(format!("v9 资产转移账本 {label} 保护探针被绕过"));
+            }
+        }
+        if connection
+            .execute(
+                r#"
+                INSERT INTO asset_transfer(
+                    protocol, account_id, namespace,
+                    sender_identity_id, recipient_identity_id,
+                    sender_subject_id, recipient_subject_id,
+                    asset_kind, currency_code, item_key, amount,
+                    sender_before, sender_after, recipient_before, recipient_after,
+                    source_message_id, operation_log_id, created_at
+                ) VALUES(
+                    'onebot11', ?1, 'v9-probe', ?2, ?3, 'wrong-sender', ?4,
+                    'currency', 'gold_soul_coin', NULL, 10,
+                    20, 10, 0, 10, 'v9-mismatch', ?5, 0
+                )
+                "#,
+                params![
+                    account_id,
+                    sender_identity_id,
+                    recipient_identity_id,
+                    recipient_subject,
+                    operation_log_id
+                ],
+            )
+            .is_ok()
+        {
+            return Err("v9 资产转移身份/审计范围保护探针被绕过".to_string());
+        }
+        connection
+            .execute(
+                "INSERT INTO operation_log(protocol, account_id, namespace, subject_kind, subject_id, command, outcome, source_message_id, details_json, created_at) VALUES('onebot11', ?1, 'v9-probe', 'user', ?2, '发送物品', 'ok', 'v9-command-mismatch', '{}', 0)",
+                params![account_id, sender_subject],
+            )
+            .map_err(|error| format!("v9 资产转移探针无法创建错配审计：{error}"))?;
+        let mismatched_operation_log_id = connection.last_insert_rowid();
+        if connection
+            .execute(
+                r#"
+                INSERT INTO asset_transfer(
+                    protocol, account_id, namespace,
+                    sender_identity_id, recipient_identity_id,
+                    sender_subject_id, recipient_subject_id,
+                    asset_kind, currency_code, item_key, amount,
+                    sender_before, sender_after, recipient_before, recipient_after,
+                    source_message_id, operation_log_id, created_at
+                ) VALUES(
+                    'onebot11', ?1, 'v9-probe', ?2, ?3, ?4, ?5,
+                    'currency', 'gold_soul_coin', NULL, 10,
+                    20, 10, 0, 10, 'v9-command-mismatch', ?6, 0
+                )
+                "#,
+                params![
+                    account_id,
+                    sender_identity_id,
+                    recipient_identity_id,
+                    sender_subject,
+                    recipient_subject,
+                    mismatched_operation_log_id
+                ],
+            )
+            .is_ok()
+        {
+            return Err("v9 资产种类与审计命令绑定探针被绕过".to_string());
+        }
+        Ok(())
+    })();
+    let rollback_result = connection
+        .execute_batch("ROLLBACK TO qimen_v9_transfer_probe; RELEASE qimen_v9_transfer_probe;")
+        .map_err(|error| format!("回滚 v9 资产转移约束探针失败：{error}"));
     match (probe_result, rollback_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -7268,6 +8472,126 @@ mod tests {
             subject_kind: "user",
             subject_id: "1875390189",
         }
+    }
+
+    fn recipient_identity<'a>() -> IdentityKey<'a> {
+        IdentityKey {
+            protocol: Protocol::OneBot11,
+            account_id: "10001",
+            namespace: "test",
+            subject_kind: "user",
+            subject_id: "recipient-openid",
+        }
+    }
+
+    fn register_awakened_pair(store: &Store) {
+        store
+            .register_player(&identity(), "转移发送方", "男")
+            .expect("应创建资产转移发送方");
+        store
+            .awaken_wuhun(&identity())
+            .expect("发送方应完成武魂觉醒");
+        store
+            .register_player(&recipient_identity(), "转移接收方", "女")
+            .expect("应创建资产转移接收方");
+        store
+            .awaken_wuhun(&recipient_identity())
+            .expect("接收方应完成武魂觉醒");
+    }
+
+    fn player_id_for(store: &Store, key: &IdentityKey<'_>) -> i64 {
+        store
+            .open()
+            .expect("应打开测试数据库")
+            .query_row(
+                r#"
+                SELECT p.id FROM identity i
+                JOIN player p ON p.identity_id = i.id
+                WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+                  AND i.subject_kind = ?4 AND i.subject_id = ?5
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind,
+                    key.subject_id
+                ],
+                |row| row.get(0),
+            )
+            .expect("应读取测试角色 ID")
+    }
+
+    fn transfer_operation<'a>(command: &'a str, message_id: &'a str) -> OperationLogInput<'a> {
+        OperationLogInput {
+            command,
+            outcome: "ok",
+            source_message_id: message_id,
+            details_json: r#"{"context":"private","has_args":true}"#,
+        }
+    }
+
+    fn seed_wallet(store: &Store, key: &IdentityKey<'_>, balance: i64) {
+        let player_id = player_id_for(store, key);
+        store
+            .open()
+            .expect("应打开测试数据库")
+            .execute(
+                r#"
+                INSERT INTO wallet(player_id, currency_code, balance, created_at, updated_at)
+                VALUES(?1, 'gold_soul_coin', ?2, 0, 0)
+                ON CONFLICT(player_id, currency_code) DO UPDATE SET
+                    balance = excluded.balance,
+                    updated_at = excluded.updated_at
+                "#,
+                params![player_id, balance],
+            )
+            .expect("应设置测试钱包余额");
+    }
+
+    fn seed_inventory(store: &Store, key: &IdentityKey<'_>, item_key: &str, quantity: i64) {
+        let player_id = player_id_for(store, key);
+        store
+            .open()
+            .expect("应打开测试数据库")
+            .execute(
+                r#"
+                INSERT INTO inventory(player_id, item_key, quantity, updated_at)
+                VALUES(?1, ?2, ?3, 0)
+                ON CONFLICT(player_id, item_key) DO UPDATE SET
+                    quantity = excluded.quantity,
+                    updated_at = excluded.updated_at
+                "#,
+                params![player_id, item_key, quantity],
+            )
+            .expect("应设置测试背包数量");
+    }
+
+    fn inventory_for(store: &Store, key: &IdentityKey<'_>, item_key: &str) -> i64 {
+        inventory_quantity(
+            &store.open().expect("应打开测试数据库"),
+            player_id_for(store, key),
+            item_key,
+        )
+        .expect("应读取测试背包数量")
+    }
+
+    fn assert_v9_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v9 损坏测试目录");
+        let store =
+            Store::initialize(directory.path(), &DatabaseConfig::default()).expect("v9 迁移应成功");
+        let connection = store.open().expect("应打开 v9 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v9 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v9 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v9"),
+            "v9 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
     }
 
     fn checkin_operation(message_id: &str) -> OperationLogInput<'_> {
@@ -9504,5 +10828,500 @@ mod tests {
         let error = Store::initialize(directory.path(), &DatabaseConfig::default())
             .expect_err("跨表触发器引用 v8 经济表必须拒绝启动");
         assert!(error.contains("v8") && error.contains("触发器"));
+    }
+
+    #[test]
+    fn v9_wallet_transfer_is_atomic_replay_safe_and_checked() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        seed_wallet(&store, &identity(), 500);
+
+        let first = store
+            .transfer_gold_with_operation(
+                &identity(),
+                recipient_identity().subject_id,
+                125,
+                &transfer_operation("转账", "transfer-success"),
+            )
+            .expect("钱包转账应成功");
+        assert!(!first.replayed);
+        assert_eq!(first.amount, 125);
+        assert_eq!(first.sender_balance_after, 375);
+        assert_eq!(first.recipient_balance_after, 125);
+        assert_eq!(
+            store.wallet_balance(&identity(), GOLD_SOUL_COIN).unwrap(),
+            Some(375)
+        );
+        assert_eq!(
+            store
+                .wallet_balance(&recipient_identity(), GOLD_SOUL_COIN)
+                .unwrap(),
+            Some(125)
+        );
+
+        let replay = store
+            .transfer_gold_with_operation(
+                &identity(),
+                recipient_identity().subject_id,
+                125,
+                &transfer_operation("转账", "transfer-success"),
+            )
+            .expect("同一消息应返回原转账回执");
+        assert!(replay.replayed);
+        assert_eq!(replay.transfer_id, first.transfer_id);
+        assert_eq!(replay.sender_balance_after, 375);
+        assert_eq!(replay.recipient_balance_after, 125);
+        assert!(
+            store
+                .transfer_gold_with_operation(
+                    &identity(),
+                    recipient_identity().subject_id,
+                    126,
+                    &transfer_operation("转账", "transfer-success"),
+                )
+                .expect_err("同消息不同金额必须拒绝")
+                .contains("不同的资产转移请求")
+        );
+
+        for (recipient, amount, message_id) in [
+            (identity().subject_id, 1, "transfer-self"),
+            (recipient_identity().subject_id, 0, "transfer-zero"),
+            (
+                recipient_identity().subject_id,
+                1_000,
+                "transfer-insufficient",
+            ),
+        ] {
+            assert!(
+                store
+                    .transfer_gold_with_operation(
+                        &identity(),
+                        recipient,
+                        amount,
+                        &transfer_operation("转账", message_id),
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            store
+                .transfer_gold_with_operation(
+                    &identity(),
+                    recipient_identity().subject_id,
+                    1,
+                    &transfer_operation("转账", ""),
+                )
+                .expect_err("资产转移不接受空消息 ID")
+                .contains("消息 ID")
+        );
+
+        seed_wallet(&store, &recipient_identity(), i64::MAX);
+        assert!(
+            store
+                .transfer_gold_with_operation(
+                    &identity(),
+                    recipient_identity().subject_id,
+                    1,
+                    &transfer_operation("转账", "transfer-overflow"),
+                )
+                .expect_err("接收方钱包溢出必须回滚")
+                .contains("溢出")
+        );
+        assert_eq!(
+            store.wallet_balance(&identity(), GOLD_SOUL_COIN).unwrap(),
+            Some(375)
+        );
+        assert_eq!(
+            store
+                .wallet_balance(&recipient_identity(), GOLD_SOUL_COIN)
+                .unwrap(),
+            Some(i64::MAX)
+        );
+
+        let connection = store.open().expect("应检查资产转移账本");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM asset_transfer", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operation_log WHERE command = '转账'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let snapshots = connection
+            .query_row(
+                "SELECT sender_before, sender_after, recipient_before, recipient_after FROM asset_transfer WHERE id = ?1",
+                [first.transfer_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
+            )
+            .unwrap();
+        assert_eq!(snapshots, (500, 375, 0, 125));
+    }
+
+    #[test]
+    fn v9_transfer_targets_are_isolated_by_protocol_account_and_namespace() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "范围发送方", "男")
+            .expect("应创建范围发送方");
+        store.awaken_wuhun(&identity()).expect("范围发送方应觉醒");
+        seed_wallet(&store, &identity(), 100);
+
+        let cross_bot = IdentityKey {
+            account_id: "10002",
+            subject_id: "cross-bot-user",
+            ..identity()
+        };
+        let cross_namespace = IdentityKey {
+            namespace: "other-test",
+            subject_id: "cross-namespace-user",
+            ..identity()
+        };
+        let cross_protocol = IdentityKey {
+            protocol: Protocol::QqOfficial,
+            subject_id: "cross-protocol-user",
+            ..identity()
+        };
+        for (key, name) in [
+            (&cross_bot, "跨机器人玩家"),
+            (&cross_namespace, "跨命名空间玩家"),
+            (&cross_protocol, "跨协议玩家"),
+        ] {
+            store.register_player(key, name, "女").unwrap();
+            store.awaken_wuhun(key).unwrap();
+        }
+
+        for (target, message_id) in [
+            (cross_bot.subject_id, "transfer-cross-bot"),
+            (cross_namespace.subject_id, "transfer-cross-namespace"),
+            (cross_protocol.subject_id, "transfer-cross-protocol"),
+        ] {
+            assert!(
+                store
+                    .transfer_gold_with_operation(
+                        &identity(),
+                        target,
+                        1,
+                        &transfer_operation("转账", message_id),
+                    )
+                    .expect_err("跨身份范围目标必须不可见")
+                    .contains("当前身份范围内不存在")
+            );
+        }
+        assert_eq!(
+            store.wallet_balance(&identity(), GOLD_SOUL_COIN).unwrap(),
+            Some(100)
+        );
+        assert_eq!(
+            store
+                .open()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM asset_transfer", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_v9_wallet_transfers_with_distinct_messages_cannot_overdraw() {
+        use std::sync::{Arc, Barrier};
+
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        seed_wallet(&store, &identity(), 100);
+        let barrier = Arc::new(Barrier::new(8));
+        let handles = (0..8)
+            .map(|index| {
+                let store = store.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let message_id = format!("concurrent-transfer-{index}");
+                    let operation = transfer_operation("转账", &message_id);
+                    barrier.wait();
+                    store.transfer_gold_with_operation(
+                        &identity(),
+                        recipient_identity().subject_id,
+                        30,
+                        &operation,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("并发转账线程不应 panic"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 3);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result
+                    .as_ref()
+                    .is_err_and(|error| error.contains("余额不足")))
+                .count(),
+            5
+        );
+        assert_eq!(
+            store.wallet_balance(&identity(), GOLD_SOUL_COIN).unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            store
+                .wallet_balance(&recipient_identity(), GOLD_SOUL_COIN)
+                .unwrap(),
+            Some(90)
+        );
+        let connection = store.open().expect("应检查并发转移结果");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM asset_transfer", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn v9_item_gift_is_policy_bound_replay_safe_and_stack_checked() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        seed_inventory(&store, &identity(), "small-healing-potion", 10);
+        seed_inventory(&store, &identity(), "revival-grass", 1);
+
+        let first = store
+            .gift_item_with_operation(
+                &identity(),
+                recipient_identity().subject_id,
+                "小回复药",
+                4,
+                &transfer_operation("发送物品", "gift-success"),
+            )
+            .expect("可转移消耗品应赠送成功");
+        assert!(!first.replayed);
+        assert_eq!(first.sender_inventory_after, 6);
+        assert_eq!(first.recipient_inventory_after, 4);
+        assert_eq!(
+            inventory_for(&store, &identity(), "small-healing-potion"),
+            6
+        );
+        assert_eq!(
+            inventory_for(&store, &recipient_identity(), "small-healing-potion"),
+            4
+        );
+
+        let replay = store
+            .gift_item_with_operation(
+                &identity(),
+                recipient_identity().subject_id,
+                "small-healing-potion",
+                4,
+                &transfer_operation("发送物品", "gift-success"),
+            )
+            .expect("同一消息应返回原赠送回执");
+        assert!(replay.replayed);
+        assert_eq!(replay.transfer_id, first.transfer_id);
+        assert!(
+            store
+                .gift_item_with_operation(
+                    &identity(),
+                    recipient_identity().subject_id,
+                    "小回复药",
+                    3,
+                    &transfer_operation("发送物品", "gift-success"),
+                )
+                .expect_err("同消息不同数量必须拒绝")
+                .contains("不同的资产转移请求")
+        );
+        assert!(
+            store
+                .gift_item_with_operation(
+                    &identity(),
+                    recipient_identity().subject_id,
+                    "复活草",
+                    1,
+                    &transfer_operation("发送物品", "gift-revival"),
+                )
+                .expect_err("复活物品不得赠送")
+                .contains("不可赠送")
+        );
+
+        seed_inventory(&store, &recipient_identity(), "small-healing-potion", 98);
+        assert!(
+            store
+                .gift_item_with_operation(
+                    &identity(),
+                    recipient_identity().subject_id,
+                    "小回复药",
+                    2,
+                    &transfer_operation("发送物品", "gift-stack-overflow"),
+                )
+                .expect_err("接收方堆叠上限必须完整回滚")
+                .contains("最多堆叠")
+        );
+        assert_eq!(
+            inventory_for(&store, &identity(), "small-healing-potion"),
+            6
+        );
+        assert_eq!(
+            inventory_for(&store, &recipient_identity(), "small-healing-potion"),
+            98
+        );
+        let connection = store.open().expect("应检查物品赠送账本");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM asset_transfer", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operation_log WHERE command = '发送物品'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn v9_transfer_rolls_back_when_audit_or_ledger_insert_fails() {
+        let (_audit_directory, audit_store) = test_store();
+        register_awakened_pair(&audit_store);
+        seed_wallet(&audit_store, &identity(), 100);
+        let connection = audit_store.open().expect("应打开审计失败测试数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER operation_log_transfer_abort
+                BEFORE INSERT ON operation_log
+                WHEN NEW.command = '转账'
+                BEGIN SELECT RAISE(ABORT, 'test transfer audit failure'); END;
+                "#,
+            )
+            .expect("应安装资产转移审计失败触发器");
+        drop(connection);
+        assert!(
+            audit_store
+                .transfer_gold_with_operation(
+                    &identity(),
+                    recipient_identity().subject_id,
+                    25,
+                    &transfer_operation("转账", "transfer-audit-failure"),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            audit_store
+                .wallet_balance(&identity(), GOLD_SOUL_COIN)
+                .unwrap(),
+            Some(100)
+        );
+        assert_eq!(
+            audit_store
+                .wallet_balance(&recipient_identity(), GOLD_SOUL_COIN)
+                .unwrap(),
+            Some(0)
+        );
+        let connection = audit_store.open().expect("应检查审计失败回滚");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM operation_log", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM asset_transfer", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        let (_ledger_directory, ledger_store) = test_store();
+        register_awakened_pair(&ledger_store);
+        seed_inventory(&ledger_store, &identity(), "small-healing-potion", 5);
+        let connection = ledger_store.open().expect("应打开账本失败测试数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER asset_transfer_test_abort
+                BEFORE INSERT ON asset_transfer
+                BEGIN SELECT RAISE(ABORT, 'test asset ledger failure'); END;
+                "#,
+            )
+            .expect("应安装资产账本失败触发器");
+        drop(connection);
+        assert!(
+            ledger_store
+                .gift_item_with_operation(
+                    &identity(),
+                    recipient_identity().subject_id,
+                    "小回复药",
+                    2,
+                    &transfer_operation("发送物品", "gift-ledger-failure"),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            inventory_for(&ledger_store, &identity(), "small-healing-potion"),
+            5
+        );
+        assert_eq!(
+            inventory_for(&ledger_store, &recipient_identity(), "small-healing-potion"),
+            0
+        );
+        let connection = ledger_store.open().expect("应检查账本失败回滚");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM operation_log", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM asset_transfer", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn recorded_v9_with_damaged_schema_or_seed_fails_closed() {
+        for mutation in [
+            "DROP TABLE item_transfer_policy;",
+            "DROP INDEX asset_transfer_sender_page;",
+            "UPDATE item_transfer_policy SET transferable = 0 WHERE item_key = 'small-healing-potion';",
+            "DROP TRIGGER asset_transfer_scope_guard;",
+        ] {
+            assert_v9_damage_fails_closed(mutation);
+        }
+    }
+
+    #[test]
+    fn recorded_v9_with_cross_table_trigger_reference_fails_closed() {
+        assert_v9_damage_fails_closed(
+            r#"
+            CREATE TRIGGER player_wuhun_reads_asset_transfer
+            AFTER INSERT ON player_wuhun
+            BEGIN
+                SELECT EXISTS(SELECT 1 FROM asset_transfer);
+            END;
+            "#,
+        );
     }
 }
