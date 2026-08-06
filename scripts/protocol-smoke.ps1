@@ -403,7 +403,8 @@ try {
     foreach ($command in @(
         "斗罗系统", "开始穿越", "武魂觉醒", "签到", "钱包", "状态", "位置",
         "地图列表", "向", "传送", "掉落", "拾取", "NPC", "对话", "商店", "背包",
-        "购买", "出售", "使用", "转账", "发送物品"
+        "购买", "出售", "使用", "转账", "发送物品", "任务", "接取任务", "任务进度",
+        "提交任务", "放弃任务"
     )) {
         $found = $commands | Where-Object { $_ -eq $command }
         Assert-Condition ($null -ne $found) "descriptor is missing command '$command' (commands=$($commands -join ', '))"
@@ -420,6 +421,10 @@ try {
         @{ Message = "钱包"; Contains = "金魂币" },
         @{ Message = "位置"; Contains = "圣魂村" },
         @{ Message = "掉落"; Contains = "当前地图没有可拾取的地面掉落" },
+        @{ Message = "任务"; Contains = "初入圣魂村" },
+        @{ Message = "接取任务 初入圣魂村"; Contains = "接取任务成功" },
+        @{ Message = "任务进度"; Contains = "初入圣魂村" },
+        @{ Message = "提交任务 初入圣魂村"; Contains = "提交任务成功" },
         @{ Message = "余额"; Contains = "金魂币" },
         @{ Message = "NPC"; Contains = "杂货商人" },
         @{ Message = "对话 杂货商人"; Contains = "当前对话已绑定" },
@@ -482,7 +487,7 @@ try {
     Assert-Condition ($null -ne $reload.data.message) "dynamic reload did not return a result"
     $afterReload = Invoke-OneBotCommand $endpoint "钱包"
     Assert-Condition ($afterReload.Text.Contains("金魂币")) "command failed after dynamic reload"
-    Write-Output "protocol smoke passed: OneBot two-player economy, private/group, synthetic QQ payload, descriptor, and reload"
+    Write-Output "protocol smoke passed: OneBot tasks/economy, private/group, synthetic QQ payload, descriptor, and reload"
 } finally {
     if ($null -ne $process -and -not $process.HasExited) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue

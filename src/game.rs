@@ -13,7 +13,8 @@ use crate::message::{GameDocument, Illustration};
 use crate::store::{
     AuthorizedContextChange, DailyCheckinInput, DailyCheckinResult, GOLD_SOUL_COIN, IdentityKey,
     LegacyClaimActor, LegacyClaimResult, LegacyIdentityState, MapExit, MapRecord, MapTravelReceipt,
-    OperationLogInput, PlayerStatus, Store, experience_progress,
+    OperationLogInput, PlayerStatus, QuestActionReceipt, QuestListEntry, Store,
+    experience_progress,
 };
 
 const MENU_PAGES: &[MenuPage] = &[
@@ -116,6 +117,32 @@ const MENU_PAGES: &[MenuPage] = &[
             MenuEntry {
                 command: "发送物品 <用户ID> <物品> [数量]",
                 description: "向同一 Bot 身份域的玩家赠送物品",
+            },
+        ],
+    },
+    MenuPage {
+        key: "任务",
+        title: "任务与成长",
+        entries: &[
+            MenuEntry {
+                command: "任务 [页码]",
+                description: "查看当前地图可接取的任务",
+            },
+            MenuEntry {
+                command: "接取任务 <任务>",
+                description: "接取一项可用任务",
+            },
+            MenuEntry {
+                command: "任务进度 [任务]",
+                description: "查看进行中的任务进度",
+            },
+            MenuEntry {
+                command: "提交任务 <任务>",
+                description: "提交已完成任务并领取奖励",
+            },
+            MenuEntry {
+                command: "放弃任务 <任务>",
+                description: "放弃进行中的任务",
             },
         ],
     },
@@ -662,6 +689,207 @@ impl GameService {
             .notice(notice)
             .command("掉落")
             .command("背包"))
+    }
+
+    pub fn quests(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let page = parse_single_page(req.args.as_str(), "任务")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let quests = self.store.quests_page(&key, page, 8)?;
+        let mut document = GameDocument::new(format!("任务列表 · {}", quests.map_name))
+            .field("页码", format!("{} / {}", quests.page, quests.page_count))
+            .field("任务总数", quests.total.to_string());
+        if quests.entries.is_empty() {
+            document = document.line("当前地图暂无可接取任务");
+        } else {
+            for entry in &quests.entries {
+                document = self.append_quest_entry(document, entry);
+            }
+        }
+        if page > 1 {
+            document = document.command(format!("任务 {}", page - 1));
+        }
+        if page < quests.page_count {
+            document = document.command(format!("任务 {}", page + 1));
+        }
+        Ok(document.command("任务进度").command("接取任务 <任务>"))
+    }
+
+    pub fn accept_quest(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let quest_name = parse_required_catalog_name(req.args.as_str(), "接取任务 <任务>")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self
+            .store
+            .accept_quest_with_operation(&key, quest_name, &operation)?;
+        Ok(self.quest_action_document(receipt))
+    }
+
+    pub fn quest_progress(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let requested = parse_optional_quest_name(req.args.as_str())?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let entries = self.store.active_quests(&key, requested)?;
+        let mut document =
+            GameDocument::new("进行中任务").field("任务数量", entries.len().to_string());
+        if entries.is_empty() {
+            document = document.line("当前没有进行中的任务");
+        } else {
+            for entry in &entries {
+                document = self.append_quest_entry(document, entry);
+            }
+        }
+        Ok(document.command("任务").command("提交任务 <任务>"))
+    }
+
+    pub fn submit_quest(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let quest_name = parse_required_catalog_name(req.args.as_str(), "提交任务 <任务>")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self
+            .store
+            .submit_quest_with_operation(&key, quest_name, &operation)?;
+        Ok(self.quest_action_document(receipt))
+    }
+
+    pub fn abandon_quest(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let quest_name = parse_required_catalog_name(req.args.as_str(), "放弃任务 <任务>")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self
+            .store
+            .abandon_quest_with_operation(&key, quest_name, &operation)?;
+        Ok(self.quest_action_document(receipt))
+    }
+
+    fn append_quest_entry(
+        &self,
+        mut document: GameDocument,
+        entry: &QuestListEntry,
+    ) -> GameDocument {
+        let status = match entry.status.as_deref() {
+            Some("active") => "进行中",
+            Some("completed") => "已完成",
+            Some("abandoned") => "已放弃",
+            _ => "可接取",
+        };
+        document = document
+            .line(format!(
+                "#{} · {} · {} · Lv.{}",
+                entry.quest.id, entry.quest.name, status, entry.quest.level_required
+            ))
+            .line(entry.quest.description.clone());
+        for requirement in &entry.progress {
+            document = document.line(format!(
+                "条件：{} {}/{}",
+                requirement.description, requirement.current_amount, requirement.required_quantity
+            ));
+        }
+        if !entry.rewards.is_empty() {
+            let rewards = entry
+                .rewards
+                .iter()
+                .map(|reward| match reward.reward_kind.as_str() {
+                    "exp" => format!("经验 x{}", reward.amount),
+                    "currency" => format!(
+                        "{} x{}",
+                        reward.currency_code.as_deref().unwrap_or("货币"),
+                        reward.amount
+                    ),
+                    "item" => format!(
+                        "{} x{}",
+                        reward
+                            .item
+                            .as_ref()
+                            .map(|item| item.name.as_str())
+                            .unwrap_or("物品"),
+                        reward.amount
+                    ),
+                    _ => format!("奖励 x{}", reward.amount),
+                })
+                .collect::<Vec<_>>()
+                .join("、");
+            document = document.line(format!("奖励：{rewards}"));
+        }
+        match entry.status.as_deref() {
+            Some("active") => document.command(format!("任务进度 {}", entry.quest.name)),
+            None => document.command(format!("接取任务 {}", entry.quest.name)),
+            _ => document,
+        }
+    }
+
+    fn quest_action_document(&self, receipt: QuestActionReceipt) -> GameDocument {
+        let title = if receipt.replayed {
+            format!("{}回执", receipt.action)
+        } else {
+            format!("{}成功", receipt.action)
+        };
+        let mut document = GameDocument::new(title)
+            .field("任务", receipt.quest.name)
+            .field("状态", receipt.action.clone());
+        if !receipt.progress.is_empty() {
+            document = document.line("任务条件：");
+            for requirement in &receipt.progress {
+                document = document.line(format!(
+                    "{} {}/{}",
+                    requirement.description,
+                    requirement.current_amount,
+                    requirement.required_quantity
+                ));
+            }
+        }
+        if !receipt.rewards.is_empty() && receipt.action == "提交任务" {
+            document = document.line("获得奖励：");
+            for reward in &receipt.rewards {
+                let text = match reward.reward_kind.as_str() {
+                    "exp" => format!("经验 x{}", reward.amount),
+                    "currency" => format!(
+                        "{} x{}",
+                        reward.currency_code.as_deref().unwrap_or("货币"),
+                        reward.amount
+                    ),
+                    "item" => format!(
+                        "{} x{}",
+                        reward
+                            .item
+                            .as_ref()
+                            .map(|item| item.name.as_str())
+                            .unwrap_or("物品"),
+                        reward.amount
+                    ),
+                    _ => format!("奖励 x{}", reward.amount),
+                };
+                document = document.line(text);
+            }
+        }
+        if let Some(experience) = receipt.experience {
+            document = document
+                .field(
+                    "经验",
+                    format!("{} → {}", experience.exp_before, experience.exp_after),
+                )
+                .field(
+                    "等级",
+                    format!("{} → {}", experience.level_before, experience.level_after),
+                );
+        }
+        if let Some(balance) = receipt.currency_balance_after {
+            document = document.field("金魂币余额", balance.to_string());
+        }
+        document
+            .notice(if receipt.replayed {
+                "检测到相同消息的重复请求，已返回原任务回执，未重复发放奖励"
+            } else {
+                "任务状态、奖励、背包、钱包和操作日志已在同一事务完成"
+            })
+            .command("任务进度")
+            .command("任务")
     }
 
     pub fn buy(&self, req: &CommandRequest) -> Result<GameDocument, String> {
@@ -1345,6 +1573,17 @@ fn parse_optional_map_name(args: &str) -> Result<Option<&str>, String> {
     Ok(Some(args))
 }
 
+fn parse_optional_quest_name(args: &str) -> Result<Option<&str>, String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Ok(None);
+    }
+    if args.chars().count() > 128 || args.chars().any(char::is_control) {
+        return Err("任务名称不能超过 128 个字符且不能包含控制字符".to_string());
+    }
+    Ok(Some(args))
+}
+
 fn parse_required_catalog_name<'a>(args: &'a str, usage: &str) -> Result<&'a str, String> {
     let name = args.trim();
     if name.is_empty() {
@@ -1688,7 +1927,7 @@ fn parse_menu_page(args: &str) -> Result<usize, String> {
     let mut parts = args.split_whitespace();
     let token = parts.next().unwrap_or_default();
     if parts.next().is_some() {
-        return Err("用法：斗罗系统 [页码|开始|角色|世界|经济]".to_string());
+        return Err("用法：斗罗系统 [页码|开始|角色|世界|经济|任务]".to_string());
     }
     if let Some(page) = token
         .parse::<usize>()
@@ -1703,7 +1942,7 @@ fn parse_menu_page(args: &str) -> Result<usize, String> {
     MENU_PAGES
         .iter()
         .position(|page| page.key == token)
-        .ok_or_else(|| "用法：斗罗系统 [页码|开始|角色|世界|经济]".to_string())
+        .ok_or_else(|| "用法：斗罗系统 [页码|开始|角色|世界|经济|任务]".to_string())
 }
 
 #[cfg(test)]
@@ -2109,7 +2348,8 @@ mod tests {
         );
         assert_eq!(parse_menu_page("世界").expect("世界分类应有效"), 2);
         assert_eq!(parse_menu_page("经济").expect("经济分类应有效"), 3);
-        assert!(parse_menu_page("5").is_err());
+        assert_eq!(parse_menu_page("任务").expect("任务分类应有效"), 4);
+        assert!(parse_menu_page("6").is_err());
         assert!(parse_menu_page("角色 多余").is_err());
     }
 
@@ -2148,6 +2388,11 @@ mod tests {
         assert!(fourth.contains("购买 <物品> [数量]：从当前商店购买物品"));
         assert!(fourth.contains("使用 <物品>：使用背包中的消耗品"));
         assert!(fourth.contains("斗罗系统 3"));
+
+        let fifth = crate::message::render_text(&service.menu("任务").expect("任务页应有效"));
+        assert!(fifth.contains("任务 [页码]：查看当前地图可接取的任务"));
+        assert!(fifth.contains("提交任务 <任务>：提交已完成任务并领取奖励"));
+        assert!(fifth.contains("斗罗系统 4"));
     }
 
     #[test]
@@ -2608,5 +2853,48 @@ mod tests {
                 .expect("默认菜单页应有效")
                 .has_illustration()
         );
+    }
+
+    #[test]
+    fn task_commands_render_the_full_lifecycle() {
+        let directory = tempfile::tempdir().expect("应创建临时目录");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("数据库应初始化");
+        let service = GameService::with_assets(
+            store,
+            PluginConfig::default(),
+            IllustrationAssets::default(),
+        );
+        service
+            .register(&command_request("开始穿越", "任务测试 男", "task-register"))
+            .expect("应创建任务测试角色");
+        service
+            .awaken(&command_request("武魂觉醒", "", "task-awaken"))
+            .expect("应完成任务测试角色觉醒");
+        let list = crate::message::render_text(
+            &service
+                .quests(&command_request("任务", "", "task-list"))
+                .expect("应渲染任务列表"),
+        );
+        assert!(list.contains("初入圣魂村"));
+        let accepted = crate::message::render_text(
+            &service
+                .accept_quest(&command_request("接取任务", "初入圣魂村", "task-accept"))
+                .expect("应接取任务"),
+        );
+        assert!(accepted.contains("接取任务成功"));
+        let progress = crate::message::render_text(
+            &service
+                .quest_progress(&command_request("任务进度", "", "task-progress"))
+                .expect("应渲染任务进度"),
+        );
+        assert!(progress.contains("初入圣魂村"));
+        let submitted = crate::message::render_text(
+            &service
+                .submit_quest(&command_request("提交任务", "初入圣魂村", "task-submit"))
+                .expect("应提交任务"),
+        );
+        assert!(submitted.contains("提交任务成功"));
+        assert!(submitted.contains("经验"));
     }
 }

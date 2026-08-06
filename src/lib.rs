@@ -373,6 +373,61 @@ mod plugin {
     }
 
     #[command(
+        name = "任务",
+        description = "查看当前地图可接取的任务：任务 [页码]",
+        aliases = "任务列表,任务清单",
+        category = "斗罗大陆·任务",
+        scope = "all"
+    )]
+    fn quests(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.quests(req))
+    }
+
+    #[command(
+        name = "接取任务",
+        description = "接取任务：接取任务 <任务>",
+        aliases = "接受任务,接任务",
+        category = "斗罗大陆·任务",
+        scope = "all"
+    )]
+    fn accept_quest(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.accept_quest(req))
+    }
+
+    #[command(
+        name = "任务进度",
+        description = "查看进行中的任务进度：任务进度 [任务]",
+        aliases = "我的任务,进行中任务",
+        category = "斗罗大陆·任务",
+        scope = "all"
+    )]
+    fn quest_progress(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.quest_progress(req))
+    }
+
+    #[command(
+        name = "提交任务",
+        description = "提交已完成任务并领取奖励：提交任务 <任务>",
+        aliases = "完成任务,交任务",
+        category = "斗罗大陆·任务",
+        scope = "all"
+    )]
+    fn submit_quest(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.submit_quest(req))
+    }
+
+    #[command(
+        name = "放弃任务",
+        description = "放弃进行中的任务：放弃任务 <任务>",
+        aliases = "取消任务",
+        category = "斗罗大陆·任务",
+        scope = "all"
+    )]
+    fn abandon_quest(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.abandon_quest(req))
+    }
+
+    #[command(
         name = "旧档检查",
         description = "检查指定用户的旧版存档认领状态",
         category = "斗罗大陆·管理",

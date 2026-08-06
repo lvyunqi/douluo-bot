@@ -1001,6 +1001,280 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_V11: &str = r#"
+CREATE TABLE quest (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    quest_key TEXT NOT NULL UNIQUE CHECK(
+        length(quest_key) BETWEEN 1 AND 96
+        AND quest_key = trim(quest_key)
+        AND quest_key GLOB '[a-z0-9][a-z0-9._-]*'
+        AND quest_key NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 128),
+    description TEXT NOT NULL CHECK(length(description) <= 2000),
+    category TEXT NOT NULL CHECK(category IN ('main', 'side', 'daily')),
+    map_key TEXT REFERENCES map(map_key) ON DELETE RESTRICT,
+    level_required INTEGER NOT NULL DEFAULT 1 CHECK(level_required BETWEEN 1 AND 120),
+    repeatable INTEGER NOT NULL DEFAULT 0 CHECK(repeatable IN (0, 1)),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+) STRICT;
+
+CREATE INDEX quest_available_page
+    ON quest(enabled, map_key, level_required, id);
+
+CREATE TABLE quest_requirement (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    quest_id INTEGER NOT NULL REFERENCES quest(id) ON DELETE RESTRICT,
+    requirement_kind TEXT NOT NULL CHECK(requirement_kind IN ('item', 'visit', 'level')),
+    target_key TEXT NOT NULL CHECK(length(target_key) BETWEEN 1 AND 96),
+    required_quantity INTEGER NOT NULL CHECK(required_quantity BETWEEN 1 AND 9999),
+    sort_order INTEGER NOT NULL CHECK(sort_order >= 0),
+    description TEXT NOT NULL CHECK(length(description) <= 500),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    UNIQUE(quest_id, sort_order),
+    CHECK(
+        (requirement_kind = 'item' AND target_key GLOB '[a-z0-9][a-z0-9._-]*'
+         AND target_key NOT GLOB '*[^a-z0-9._-]*')
+        OR (requirement_kind = 'visit' AND target_key GLOB '[a-z0-9][a-z0-9._-]*'
+            AND target_key NOT GLOB '*[^a-z0-9._-]*')
+        OR (requirement_kind = 'level' AND target_key = 'level')
+    )
+) STRICT;
+
+CREATE INDEX quest_requirement_quest_page
+    ON quest_requirement(quest_id, sort_order, id);
+
+CREATE TABLE quest_reward (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    quest_id INTEGER NOT NULL REFERENCES quest(id) ON DELETE RESTRICT,
+    reward_kind TEXT NOT NULL CHECK(reward_kind IN ('exp', 'currency', 'item')),
+    currency_code TEXT CHECK(
+        currency_code IS NULL OR (
+            length(currency_code) BETWEEN 1 AND 32
+            AND currency_code = trim(currency_code)
+            AND currency_code GLOB '[A-Za-z0-9._-]*'
+            AND currency_code NOT GLOB '*[^A-Za-z0-9._-]*'
+        )
+    ),
+    item_key TEXT REFERENCES item(item_key) ON DELETE RESTRICT,
+    amount INTEGER NOT NULL CHECK(amount BETWEEN 1 AND 999999999),
+    sort_order INTEGER NOT NULL CHECK(sort_order >= 0),
+    description TEXT NOT NULL CHECK(length(description) <= 500),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    UNIQUE(quest_id, sort_order),
+    CHECK(
+        (reward_kind = 'exp' AND currency_code IS NULL AND item_key IS NULL)
+        OR (reward_kind = 'currency' AND currency_code IS NOT NULL AND item_key IS NULL)
+        OR (reward_kind = 'item' AND currency_code IS NULL AND item_key IS NOT NULL)
+    )
+) STRICT;
+
+CREATE INDEX quest_reward_quest_page
+    ON quest_reward(quest_id, sort_order, id);
+
+CREATE TABLE player_quest (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE CASCADE,
+    quest_id INTEGER NOT NULL REFERENCES quest(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK(status IN ('active', 'completed', 'abandoned')),
+    accepted_at INTEGER NOT NULL CHECK(accepted_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+    completed_at INTEGER CHECK(completed_at IS NULL OR completed_at >= accepted_at),
+    UNIQUE(player_id, quest_id),
+    CHECK((status = 'completed' AND completed_at IS NOT NULL)
+       OR (status <> 'completed' AND completed_at IS NULL))
+) STRICT;
+
+CREATE INDEX player_quest_player_status_page
+    ON player_quest(player_id, status, id);
+
+CREATE TABLE player_quest_progress (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_quest_id INTEGER NOT NULL REFERENCES player_quest(id) ON DELETE CASCADE,
+    requirement_id INTEGER NOT NULL REFERENCES quest_requirement(id) ON DELETE RESTRICT,
+    current_amount INTEGER NOT NULL CHECK(current_amount >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+    UNIQUE(player_quest_id, requirement_id)
+) STRICT;
+
+CREATE INDEX player_quest_progress_page
+    ON player_quest_progress(player_quest_id, requirement_id);
+
+CREATE TABLE player_quest_action (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_quest_id INTEGER NOT NULL REFERENCES player_quest(id) ON DELETE RESTRICT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    quest_id INTEGER NOT NULL REFERENCES quest(id) ON DELETE RESTRICT,
+    action_kind TEXT NOT NULL CHECK(action_kind IN ('accepted', 'completed', 'abandoned')),
+    status_before TEXT CHECK(status_before IS NULL OR status_before IN ('active', 'completed', 'abandoned')),
+    status_after TEXT NOT NULL CHECK(status_after IN ('active', 'completed', 'abandoned')),
+    source_message_id TEXT NOT NULL CHECK(
+        length(source_message_id) <= 256
+        AND instr(source_message_id, char(0)) = 0
+        AND source_message_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    operation_log_id INTEGER NOT NULL REFERENCES operation_log(id) ON DELETE RESTRICT,
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    CHECK((action_kind = 'accepted' AND (status_before IS NULL OR status_before = 'abandoned') AND status_after = 'active')
+       OR (action_kind = 'completed' AND status_before = 'active' AND status_after = 'completed')
+       OR (action_kind = 'abandoned' AND status_before = 'active' AND status_after = 'abandoned'))
+) STRICT;
+
+CREATE UNIQUE INDEX player_quest_action_operation
+    ON player_quest_action(operation_log_id);
+CREATE INDEX player_quest_action_player_page
+    ON player_quest_action(player_id, id);
+
+INSERT OR IGNORE INTO quest(
+    quest_key, name, description, category, map_key, level_required,
+    repeatable, enabled, created_at, updated_at
+) VALUES
+    ('village-introduction', '初入圣魂村', '在圣魂村完成第一次冒险登记。', 'main', 'holy-soul-village', 1, 0, 1, 0, 0),
+    ('healing-supplies', '收集回复药', '为村中商人准备两瓶小回复药。', 'side', 'holy-soul-village', 1, 0, 1, 0, 0);
+
+INSERT OR IGNORE INTO quest_requirement(
+    quest_id, requirement_kind, target_key, required_quantity, sort_order, description, created_at
+)
+SELECT id, 'visit', 'holy-soul-village', 1, 0, '到访圣魂村', 0
+  FROM quest WHERE quest_key = 'village-introduction';
+INSERT OR IGNORE INTO quest_requirement(
+    quest_id, requirement_kind, target_key, required_quantity, sort_order, description, created_at
+)
+SELECT id, 'item', 'small-healing-potion', 2, 0, '拥有两瓶小回复药', 0
+  FROM quest WHERE quest_key = 'healing-supplies';
+
+INSERT OR IGNORE INTO quest_reward(
+    quest_id, reward_kind, currency_code, item_key, amount, sort_order, description, created_at
+)
+SELECT id, 'exp', NULL, NULL, 80, 0, '经验奖励', 0
+  FROM quest WHERE quest_key = 'village-introduction';
+INSERT OR IGNORE INTO quest_reward(
+    quest_id, reward_kind, currency_code, item_key, amount, sort_order, description, created_at
+)
+SELECT id, 'currency', 'gold_soul_coin', NULL, 30, 1, '金魂币奖励', 0
+  FROM quest WHERE quest_key = 'village-introduction';
+INSERT OR IGNORE INTO quest_reward(
+    quest_id, reward_kind, currency_code, item_key, amount, sort_order, description, created_at
+)
+SELECT id, 'exp', NULL, NULL, 100, 0, '经验奖励', 0
+  FROM quest WHERE quest_key = 'healing-supplies';
+INSERT OR IGNORE INTO quest_reward(
+    quest_id, reward_kind, currency_code, item_key, amount, sort_order, description, created_at
+)
+SELECT id, 'currency', 'gold_soul_coin', NULL, 50, 1, '金魂币奖励', 0
+  FROM quest WHERE quest_key = 'healing-supplies';
+
+CREATE TRIGGER quest_no_update
+BEFORE UPDATE ON quest
+BEGIN
+    SELECT RAISE(ABORT, 'quest catalog is immutable');
+END;
+CREATE TRIGGER quest_no_delete
+BEFORE DELETE ON quest
+BEGIN
+    SELECT RAISE(ABORT, 'quest catalog is immutable');
+END;
+CREATE TRIGGER quest_no_reinsert
+BEFORE INSERT ON quest
+WHEN EXISTS(SELECT 1 FROM quest WHERE quest_key = NEW.quest_key)
+BEGIN
+    SELECT RAISE(ABORT, 'quest catalog is immutable');
+END;
+
+CREATE TRIGGER quest_requirement_no_update
+BEFORE UPDATE ON quest_requirement
+BEGIN
+    SELECT RAISE(ABORT, 'quest requirement is immutable');
+END;
+CREATE TRIGGER quest_requirement_no_delete
+BEFORE DELETE ON quest_requirement
+BEGIN
+    SELECT RAISE(ABORT, 'quest requirement is immutable');
+END;
+CREATE TRIGGER quest_requirement_no_reinsert
+BEFORE INSERT ON quest_requirement
+WHEN EXISTS(SELECT 1 FROM quest_requirement WHERE quest_id = NEW.quest_id AND sort_order = NEW.sort_order)
+BEGIN
+    SELECT RAISE(ABORT, 'quest requirement is immutable');
+END;
+
+CREATE TRIGGER quest_reward_no_update
+BEFORE UPDATE ON quest_reward
+BEGIN
+    SELECT RAISE(ABORT, 'quest reward is immutable');
+END;
+CREATE TRIGGER quest_reward_no_delete
+BEFORE DELETE ON quest_reward
+BEGIN
+    SELECT RAISE(ABORT, 'quest reward is immutable');
+END;
+CREATE TRIGGER quest_reward_no_reinsert
+BEFORE INSERT ON quest_reward
+WHEN EXISTS(SELECT 1 FROM quest_reward WHERE quest_id = NEW.quest_id AND sort_order = NEW.sort_order)
+BEGIN
+    SELECT RAISE(ABORT, 'quest reward is immutable');
+END;
+
+CREATE TRIGGER player_quest_action_no_update
+BEFORE UPDATE ON player_quest_action
+BEGIN
+    SELECT RAISE(ABORT, 'player quest action is immutable');
+END;
+CREATE TRIGGER player_quest_action_no_delete
+BEFORE DELETE ON player_quest_action
+BEGIN
+    SELECT RAISE(ABORT, 'player quest action is immutable');
+END;
+CREATE TRIGGER player_quest_action_no_reinsert
+BEFORE INSERT ON player_quest_action
+WHEN EXISTS(SELECT 1 FROM player_quest_action WHERE operation_log_id = NEW.operation_log_id)
+BEGIN
+    SELECT RAISE(ABORT, 'player quest action is immutable');
+END;
+
+CREATE TRIGGER player_quest_action_scope_guard
+BEFORE INSERT ON player_quest_action
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM player_quest pq
+      JOIN player p ON p.id = NEW.player_id
+      JOIN identity i ON i.id = p.identity_id
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE pq.id = NEW.player_quest_id
+       AND pq.player_id = NEW.player_id
+       AND pq.quest_id = NEW.quest_id
+       AND i.protocol = audit.protocol
+       AND i.account_id = audit.account_id
+       AND i.namespace = audit.namespace
+       AND audit.subject_kind = 'user'
+       AND audit.subject_id = i.subject_id
+       AND audit.command = CASE NEW.action_kind
+           WHEN 'accepted' THEN '接取任务'
+           WHEN 'completed' THEN '提交任务'
+           WHEN 'abandoned' THEN '放弃任务'
+       END
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'player quest action scope or audit mismatch');
+END;
+
+CREATE TRIGGER player_quest_transition_guard
+BEFORE UPDATE ON player_quest
+WHEN OLD.player_id <> NEW.player_id
+  OR OLD.quest_id <> NEW.quest_id
+  OR NOT (
+      (OLD.status = 'active' AND NEW.status IN ('completed', 'abandoned'))
+      OR (OLD.status = 'abandoned' AND NEW.status = 'active')
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid player quest transition');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -1261,6 +1535,66 @@ pub struct GroundDropPickupReceipt {
     pub item: ItemRecord,
     pub quantity: i64,
     pub inventory_after: i64,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestRecord {
+    pub id: i64,
+    pub quest_key: String,
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    pub map_key: Option<String>,
+    pub map_name: Option<String>,
+    pub level_required: i64,
+    pub repeatable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestRequirementProgress {
+    pub requirement_id: i64,
+    pub requirement_kind: String,
+    pub target_key: String,
+    pub description: String,
+    pub current_amount: i64,
+    pub required_quantity: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestRewardRecord {
+    pub reward_kind: String,
+    pub currency_code: Option<String>,
+    pub item: Option<ItemRecord>,
+    pub amount: i64,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestListEntry {
+    pub quest: QuestRecord,
+    pub status: Option<String>,
+    pub progress: Vec<QuestRequirementProgress>,
+    pub rewards: Vec<QuestRewardRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestPage {
+    pub entries: Vec<QuestListEntry>,
+    pub map_name: String,
+    pub page: usize,
+    pub page_count: usize,
+    pub total: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestActionReceipt {
+    pub quest: QuestRecord,
+    pub action: String,
+    pub progress: Vec<QuestRequirementProgress>,
+    pub rewards: Vec<QuestRewardRecord>,
+    pub experience: Option<ExperienceGrantReceipt>,
+    pub currency_balance_after: Option<i64>,
     pub replayed: bool,
 }
 
@@ -1891,6 +2225,21 @@ impl Store {
                 validate_v10_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 11)? {
+                transaction
+                    .execute_batch(MIGRATION_V11)
+                    .map_err(|error| format!("执行数据库迁移 v11 失败：{error}"))?;
+                validate_v11_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(11, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v11 失败：{error}"))?;
+            } else {
+                validate_v11_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!("提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10 失败：{error}")
@@ -1910,6 +2259,7 @@ impl Store {
                 validate_v8_schema(connection)?;
                 validate_v9_schema(connection)?;
                 validate_v10_schema(connection)?;
+                validate_v11_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -3066,6 +3416,544 @@ impl Store {
             item: drop.item,
             quantity: drop.quantity,
             inventory_after,
+            replayed: false,
+        })
+    }
+
+    pub fn quests_page(
+        &self,
+        key: &IdentityKey<'_>,
+        page: usize,
+        limit: usize,
+    ) -> Result<QuestPage, String> {
+        validate_identity_key(key)?;
+        validate_quest_page(page, limit)?;
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let (player_id, level, map) = load_player_map_for_identity(&connection, key)?;
+        let total = connection
+            .query_row(
+                r#"
+                SELECT COUNT(*)
+                  FROM quest q
+                 WHERE q.enabled = 1
+                   AND q.level_required <= ?1
+                   AND (q.map_key IS NULL OR q.map_key = ?2)
+                   AND NOT EXISTS(
+                       SELECT 1 FROM player_quest pq
+                        WHERE pq.player_id = ?3 AND pq.quest_id = q.id
+                          AND pq.status = 'completed' AND q.repeatable = 0
+                   )
+                "#,
+                params![level, map.map_key, player_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("统计任务数量失败：{error}"))?;
+        let total = usize::try_from(total).map_err(|_| "任务数量超出分页范围".to_string())?;
+        let page_count = total.div_ceil(limit).max(1);
+        if page > page_count {
+            return Err(format!("任务页码必须在 1 到 {page_count} 之间"));
+        }
+        let offset = page
+            .checked_sub(1)
+            .and_then(|value| value.checked_mul(limit))
+            .ok_or_else(|| "任务分页偏移量溢出".to_string())?;
+        let fetch_limit = i64::try_from(limit).map_err(|_| "任务分页数量无法转换".to_string())?;
+        let offset = i64::try_from(offset).map_err(|_| "任务分页偏移量无法转换".to_string())?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT q.id, q.quest_key, q.name, q.description, q.category,
+                       q.map_key, m.name, q.level_required, q.repeatable,
+                       pq.status
+                  FROM quest q
+             LEFT JOIN map m ON m.map_key = q.map_key
+             LEFT JOIN player_quest pq
+                    ON pq.quest_id = q.id AND pq.player_id = ?1
+                 WHERE q.enabled = 1
+                   AND q.level_required <= ?2
+                   AND (q.map_key IS NULL OR q.map_key = ?3)
+                   AND NOT (COALESCE(pq.status, '') = 'completed' AND q.repeatable = 0)
+                 ORDER BY q.category, q.id
+                 LIMIT ?4 OFFSET ?5
+                "#,
+            )
+            .map_err(|error| format!("准备任务分页查询失败：{error}"))?;
+        let rows = statement
+            .query_map(
+                params![player_id, level, map.map_key, fetch_limit, offset],
+                |row| {
+                    Ok((
+                        quest_record_from_row(row, 0)?,
+                        row.get::<_, Option<String>>(9)?,
+                    ))
+                },
+            )
+            .map_err(|error| format!("查询任务分页失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析任务分页失败：{error}"))?;
+        let entries = rows
+            .into_iter()
+            .map(|(quest, status)| {
+                load_quest_list_entry(&connection, player_id, level, &map.map_key, quest, status)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(QuestPage {
+            entries,
+            map_name: map.name,
+            page,
+            page_count,
+            total,
+        })
+    }
+
+    pub fn active_quests(
+        &self,
+        key: &IdentityKey<'_>,
+        requested_name_or_key: Option<&str>,
+    ) -> Result<Vec<QuestListEntry>, String> {
+        validate_identity_key(key)?;
+        if let Some(value) = requested_name_or_key {
+            validate_catalog_lookup(value, "任务名称")?;
+        }
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let (player_id, level, map) = load_player_map_for_identity(&connection, key)?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT q.id, q.quest_key, q.name, q.description, q.category,
+                       q.map_key, m.name, q.level_required, q.repeatable,
+                       pq.status
+                  FROM player_quest pq
+                  JOIN quest q ON q.id = pq.quest_id
+             LEFT JOIN map m ON m.map_key = q.map_key
+                 WHERE pq.player_id = ?1 AND pq.status = 'active'
+                   AND (?2 IS NULL OR q.name = ?2 OR q.quest_key = ?2)
+                 ORDER BY pq.id
+                "#,
+            )
+            .map_err(|error| format!("准备活动任务查询失败：{error}"))?;
+        let rows = statement
+            .query_map(params![player_id, requested_name_or_key], |row| {
+                Ok((
+                    quest_record_from_row(row, 0)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            })
+            .map_err(|error| format!("查询活动任务失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析活动任务失败：{error}"))?;
+        rows.into_iter()
+            .map(|(quest, status)| {
+                load_quest_list_entry(&connection, player_id, level, &map.map_key, quest, status)
+            })
+            .collect()
+    }
+
+    pub fn accept_quest_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        requested_name_or_key: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<QuestActionReceipt, String> {
+        validate_identity_key(key)?;
+        validate_catalog_lookup(requested_name_or_key, "任务名称")?;
+        validate_quest_operation(operation, "接取任务")?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始接取任务事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let sender = load_transfer_sender(&transaction, key)?;
+        ensure_transfer_participant_eligible(&sender, "你的角色")?;
+        if !operation.source_message_id.is_empty()
+            && let Some(existing) = load_quest_action_by_message(
+                &transaction,
+                sender.player_id,
+                operation.source_message_id,
+            )?
+        {
+            if existing.action_kind != "accepted"
+                || existing.quest_id
+                    != load_quest_by_name_or_key(&transaction, requested_name_or_key)?.id
+            {
+                return Err("该消息 ID 已用于不同的任务操作，拒绝重放".to_string());
+            }
+            return load_quest_action_receipt(
+                &transaction,
+                sender.player_id,
+                existing.quest_id,
+                "接取任务",
+                true,
+            );
+        }
+        let quest = load_quest_by_name_or_key(&transaction, requested_name_or_key)?;
+        let enabled = transaction
+            .query_row(
+                "SELECT enabled FROM quest WHERE id = ?1",
+                [quest.id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("读取任务状态失败：{error}"))?;
+        if !enabled || quest.level_required > load_player_level(&transaction, sender.player_id)? {
+            return Err("当前等级或任务状态不满足接取条件".to_string());
+        }
+        let current_map_key = load_player_map_key(&transaction, sender.player_id);
+        if quest
+            .map_key
+            .as_deref()
+            .is_some_and(|map_key| map_key != current_map_key)
+        {
+            return Err("该任务不在当前地图可接取范围内".to_string());
+        }
+        let timestamp = now_timestamp()?;
+        let existing = load_player_quest_row(&transaction, sender.player_id, quest.id)?;
+        let status_before = existing.as_ref().map(|row| row.status.as_str());
+        match existing.as_ref().map(|row| row.status.as_str()) {
+            Some("active") => return Err("该任务已经在进行中".to_string()),
+            Some("completed") if !quest.repeatable => {
+                return Err("该任务已经完成，不能重复接取".to_string());
+            }
+            Some("completed") => return Err("可重复任务暂未开放再次接取".to_string()),
+            Some("abandoned") => {
+                transaction
+                    .execute(
+                        "UPDATE player_quest SET status = 'active', accepted_at = ?1, updated_at = ?1, completed_at = NULL WHERE id = ?2",
+                        params![timestamp, existing.as_ref().expect("已有任务").id],
+                    )
+                    .map_err(|error| format!("重新接取任务失败：{error}"))?;
+                transaction
+                    .execute(
+                        "DELETE FROM player_quest_progress WHERE player_quest_id = ?1",
+                        [existing.as_ref().expect("已有任务").id],
+                    )
+                    .map_err(|error| format!("重置任务进度失败：{error}"))?;
+            }
+            None => {
+                transaction
+                    .execute(
+                        "INSERT INTO player_quest(player_id, quest_id, status, accepted_at, updated_at, completed_at) VALUES(?1, ?2, 'active', ?3, ?3, NULL)",
+                        params![sender.player_id, quest.id, timestamp],
+                    )
+                    .map_err(|error| format!("创建玩家任务失败：{error}"))?;
+            }
+            _ => return Err("玩家任务状态无效".to_string()),
+        }
+        let player_quest_id = existing
+            .as_ref()
+            .map(|row| row.id)
+            .unwrap_or_else(|| transaction.last_insert_rowid());
+        sync_player_quest_progress(&transaction, player_quest_id, sender.player_id, timestamp)?;
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        insert_player_quest_action(
+            &transaction,
+            player_quest_id,
+            sender.player_id,
+            quest.id,
+            "accepted",
+            status_before,
+            "active",
+            operation.source_message_id,
+            operation_log_id,
+            timestamp,
+        )?;
+        let progress = load_quest_requirements(
+            &transaction,
+            sender.player_id,
+            quest.id,
+            player_quest_id,
+            load_player_level(&transaction, sender.player_id)?,
+            &load_player_map_key(&transaction, sender.player_id),
+        )?;
+        let rewards = load_quest_rewards(&transaction, quest.id)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交接取任务事务失败：{error}"))?;
+        Ok(QuestActionReceipt {
+            quest,
+            action: "接取任务".to_string(),
+            progress,
+            rewards,
+            experience: None,
+            currency_balance_after: None,
+            replayed: false,
+        })
+    }
+
+    pub fn submit_quest_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        requested_name_or_key: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<QuestActionReceipt, String> {
+        validate_identity_key(key)?;
+        validate_catalog_lookup(requested_name_or_key, "任务名称")?;
+        validate_quest_operation(operation, "提交任务")?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始提交任务事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let sender = load_transfer_sender(&transaction, key)?;
+        ensure_transfer_participant_eligible(&sender, "你的角色")?;
+        let quest = load_quest_by_name_or_key(&transaction, requested_name_or_key)?;
+        if !operation.source_message_id.is_empty()
+            && let Some(existing) = load_quest_action_by_message(
+                &transaction,
+                sender.player_id,
+                operation.source_message_id,
+            )?
+        {
+            if existing.action_kind != "completed" || existing.quest_id != quest.id {
+                return Err("该消息 ID 已用于不同的任务操作，拒绝重放".to_string());
+            }
+            return load_quest_action_receipt(
+                &transaction,
+                sender.player_id,
+                quest.id,
+                "提交任务",
+                true,
+            );
+        }
+        let player_quest = load_player_quest_row(&transaction, sender.player_id, quest.id)?
+            .ok_or_else(|| "你尚未接取该任务".to_string())?;
+        if player_quest.status != "active" {
+            return Err(match player_quest.status.as_str() {
+                "completed" => "该任务已经提交过了".to_string(),
+                "abandoned" => "该任务已放弃，请先重新接取".to_string(),
+                _ => "玩家任务状态无效".to_string(),
+            });
+        }
+        let current_map_key = load_player_map_key(&transaction, sender.player_id);
+        let progress = load_quest_requirements(
+            &transaction,
+            sender.player_id,
+            quest.id,
+            player_quest.id,
+            load_player_level(&transaction, sender.player_id)?,
+            &current_map_key,
+        )?;
+        if progress
+            .iter()
+            .any(|entry| entry.current_amount < entry.required_quantity)
+        {
+            return Err("任务条件尚未全部完成".to_string());
+        }
+        let timestamp = now_timestamp()?;
+        for requirement in &progress {
+            if requirement.requirement_kind == "item" {
+                let before =
+                    inventory_quantity(&transaction, sender.player_id, &requirement.target_key)?;
+                let after = before
+                    .checked_sub(requirement.required_quantity)
+                    .ok_or_else(|| "任务物品数量计算溢出".to_string())?;
+                set_inventory_quantity(
+                    &transaction,
+                    sender.player_id,
+                    &requirement.target_key,
+                    after,
+                    timestamp,
+                )?;
+            }
+        }
+        let rewards = load_quest_rewards(&transaction, quest.id)?;
+        let mut exp_amount = 0_i64;
+        let mut currency_code: Option<String> = None;
+        let mut currency_amount = 0_i64;
+        for reward in &rewards {
+            match reward.reward_kind.as_str() {
+                "exp" => {
+                    exp_amount = exp_amount
+                        .checked_add(reward.amount)
+                        .ok_or_else(|| "任务经验奖励计算溢出".to_string())?;
+                }
+                "currency" => {
+                    let code = reward
+                        .currency_code
+                        .as_deref()
+                        .ok_or_else(|| "任务货币奖励缺少币种".to_string())?;
+                    validate_currency_code(code)?;
+                    if let Some(existing_code) = &currency_code {
+                        if existing_code != code {
+                            return Err("同一任务暂不支持多种奖励币种".to_string());
+                        }
+                    } else {
+                        currency_code = Some(code.to_string());
+                    }
+                    currency_amount = currency_amount
+                        .checked_add(reward.amount)
+                        .ok_or_else(|| "任务货币奖励计算溢出".to_string())?;
+                }
+                "item" => {
+                    let item = reward
+                        .item
+                        .as_ref()
+                        .ok_or_else(|| "任务物品奖励缺少物品定义".to_string())?;
+                    let before =
+                        inventory_quantity(&transaction, sender.player_id, &item.item_key)?;
+                    let after = before
+                        .checked_add(reward.amount)
+                        .ok_or_else(|| "任务物品奖励计算溢出".to_string())?;
+                    if after > item.max_stack {
+                        return Err(format!(
+                            "任务奖励会超过{}的堆叠上限 {}，提交已回滚",
+                            item.name, item.max_stack
+                        ));
+                    }
+                    set_inventory_quantity(
+                        &transaction,
+                        sender.player_id,
+                        &item.item_key,
+                        after,
+                        timestamp,
+                    )?;
+                }
+                _ => return Err("任务奖励类型无效".to_string()),
+            }
+        }
+        let experience = if exp_amount > 0 {
+            let (level_before, exp_before) = transaction
+                .query_row(
+                    "SELECT level, exp FROM player WHERE id = ?1",
+                    [sender.player_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .map_err(|error| format!("读取任务奖励经验状态失败：{error}"))?;
+            Some(apply_experience_in_transaction(
+                &transaction,
+                sender.player_id,
+                level_before,
+                exp_before,
+                exp_amount,
+                timestamp,
+            )?)
+        } else {
+            None
+        };
+        let currency_balance_after = if let Some(code) = currency_code.as_deref() {
+            ensure_wallet(&transaction, sender.player_id, code, timestamp)?;
+            let before = wallet_balance_in_transaction(&transaction, sender.player_id, code)?;
+            let after = before
+                .checked_add(currency_amount)
+                .ok_or_else(|| "任务货币奖励计算溢出".to_string())?;
+            update_wallet_balance(&transaction, sender.player_id, code, after, timestamp)?;
+            Some(after)
+        } else {
+            None
+        };
+        transaction
+            .execute(
+                "UPDATE player_quest SET status = 'completed', updated_at = ?1, completed_at = ?1 WHERE id = ?2",
+                params![timestamp, player_quest.id],
+            )
+            .map_err(|error| format!("更新任务完成状态失败：{error}"))?;
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        insert_player_quest_action(
+            &transaction,
+            player_quest.id,
+            sender.player_id,
+            quest.id,
+            "completed",
+            Some("active"),
+            "completed",
+            operation.source_message_id,
+            operation_log_id,
+            timestamp,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交任务完成事务失败：{error}"))?;
+        Ok(QuestActionReceipt {
+            quest,
+            action: "提交任务".to_string(),
+            progress,
+            rewards,
+            experience,
+            currency_balance_after,
+            replayed: false,
+        })
+    }
+
+    pub fn abandon_quest_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        requested_name_or_key: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<QuestActionReceipt, String> {
+        validate_identity_key(key)?;
+        validate_catalog_lookup(requested_name_or_key, "任务名称")?;
+        validate_quest_operation(operation, "放弃任务")?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始放弃任务事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let sender = load_transfer_sender(&transaction, key)?;
+        ensure_transfer_participant_eligible(&sender, "你的角色")?;
+        let quest = load_quest_by_name_or_key(&transaction, requested_name_or_key)?;
+        if !operation.source_message_id.is_empty()
+            && let Some(existing) = load_quest_action_by_message(
+                &transaction,
+                sender.player_id,
+                operation.source_message_id,
+            )?
+        {
+            if existing.action_kind != "abandoned" || existing.quest_id != quest.id {
+                return Err("该消息 ID 已用于不同的任务操作，拒绝重放".to_string());
+            }
+            return load_quest_action_receipt(
+                &transaction,
+                sender.player_id,
+                quest.id,
+                "放弃任务",
+                true,
+            );
+        }
+        let player_quest = load_player_quest_row(&transaction, sender.player_id, quest.id)?
+            .ok_or_else(|| "你尚未接取该任务".to_string())?;
+        if player_quest.status != "active" {
+            return Err("只有进行中的任务可以放弃".to_string());
+        }
+        let timestamp = now_timestamp()?;
+        let progress = load_quest_requirements(
+            &transaction,
+            sender.player_id,
+            quest.id,
+            player_quest.id,
+            load_player_level(&transaction, sender.player_id)?,
+            &load_player_map_key(&transaction, sender.player_id),
+        )?;
+        transaction
+            .execute(
+                "UPDATE player_quest SET status = 'abandoned', updated_at = ?1, completed_at = NULL WHERE id = ?2",
+                params![timestamp, player_quest.id],
+            )
+            .map_err(|error| format!("更新任务放弃状态失败：{error}"))?;
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        insert_player_quest_action(
+            &transaction,
+            player_quest.id,
+            sender.player_id,
+            quest.id,
+            "abandoned",
+            Some("active"),
+            "abandoned",
+            operation.source_message_id,
+            operation_log_id,
+            timestamp,
+        )?;
+        let rewards = load_quest_rewards(&transaction, quest.id)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交任务放弃事务失败：{error}"))?;
+        Ok(QuestActionReceipt {
+            quest,
+            action: "放弃任务".to_string(),
+            progress,
+            rewards,
+            experience: None,
+            currency_balance_after: None,
             replayed: false,
         })
     }
@@ -4845,6 +5733,423 @@ fn insert_asset_transfer(
         )
         .map_err(|error| format!("写入不可变资产转移账本失败：{error}"))?;
     Ok(connection.last_insert_rowid())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlayerQuestRow {
+    id: i64,
+    status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlayerQuestActionRecord {
+    quest_id: i64,
+    action_kind: String,
+}
+
+fn quest_record_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<QuestRecord> {
+    Ok(QuestRecord {
+        id: row.get(offset)?,
+        quest_key: row.get(offset + 1)?,
+        name: row.get(offset + 2)?,
+        description: row.get(offset + 3)?,
+        category: row.get(offset + 4)?,
+        map_key: row.get(offset + 5)?,
+        map_name: row.get(offset + 6)?,
+        level_required: row.get(offset + 7)?,
+        repeatable: row.get(offset + 8)?,
+    })
+}
+
+fn load_quest_by_name_or_key(
+    connection: &Connection,
+    requested_name_or_key: &str,
+) -> Result<QuestRecord, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT q.id, q.quest_key, q.name, q.description, q.category,
+                   q.map_key, m.name, q.level_required, q.repeatable
+              FROM quest q
+         LEFT JOIN map m ON m.map_key = q.map_key
+             WHERE q.name = ?1 OR q.quest_key = ?1
+             LIMIT 1
+            "#,
+            [requested_name_or_key],
+            |row| quest_record_from_row(row, 0),
+        )
+        .optional()
+        .map_err(|error| format!("读取任务定义失败：{error}"))?
+        .ok_or_else(|| "当前世界不存在该任务".to_string())
+}
+
+fn load_quest_list_entry(
+    connection: &Connection,
+    player_id: i64,
+    player_level: i64,
+    current_map_key: &str,
+    quest: QuestRecord,
+    status: Option<String>,
+) -> Result<QuestListEntry, String> {
+    let player_quest_id = connection
+        .query_row(
+            "SELECT id FROM player_quest WHERE player_id = ?1 AND quest_id = ?2",
+            params![player_id, quest.id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取任务状态失败：{error}"))?
+        .unwrap_or(0);
+    let progress = load_quest_requirements(
+        connection,
+        player_id,
+        quest.id,
+        player_quest_id,
+        player_level,
+        current_map_key,
+    )?;
+    let rewards = load_quest_rewards(connection, quest.id)?;
+    Ok(QuestListEntry {
+        quest,
+        status,
+        progress,
+        rewards,
+    })
+}
+
+fn load_quest_requirements(
+    connection: &Connection,
+    player_id: i64,
+    quest_id: i64,
+    player_quest_id: i64,
+    player_level: i64,
+    current_map_key: &str,
+) -> Result<Vec<QuestRequirementProgress>, String> {
+    let completed = if player_quest_id > 0 {
+        connection
+            .query_row(
+                "SELECT status = 'completed' FROM player_quest WHERE id = ?1",
+                [player_quest_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(|error| format!("读取任务完成状态失败：{error}"))?
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT id, requirement_kind, target_key, description, required_quantity
+              FROM quest_requirement
+             WHERE quest_id = ?1
+             ORDER BY sort_order, id
+            "#,
+        )
+        .map_err(|error| format!("准备任务条件查询失败：{error}"))?;
+    let rows = statement
+        .query_map([quest_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|error| format!("查询任务条件失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析任务条件失败：{error}"))?;
+    rows.into_iter()
+        .map(
+            |(requirement_id, kind, target_key, description, required_quantity)| {
+                let current_amount = if completed {
+                    required_quantity
+                } else {
+                    let current = match kind.as_str() {
+                        "item" => inventory_quantity(connection, player_id, &target_key)?,
+                        "visit" => {
+                            if current_map_key == target_key {
+                                required_quantity
+                            } else {
+                                0
+                            }
+                        }
+                        "level" => player_level.min(required_quantity),
+                        _ => return Err("任务条件类型无效".to_string()),
+                    };
+                    current.min(required_quantity)
+                };
+                Ok(QuestRequirementProgress {
+                    requirement_id,
+                    requirement_kind: kind,
+                    target_key,
+                    description,
+                    current_amount,
+                    required_quantity,
+                })
+            },
+        )
+        .collect()
+}
+
+fn load_quest_rewards(
+    connection: &Connection,
+    quest_id: i64,
+) -> Result<Vec<QuestRewardRecord>, String> {
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT reward_kind, currency_code, item_key, amount, description
+              FROM quest_reward
+             WHERE quest_id = ?1
+             ORDER BY sort_order, id
+            "#,
+        )
+        .map_err(|error| format!("准备任务奖励查询失败：{error}"))?;
+    let rows = statement
+        .query_map([quest_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|error| format!("查询任务奖励失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析任务奖励失败：{error}"))?;
+    rows.into_iter()
+        .map(
+            |(reward_kind, currency_code, item_key, amount, description)| {
+                let item = item_key
+                    .as_deref()
+                    .map(|key| load_item_by_name_or_key(connection, key))
+                    .transpose()?;
+                Ok(QuestRewardRecord {
+                    reward_kind,
+                    currency_code,
+                    item,
+                    amount,
+                    description,
+                })
+            },
+        )
+        .collect()
+}
+
+fn load_player_quest_row(
+    connection: &Connection,
+    player_id: i64,
+    quest_id: i64,
+) -> Result<Option<PlayerQuestRow>, String> {
+    connection
+        .query_row(
+            "SELECT id, status FROM player_quest WHERE player_id = ?1 AND quest_id = ?2",
+            params![player_id, quest_id],
+            |row| {
+                Ok(PlayerQuestRow {
+                    id: row.get(0)?,
+                    status: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取玩家任务状态失败：{error}"))
+}
+
+fn load_quest_action_by_message(
+    connection: &Connection,
+    player_id: i64,
+    source_message_id: &str,
+) -> Result<Option<PlayerQuestActionRecord>, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT quest_id, action_kind
+              FROM player_quest_action
+             WHERE player_id = ?1 AND source_message_id = ?2
+             ORDER BY id DESC
+             LIMIT 1
+            "#,
+            params![player_id, source_message_id],
+            |row| {
+                Ok(PlayerQuestActionRecord {
+                    quest_id: row.get(0)?,
+                    action_kind: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取任务操作幂等记录失败：{error}"))
+}
+
+fn load_quest_action_receipt(
+    connection: &Connection,
+    player_id: i64,
+    quest_id: i64,
+    action: &str,
+    replayed: bool,
+) -> Result<QuestActionReceipt, String> {
+    let player_quest = load_player_quest_row(connection, player_id, quest_id)?
+        .ok_or_else(|| "玩家任务记录不存在".to_string())?;
+    let quest = connection
+        .query_row(
+            r#"
+            SELECT q.id, q.quest_key, q.name, q.description, q.category,
+                   q.map_key, m.name, q.level_required, q.repeatable
+              FROM quest q
+         LEFT JOIN map m ON m.map_key = q.map_key
+             WHERE q.id = ?1
+            "#,
+            [quest_id],
+            |row| quest_record_from_row(row, 0),
+        )
+        .map_err(|error| format!("读取任务回执定义失败：{error}"))?;
+    let level = load_player_level(connection, player_id)?;
+    let map_key = load_player_map_key(connection, player_id);
+    let progress = load_quest_requirements(
+        connection,
+        player_id,
+        quest.id,
+        player_quest.id,
+        level,
+        &map_key,
+    )?;
+    Ok(QuestActionReceipt {
+        quest: quest.clone(),
+        action: action.to_string(),
+        progress,
+        rewards: load_quest_rewards(connection, quest.id)?,
+        experience: None,
+        currency_balance_after: None,
+        replayed,
+    })
+}
+
+fn sync_player_quest_progress(
+    connection: &Connection,
+    player_quest_id: i64,
+    player_id: i64,
+    updated_at: i64,
+) -> Result<(), String> {
+    let player_level = load_player_level(connection, player_id)?;
+    let map_key = load_player_map_key(connection, player_id);
+    let requirements = load_quest_requirements(
+        connection,
+        player_id,
+        connection
+            .query_row(
+                "SELECT quest_id FROM player_quest WHERE id = ?1",
+                [player_quest_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("读取任务定义 ID 失败：{error}"))?,
+        player_quest_id,
+        player_level,
+        &map_key,
+    )?;
+    for requirement in requirements {
+        connection
+            .execute(
+                r#"
+                INSERT INTO player_quest_progress(player_quest_id, requirement_id, current_amount, updated_at)
+                VALUES(?1, ?2, ?3, ?4)
+                ON CONFLICT(player_quest_id, requirement_id) DO UPDATE SET
+                    current_amount = excluded.current_amount,
+                    updated_at = excluded.updated_at
+                "#,
+                params![
+                    player_quest_id,
+                    requirement.requirement_id,
+                    requirement.current_amount,
+                    updated_at
+                ],
+            )
+            .map_err(|error| format!("写入任务进度失败：{error}"))?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // 任务动作账本必须完整记录状态、操作和身份快照。
+fn insert_player_quest_action(
+    connection: &Connection,
+    player_quest_id: i64,
+    player_id: i64,
+    quest_id: i64,
+    action_kind: &str,
+    status_before: Option<&str>,
+    status_after: &str,
+    source_message_id: &str,
+    operation_log_id: i64,
+    created_at: i64,
+) -> Result<i64, String> {
+    connection
+        .execute(
+            r#"
+            INSERT INTO player_quest_action(
+                player_quest_id, player_id, quest_id, action_kind,
+                status_before, status_after, source_message_id,
+                operation_log_id, created_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                player_quest_id,
+                player_id,
+                quest_id,
+                action_kind,
+                status_before,
+                status_after,
+                source_message_id,
+                operation_log_id,
+                created_at
+            ],
+        )
+        .map_err(|error| format!("写入任务动作账本失败：{error}"))?;
+    Ok(connection.last_insert_rowid())
+}
+
+fn load_player_level(connection: &Connection, player_id: i64) -> Result<i64, String> {
+    connection
+        .query_row(
+            "SELECT level FROM player WHERE id = ?1",
+            [player_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("读取角色等级失败：{error}"))
+}
+
+fn load_player_map_key(connection: &Connection, player_id: i64) -> String {
+    connection
+        .query_row(
+            "SELECT map_key FROM player_map WHERE player_id = ?1",
+            [player_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_default()
+}
+
+fn validate_quest_page(page: usize, limit: usize) -> Result<(), String> {
+    if !(1..=100).contains(&page) || !(1..=100).contains(&limit) {
+        return Err("任务页码和分页大小必须在 1 到 100 之间".to_string());
+    }
+    Ok(())
+}
+
+fn validate_quest_operation(
+    operation: &OperationLogInput<'_>,
+    command: &str,
+) -> Result<(), String> {
+    validate_operation_input(operation)?;
+    if operation.command != command || operation.outcome != "ok" {
+        return Err(format!("任务操作审计必须使用规范命令“{command}”和 ok 结果"));
+    }
+    if !valid_audit_value(operation.source_message_id, 256) {
+        return Err("任务操作消息 ID 含有非法控制字符".to_string());
+    }
+    Ok(())
 }
 
 fn load_bound_npc_for_player(
@@ -8502,6 +9807,343 @@ fn validate_v10_schema(connection: &Connection) -> Result<(), String> {
     probe_v10_ground_drop_guards(connection)
 }
 
+fn validate_v11_schema(connection: &Connection) -> Result<(), String> {
+    let expected = [
+        (
+            "quest",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("quest_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("name", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("description", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("category", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("map_key", "TEXT", false, false, None, 0),
+                TableColumnInfo::new("level_required", "INTEGER", true, false, Some("1"), 0),
+                TableColumnInfo::new("repeatable", "INTEGER", true, false, Some("0"), 0),
+                TableColumnInfo::new("enabled", "INTEGER", true, false, Some("1"), 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("updated_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+        (
+            "quest_requirement",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("quest_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("requirement_kind", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("target_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("required_quantity", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("sort_order", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("description", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+        (
+            "quest_reward",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("quest_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("reward_kind", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("currency_code", "TEXT", false, false, None, 0),
+                TableColumnInfo::new("item_key", "TEXT", false, false, None, 0),
+                TableColumnInfo::new("amount", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("sort_order", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("description", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+        (
+            "player_quest",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("quest_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("status", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("accepted_at", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("updated_at", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("completed_at", "INTEGER", false, false, None, 0),
+            ],
+        ),
+        (
+            "player_quest_progress",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("player_quest_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("requirement_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("current_amount", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("updated_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+        (
+            "player_quest_action",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("player_quest_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("quest_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("action_kind", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("status_before", "TEXT", false, false, None, 0),
+                TableColumnInfo::new("status_after", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("source_message_id", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("operation_log_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+    ];
+    for (table, columns) in expected {
+        let actual = table_columns_with_type(connection, table)?;
+        if actual != columns {
+            return Err(format!(
+                "数据库已标记迁移 v11，但表 {table} 字段不匹配：{actual:?}"
+            ));
+        }
+        let sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v11 表 {table} 建表语句失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v11，但缺少表 {table}"))?
+            .to_ascii_uppercase();
+        if !sql.contains(") STRICT") {
+            return Err(format!("v11 表 {table} 必须是 STRICT"));
+        }
+    }
+
+    validate_v9_foreign_keys(
+        connection,
+        "quest",
+        &[("map", "map_key", "map_key", "NO ACTION", "RESTRICT")],
+    )?;
+    validate_v9_foreign_keys(
+        connection,
+        "quest_requirement",
+        &[("quest", "quest_id", "id", "NO ACTION", "RESTRICT")],
+    )?;
+    validate_v9_foreign_keys(
+        connection,
+        "quest_reward",
+        &[
+            ("item", "item_key", "item_key", "NO ACTION", "RESTRICT"),
+            ("quest", "quest_id", "id", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+    validate_v9_foreign_keys(
+        connection,
+        "player_quest",
+        &[
+            ("player", "player_id", "id", "NO ACTION", "CASCADE"),
+            ("quest", "quest_id", "id", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+    validate_v9_foreign_keys(
+        connection,
+        "player_quest_progress",
+        &[
+            (
+                "player_quest",
+                "player_quest_id",
+                "id",
+                "NO ACTION",
+                "CASCADE",
+            ),
+            (
+                "quest_requirement",
+                "requirement_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+        ],
+    )?;
+    validate_v9_foreign_keys(
+        connection,
+        "player_quest_action",
+        &[
+            (
+                "operation_log",
+                "operation_log_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+            (
+                "player_quest",
+                "player_quest_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("quest", "quest_id", "id", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+
+    validate_v11_custom_index_set(connection, "quest", &["quest_available_page"])?;
+    validate_v11_custom_index_set(
+        connection,
+        "quest_requirement",
+        &["quest_requirement_quest_page"],
+    )?;
+    validate_v11_custom_index_set(connection, "quest_reward", &["quest_reward_quest_page"])?;
+    validate_v11_custom_index_set(
+        connection,
+        "player_quest",
+        &["player_quest_player_status_page"],
+    )?;
+    validate_v11_custom_index_set(
+        connection,
+        "player_quest_progress",
+        &["player_quest_progress_page"],
+    )?;
+    validate_v11_custom_index_set(
+        connection,
+        "player_quest_action",
+        &[
+            "player_quest_action_operation",
+            "player_quest_action_player_page",
+        ],
+    )?;
+    validate_named_index(
+        connection,
+        "quest",
+        "quest_available_page",
+        false,
+        &["enabled", "map_key", "level_required", "id"],
+    )?;
+    validate_named_index(
+        connection,
+        "quest_requirement",
+        "quest_requirement_quest_page",
+        false,
+        &["quest_id", "sort_order", "id"],
+    )?;
+    validate_named_index(
+        connection,
+        "quest_reward",
+        "quest_reward_quest_page",
+        false,
+        &["quest_id", "sort_order", "id"],
+    )?;
+    validate_named_index(
+        connection,
+        "player_quest",
+        "player_quest_player_status_page",
+        false,
+        &["player_id", "status", "id"],
+    )?;
+    validate_named_index(
+        connection,
+        "player_quest_progress",
+        "player_quest_progress_page",
+        false,
+        &["player_quest_id", "requirement_id"],
+    )?;
+    validate_named_index(
+        connection,
+        "player_quest_action",
+        "player_quest_action_operation",
+        true,
+        &["operation_log_id"],
+    )?;
+    validate_named_index(
+        connection,
+        "player_quest_action",
+        "player_quest_action_player_page",
+        false,
+        &["player_id", "id"],
+    )?;
+    validate_v11_triggers(connection)?;
+
+    let seed_counts = connection
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM quest), (SELECT COUNT(*) FROM quest_requirement), (SELECT COUNT(*) FROM quest_reward)",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+        )
+        .map_err(|error| format!("读取 v11 任务种子失败：{error}"))?;
+    if seed_counts != (2, 2, 4) {
+        return Err(format!("v11 任务种子不完整：{seed_counts:?}"));
+    }
+    Ok(())
+}
+
+fn validate_v11_triggers(connection: &Connection) -> Result<(), String> {
+    let expected = [
+        ("quest_no_update", "quest"),
+        ("quest_no_delete", "quest"),
+        ("quest_no_reinsert", "quest"),
+        ("quest_requirement_no_update", "quest_requirement"),
+        ("quest_requirement_no_delete", "quest_requirement"),
+        ("quest_requirement_no_reinsert", "quest_requirement"),
+        ("quest_reward_no_update", "quest_reward"),
+        ("quest_reward_no_delete", "quest_reward"),
+        ("quest_reward_no_reinsert", "quest_reward"),
+        ("player_quest_action_no_update", "player_quest_action"),
+        ("player_quest_action_no_delete", "player_quest_action"),
+        ("player_quest_action_no_reinsert", "player_quest_action"),
+        ("player_quest_action_scope_guard", "player_quest_action"),
+        ("player_quest_transition_guard", "player_quest"),
+    ];
+    for (name, table) in expected {
+        let (actual_table, sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v11 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v11，但缺少触发器 {name}"))?;
+        if actual_table != table || !sql.to_ascii_uppercase().contains("RAISE(ABORT") {
+            return Err(format!("v11 触发器 {name} 契约不匹配"));
+        }
+    }
+    let mut statement = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v11 全库触发器失败：{error}"))?;
+    let triggers = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v11 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v11 全库触发器失败：{error}"))?;
+    for (name, table, sql) in triggers {
+        let declared = expected.iter().any(|(expected_name, expected_table)| {
+            name == *expected_name && table == *expected_table
+        });
+        let touches_v11 = matches!(
+            table.as_str(),
+            "quest"
+                | "quest_requirement"
+                | "quest_reward"
+                | "player_quest"
+                | "player_quest_progress"
+                | "player_quest_action"
+        ) || [
+            "quest",
+            "quest_requirement",
+            "quest_reward",
+            "player_quest",
+            "player_quest_progress",
+            "player_quest_action",
+        ]
+        .iter()
+        .any(|identifier| sql_mentions_identifier(&sql, identifier));
+        if touches_v11 && !declared {
+            return Err(format!("v11 触发器 {name} 未声明却引用任务表 {table}"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_v10_table_sql(
     connection: &Connection,
     table: &str,
@@ -8571,6 +10213,15 @@ fn validate_v10_custom_index_set(
         ));
     }
     Ok(())
+}
+
+fn validate_v11_custom_index_set(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), String> {
+    validate_v10_custom_index_set(connection, table, expected)
+        .map_err(|error| error.replace("v10", "v11"))
 }
 
 fn validate_v10_triggers(connection: &Connection) -> Result<(), String> {
@@ -9361,7 +11012,15 @@ fn validate_v7_triggers(connection: &Connection) -> Result<(), String> {
     for (name, table, sql) in triggers {
         if matches!(
             table.as_str(),
-            "ground_drop" | "ground_drop_claim" | "ground_drop_expiration"
+            "ground_drop"
+                | "ground_drop_claim"
+                | "ground_drop_expiration"
+                | "quest"
+                | "quest_requirement"
+                | "quest_reward"
+                | "player_quest"
+                | "player_quest_progress"
+                | "player_quest_action"
         ) {
             continue;
         }
@@ -9931,6 +11590,24 @@ mod tests {
         assert!(
             error.contains("v10"),
             "v10 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    fn assert_v11_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v11 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v11 迁移应成功");
+        let connection = store.open().expect("应打开 v11 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v11 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v11 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v11"),
+            "v11 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
         );
     }
 
@@ -13085,6 +14762,122 @@ mod tests {
             AFTER INSERT ON player_wuhun
             BEGIN
                 SELECT EXISTS(SELECT 1 FROM ground_drop);
+            END;
+            "#,
+        );
+    }
+
+    #[test]
+    fn v11_tasks_support_accept_progress_submit_rewards_and_replay() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        let page = store
+            .quests_page(&identity(), 1, 8)
+            .expect("应读取任务列表");
+        assert_eq!(page.total, 2);
+        assert_eq!(page.entries[0].status, None);
+        let accepted = store
+            .accept_quest_with_operation(
+                &identity(),
+                "village-introduction",
+                &transfer_operation("接取任务", "quest-accept-1"),
+            )
+            .expect("应接取到访任务");
+        assert_eq!(accepted.quest.quest_key, "village-introduction");
+        assert_eq!(accepted.progress[0].current_amount, 1);
+        let active = store
+            .active_quests(&identity(), None)
+            .expect("应读取进行中任务");
+        assert_eq!(active.len(), 1);
+        let submitted = store
+            .submit_quest_with_operation(
+                &identity(),
+                "初入圣魂村",
+                &transfer_operation("提交任务", "quest-submit-1"),
+            )
+            .expect("应提交到访任务");
+        assert!(!submitted.replayed);
+        assert_eq!(submitted.experience.expect("应发经验").amount, 80);
+        assert_eq!(
+            store.wallet_balance(&identity(), GOLD_SOUL_COIN).unwrap(),
+            Some(30)
+        );
+        let replay = store
+            .submit_quest_with_operation(
+                &identity(),
+                "初入圣魂村",
+                &transfer_operation("提交任务", "quest-submit-1"),
+            )
+            .expect("重复提交应返回原回执");
+        assert!(replay.replayed);
+        assert_eq!(
+            store.wallet_balance(&identity(), GOLD_SOUL_COIN).unwrap(),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn v11_item_task_consumes_requirements_and_abandon_can_reaccept() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        let accepted = store
+            .accept_quest_with_operation(
+                &identity(),
+                "收集回复药",
+                &transfer_operation("接取任务", "quest-item-accept"),
+            )
+            .expect("应接取物品任务");
+        assert_eq!(accepted.progress[0].current_amount, 0);
+        let abandoned = store
+            .abandon_quest_with_operation(
+                &identity(),
+                "healing-supplies",
+                &transfer_operation("放弃任务", "quest-abandon-1"),
+            )
+            .expect("应放弃物品任务");
+        assert_eq!(abandoned.action, "放弃任务");
+        let reaccepted = store
+            .accept_quest_with_operation(
+                &identity(),
+                "healing-supplies",
+                &transfer_operation("接取任务", "quest-item-reaccept"),
+            )
+            .expect("放弃后应可重新接取");
+        assert_eq!(reaccepted.progress[0].current_amount, 0);
+        seed_inventory(&store, &identity(), "small-healing-potion", 2);
+        let submitted = store
+            .submit_quest_with_operation(
+                &identity(),
+                "healing-supplies",
+                &transfer_operation("提交任务", "quest-item-submit"),
+            )
+            .expect("物品条件满足后应可提交");
+        assert_eq!(submitted.experience.expect("应发经验").amount, 100);
+        assert_eq!(
+            inventory_for(&store, &identity(), "small-healing-potion"),
+            0
+        );
+        assert_eq!(
+            store.wallet_balance(&identity(), GOLD_SOUL_COIN).unwrap(),
+            Some(50)
+        );
+    }
+
+    #[test]
+    fn recorded_v11_with_damaged_schema_or_cross_table_trigger_fails_closed() {
+        for mutation in [
+            "DROP TABLE quest_reward;",
+            "DROP INDEX player_quest_action_operation;",
+            "DROP TRIGGER player_quest_transition_guard;",
+        ] {
+            assert_v11_damage_fails_closed(mutation);
+        }
+        assert_v11_damage_fails_closed(
+            r#"
+            CREATE TRIGGER player_wuhun_reads_quest
+            AFTER INSERT ON player_wuhun
+            BEGIN
+                SELECT EXISTS(SELECT 1 FROM quest);
             END;
             "#,
         );
