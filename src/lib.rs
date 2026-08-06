@@ -220,6 +220,28 @@ mod plugin {
     }
 
     #[command(
+        name = "装备魂技",
+        description = "装备已学习魂技：装备魂技 <魂技>",
+        aliases = "装备技能",
+        category = "斗罗大陆·角色",
+        scope = "all"
+    )]
+    fn equip_skill(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.equip_skill(req))
+    }
+
+    #[command(
+        name = "卸下魂技",
+        description = "卸下已装备魂技：卸下魂技 <魂技>",
+        aliases = "卸下技能",
+        category = "斗罗大陆·角色",
+        scope = "all"
+    )]
+    fn unequip_skill(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.unequip_skill(req))
+    }
+
+    #[command(
         name = "魂环",
         description = "查看已吸收魂环和待吸收魂环",
         aliases = "查看魂环",

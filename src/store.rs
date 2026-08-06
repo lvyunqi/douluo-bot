@@ -2495,6 +2495,98 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_V18: &str = r#"
+CREATE TABLE skill_loadout_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    player_skill_id INTEGER NOT NULL REFERENCES player_skill(id) ON DELETE RESTRICT,
+    skill_key TEXT NOT NULL REFERENCES skill(skill_key) ON DELETE RESTRICT,
+    action TEXT NOT NULL CHECK(action IN ('equip', 'unequip')),
+    equipped_before INTEGER NOT NULL CHECK(equipped_before IN (0, 1)),
+    equipped_after INTEGER NOT NULL CHECK(equipped_after IN (0, 1)),
+    source_message_id TEXT NOT NULL CHECK(
+        length(source_message_id) BETWEEN 1 AND 256
+        AND instr(source_message_id, char(0)) = 0
+        AND source_message_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    operation_log_id INTEGER NOT NULL UNIQUE REFERENCES operation_log(id) ON DELETE RESTRICT,
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    CHECK(
+        (action = 'equip' AND equipped_before = 0 AND equipped_after = 1)
+        OR (action = 'unequip' AND equipped_before = 1 AND equipped_after = 0)
+    )
+) STRICT;
+
+CREATE INDEX skill_loadout_event_player_page
+    ON skill_loadout_event(player_id, id);
+CREATE UNIQUE INDEX skill_loadout_event_player_message
+    ON skill_loadout_event(player_id, source_message_id);
+
+CREATE TRIGGER skill_loadout_event_no_update
+BEFORE UPDATE ON skill_loadout_event
+BEGIN
+    SELECT RAISE(ABORT, 'skill loadout event is immutable');
+END;
+
+CREATE TRIGGER skill_loadout_event_no_delete
+BEFORE DELETE ON skill_loadout_event
+BEGIN
+    SELECT RAISE(ABORT, 'skill loadout event is immutable');
+END;
+
+CREATE TRIGGER skill_loadout_event_no_reinsert
+BEFORE INSERT ON skill_loadout_event
+WHEN EXISTS(
+    SELECT 1 FROM skill_loadout_event
+     WHERE id = NEW.id OR operation_log_id = NEW.operation_log_id
+        OR (player_id = NEW.player_id AND source_message_id = NEW.source_message_id)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'skill loadout event is append-only');
+END;
+
+CREATE TRIGGER skill_loadout_event_scope_guard
+BEFORE INSERT ON skill_loadout_event
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM player_skill learned
+      JOIN skill ON skill.skill_key = learned.skill_key
+      JOIN player p ON p.id = learned.player_id
+      JOIN identity i ON i.id = p.identity_id
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE learned.id = NEW.player_skill_id
+       AND learned.player_id = NEW.player_id
+       AND learned.skill_key = NEW.skill_key
+       AND learned.equipped = NEW.equipped_before
+       AND skill.enabled = 1
+       AND audit.protocol = i.protocol
+       AND audit.account_id = i.account_id
+       AND audit.namespace = i.namespace
+       AND audit.subject_kind = i.subject_kind
+       AND audit.subject_id = i.subject_id
+       AND audit.command = CASE NEW.action
+           WHEN 'equip' THEN '装备魂技'
+           WHEN 'unequip' THEN '卸下魂技'
+       END
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+       AND (
+           (NEW.action = 'equip' AND (
+               SELECT COUNT(*) FROM player_skill
+                WHERE player_id = NEW.player_id AND equipped = 1
+           ) < 4)
+           OR
+           (NEW.action = 'unequip' AND (
+               SELECT COUNT(*) FROM player_skill
+                WHERE player_id = NEW.player_id AND equipped = 1
+           ) > 1)
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'skill loadout scope, audit, or capacity mismatch');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -2980,6 +3072,15 @@ pub struct SoulRingAbsorbReceipt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillLoadoutReceipt {
+    pub skill: SkillRecord,
+    pub equipped: bool,
+    pub equipped_count: i64,
+    pub capacity: i64,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BattleActionReceipt {
     pub battle: BattleSnapshot,
     pub event: BattleEventRecord,
@@ -3218,6 +3319,7 @@ struct LevelTier {
 
 pub const MAX_PLAYER_LEVEL: i64 = 120;
 pub const GOLD_SOUL_COIN: &str = "gold_soul_coin";
+pub const MAX_EQUIPPED_SKILLS: i64 = 4;
 
 const LEVEL_TIERS: [LevelTier; 14] = [
     LevelTier {
@@ -3546,7 +3648,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
                     format!(
-                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17 失败：{error}"
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18 失败：{error}"
                     )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
@@ -3813,10 +3915,25 @@ impl Store {
                 validate_v17_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 18)? {
+                transaction
+                    .execute_batch(MIGRATION_V18)
+                    .map_err(|error| format!("执行数据库迁移 v18 失败：{error}"))?;
+                validate_v18_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(18, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v18 失败：{error}"))?;
+            } else {
+                validate_v18_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18 失败：{error}"
                 )
             })?;
             Ok(())
@@ -3841,6 +3958,7 @@ impl Store {
                 validate_v15_schema(connection)?;
                 validate_v16_schema(connection)?;
                 validate_v17_schema(connection)?;
+                validate_v18_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -4288,9 +4406,7 @@ impl Store {
         }
 
         let mut connection = self.open()?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| format!("开始钱包转账事务失败：{error}"))?;
+        let transaction = self.begin_immediate(&mut connection, "开始钱包转账事务失败")?;
         ensure_no_legacy_identity(&transaction, key)?;
         let sender = load_transfer_sender(&transaction, key)?;
         if let Some(existing) = load_asset_transfer_by_message(
@@ -5679,6 +5795,130 @@ impl Store {
             )
             .optional()
             .map_err(|error| format!("查询魂技详情失败：{error}"))
+    }
+
+    pub fn equip_skill_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        skill_name_or_key: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<SkillLoadoutReceipt, String> {
+        self.set_skill_equipped_with_operation(key, skill_name_or_key, true, operation)
+    }
+
+    pub fn unequip_skill_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        skill_name_or_key: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<SkillLoadoutReceipt, String> {
+        self.set_skill_equipped_with_operation(key, skill_name_or_key, false, operation)
+    }
+
+    fn set_skill_equipped_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        skill_name_or_key: &str,
+        equipped: bool,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<SkillLoadoutReceipt, String> {
+        validate_identity_key(key)?;
+        validate_catalog_lookup(skill_name_or_key, "魂技名称")?;
+        let expected_command = if equipped {
+            "装备魂技"
+        } else {
+            "卸下魂技"
+        };
+        validate_skill_loadout_operation(operation, expected_command)?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始{expected_command}事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let player = load_transfer_sender(&transaction, key)?;
+        ensure_transfer_participant_eligible(&player, "你的角色")?;
+        let learned =
+            load_player_skill_by_name_or_key(&transaction, player.player_id, skill_name_or_key)?;
+        if let Some((event_skill_key, event_equipped)) = load_skill_loadout_event_by_message(
+            &transaction,
+            player.player_id,
+            operation.source_message_id,
+        )? {
+            if event_skill_key != learned.skill.skill_key || event_equipped != equipped {
+                return Err("该消息 ID 已用于不同的魂技装备操作，拒绝重放".to_string());
+            }
+            let equipped_count = count_equipped_skills(&transaction, player.player_id)?;
+            transaction
+                .commit()
+                .map_err(|error| format!("提交{expected_command}重放事务失败：{error}"))?;
+            return Ok(SkillLoadoutReceipt {
+                skill: learned.skill,
+                equipped: event_equipped,
+                equipped_count,
+                capacity: MAX_EQUIPPED_SKILLS,
+                replayed: true,
+            });
+        }
+        if learned.equipped == equipped {
+            return Err(if equipped {
+                format!("魂技“{}”已经装备", learned.skill.name)
+            } else {
+                format!("魂技“{}”已经卸下", learned.skill.name)
+            });
+        }
+        let equipped_count = count_equipped_skills(&transaction, player.player_id)?;
+        if equipped && equipped_count >= MAX_EQUIPPED_SKILLS {
+            return Err(format!(
+                "魂技装备位已满（{equipped_count}/{MAX_EQUIPPED_SKILLS}），请先卸下其他魂技"
+            ));
+        }
+        if !equipped && equipped_count <= 1 {
+            return Err("至少保留一个已装备魂技，不能卸下最后一个魂技".to_string());
+        }
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        let created_at = now_timestamp()?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO skill_loadout_event(
+                    player_id, player_skill_id, skill_key, action,
+                    equipped_before, equipped_after, source_message_id,
+                    operation_log_id, created_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+                params![
+                    player.player_id,
+                    learned.id,
+                    learned.skill.skill_key,
+                    if equipped { "equip" } else { "unequip" },
+                    learned.equipped,
+                    equipped,
+                    operation.source_message_id,
+                    operation_log_id,
+                    created_at,
+                ],
+            )
+            .map_err(|error| format!("写入魂技装备事件失败：{error}"))?;
+        let updated = transaction
+            .execute(
+                "UPDATE player_skill SET equipped = ?1 WHERE id = ?2",
+                params![equipped, learned.id],
+            )
+            .map_err(|error| format!("更新魂技装备状态失败：{error}"))?;
+        if updated != 1 {
+            return Err("更新魂技装备状态时目标行发生变化".to_string());
+        }
+        let equipped_count_after = count_equipped_skills(&transaction, player.player_id)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交{expected_command}事务失败：{error}"))?;
+        Ok(SkillLoadoutReceipt {
+            skill: learned.skill,
+            equipped,
+            equipped_count: equipped_count_after,
+            capacity: MAX_EQUIPPED_SKILLS,
+            replayed: false,
+        })
     }
 
     pub fn soul_rings_page(&self, key: &IdentityKey<'_>) -> Result<SoulRingPage, String> {
@@ -9358,6 +9598,31 @@ fn load_player_skill_by_name_or_key(
         .and_then(|record| record.ok_or_else(|| format!("你尚未学习魂技“{requested_name_or_key}”")))
 }
 
+fn count_equipped_skills(connection: &Connection, player_id: i64) -> Result<i64, String> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM player_skill WHERE player_id = ?1 AND equipped = 1",
+            [player_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("读取已装备魂技数量失败：{error}"))
+}
+
+fn load_skill_loadout_event_by_message(
+    connection: &Connection,
+    player_id: i64,
+    source_message_id: &str,
+) -> Result<Option<(String, bool)>, String> {
+    connection
+        .query_row(
+            "SELECT skill_key, equipped_after FROM skill_loadout_event WHERE player_id = ?1 AND source_message_id = ?2",
+            params![player_id, source_message_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("读取魂技装备重放事件失败：{error}"))
+}
+
 fn load_soul_ring_by_key(
     connection: &Connection,
     ring_key: &str,
@@ -10532,6 +10797,22 @@ fn validate_transfer_operation(
     }
     if !valid_audit_value(operation.source_message_id, 256) {
         return Err("资产转移要求 1 到 256 个无控制字符的非空消息 ID".to_string());
+    }
+    Ok(())
+}
+
+fn validate_skill_loadout_operation(
+    operation: &OperationLogInput<'_>,
+    expected_command: &str,
+) -> Result<(), String> {
+    validate_operation_input(operation)?;
+    if operation.command != expected_command || operation.outcome != "ok" {
+        return Err(format!(
+            "魂技装备成功审计必须使用规范命令“{expected_command}”和 ok 结果"
+        ));
+    }
+    if !valid_audit_value(operation.source_message_id, 256) {
+        return Err("魂技装备要求 1 到 256 个无控制字符的非空消息 ID".to_string());
     }
     Ok(())
 }
@@ -15321,6 +15602,8 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
                 name == *expected_name && table == *expected_table
             })
             || name == "battle_event_scope_guard"
+            || table == "skill_loadout_event"
+            || sql_mentions_identifier(&trigger_sql, "skill_loadout_event")
             || matches!(
                 table.as_str(),
                 "soul_ring" | "soul_ring_drop" | "player_soul_ring" | "soul_ring_event"
@@ -15703,6 +15986,170 @@ fn validate_v17_schema(connection: &Connection) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn validate_v18_schema(connection: &Connection) -> Result<(), String> {
+    let expected = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("player_skill_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("skill_key", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("action", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("equipped_before", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("equipped_after", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("source_message_id", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("operation_log_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+    ];
+    let actual = table_columns_with_type(connection, "skill_loadout_event")?;
+    if actual != expected {
+        return Err(format!(
+            "数据库已标记迁移 v18，但表 skill_loadout_event 字段不匹配：{actual:?}"
+        ));
+    }
+    let sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'skill_loadout_event'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v18 魂技装备事件表建表语句失败：{error}"))?
+        .ok_or_else(|| "数据库已标记迁移 v18，但缺少表 skill_loadout_event".to_string())?
+        .to_ascii_uppercase();
+    if !sql.contains(") STRICT") {
+        return Err("v18 表 skill_loadout_event 必须是 STRICT".to_string());
+    }
+    validate_v18_foreign_keys(
+        connection,
+        &[
+            (
+                "operation_log",
+                "operation_log_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+            (
+                "player_skill",
+                "player_skill_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("skill", "skill_key", "skill_key", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+    validate_v18_custom_index_set(
+        connection,
+        &[
+            "skill_loadout_event_player_message",
+            "skill_loadout_event_player_page",
+        ],
+    )?;
+    validate_v18_index(
+        connection,
+        "skill_loadout_event_player_page",
+        false,
+        &["player_id", "id"],
+        false,
+    )?;
+    validate_v18_index(
+        connection,
+        "skill_loadout_event_player_message",
+        true,
+        &["player_id", "source_message_id"],
+        false,
+    )?;
+    let over_capacity = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM player_skill WHERE equipped = 1 GROUP BY player_id HAVING COUNT(*) > ?1)",
+            [MAX_EQUIPPED_SKILLS],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v18 魂技装备位上限失败：{error}"))?;
+    if over_capacity {
+        return Err("数据库已标记迁移 v18，但存在超过魂技装备位上限的角色".to_string());
+    }
+
+    let expected_triggers = [
+        "skill_loadout_event_no_update",
+        "skill_loadout_event_no_delete",
+        "skill_loadout_event_no_reinsert",
+        "skill_loadout_event_scope_guard",
+    ];
+    for name in expected_triggers {
+        let (table, trigger_sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v18 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v18，但缺少触发器 {name}"))?;
+        let normalized = trigger_sql.to_ascii_uppercase();
+        if table != "skill_loadout_event" || !normalized.contains("RAISE(ABORT") {
+            return Err(format!("v18 触发器 {name} 契约不匹配"));
+        }
+        if name == "skill_loadout_event_scope_guard"
+            && (!normalized.contains("FROM PLAYER_SKILL")
+                || !normalized.contains("JOIN OPERATION_LOG")
+                || !normalized.contains("装备魂技")
+                || !normalized.contains("卸下魂技"))
+        {
+            return Err("v18 魂技装备范围触发器不完整".to_string());
+        }
+    }
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v18 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v18 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v18 全库触发器失败：{error}"))?;
+    for (name, table, trigger_sql) in triggers {
+        let declared = expected_triggers.iter().any(|expected| name == *expected);
+        let touches_v18 = table == "skill_loadout_event"
+            || sql_mentions_identifier(&trigger_sql, "skill_loadout_event");
+        if touches_v18 && !declared {
+            return Err(format!(
+                "v18 触发器 {name} 未声明却引用魂技装备事件表 {table}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v18_foreign_keys(
+    connection: &Connection,
+    expected: &[(&str, &str, &str, &str, &str)],
+) -> Result<(), String> {
+    validate_v9_foreign_keys(connection, "skill_loadout_event", expected)
+        .map_err(|error| error.replace("v9", "v18"))
+}
+
+fn validate_v18_custom_index_set(connection: &Connection, expected: &[&str]) -> Result<(), String> {
+    validate_v10_custom_index_set(connection, "skill_loadout_event", expected)
+        .map_err(|error| error.replace("v10", "v18"))
+}
+
+fn validate_v18_index(
+    connection: &Connection,
+    index_name: &str,
+    unique: bool,
+    columns: &[&str],
+    partial: bool,
+) -> Result<(), String> {
+    validate_v7_index(connection, index_name, unique, columns, partial)
+        .map_err(|error| error.replace("v7", "v18"))
 }
 
 fn validate_v17_foreign_keys(
@@ -17596,6 +18043,24 @@ mod tests {
         assert!(
             error.contains("v17"),
             "v17 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    fn assert_v18_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v18 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v18 迁移应成功");
+        let connection = store.open().expect("应打开 v18 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v18 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v18 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v18"),
+            "v18 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
         );
     }
 
@@ -21950,6 +22415,140 @@ mod tests {
     }
 
     #[test]
+    fn v18_skill_loadout_is_atomic_replay_safe_and_gated() {
+        let (directory, store) = test_store();
+        register_awakened_pair(&store);
+        let player_id = player_id_for(&store, &identity());
+        let connection = store.open().expect("应打开 v18 魂技装备测试数据库");
+        connection
+            .execute(
+                "UPDATE player SET level = 10, hp = 100, max_hp = 100, strength = 1000, endurance = 100, soul_power = 50, max_soul_power = 50, updated_at = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置 v18 测试属性");
+        drop(connection);
+
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "v18-loadout-map"),
+            )
+            .expect("角色应进入落日森林");
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "哥布林",
+                &transfer_operation("挑战", "v18-loadout-start"),
+            )
+            .expect("角色应挑战哥布林");
+        store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "v18-loadout-win"),
+            )
+            .expect("角色应击败哥布林");
+        store
+            .absorb_soul_ring_with_operation(
+                &identity(),
+                "哥布林",
+                &transfer_operation("吸收魂环", "v18-loadout-absorb"),
+            )
+            .expect("角色应吸收哥布林魂环");
+
+        let initial = store.skills_page(&identity()).expect("应读取初始魂技装备");
+        assert_eq!(initial.entries.len(), 2);
+        assert_eq!(
+            initial
+                .entries
+                .iter()
+                .filter(|entry| entry.equipped)
+                .count(),
+            2
+        );
+
+        let unequip = store
+            .unequip_skill_with_operation(
+                &identity(),
+                "毒刺",
+                &transfer_operation("卸下魂技", "v18-loadout-unequip"),
+            )
+            .expect("应卸下毒刺");
+        assert!(!unequip.equipped);
+        assert_eq!(unequip.equipped_count, 1);
+        let replay = store
+            .unequip_skill_with_operation(
+                &identity(),
+                "毒刺",
+                &transfer_operation("卸下魂技", "v18-loadout-unequip"),
+            )
+            .expect("重复卸下应返回原回执");
+        assert!(replay.replayed);
+        assert!(!replay.equipped);
+        assert!(
+            store
+                .equip_skill_with_operation(
+                    &identity(),
+                    "缠绕",
+                    &transfer_operation("装备魂技", "v18-loadout-unequip"),
+                )
+                .is_err()
+        );
+
+        let equip = store
+            .equip_skill_with_operation(
+                &identity(),
+                "毒刺",
+                &transfer_operation("装备魂技", "v18-loadout-equip"),
+            )
+            .expect("应重新装备毒刺");
+        assert!(equip.equipped);
+        assert_eq!(equip.equipped_count, 2);
+        let unequip_base = store
+            .unequip_skill_with_operation(
+                &identity(),
+                "缠绕",
+                &transfer_operation("卸下魂技", "v18-loadout-unequip-base"),
+            )
+            .expect("应卸下缠绕并保留毒刺");
+        assert!(!unequip_base.equipped);
+        assert_eq!(unequip_base.equipped_count, 1);
+        let last = store
+            .unequip_skill_with_operation(
+                &identity(),
+                "毒刺",
+                &transfer_operation("卸下魂技", "v18-loadout-last"),
+            )
+            .expect_err("不能卸下最后一个已装备魂技");
+        assert!(last.contains("至少保留一个"));
+
+        let final_page = store.skills_page(&identity()).expect("应读取最终魂技装备");
+        assert!(
+            final_page
+                .entries
+                .iter()
+                .any(|entry| entry.skill.skill_key == "entangle" && !entry.equipped)
+        );
+        assert!(
+            final_page
+                .entries
+                .iter()
+                .any(|entry| entry.skill.skill_key == "sting" && entry.equipped)
+        );
+        let event_count = store
+            .open()
+            .expect("应读取魂技装备事件")
+            .query_row(
+                "SELECT COUNT(*) FROM skill_loadout_event WHERE player_id = ?1",
+                [player_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("应统计魂技装备事件");
+        assert_eq!(event_count, 3);
+        drop(directory);
+    }
+
+    #[test]
     fn recorded_v17_with_damaged_schema_or_trigger_fails_closed() {
         for mutation in [
             "DROP TABLE soul_ring_event;",
@@ -21970,6 +22569,25 @@ mod tests {
             CREATE TRIGGER player_skill_reads_soul_ring
             AFTER INSERT ON player_skill
             BEGIN SELECT EXISTS(SELECT 1 FROM soul_ring); END;
+            "#,
+        );
+    }
+
+    #[test]
+    fn recorded_v18_with_damaged_schema_or_trigger_fails_closed() {
+        for mutation in [
+            "DROP TABLE skill_loadout_event;",
+            "DROP INDEX skill_loadout_event_player_page;",
+            "DROP INDEX skill_loadout_event_player_message;",
+            "DROP TRIGGER skill_loadout_event_scope_guard;",
+        ] {
+            assert_v18_damage_fails_closed(mutation);
+        }
+        assert_v18_damage_fails_closed(
+            r#"
+            CREATE TRIGGER skill_loadout_event_shadow
+            AFTER INSERT ON skill_loadout_event
+            BEGIN SELECT 1; END;
             "#,
         );
     }

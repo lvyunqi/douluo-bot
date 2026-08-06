@@ -14,8 +14,9 @@ use crate::store::{
     AuthorizedContextChange, BattleActionReceipt, BattleEventRecord, BattleLog, BattleSnapshot,
     DailyCheckinInput, DailyCheckinResult, GOLD_SOUL_COIN, IdentityKey, LegacyClaimActor,
     LegacyClaimResult, LegacyIdentityState, MapExit, MapRecord, MapTravelReceipt,
-    OperationLogInput, PlayerStatus, QuestActionReceipt, QuestListEntry, SkillPage, SoulBeastPage,
-    SoulRingAbsorbReceipt, SoulRingPage, Store, WuhunToggleReceipt, experience_progress,
+    OperationLogInput, PlayerStatus, QuestActionReceipt, QuestListEntry, SkillLoadoutReceipt,
+    SkillPage, SoulBeastPage, SoulRingAbsorbReceipt, SoulRingPage, Store, WuhunToggleReceipt,
+    experience_progress,
 };
 
 const MENU_PAGES: &[MenuPage] = &[
@@ -50,6 +51,14 @@ const MENU_PAGES: &[MenuPage] = &[
             MenuEntry {
                 command: "技能",
                 description: "查看已学习魂技和魂力消耗",
+            },
+            MenuEntry {
+                command: "装备魂技 <魂技>",
+                description: "装备已学习魂技并加入战斗可用列表",
+            },
+            MenuEntry {
+                command: "卸下魂技 <魂技>",
+                description: "卸下已装备魂技，至少保留一个可用魂技",
             },
             MenuEntry {
                 command: "魂环",
@@ -397,6 +406,14 @@ impl GameService {
                 .field("类型", skill.skill.skill_type.clone())
                 .field("魂环", format!("第{}魂技", skill.skill.ring_index))
                 .field("等级", skill.level.to_string())
+                .field(
+                    "装备状态",
+                    if skill.equipped {
+                        "已装备"
+                    } else {
+                        "未装备"
+                    },
+                )
                 .field("魂力消耗", skill.skill.soul_power_cost.to_string())
                 .field("冷却", format!("{} 回合", skill.skill.cooldown_rounds))
                 .field("基础伤害", skill.skill.base_damage.to_string())
@@ -404,6 +421,75 @@ impl GameService {
                 .command("技能")
                 .command(format!("释放技能 {}", skill.skill.name)),
         )
+    }
+
+    pub fn equip_skill(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        self.set_skill_equipped(req, true)
+    }
+
+    pub fn unequip_skill(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        self.set_skill_equipped(req, false)
+    }
+
+    fn set_skill_equipped(
+        &self,
+        req: &CommandRequest,
+        equipped: bool,
+    ) -> Result<GameDocument, String> {
+        let skill_name = parse_required_catalog_name(
+            req.args.as_str(),
+            if equipped {
+                "装备魂技 <魂技>"
+            } else {
+                "卸下魂技 <魂技>"
+            },
+        )?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = if equipped {
+            self.store
+                .equip_skill_with_operation(&key, skill_name, &operation)?
+        } else {
+            self.store
+                .unequip_skill_with_operation(&key, skill_name, &operation)?
+        };
+        Ok(self.skill_loadout_document(receipt))
+    }
+
+    fn skill_loadout_document(&self, receipt: SkillLoadoutReceipt) -> GameDocument {
+        GameDocument::new(if receipt.replayed {
+            "魂技装备回执"
+        } else if receipt.equipped {
+            "魂技装备成功"
+        } else {
+            "魂技卸下成功"
+        })
+        .field("魂技", receipt.skill.name.clone())
+        .field(
+            "状态",
+            if receipt.equipped {
+                "已装备"
+            } else {
+                "未装备"
+            },
+        )
+        .field(
+            "装备位",
+            format!("{}/{}", receipt.equipped_count, receipt.capacity),
+        )
+        .notice(if receipt.replayed {
+            "检测到相同消息的重复请求，已返回原装备回执，未重复变更状态"
+        } else {
+            "魂技装备状态、操作日志和不可变装备事件已在同一事务完成"
+        })
+        .command("技能")
+        .command(format!(
+            "{}魂技 {}",
+            if receipt.equipped { "卸下" } else { "装备" },
+            receipt.skill.name
+        ))
     }
 
     pub fn soul_rings(&self, req: &CommandRequest) -> Result<GameDocument, String> {
@@ -498,10 +584,15 @@ impl GameService {
         for entry in page.entries {
             document = document
                 .line(format!(
-                    "#{} · {} · Lv.{} · {}魂力 · 冷却 {} 回合",
+                    "#{} · {} · Lv.{} · {} · {}魂力 · 冷却 {} 回合",
                     entry.skill.ring_index,
                     entry.skill.name,
                     entry.level,
+                    if entry.equipped {
+                        "已装备"
+                    } else {
+                        "未装备"
+                    },
                     entry.skill.soul_power_cost,
                     entry.skill.cooldown_rounds
                 ))
