@@ -188,6 +188,17 @@ mod plugin {
     }
 
     #[command(
+        name = "钱包",
+        description = "查看金魂币余额",
+        aliases = "我的钱包,余额",
+        category = "斗罗大陆·角色",
+        scope = "all"
+    )]
+    fn wallet(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.wallet(req))
+    }
+
+    #[command(
         name = "状态",
         description = "查看自己的角色状态",
         aliases = "我的状态,属性",

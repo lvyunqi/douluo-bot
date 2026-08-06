@@ -37,6 +37,10 @@ const MENU_PAGES: &[MenuPage] = &[
                 command: "签到",
                 description: "领取每日经验和金魂币",
             },
+            MenuEntry {
+                command: "钱包",
+                description: "查看金魂币余额",
+            },
         ],
     },
     MenuPage {
@@ -282,6 +286,22 @@ impl GameService {
             document.notice("签到成功，下一个北京时间 04:00 刷新后可再次领取")
         };
         Ok(document)
+    }
+
+    pub fn wallet(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        if !req.args.as_str().trim().is_empty() {
+            return Err("用法：钱包".to_string());
+        }
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let balance = self
+            .store
+            .wallet_balance(&key, CHECKIN_CURRENCY_CODE)?
+            .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())?;
+        Ok(GameDocument::new("我的钱包")
+            .field(CHECKIN_CURRENCY_NAME, balance.to_string())
+            .command("签到")
+            .notice("当前展示签到使用的金魂币余额"))
     }
 
     pub fn status(&self, req: &CommandRequest) -> Result<GameDocument, String> {
@@ -879,6 +899,18 @@ mod tests {
             .register(&request("开始穿越", "签到测试 女", "register"))
             .expect("应创建签到测试角色");
 
+        let initial_wallet = crate::message::render_text(
+            &service
+                .wallet(&request("钱包", "", "wallet-initial"))
+                .expect("未签到角色应能查询零余额"),
+        );
+        assert!(initial_wallet.contains("金魂币：0"));
+        assert!(
+            service
+                .wallet(&request("钱包", "extra", "wallet-invalid"))
+                .is_err()
+        );
+
         let first = crate::message::render_text(
             &service
                 .daily_checkin(&request("签到", "", "checkin-first"))
@@ -887,6 +919,14 @@ mod tests {
         assert!(first.contains("结果：签到成功"));
         assert!(first.contains("经验奖励：+60"));
         assert!(first.contains("金魂币奖励：+"));
+
+        let wallet = crate::message::render_text(
+            &service
+                .wallet(&request("余额", "", "wallet-after-checkin"))
+                .expect("签到后应能查询余额"),
+        );
+        assert!(wallet.contains("金魂币："));
+        assert!(wallet.contains("当前展示签到使用的金魂币余额"));
 
         let duplicate = crate::message::render_text(
             &service
@@ -1107,6 +1147,12 @@ mod tests {
                 .iter()
                 .any(|entry| entry.command == "签到")
         );
+        assert!(
+            MENU_PAGES[second]
+                .entries
+                .iter()
+                .any(|entry| entry.command == "钱包")
+        );
         assert_eq!(parse_menu_page("世界").expect("世界分类应有效"), 2);
         assert!(parse_menu_page("4").is_err());
         assert!(parse_menu_page("角色 多余").is_err());
@@ -1131,6 +1177,7 @@ mod tests {
         assert!(second.contains("武魂觉醒：觉醒第一武魂"));
         assert!(second.contains("状态：查看角色属性、武魂和位置"));
         assert!(second.contains("签到：领取每日经验和金魂币"));
+        assert!(second.contains("钱包：查看金魂币余额"));
         assert!(second.contains("斗罗系统 1"));
         assert!(second.contains("斗罗系统 3"));
 

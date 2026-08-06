@@ -725,6 +725,40 @@ impl Store {
             .map_err(|error| format!("查询角色状态失败：{error}"))
     }
 
+    pub fn wallet_balance(
+        &self,
+        key: &IdentityKey<'_>,
+        currency_code: &str,
+    ) -> Result<Option<i64>, String> {
+        validate_identity_key(key)?;
+        validate_currency_code(currency_code)?;
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        connection
+            .query_row(
+                r#"
+                SELECT COALESCE(w.balance, 0)
+                  FROM identity i
+                  JOIN player p ON p.identity_id = i.id
+             LEFT JOIN wallet w
+                    ON w.player_id = p.id AND w.currency_code = ?6
+                 WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+                   AND i.subject_kind = ?4 AND i.subject_id = ?5
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind,
+                    key.subject_id,
+                    currency_code
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("查询钱包余额失败：{error}"))
+    }
+
     #[allow(dead_code)]
     pub fn awaken_wuhun(&self, key: &IdentityKey<'_>) -> Result<AwakenedWuhun, String> {
         self.awaken_wuhun_with_operation(key, None)
@@ -1439,21 +1473,25 @@ fn validate_daily_checkin_input(input: &DailyCheckinInput<'_>) -> Result<(), Str
     if input.game_day < 0 {
         return Err("签到游戏日不能为负数".to_string());
     }
-    if input.currency_code != input.currency_code.trim()
-        || input.currency_code.is_empty()
-        || input.currency_code.len() > 32
-        || !input
-            .currency_code
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    {
-        return Err("签到币种代码必须是 1 到 32 个字母、数字、点、下划线或横线".to_string());
-    }
+    validate_currency_code(input.currency_code)?;
     if input
         .currency_reward_override
         .is_some_and(|reward| !(100..=199).contains(&reward))
     {
         return Err("签到货币奖励覆盖值必须在 100 到 199 之间".to_string());
+    }
+    Ok(())
+}
+
+fn validate_currency_code(currency_code: &str) -> Result<(), String> {
+    if currency_code != currency_code.trim()
+        || currency_code.is_empty()
+        || currency_code.len() > 32
+        || !currency_code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err("币种代码必须是 1 到 32 个字母、数字、点、下划线或横线".to_string());
     }
     Ok(())
 }
@@ -4365,6 +4403,50 @@ mod tests {
                 .is_authorized(&identity(), "group", "group-atomic")
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn wallet_balance_is_zero_before_checkin_and_isolated_by_identity() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "钱包角色", "男")
+            .expect("应创建钱包角色");
+        let mut other = identity();
+        other.subject_id = "wallet-other";
+        store
+            .register_player(&other, "另一个钱包角色", "女")
+            .expect("应创建另一个钱包角色");
+
+        assert_eq!(
+            store
+                .wallet_balance(&identity(), "gold_soul_coin")
+                .expect("未签到余额查询应成功"),
+            Some(0)
+        );
+        store
+            .daily_checkin(
+                &identity(),
+                &DailyCheckinInput {
+                    game_day: 400,
+                    currency_code: "gold_soul_coin",
+                    currency_reward_override: Some(123),
+                },
+                &checkin_operation("wallet-checkin"),
+            )
+            .expect("签到应成功");
+        assert_eq!(
+            store
+                .wallet_balance(&identity(), "gold_soul_coin")
+                .expect("签到后余额查询应成功"),
+            Some(123)
+        );
+        assert_eq!(
+            store
+                .wallet_balance(&other, "gold_soul_coin")
+                .expect("其他角色余额查询应成功"),
+            Some(0)
+        );
+        assert!(store.wallet_balance(&identity(), "bad code").is_err());
     }
 
     #[test]
