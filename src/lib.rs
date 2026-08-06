@@ -67,13 +67,8 @@ fn with_service(
     let Some(service) = service else {
         return CommandResponse::text("斗罗大陆插件尚未完成初始化，请联系管理员");
     };
-    let authorization = if require_authorized_context {
-        service.ensure_context_authorized(req)
-    } else {
-        Ok(())
-    };
-    let denied = authorization.is_err();
-    let result = authorization.and_then(|()| operation(&service));
+    let (result, denied) =
+        execute_service_operation(&service, req, require_authorized_context, operation);
     let outcome = if denied {
         "denied"
     } else if result.is_ok() {
@@ -95,6 +90,22 @@ fn with_service(
         service.message_config(),
         service.illustration_config(),
     )
+}
+
+fn execute_service_operation(
+    service: &GameService,
+    req: &CommandRequest,
+    require_authorized_context: bool,
+    operation: impl FnOnce(&GameService) -> Result<GameDocument, String>,
+) -> (Result<GameDocument, String>, bool) {
+    let authorization = if require_authorized_context {
+        service.ensure_context_authorized(req)
+    } else {
+        Ok(())
+    };
+    let denied = authorization.is_err();
+    let result = authorization.and_then(|()| operation(service));
+    (result, denied)
 }
 
 #[dynamic_plugin(
@@ -163,6 +174,17 @@ mod plugin {
     )]
     fn awaken(req: &CommandRequest) -> CommandResponse {
         with_service(req, false, true, |service| service.awaken(req))
+    }
+
+    #[command(
+        name = "签到",
+        description = "领取每日经验和金魂币",
+        aliases = "每日签到,打卡",
+        category = "斗罗大陆·角色",
+        scope = "all"
+    )]
+    fn daily_checkin(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.daily_checkin(req))
     }
 
     #[command(
@@ -243,5 +265,73 @@ mod plugin {
     )]
     fn list_contexts(req: &CommandRequest) -> CommandResponse {
         with_service(req, true, false, |service| service.list_contexts(req))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use abi_stable::std_types::RString;
+
+    use super::*;
+    use crate::config::{AuthorizationMode, PluginConfig};
+    use crate::store::IdentityKey;
+
+    #[test]
+    fn denied_allowlist_request_never_executes_economic_operation() {
+        let directory = tempfile::tempdir().expect("应创建临时目录");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("应初始化数据库");
+        let key = IdentityKey {
+            protocol: crate::message::Protocol::OneBot11,
+            account_id: "10001",
+            namespace: "default",
+            subject_kind: "user",
+            subject_id: "denied-user",
+        };
+        store
+            .register_player(&key, "拒绝测试", "男")
+            .expect("应创建测试角色");
+        let mut config = PluginConfig::default();
+        config.authorization.mode = AuthorizationMode::Allowlist;
+        let service =
+            GameService::with_assets(store.clone(), config, IllustrationAssets::default());
+        let request = CommandRequest {
+            args: RString::new(),
+            command_name: RString::from("签到"),
+            sender_id: RString::from("denied-user"),
+            group_id: RString::from("unauthorized-group"),
+            raw_event_json: RString::from(
+                r#"{"self_id":"10001","qimen_context":{"version":1,"protocol":"onebot11","account_id":"10001"}}"#,
+            ),
+            sender_nickname: RString::new(),
+            message_id: RString::from("denied-message"),
+            timestamp: 0,
+        };
+        let executed = Cell::new(false);
+        let (result, denied) = execute_service_operation(&service, &request, true, |service| {
+            executed.set(true);
+            service.daily_checkin(&request)
+        });
+        assert!(denied);
+        assert!(result.is_err());
+        assert!(!executed.get());
+        assert_eq!(
+            store
+                .player_status(&key)
+                .expect("应读取角色")
+                .expect("角色应存在")
+                .exp,
+            0
+        );
+        assert!(
+            store
+                .list_operation_logs(&key, None, 100)
+                .expect("应读取日志")
+                .entries
+                .iter()
+                .all(|entry| entry.command != "签到")
+        );
     }
 }

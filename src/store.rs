@@ -1,8 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 
 use crate::config::DatabaseConfig;
 use crate::message::Protocol;
@@ -254,6 +257,59 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_V5: &str = r#"
+CREATE TABLE wallet (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE CASCADE,
+    currency_code TEXT NOT NULL CHECK(
+        length(currency_code) BETWEEN 1 AND 32
+        AND currency_code = trim(currency_code)
+        AND currency_code GLOB '[A-Za-z0-9._-]*'
+        AND currency_code NOT GLOB '*[^A-Za-z0-9._-]*'
+    ),
+    balance INTEGER NOT NULL DEFAULT 0 CHECK(balance >= 0),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+) STRICT;
+
+CREATE UNIQUE INDEX wallet_player_currency
+    ON wallet(player_id, currency_code);
+
+CREATE TABLE daily_checkin_claim (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE CASCADE,
+    game_day INTEGER NOT NULL CHECK(game_day >= 0),
+    total_claims INTEGER NOT NULL CHECK(total_claims >= 1),
+    streak_days INTEGER NOT NULL CHECK(streak_days BETWEEN 1 AND total_claims),
+    cycle_day INTEGER NOT NULL CHECK(
+        cycle_day BETWEEN 1 AND 7
+        AND cycle_day = ((streak_days - 1) % 7) + 1
+    ),
+    exp_reward INTEGER NOT NULL CHECK(
+        exp_reward = CASE cycle_day
+            WHEN 1 THEN 60 WHEN 2 THEN 70 WHEN 3 THEN 80 WHEN 4 THEN 90
+            WHEN 5 THEN 100 WHEN 6 THEN 110 WHEN 7 THEN 150
+        END
+    ),
+    currency_code TEXT NOT NULL CHECK(
+        length(currency_code) BETWEEN 1 AND 32
+        AND currency_code = trim(currency_code)
+        AND currency_code GLOB '[A-Za-z0-9._-]*'
+        AND currency_code NOT GLOB '*[^A-Za-z0-9._-]*'
+    ),
+    currency_reward INTEGER NOT NULL CHECK(currency_reward BETWEEN 100 AND 199),
+    exp_after INTEGER NOT NULL CHECK(exp_after >= 0),
+    currency_balance_after INTEGER NOT NULL CHECK(currency_balance_after >= 0),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0)
+) STRICT;
+
+CREATE UNIQUE INDEX daily_checkin_claim_player_day
+    ON daily_checkin_claim(player_id, game_day);
+
+CREATE INDEX daily_checkin_claim_player_page
+    ON daily_checkin_claim(player_id, id);
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -380,6 +436,32 @@ pub enum AuthorizedContextChange {
     AlreadyRevoked,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DailyCheckinInput<'a> {
+    pub game_day: i64,
+    pub currency_code: &'a str,
+    pub currency_reward_override: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DailyCheckinReceipt {
+    pub game_day: i64,
+    pub total_claims: i64,
+    pub streak_days: i64,
+    pub cycle_day: i64,
+    pub exp_reward: i64,
+    pub currency_code: String,
+    pub currency_reward: i64,
+    pub exp_after: i64,
+    pub currency_balance_after: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DailyCheckinResult {
+    Claimed(DailyCheckinReceipt),
+    AlreadyClaimed(DailyCheckinReceipt),
+}
+
 impl Store {
     pub fn initialize(data_dir: &Path, config: &DatabaseConfig) -> Result<Self, String> {
         let path = data_dir.join(&config.relative_path);
@@ -392,6 +474,7 @@ impl Store {
             busy_timeout: Duration::from_millis(config.busy_timeout_ms),
         };
         let mut connection = store.open()?;
+        store.ensure_wal_mode(&connection)?;
         store.migrate(&mut connection)?;
         Ok(store)
     }
@@ -403,10 +486,26 @@ impl Store {
             .busy_timeout(self.busy_timeout)
             .map_err(|error| format!("设置 SQLite busy timeout 失败：{error}"))?;
         connection
-            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
+            .execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(|error| format!("初始化 SQLite PRAGMA 失败：{error}"))?;
         verify_foreign_keys(&connection, true)?;
         Ok(connection)
+    }
+
+    fn ensure_wal_mode(&self, connection: &Connection) -> Result<(), String> {
+        let deadline = Instant::now() + self.busy_timeout;
+        loop {
+            match connection.query_row("PRAGMA journal_mode = WAL", [], |row| {
+                row.get::<_, String>(0)
+            }) {
+                Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
+                Ok(mode) => return Err(format!("SQLite 未进入 WAL 模式，当前模式为 {mode}")),
+                Err(error) if sqlite_is_busy_or_locked(&error) && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(format!("启用 SQLite WAL 模式失败：{error}")),
+            }
+        }
     }
 
     fn migrate(&self, connection: &mut Connection) -> Result<(), String> {
@@ -432,7 +531,7 @@ impl Store {
         let migration_result = (|| -> Result<(), String> {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|error| format!("开始数据库迁移 v2/v3/v4 失败：{error}"))?;
+                .map_err(|error| format!("开始数据库迁移 v2/v3/v4/v5 失败：{error}"))?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
             if !migration_applied(&transaction, 2)? {
                 let old_identity_sequence = transaction
@@ -490,10 +589,25 @@ impl Store {
                 validate_v4_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 5)? {
+                transaction
+                    .execute_batch(MIGRATION_V5)
+                    .map_err(|error| format!("执行数据库迁移 v5 失败：{error}"))?;
+                validate_v5_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(5, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v5 失败：{error}"))?;
+            } else {
+                validate_v5_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction
                 .commit()
-                .map_err(|error| format!("提交数据库迁移 v2/v3/v4 失败：{error}"))?;
+                .map_err(|error| format!("提交数据库迁移 v2/v3/v4/v5 失败：{error}"))?;
             Ok(())
         })();
         let restore_result = set_foreign_keys(connection, true);
@@ -503,6 +617,7 @@ impl Store {
                 validate_v2_schema(connection)?;
                 validate_v3_schema(connection)?;
                 validate_v4_schema(connection)?;
+                validate_v5_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -844,7 +959,7 @@ impl Store {
         Ok(LegacyClaimResult::Claimed { identity_id })
     }
 
-    #[allow(dead_code)] // Foundation API; chat commands are wired in a later slice.
+    #[allow(dead_code)] // 为后续只读管理入口保留直接追加接口。
     pub fn append_operation(
         &self,
         key: &IdentityKey<'_>,
@@ -865,7 +980,7 @@ impl Store {
         insert_operation_log(&connection, key, &operation)
     }
 
-    #[allow(dead_code)] // Foundation API; chat commands are wired in a later slice.
+    #[allow(dead_code)] // 为后续只读管理入口保留操作日志分页接口。
     pub fn list_operation_logs(
         &self,
         key: &IdentityKey<'_>,
@@ -1146,6 +1261,266 @@ impl Store {
             )
             .map_err(|error| format!("查询授权上下文状态失败：{error}"))
     }
+    pub fn daily_checkin(
+        &self,
+        key: &IdentityKey<'_>,
+        input: &DailyCheckinInput<'_>,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<DailyCheckinResult, String> {
+        validate_identity_key(key)?;
+        validate_daily_checkin_input(input)?;
+        validate_operation_input(operation)?;
+
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始签到事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let (player_id, current_exp) = transaction
+            .query_row(
+                r#"
+                SELECT p.id, p.exp
+                  FROM identity i
+                  JOIN player p ON p.identity_id = i.id
+                 WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+                   AND i.subject_kind = ?4 AND i.subject_id = ?5
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind,
+                    key.subject_id
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取签到角色失败：{error}"))?
+            .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())?;
+
+        if let Some(receipt) = load_daily_checkin_receipt(&transaction, player_id, input.game_day)?
+        {
+            return Ok(DailyCheckinResult::AlreadyClaimed(receipt));
+        }
+
+        let previous = latest_daily_checkin(&transaction, player_id)?;
+        if previous.is_some_and(|claim| claim.game_day > input.game_day) {
+            return Err("签到游戏日不能早于已有记录".to_string());
+        }
+
+        let total_claims = previous
+            .map(|claim| claim.total_claims)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| "累计签到次数溢出".to_string())?;
+        let streak_days = match previous {
+            Some(claim) if claim.game_day.checked_add(1) == Some(input.game_day) => claim
+                .streak_days
+                .checked_add(1)
+                .ok_or_else(|| "连续签到天数溢出".to_string())?,
+            _ => 1,
+        };
+        let cycle_day = ((streak_days - 1) % 7) + 1;
+        let exp_reward = expected_daily_checkin_exp(cycle_day)?;
+        let currency_reward = match input.currency_reward_override {
+            Some(reward) => reward,
+            None => transaction
+                .query_row(
+                    "SELECT 100 + ((random() & 9223372036854775807) % 100)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| format!("生成签到货币奖励失败：{error}"))?,
+        };
+
+        let timestamp = now_timestamp()?;
+        transaction
+            .execute(
+                r#"
+                INSERT OR IGNORE INTO wallet(
+                    player_id, currency_code, balance, created_at, updated_at
+                ) VALUES(?1, ?2, 0, ?3, ?3)
+                "#,
+                params![player_id, input.currency_code, timestamp],
+            )
+            .map_err(|error| format!("创建签到钱包失败：{error}"))?;
+        let current_balance = transaction
+            .query_row(
+                "SELECT balance FROM wallet WHERE player_id = ?1 AND currency_code = ?2",
+                params![player_id, input.currency_code],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("读取签到钱包余额失败：{error}"))?;
+        let exp_after = current_exp
+            .checked_add(exp_reward)
+            .ok_or_else(|| "签到经验累加溢出".to_string())?;
+        let currency_balance_after = current_balance
+            .checked_add(currency_reward)
+            .ok_or_else(|| "签到钱包余额累加溢出".to_string())?;
+
+        let player_updates = transaction
+            .execute(
+                "UPDATE player SET exp = ?1, updated_at = ?2 WHERE id = ?3",
+                params![exp_after, timestamp, player_id],
+            )
+            .map_err(|error| format!("更新签到经验失败：{error}"))?;
+        if player_updates != 1 {
+            return Err("更新签到经验时角色状态发生变化".to_string());
+        }
+        let wallet_updates = transaction
+            .execute(
+                r#"
+                UPDATE wallet
+                   SET balance = ?1, updated_at = ?2
+                 WHERE player_id = ?3 AND currency_code = ?4
+                "#,
+                params![
+                    currency_balance_after,
+                    timestamp,
+                    player_id,
+                    input.currency_code
+                ],
+            )
+            .map_err(|error| format!("更新签到钱包余额失败：{error}"))?;
+        if wallet_updates != 1 {
+            return Err("更新签到钱包时记录状态发生变化".to_string());
+        }
+        transaction
+            .execute(
+                r#"
+                INSERT INTO daily_checkin_claim(
+                    player_id, game_day, total_claims, streak_days, cycle_day,
+                    exp_reward, currency_code, currency_reward, exp_after,
+                    currency_balance_after, created_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "#,
+                params![
+                    player_id,
+                    input.game_day,
+                    total_claims,
+                    streak_days,
+                    cycle_day,
+                    exp_reward,
+                    input.currency_code,
+                    currency_reward,
+                    exp_after,
+                    currency_balance_after,
+                    timestamp
+                ],
+            )
+            .map_err(|error| format!("写入签到领取记录失败：{error}"))?;
+        insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交签到事务失败：{error}"))?;
+
+        Ok(DailyCheckinResult::Claimed(DailyCheckinReceipt {
+            game_day: input.game_day,
+            total_claims,
+            streak_days,
+            cycle_day,
+            exp_reward,
+            currency_code: input.currency_code.to_string(),
+            currency_reward,
+            exp_after,
+            currency_balance_after,
+        }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LatestDailyCheckin {
+    game_day: i64,
+    total_claims: i64,
+    streak_days: i64,
+}
+
+fn validate_daily_checkin_input(input: &DailyCheckinInput<'_>) -> Result<(), String> {
+    if input.game_day < 0 {
+        return Err("签到游戏日不能为负数".to_string());
+    }
+    if input.currency_code != input.currency_code.trim()
+        || input.currency_code.is_empty()
+        || input.currency_code.len() > 32
+        || !input
+            .currency_code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err("签到币种代码必须是 1 到 32 个字母、数字、点、下划线或横线".to_string());
+    }
+    if input
+        .currency_reward_override
+        .is_some_and(|reward| !(100..=199).contains(&reward))
+    {
+        return Err("签到货币奖励覆盖值必须在 100 到 199 之间".to_string());
+    }
+    Ok(())
+}
+
+fn expected_daily_checkin_exp(cycle_day: i64) -> Result<i64, String> {
+    [60, 70, 80, 90, 100, 110, 150]
+        .get(usize::try_from(cycle_day - 1).map_err(|_| "签到轮次必须在 1 到 7 之间".to_string())?)
+        .copied()
+        .ok_or_else(|| "签到轮次必须在 1 到 7 之间".to_string())
+}
+
+fn latest_daily_checkin(
+    connection: &Connection,
+    player_id: i64,
+) -> Result<Option<LatestDailyCheckin>, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT game_day, total_claims, streak_days
+              FROM daily_checkin_claim
+             WHERE player_id = ?1
+             ORDER BY game_day DESC
+             LIMIT 1
+            "#,
+            [player_id],
+            |row| {
+                Ok(LatestDailyCheckin {
+                    game_day: row.get(0)?,
+                    total_claims: row.get(1)?,
+                    streak_days: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取最近签到记录失败：{error}"))
+}
+
+fn load_daily_checkin_receipt(
+    connection: &Connection,
+    player_id: i64,
+    game_day: i64,
+) -> Result<Option<DailyCheckinReceipt>, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT game_day, total_claims, streak_days, cycle_day, exp_reward,
+                   currency_code, currency_reward, exp_after, currency_balance_after
+              FROM daily_checkin_claim
+             WHERE player_id = ?1 AND game_day = ?2
+            "#,
+            params![player_id, game_day],
+            |row| {
+                Ok(DailyCheckinReceipt {
+                    game_day: row.get(0)?,
+                    total_claims: row.get(1)?,
+                    streak_days: row.get(2)?,
+                    cycle_day: row.get(3)?,
+                    exp_reward: row.get(4)?,
+                    currency_code: row.get(5)?,
+                    currency_reward: row.get(6)?,
+                    exp_after: row.get(7)?,
+                    currency_balance_after: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取当日签到记录失败：{error}"))
 }
 
 fn migration_applied(connection: &Connection, version: i64) -> Result<bool, String> {
@@ -1156,6 +1531,14 @@ fn migration_applied(connection: &Connection, version: i64) -> Result<bool, Stri
             |row| row.get(0),
         )
         .map_err(|error| format!("读取数据库迁移版本失败：{error}"))
+}
+
+fn sqlite_is_busy_or_locked(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(failure.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
 }
 
 fn restore_identity_sequence(transaction: &Transaction<'_>, sequence: i64) -> Result<(), String> {
@@ -2149,6 +2532,552 @@ fn probe_v4_details_guard(connection: &Connection) -> Result<(), String> {
     }
 }
 
+fn validate_v5_schema(connection: &Connection) -> Result<(), String> {
+    let wallet_columns = table_columns_with_type(connection, "wallet")?;
+    let expected_wallet_columns = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("currency_code", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("balance", "INTEGER", true, false, Some("0"), 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("updated_at", "INTEGER", true, false, None, 0),
+    ];
+    if wallet_columns != expected_wallet_columns {
+        return Err(format!(
+            "数据库已标记迁移 v5，但钱包字段不匹配：{wallet_columns:?}"
+        ));
+    }
+
+    let claim_columns = table_columns_with_type(connection, "daily_checkin_claim")?;
+    let expected_claim_columns = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("game_day", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("total_claims", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("streak_days", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("cycle_day", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("exp_reward", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("currency_code", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("currency_reward", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("exp_after", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("currency_balance_after", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+    ];
+    if claim_columns != expected_claim_columns {
+        return Err(format!(
+            "数据库已标记迁移 v5，但签到领取字段不匹配：{claim_columns:?}"
+        ));
+    }
+
+    validate_player_foreign_key(connection, "wallet")?;
+    validate_player_foreign_key(connection, "daily_checkin_claim")?;
+    validate_v5_index_set(connection, "wallet", &["wallet_player_currency"])?;
+    validate_v5_index_set(
+        connection,
+        "daily_checkin_claim",
+        &[
+            "daily_checkin_claim_player_day",
+            "daily_checkin_claim_player_page",
+        ],
+    )?;
+    validate_named_index(
+        connection,
+        "wallet",
+        "wallet_player_currency",
+        true,
+        &["player_id", "currency_code"],
+    )?;
+    validate_named_index(
+        connection,
+        "daily_checkin_claim",
+        "daily_checkin_claim_player_day",
+        true,
+        &["player_id", "game_day"],
+    )?;
+    validate_named_index(
+        connection,
+        "daily_checkin_claim",
+        "daily_checkin_claim_player_page",
+        false,
+        &["player_id", "id"],
+    )?;
+
+    validate_v5_table_sql(
+        connection,
+        "wallet",
+        &[
+            "AUTOINCREMENT",
+            ") STRICT",
+            "REFERENCES PLAYER(ID) ON DELETE CASCADE",
+            "LENGTH(CURRENCY_CODE) BETWEEN 1 AND 32",
+            "CURRENCY_CODE = TRIM(CURRENCY_CODE)",
+            "CURRENCY_CODE NOT GLOB",
+            "BALANCE INTEGER NOT NULL DEFAULT 0",
+            "BALANCE >= 0",
+            "CREATED_AT >= 0",
+            "UPDATED_AT >= 0",
+        ],
+    )?;
+    validate_v5_table_sql(
+        connection,
+        "daily_checkin_claim",
+        &[
+            "AUTOINCREMENT",
+            ") STRICT",
+            "REFERENCES PLAYER(ID) ON DELETE CASCADE",
+            "GAME_DAY >= 0",
+            "TOTAL_CLAIMS >= 1",
+            "STREAK_DAYS BETWEEN 1 AND TOTAL_CLAIMS",
+            "CYCLE_DAY = ((STREAK_DAYS - 1) % 7) + 1",
+            "WHEN 7 THEN 150",
+            "LENGTH(CURRENCY_CODE) BETWEEN 1 AND 32",
+            "CURRENCY_CODE = TRIM(CURRENCY_CODE)",
+            "CURRENCY_CODE NOT GLOB",
+            "CURRENCY_REWARD BETWEEN 100 AND 199",
+            "EXP_AFTER >= 0",
+            "CURRENCY_BALANCE_AFTER >= 0",
+            "CREATED_AT >= 0",
+        ],
+    )?;
+
+    validate_v5_triggers(connection)?;
+    probe_v5_guards(connection)
+}
+
+fn probe_v5_guards(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch("SAVEPOINT qimen_v5_guard_probe;")
+        .map_err(|error| format!("开始 v5 经济约束探针失败：{error}"))?;
+    let probe_result = (|| -> Result<(), String> {
+        let token = connection
+            .query_row("SELECT lower(hex(randomblob(16)))", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("生成 v5 经济探针标识失败：{error}"))?;
+        let account_id = format!("v5-probe-{token}");
+        connection
+            .execute(
+                r#"
+                INSERT INTO identity(
+                    protocol, account_id, namespace, subject_kind, subject_id, created_at
+                ) VALUES('onebot11', ?1, 'v5-probe', 'user', ?1, 0)
+                "#,
+                [&account_id],
+            )
+            .map_err(|error| format!("v5 经济探针无法创建临时身份：{error}"))?;
+        let identity_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO player(identity_id, name, gender, created_at, updated_at) VALUES(?1, 'v5-probe', '男', 0, 0)",
+                [identity_id],
+            )
+            .map_err(|error| format!("v5 经济探针无法创建临时角色：{error}"))?;
+        let player_id = connection.last_insert_rowid();
+
+        connection
+            .execute(
+                "INSERT INTO wallet(player_id, currency_code, balance, created_at, updated_at) VALUES(?1, 'valid', 0, 0, 0)",
+                [player_id],
+            )
+            .map_err(|error| format!("v5 经济探针无法插入合法钱包：{error}"))?;
+        if connection
+            .execute(
+                "INSERT INTO wallet(player_id, currency_code, balance, created_at, updated_at) VALUES(?1, 'valid', 0, 0, 0)",
+                [player_id],
+            )
+            .is_ok()
+        {
+            return Err("v5 钱包唯一约束探针被绕过".to_string());
+        }
+        for (label, sql) in [
+            (
+                "负余额",
+                "INSERT INTO wallet(player_id, currency_code, balance, created_at, updated_at) VALUES(?1, 'negative', -1, 0, 0)",
+            ),
+            (
+                "非法币种",
+                "INSERT INTO wallet(player_id, currency_code, balance, created_at, updated_at) VALUES(?1, 'bad code', 0, 0, 0)",
+            ),
+            (
+                "REAL 余额",
+                "INSERT INTO wallet(player_id, currency_code, balance, created_at, updated_at) VALUES(?1, 'real', 1.5, 0, 0)",
+            ),
+            (
+                "TEXT 余额",
+                "INSERT INTO wallet(player_id, currency_code, balance, created_at, updated_at) VALUES(?1, 'text', 'abc', 0, 0)",
+            ),
+        ] {
+            if connection.execute(sql, [player_id]).is_ok() {
+                return Err(format!("v5 钱包 {label} 约束探针被绕过"));
+            }
+        }
+
+        let valid_claim = r#"
+            INSERT INTO daily_checkin_claim(
+                player_id, game_day, total_claims, streak_days, cycle_day,
+                exp_reward, currency_code, currency_reward, exp_after,
+                currency_balance_after, created_at
+            ) VALUES(?1, 1, 1, 1, 1, 60, 'valid', 100, 60, 100, 0)
+        "#;
+        connection
+            .execute(valid_claim, [player_id])
+            .map_err(|error| format!("v5 经济探针无法插入合法签到领取：{error}"))?;
+        if connection.execute(valid_claim, [player_id]).is_ok() {
+            return Err("v5 签到领取唯一约束探针被绕过".to_string());
+        }
+        for (label, sql) in [
+            (
+                "负游戏日",
+                "INSERT INTO daily_checkin_claim VALUES(NULL, ?1, -1, 1, 1, 1, 60, 'valid', 100, 60, 100, 0)",
+            ),
+            (
+                "零累计",
+                "INSERT INTO daily_checkin_claim VALUES(NULL, ?1, 2, 0, 1, 1, 60, 'valid', 100, 60, 100, 0)",
+            ),
+            (
+                "连签超过累计",
+                "INSERT INTO daily_checkin_claim VALUES(NULL, ?1, 3, 1, 2, 2, 70, 'valid', 100, 70, 100, 0)",
+            ),
+            (
+                "轮次不匹配",
+                "INSERT INTO daily_checkin_claim VALUES(NULL, ?1, 4, 1, 1, 2, 70, 'valid', 100, 70, 100, 0)",
+            ),
+            (
+                "经验奖励不匹配",
+                "INSERT INTO daily_checkin_claim VALUES(NULL, ?1, 5, 1, 1, 1, 70, 'valid', 100, 70, 100, 0)",
+            ),
+            (
+                "货币奖励过小",
+                "INSERT INTO daily_checkin_claim VALUES(NULL, ?1, 6, 1, 1, 1, 60, 'valid', 99, 60, 99, 0)",
+            ),
+            (
+                "货币奖励过大",
+                "INSERT INTO daily_checkin_claim VALUES(NULL, ?1, 7, 1, 1, 1, 60, 'valid', 200, 60, 200, 0)",
+            ),
+            (
+                "负经验余额",
+                "INSERT INTO daily_checkin_claim VALUES(NULL, ?1, 8, 1, 1, 1, 60, 'valid', 100, -1, 100, 0)",
+            ),
+            (
+                "负货币余额",
+                "INSERT INTO daily_checkin_claim VALUES(NULL, ?1, 9, 1, 1, 1, 60, 'valid', 100, 60, -1, 0)",
+            ),
+            (
+                "负创建时间",
+                "INSERT INTO daily_checkin_claim VALUES(NULL, ?1, 10, 1, 1, 1, 60, 'valid', 100, 60, 100, -1)",
+            ),
+            (
+                "REAL 游戏日",
+                "INSERT INTO daily_checkin_claim VALUES(NULL, ?1, 11.5, 1, 1, 1, 60, 'valid', 100, 60, 100, 0)",
+            ),
+            (
+                "TEXT 累计",
+                "INSERT INTO daily_checkin_claim VALUES(NULL, ?1, 12, 'abc', 1, 1, 60, 'valid', 100, 60, 100, 0)",
+            ),
+            (
+                "非法签到币种",
+                "INSERT INTO daily_checkin_claim VALUES(NULL, ?1, 13, 1, 1, 1, 60, 'bad code', 100, 60, 100, 0)",
+            ),
+        ] {
+            if connection.execute(sql, [player_id]).is_ok() {
+                return Err(format!("v5 签到领取 {label} 约束探针被绕过"));
+            }
+        }
+        Ok(())
+    })();
+    let rollback_result = connection
+        .execute_batch("ROLLBACK TO qimen_v5_guard_probe; RELEASE qimen_v5_guard_probe;")
+        .map_err(|error| format!("回滚 v5 经济约束探针失败：{error}"));
+    match (probe_result, rollback_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(probe_error), Err(rollback_error)) => Err(format!("{probe_error}；{rollback_error}")),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TableColumnInfo {
+    name: String,
+    sql_type: String,
+    not_null: bool,
+    primary_key: bool,
+    default_value: Option<String>,
+    hidden: i64,
+}
+
+impl TableColumnInfo {
+    fn new(
+        name: &str,
+        sql_type: &str,
+        not_null: bool,
+        primary_key: bool,
+        default_value: Option<&str>,
+        hidden: i64,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            sql_type: sql_type.to_string(),
+            not_null,
+            primary_key,
+            default_value: default_value.map(str::to_string),
+            hidden,
+        }
+    }
+}
+
+fn table_columns_with_type(
+    connection: &Connection,
+    table: &str,
+) -> Result<Vec<TableColumnInfo>, String> {
+    let escaped_table = table.replace('"', "\"\"");
+    connection
+        .prepare(&format!("PRAGMA table_xinfo(\"{escaped_table}\")"))
+        .map_err(|error| format!("读取表 {table} 字段失败：{error}"))?
+        .query_map([], |row| {
+            Ok(TableColumnInfo {
+                name: row.get(1)?,
+                sql_type: row.get(2)?,
+                not_null: row.get(3)?,
+                default_value: row.get(4)?,
+                primary_key: row.get(5)?,
+                hidden: row.get(6)?,
+            })
+        })
+        .map_err(|error| format!("查询表 {table} 字段失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析表 {table} 字段失败：{error}"))
+}
+
+fn validate_player_foreign_key(connection: &Connection, table: &str) -> Result<(), String> {
+    let escaped_table = table.replace('"', "\"\"");
+    let mut foreign_keys = connection
+        .prepare(&format!("PRAGMA foreign_key_list(\"{escaped_table}\")"))
+        .map_err(|error| format!("读取表 {table} 外键失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(|error| format!("查询表 {table} 外键失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析表 {table} 外键失败：{error}"))?;
+    foreign_keys.sort();
+    let expected = [(
+        "player".to_string(),
+        "player_id".to_string(),
+        "id".to_string(),
+        "NO ACTION".to_string(),
+        "CASCADE".to_string(),
+        "NONE".to_string(),
+    )];
+    if foreign_keys != expected {
+        return Err(format!(
+            "数据库已标记迁移 v5，但表 {table} 的玩家外键不匹配：{foreign_keys:?}"
+        ));
+    }
+    let table_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取表 {table} 外键声明失败：{error}"))?
+        .ok_or_else(|| format!("数据库已标记迁移 v5，但缺少表 {table}"))?
+        .to_ascii_uppercase();
+    if table_sql.contains("DEFERRABLE") || table_sql.contains("INITIALLY") {
+        return Err(format!(
+            "数据库已标记迁移 v5，但表 {table} 的玩家外键不得延迟约束"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v5_index_set(
+    connection: &Connection,
+    table: &str,
+    expected_names: &[&str],
+) -> Result<(), String> {
+    let escaped_table = table.replace('"', "\"\"");
+    let mut actual_names = connection
+        .prepare(&format!("PRAGMA index_list(\"{escaped_table}\")"))
+        .map_err(|error| format!("读取表 {table} 索引集合失败：{error}"))?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("查询表 {table} 索引集合失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析表 {table} 索引集合失败：{error}"))?;
+    actual_names.sort();
+    let mut expected_names = expected_names
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    expected_names.sort();
+    if actual_names != expected_names {
+        return Err(format!(
+            "数据库已标记迁移 v5，但表 {table} 的索引集合不匹配：实际 {actual_names:?}，期望 {expected_names:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v5_triggers(connection: &Connection) -> Result<(), String> {
+    let triggers = connection
+        .prepare(
+            "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name",
+        )
+        .map_err(|error| format!("读取 v5 触发器集合失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v5 触发器集合失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v5 触发器集合失败：{error}"))?;
+    for (name, table, sql) in triggers {
+        if sql_mentions_identifier(&sql, "wallet")
+            || sql_mentions_identifier(&sql, "daily_checkin_claim")
+        {
+            return Err(format!(
+                "数据库已标记迁移 v5，但触发器 {name}（目标表 {table}）引用了 v5 经济表"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sql_mentions_identifier(sql: &str, identifier: &str) -> bool {
+    let sql = sql.to_ascii_uppercase();
+    let identifier = identifier.to_ascii_uppercase();
+    let mut offset = 0;
+    while let Some(relative) = sql[offset..].find(&identifier) {
+        let start = offset + relative;
+        let end = start + identifier.len();
+        let is_boundary = |byte: Option<u8>| {
+            byte.is_none_or(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'))
+        };
+        if is_boundary(sql.as_bytes().get(start.wrapping_sub(1)).copied())
+            && is_boundary(sql.as_bytes().get(end).copied())
+        {
+            return true;
+        }
+        offset = end;
+    }
+    false
+}
+
+fn validate_named_index(
+    connection: &Connection,
+    table: &str,
+    index_name: &str,
+    expected_unique: bool,
+    expected_columns: &[&str],
+) -> Result<(), String> {
+    let escaped_table = table.replace('"', "\"\"");
+    let indexes = connection
+        .prepare(&format!("PRAGMA index_list(\"{escaped_table}\")"))
+        .map_err(|error| format!("读取表 {table} 索引失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, bool>(4)?,
+            ))
+        })
+        .map_err(|error| format!("查询表 {table} 索引失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析表 {table} 索引失败：{error}"))?;
+    let (_, unique, origin, partial) = indexes
+        .into_iter()
+        .find(|(name, _, _, _)| name == index_name)
+        .ok_or_else(|| format!("数据库已标记迁移 v5，但缺少索引 {index_name}"))?;
+    if unique != expected_unique || origin != "c" || partial {
+        return Err(format!(
+            "数据库已标记迁移 v5，但索引 {index_name} 的 unique/origin/partial 不匹配"
+        ));
+    }
+    let escaped_index = index_name.replace('"', "\"\"");
+    let mut index_columns = connection
+        .prepare(&format!("PRAGMA index_xinfo(\"{escaped_index}\")"))
+        .map_err(|error| format!("读取索引 {index_name} 字段失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, bool>(5)?,
+            ))
+        })
+        .map_err(|error| format!("查询索引 {index_name} 字段失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析索引 {index_name} 字段失败：{error}"))?;
+    index_columns.sort_by_key(|(seqno, ..)| *seqno);
+    let key_columns = index_columns
+        .iter()
+        .filter(|(_, _, _, _, _, key)| *key)
+        .map(|(_, _, name, desc, collation, _)| (name.clone(), *desc, collation.clone()))
+        .collect::<Vec<_>>();
+    let expected_key_columns = expected_columns
+        .iter()
+        .map(|column| (Some((*column).to_string()), false, "BINARY".to_string()))
+        .collect::<Vec<_>>();
+    if key_columns != expected_key_columns {
+        return Err(format!(
+            "数据库已标记迁移 v5，但索引 {index_name} 字段不匹配：{key_columns:?}"
+        ));
+    }
+    let auxiliary_columns = index_columns
+        .iter()
+        .filter(|(_, _, _, _, _, key)| !*key)
+        .collect::<Vec<_>>();
+    if auxiliary_columns.len() != 1
+        || auxiliary_columns[0].1 != -1
+        || auxiliary_columns[0].2.is_some()
+        || auxiliary_columns[0].3
+        || auxiliary_columns[0].4 != "BINARY"
+    {
+        return Err(format!(
+            "数据库已标记迁移 v5，但索引 {index_name} 存在异常辅助字段"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v5_table_sql(
+    connection: &Connection,
+    table: &str,
+    markers: &[&str],
+) -> Result<(), String> {
+    let sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v5 表 {table} 建表语句失败：{error}"))?
+        .ok_or_else(|| format!("数据库已标记迁移 v5，但缺少表 {table}"))?
+        .to_ascii_uppercase();
+    for marker in markers {
+        if !sql.contains(marker) {
+            return Err(format!(
+                "数据库已标记迁移 v5，但表 {table} 缺少约束：{marker}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_identity_key(key: &IdentityKey<'_>) -> Result<(), String> {
     validate_account_id(key.account_id)?;
     if key.namespace.is_empty()
@@ -2465,6 +3394,15 @@ mod tests {
         }
     }
 
+    fn checkin_operation(message_id: &str) -> OperationLogInput<'_> {
+        OperationLogInput {
+            command: "签到",
+            outcome: "ok",
+            source_message_id: message_id,
+            details_json: r#"{"context":"private","has_args":false}"#,
+        }
+    }
+
     fn create_v1_database(directory: &Path, subject_id: &str) -> PathBuf {
         let relative_path = &DatabaseConfig::default().relative_path;
         let path = directory.join(relative_path);
@@ -2652,12 +3590,12 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT COUNT(*) FROM schema_migration WHERE version IN (2, 3, 4)",
+                    "SELECT COUNT(*) FROM schema_migration WHERE version IN (2, 3, 4, 5)",
                     [],
                     |row| row.get::<_, i64>(0)
                 )
                 .expect("应读取迁移记录"),
-            3
+            4
         );
 
         let broken_directory = tempdir().expect("应创建损坏测试目录");
@@ -2702,12 +3640,12 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT COUNT(*) FROM schema_migration WHERE version IN (2, 3, 4)",
+                    "SELECT COUNT(*) FROM schema_migration WHERE version IN (2, 3, 4, 5)",
                     [],
                     |row| row.get::<_, i64>(0)
                 )
                 .expect("应读取迁移记录"),
-            3
+            4
         );
     }
 
@@ -3426,6 +4364,337 @@ mod tests {
             store
                 .is_authorized(&identity(), "group", "group-atomic")
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn daily_checkin_is_idempotent_and_tracks_real_streaks() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "签到角色", "女")
+            .expect("应创建签到角色");
+
+        let first_input = DailyCheckinInput {
+            game_day: 100,
+            currency_code: "gold_soul_coin",
+            currency_reward_override: Some(100),
+        };
+        let first = store
+            .daily_checkin(&identity(), &first_input, &checkin_operation("checkin-1"))
+            .expect("首签应成功");
+        let DailyCheckinResult::Claimed(first) = first else {
+            panic!("首签不应返回重复领取");
+        };
+        assert_eq!(first.total_claims, 1);
+        assert_eq!(first.streak_days, 1);
+        assert_eq!(first.cycle_day, 1);
+        assert_eq!(first.exp_reward, 60);
+        assert_eq!(first.exp_after, 60);
+        assert_eq!(first.currency_balance_after, 100);
+
+        let duplicate = store
+            .daily_checkin(
+                &identity(),
+                &DailyCheckinInput {
+                    currency_reward_override: Some(199),
+                    ..first_input
+                },
+                &checkin_operation("checkin-duplicate"),
+            )
+            .expect("同日重复签到应返回原记录");
+        assert_eq!(duplicate, DailyCheckinResult::AlreadyClaimed(first.clone()));
+        assert_eq!(
+            store
+                .list_operation_logs(&identity(), None, 100)
+                .expect("应读取签到日志")
+                .entries
+                .iter()
+                .filter(|entry| entry.command == "签到")
+                .count(),
+            1
+        );
+
+        let next = store
+            .daily_checkin(
+                &identity(),
+                &DailyCheckinInput {
+                    game_day: 101,
+                    currency_code: "gold_soul_coin",
+                    currency_reward_override: Some(150),
+                },
+                &checkin_operation("checkin-2"),
+            )
+            .expect("次日签到应成功");
+        let DailyCheckinResult::Claimed(next) = next else {
+            panic!("次日不应重复");
+        };
+        assert_eq!(
+            (next.total_claims, next.streak_days, next.cycle_day),
+            (2, 2, 2)
+        );
+        assert_eq!((next.exp_reward, next.exp_after), (70, 130));
+        assert_eq!(next.currency_balance_after, 250);
+
+        let after_gap = store
+            .daily_checkin(
+                &identity(),
+                &DailyCheckinInput {
+                    game_day: 103,
+                    currency_code: "gold_soul_coin",
+                    currency_reward_override: Some(199),
+                },
+                &checkin_operation("checkin-3"),
+            )
+            .expect("断签后应重新开始连签");
+        let DailyCheckinResult::Claimed(after_gap) = after_gap else {
+            panic!("断签后的新游戏日不应重复");
+        };
+        assert_eq!(
+            (
+                after_gap.total_claims,
+                after_gap.streak_days,
+                after_gap.cycle_day,
+                after_gap.exp_reward
+            ),
+            (3, 1, 1, 60)
+        );
+        assert_eq!(after_gap.currency_balance_after, 449);
+    }
+
+    #[test]
+    fn concurrent_daily_checkin_grants_exactly_once() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "并发签到", "男")
+            .expect("应创建并发签到角色");
+        let store = Arc::new(store);
+        let barrier = Arc::new(Barrier::new(12));
+        let handles = (0..12)
+            .map(|index| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.daily_checkin(
+                        &identity(),
+                        &DailyCheckinInput {
+                            game_day: 200,
+                            currency_code: "gold_soul_coin",
+                            currency_reward_override: Some(123),
+                        },
+                        &checkin_operation(&format!("concurrent-{index}")),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .expect("签到线程不应 panic")
+                    .expect("签到应成功")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, DailyCheckinResult::Claimed(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, DailyCheckinResult::AlreadyClaimed(_)))
+                .count(),
+            11
+        );
+        assert!(results.iter().all(|result| match result {
+            DailyCheckinResult::Claimed(receipt) | DailyCheckinResult::AlreadyClaimed(receipt) => {
+                receipt.exp_after == 60 && receipt.currency_balance_after == 123
+            }
+        }));
+        assert_eq!(
+            store
+                .list_operation_logs(&identity(), None, 100)
+                .expect("应读取并发签到日志")
+                .entries
+                .iter()
+                .filter(|entry| entry.command == "签到")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn daily_checkin_rolls_back_rewards_when_audit_or_arithmetic_fails() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "回滚签到", "男")
+            .expect("应创建回滚签到角色");
+        let connection = store.open().expect("应打开数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER operation_log_checkin_abort
+                BEFORE INSERT ON operation_log
+                WHEN NEW.command = '签到'
+                BEGIN SELECT RAISE(ABORT, 'test checkin audit failure'); END;
+                "#,
+            )
+            .expect("应安装签到审计失败触发器");
+        drop(connection);
+        let input = DailyCheckinInput {
+            game_day: 300,
+            currency_code: "gold_soul_coin",
+            currency_reward_override: Some(188),
+        };
+        assert!(
+            store
+                .daily_checkin(&identity(), &input, &checkin_operation("rollback-audit"))
+                .is_err()
+        );
+        assert_eq!(store.player_status(&identity()).unwrap().unwrap().exp, 0);
+        let connection = store.open().expect("应重开数据库");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM wallet", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM daily_checkin_claim", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        connection
+            .execute("DROP TRIGGER operation_log_checkin_abort", [])
+            .expect("应移除审计失败触发器");
+        connection
+            .execute("UPDATE player SET exp = ?1", [i64::MAX])
+            .expect("应设置经验边界");
+        drop(connection);
+        assert!(
+            store
+                .daily_checkin(&identity(), &input, &checkin_operation("rollback-overflow"))
+                .expect_err("经验溢出必须拒绝")
+                .contains("溢出")
+        );
+        let connection = store.open().expect("应再次打开数据库");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM wallet", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM daily_checkin_claim", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn recorded_v5_with_damaged_schema_fails_closed() {
+        let directory = tempdir().expect("应创建测试目录");
+        let store =
+            Store::initialize(directory.path(), &DatabaseConfig::default()).expect("v5 迁移应成功");
+        let connection = store.open().expect("应打开数据库");
+        connection
+            .execute("DROP INDEX wallet_player_currency", [])
+            .expect("应破坏钱包唯一索引");
+        drop(connection);
+        assert!(
+            Store::initialize(directory.path(), &DatabaseConfig::default())
+                .expect_err("记录 v5 后损坏 schema 必须拒绝")
+                .contains("v5")
+        );
+
+        let trigger_directory = tempdir().expect("应创建第二测试目录");
+        let trigger_store = Store::initialize(trigger_directory.path(), &DatabaseConfig::default())
+            .expect("v5 迁移应成功");
+        let connection = trigger_store.open().expect("应打开第二数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER wallet_test_tamper
+                AFTER UPDATE ON wallet
+                BEGIN UPDATE wallet SET balance = balance + 1 WHERE id = NEW.id; END;
+                "#,
+            )
+            .expect("应安装钱包篡改触发器");
+        drop(connection);
+        assert!(
+            Store::initialize(trigger_directory.path(), &DatabaseConfig::default())
+                .expect_err("v5 表额外 trigger 必须拒绝")
+                .contains("v5")
+        );
+        let extra_index_directory = tempdir().expect("应创建额外索引测试目录");
+        let extra_index_store =
+            Store::initialize(extra_index_directory.path(), &DatabaseConfig::default())
+                .expect("v5 迁移应成功");
+        let connection = extra_index_store.open().expect("应打开额外索引数据库");
+        connection
+            .execute(
+                "CREATE UNIQUE INDEX wallet_currency_only ON wallet(currency_code)",
+                [],
+            )
+            .expect("应安装额外唯一索引");
+        drop(connection);
+        assert!(
+            Store::initialize(extra_index_directory.path(), &DatabaseConfig::default())
+                .expect_err("v5 额外索引必须拒绝")
+                .contains("v5")
+        );
+
+        let cross_trigger_directory = tempdir().expect("应创建跨表触发器测试目录");
+        let cross_trigger_store =
+            Store::initialize(cross_trigger_directory.path(), &DatabaseConfig::default())
+                .expect("v5 迁移应成功");
+        let connection = cross_trigger_store.open().expect("应打开跨表触发器数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER player_wallet_tamper
+                AFTER UPDATE OF exp ON player
+                BEGIN
+                    UPDATE wallet SET balance = balance WHERE player_id = NEW.id;
+                END;
+                "#,
+            )
+            .expect("应安装跨表经济触发器");
+        drop(connection);
+        assert!(
+            Store::initialize(cross_trigger_directory.path(), &DatabaseConfig::default())
+                .expect_err("引用 v5 经济表的跨表触发器必须拒绝")
+                .contains("v5")
+        );
+
+        let hidden_column_directory = tempdir().expect("应创建隐藏列测试目录");
+        let hidden_column_store =
+            Store::initialize(hidden_column_directory.path(), &DatabaseConfig::default())
+                .expect("v5 迁移应成功");
+        let connection = hidden_column_store.open().expect("应打开隐藏列测试数据库");
+        connection
+            .execute(
+                "ALTER TABLE wallet ADD COLUMN shadow INTEGER GENERATED ALWAYS AS(balance) VIRTUAL",
+                [],
+            )
+            .expect("应安装 generated 列");
+        drop(connection);
+        assert!(
+            Store::initialize(hidden_column_directory.path(), &DatabaseConfig::default())
+                .expect_err("v5 隐藏 generated 列必须拒绝")
+                .contains("v5")
         );
     }
 

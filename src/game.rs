@@ -1,4 +1,5 @@
 use abi_stable_host_api::CommandRequest;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::assets::IllustrationAssets;
 use crate::catalog;
@@ -7,8 +8,8 @@ use crate::context::resolve_conversation_context;
 use crate::identity::{ResolvedIdentity, resolve_identity, resolve_protocol};
 use crate::message::{GameDocument, Illustration};
 use crate::store::{
-    AuthorizedContextChange, IdentityKey, LegacyClaimActor, LegacyClaimResult, LegacyIdentityState,
-    OperationLogInput, PlayerStatus, Store,
+    AuthorizedContextChange, DailyCheckinInput, DailyCheckinResult, IdentityKey, LegacyClaimActor,
+    LegacyClaimResult, LegacyIdentityState, OperationLogInput, PlayerStatus, Store,
 };
 
 const MENU_PAGES: &[MenuPage] = &[
@@ -32,6 +33,10 @@ const MENU_PAGES: &[MenuPage] = &[
                 command: "状态",
                 description: "查看角色属性、武魂和位置",
             },
+            MenuEntry {
+                command: "签到",
+                description: "领取每日经验和金魂币",
+            },
         ],
     },
     MenuPage {
@@ -43,6 +48,12 @@ const MENU_PAGES: &[MenuPage] = &[
         }],
     },
 ];
+
+const CHECKIN_CURRENCY_CODE: &str = "gold_soul_coin";
+const CHECKIN_CURRENCY_NAME: &str = "金魂币";
+const CHECKIN_EXP_REWARDS: [i64; 7] = [60, 70, 80, 90, 100, 110, 150];
+const SECONDS_PER_DAY: i64 = 86_400;
+const BEIJING_04_OFFSET_SECONDS: i64 = 4 * 3_600;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MenuEntry {
@@ -206,6 +217,71 @@ impl GameService {
             .field("描述", wuhun.description)
             .illustration_if(illustration)
             .command("状态"))
+    }
+
+    /// 按北京时间每日 04:00 划分游戏日，并由 Store 在单事务内发放奖励。
+    pub fn daily_checkin(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        if !req.args.as_str().trim().is_empty() {
+            return Err("用法：签到".to_string());
+        }
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let input = DailyCheckinInput {
+            game_day: game_day_from_timestamp(current_unix_timestamp()?)?,
+            currency_code: CHECKIN_CURRENCY_CODE,
+            currency_reward_override: None,
+        };
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let result = self.store.daily_checkin(&key, &input, &operation)?;
+        let (receipt, already_claimed) = match result {
+            DailyCheckinResult::Claimed(receipt) => (receipt, false),
+            DailyCheckinResult::AlreadyClaimed(receipt) => (receipt, true),
+        };
+        if receipt.currency_code != CHECKIN_CURRENCY_CODE
+            || checkin_exp_reward(receipt.cycle_day)? != receipt.exp_reward
+        {
+            return Err("签到记录的奖励规则与当前版本不一致".to_string());
+        }
+        let mut document = GameDocument::new("每日签到")
+            .field(
+                "结果",
+                if already_claimed {
+                    "今日已签到"
+                } else {
+                    "签到成功"
+                },
+            )
+            .field("累计签到", format!("{} 天", receipt.total_claims))
+            .field("连续签到", format!("{} 天", receipt.streak_days))
+            .field("本轮", format!("第 {}/7 天", receipt.cycle_day))
+            .field("当前经验", receipt.exp_after.to_string())
+            .field(
+                format!("当前{CHECKIN_CURRENCY_NAME}"),
+                receipt.currency_balance_after.to_string(),
+            )
+            .command("状态");
+        document = if already_claimed {
+            document
+                .field("当日经验奖励", format!("{}（已领取）", receipt.exp_reward))
+                .field(
+                    format!("当日{CHECKIN_CURRENCY_NAME}奖励"),
+                    format!("{}（已领取）", receipt.currency_reward),
+                )
+        } else {
+            document
+                .field("经验奖励", format!("+{}", receipt.exp_reward))
+                .field(
+                    format!("{CHECKIN_CURRENCY_NAME}奖励"),
+                    format!("+{}", receipt.currency_reward),
+                )
+        };
+        document = if already_claimed {
+            document.notice("本游戏日已经签到过了，奖励不会重复发放")
+        } else {
+            document.notice("签到成功，下一个北京时间 04:00 刷新后可再次领取")
+        };
+        Ok(document)
     }
 
     pub fn status(&self, req: &CommandRequest) -> Result<GameDocument, String> {
@@ -594,6 +670,38 @@ fn parse_context_cursor(args: &str) -> Result<Option<i64>, String> {
     Ok(Some(cursor))
 }
 
+fn game_day_from_timestamp(timestamp: i64) -> Result<i64, String> {
+    timestamp
+        .checked_add(BEIJING_04_OFFSET_SECONDS)
+        .ok_or_else(|| "系统时间戳超出可计算范围".to_string())
+        .map(|shifted| shifted.div_euclid(SECONDS_PER_DAY))
+}
+
+fn current_unix_timestamp() -> Result<i64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("系统时间早于 Unix epoch：{error}"))
+        .and_then(|duration| {
+            i64::try_from(duration.as_secs()).map_err(|_| "系统时间戳超出 i64 范围".to_string())
+        })
+}
+
+#[cfg(test)]
+fn checkin_cycle_day(streak_days: i64) -> Result<i64, String> {
+    if streak_days <= 0 {
+        return Err("连签天数必须大于 0".to_string());
+    }
+    Ok((streak_days - 1).rem_euclid(7) + 1)
+}
+
+fn checkin_exp_reward(cycle_day: i64) -> Result<i64, String> {
+    let index = usize::try_from(cycle_day - 1).map_err(|_| "签到轮次无效".to_string())?;
+    CHECKIN_EXP_REWARDS
+        .get(index)
+        .copied()
+        .ok_or_else(|| "签到轮次必须在 1 到 7 之间".to_string())
+}
+
 fn validate_context_kind_for_protocol(
     protocol: crate::message::Protocol,
     context_kind: &str,
@@ -715,6 +823,99 @@ mod tests {
         assert_eq!(parse_context_cursor(""), Ok(None));
         assert_eq!(parse_context_cursor("12"), Ok(Some(12)));
         assert!(parse_context_cursor("-1").is_err());
+    }
+
+    #[test]
+    fn checkin_rewards_use_beijing_four_oclock_game_day_and_legacy_formula() {
+        assert_eq!(game_day_from_timestamp(0), Ok(0));
+        assert_eq!(game_day_from_timestamp(19 * 3_600 + 59 * 60 + 59), Ok(0));
+        assert_eq!(game_day_from_timestamp(20 * 3_600), Ok(1));
+        assert_eq!(game_day_from_timestamp(20 * 3_600 + SECONDS_PER_DAY), Ok(2));
+
+        let expected = [
+            (1, 1, 60),
+            (2, 2, 70),
+            (3, 3, 80),
+            (4, 4, 90),
+            (5, 5, 100),
+            (6, 6, 110),
+            (7, 7, 150),
+            (8, 1, 60),
+        ];
+        for (streak, cycle, exp) in expected {
+            let computed_cycle = checkin_cycle_day(streak).expect("连签轮次应有效");
+            assert_eq!(computed_cycle, cycle);
+            assert_eq!(checkin_exp_reward(computed_cycle), Ok(exp));
+        }
+        assert!(checkin_cycle_day(0).is_err());
+        assert!(checkin_exp_reward(0).is_err());
+        assert_eq!(CHECKIN_CURRENCY_CODE, "gold_soul_coin");
+        assert_eq!(CHECKIN_CURRENCY_NAME, "金魂币");
+    }
+
+    #[test]
+    fn daily_checkin_command_persists_once_and_renders_duplicate_without_regranting() {
+        let directory = tempfile::tempdir().expect("临时目录应创建");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("数据库应初始化");
+        let service = GameService::with_assets(
+            store,
+            PluginConfig::default(),
+            IllustrationAssets::default(),
+        );
+        let request = |command: &str, args: &str, message_id: &str| CommandRequest {
+            args: abi_stable::std_types::RString::from(args),
+            command_name: abi_stable::std_types::RString::from(command),
+            sender_id: abi_stable::std_types::RString::from("checkin-user"),
+            group_id: abi_stable::std_types::RString::new(),
+            raw_event_json: abi_stable::std_types::RString::from(
+                r#"{"self_id":"10001","qimen_context":{"version":1,"protocol":"onebot11","account_id":"10001"}}"#,
+            ),
+            sender_nickname: abi_stable::std_types::RString::new(),
+            message_id: abi_stable::std_types::RString::from(message_id),
+            timestamp: 0,
+        };
+        service
+            .register(&request("开始穿越", "签到测试 女", "register"))
+            .expect("应创建签到测试角色");
+
+        let first = crate::message::render_text(
+            &service
+                .daily_checkin(&request("签到", "", "checkin-first"))
+                .expect("首签应成功"),
+        );
+        assert!(first.contains("结果：签到成功"));
+        assert!(first.contains("经验奖励：+60"));
+        assert!(first.contains("金魂币奖励：+"));
+
+        let duplicate = crate::message::render_text(
+            &service
+                .daily_checkin(&request("打卡", "", "checkin-duplicate"))
+                .expect("同日重复应返回领取凭据"),
+        );
+        assert!(duplicate.contains("结果：今日已签到"));
+        assert!(duplicate.contains("（已领取）"));
+        assert!(!duplicate.contains("经验奖励：+"));
+        assert!(
+            service
+                .daily_checkin(&request("签到", "extra", "checkin-invalid"))
+                .is_err()
+        );
+
+        let identity = resolve_identity(&request("状态", "", "status"), &service.config.identity)
+            .expect("身份应解析");
+        let key = service.identity_key(&identity, &identity.subject_id);
+        assert_eq!(
+            service
+                .store
+                .list_operation_logs(&key, None, 100)
+                .expect("应读取操作日志")
+                .entries
+                .iter()
+                .filter(|entry| entry.command == "签到")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -900,6 +1101,12 @@ mod tests {
                 .iter()
                 .any(|entry| entry.command == "状态")
         );
+        assert!(
+            MENU_PAGES[second]
+                .entries
+                .iter()
+                .any(|entry| entry.command == "签到")
+        );
         assert_eq!(parse_menu_page("世界").expect("世界分类应有效"), 2);
         assert!(parse_menu_page("4").is_err());
         assert!(parse_menu_page("角色 多余").is_err());
@@ -923,6 +1130,7 @@ mod tests {
         let second = crate::message::render_text(&service.menu("2").expect("第二页应有效"));
         assert!(second.contains("武魂觉醒：觉醒第一武魂"));
         assert!(second.contains("状态：查看角色属性、武魂和位置"));
+        assert!(second.contains("签到：领取每日经验和金魂币"));
         assert!(second.contains("斗罗系统 1"));
         assert!(second.contains("斗罗系统 3"));
 
