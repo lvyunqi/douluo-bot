@@ -15,7 +15,7 @@ use crate::store::{
     DailyCheckinInput, DailyCheckinResult, GOLD_SOUL_COIN, IdentityKey, LegacyClaimActor,
     LegacyClaimResult, LegacyIdentityState, MapExit, MapRecord, MapTravelReceipt,
     OperationLogInput, PlayerStatus, QuestActionReceipt, QuestListEntry, SkillPage, SoulBeastPage,
-    Store, WuhunToggleReceipt, experience_progress,
+    SoulRingAbsorbReceipt, SoulRingPage, Store, WuhunToggleReceipt, experience_progress,
 };
 
 const MENU_PAGES: &[MenuPage] = &[
@@ -50,6 +50,10 @@ const MENU_PAGES: &[MenuPage] = &[
             MenuEntry {
                 command: "技能",
                 description: "查看已学习魂技和魂力消耗",
+            },
+            MenuEntry {
+                command: "魂环",
+                description: "查看已吸收魂环和待吸收魂环",
             },
             MenuEntry {
                 command: "签到",
@@ -174,6 +178,10 @@ const MENU_PAGES: &[MenuPage] = &[
             MenuEntry {
                 command: "攻击",
                 description: "按武魂修正进行普通攻击并承受魂兽反击",
+            },
+            MenuEntry {
+                command: "吸收魂环 <魂兽>",
+                description: "吸收击杀魂兽留下的魂环并解锁魂技",
             },
             MenuEntry {
                 command: "逃跑",
@@ -396,6 +404,85 @@ impl GameService {
                 .command("技能")
                 .command(format!("释放技能 {}", skill.skill.name)),
         )
+    }
+
+    pub fn soul_rings(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        if !req.args.as_str().trim().is_empty() {
+            return Err("用法：魂环".to_string());
+        }
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let page = self.store.soul_rings_page(&key)?;
+        Ok(self.soul_rings_document(page))
+    }
+
+    pub fn absorb_soul_ring(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let soul_beast_name = parse_required_catalog_name(req.args.as_str(), "吸收魂环 <魂兽>")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt =
+            self.store
+                .absorb_soul_ring_with_operation(&key, soul_beast_name, &operation)?;
+        Ok(self.absorb_soul_ring_document(receipt))
+    }
+
+    fn soul_rings_document(&self, page: SoulRingPage) -> GameDocument {
+        let mut document = GameDocument::new("魂环列表").field(
+            "魂环槽位",
+            format!("{}/{}", page.rings.len(), page.ring_capacity),
+        );
+        if page.rings.is_empty() {
+            document = document.line("你还没有吸收任何魂环");
+        } else {
+            for ring in &page.rings {
+                document = document
+                    .line(format!(
+                        "第{}魂环 · {} · {} · {}年",
+                        ring.ring_index,
+                        ring.ring.name,
+                        soul_ring_color_label(&ring.ring.color),
+                        ring.ring.age
+                    ))
+                    .line(format!("魂技：{}", ring.ring.skill.name));
+            }
+        }
+        if page.pending.is_empty() {
+            document = document.line("当前没有待吸收魂环");
+        } else {
+            document = document.line("待吸收魂环：");
+            for drop in &page.pending {
+                document = document
+                    .line(format!(
+                        "{} · {} · {}年",
+                        drop.ring.soul_beast_name, drop.ring.name, drop.ring.age
+                    ))
+                    .command(format!("吸收魂环 {}", drop.ring.soul_beast_name));
+            }
+        }
+        document.command("技能").command("状态")
+    }
+
+    fn absorb_soul_ring_document(&self, receipt: SoulRingAbsorbReceipt) -> GameDocument {
+        GameDocument::new(if receipt.replayed {
+            "魂环吸收回执"
+        } else {
+            "魂环吸收成功"
+        })
+        .field("魂环", receipt.ring.ring.name)
+        .field("魂兽", receipt.ring.ring.soul_beast_name)
+        .field("年限", format!("{}年", receipt.ring.ring.age))
+        .field("品质", soul_ring_color_label(&receipt.ring.ring.color))
+        .field("魂技", receipt.skill.name)
+        .field("魂环槽位", format!("第{}魂环", receipt.ring.ring_index))
+        .notice(if receipt.replayed {
+            "检测到相同消息的重复请求，已返回原吸收回执，未重复占用魂环槽位"
+        } else {
+            "魂环、魂技绑定、操作日志和吸收事件已在同一事务完成"
+        })
+        .command("魂环")
+        .command("技能")
     }
 
     fn skills_document(&self, page: SkillPage) -> GameDocument {
@@ -1137,12 +1224,20 @@ impl GameService {
         if event.status_after == "won" {
             document = document
                 .field("获得经验", event.experience_awarded.to_string())
-                .line("魂兽倒下，地面出现了新的掉落")
-                .notice(if receipt.replayed {
-                    "检测到相同消息的重复请求，已返回原战斗回执，未重复发放经验或掉落"
-                } else {
-                    "战斗状态、生命、经验、掉落、操作日志和战斗事件已在同一事务完成"
-                });
+                .line("魂兽倒下，地面出现了新的掉落");
+            if let Some(drop) = &receipt.soul_ring_drop {
+                document = document
+                    .field("待吸收魂环", drop.ring.name.clone())
+                    .line(format!(
+                        "可使用“吸收魂环 {}”吸收并解锁魂技 {}",
+                        drop.ring.soul_beast_name, drop.ring.skill.name
+                    ));
+            }
+            document = document.notice(if receipt.replayed {
+                "检测到相同消息的重复请求，已返回原战斗回执，未重复发放经验或掉落"
+            } else {
+                "战斗状态、生命、经验、掉落、操作日志和战斗事件已在同一事务完成"
+            });
         } else if event.status_after == "defeated" {
             document = document
                 .line("你被魂兽击败，系统将你救回到濒死状态")
@@ -1173,7 +1268,13 @@ impl GameService {
                 .command("释放技能 <魂技>")
                 .command("逃跑")
                 .command("战斗状态"),
-            "won" => document.command("掉落").command("魂兽"),
+            "won" => {
+                let mut document = document.command("掉落").command("魂兽").command("魂环");
+                if let Some(drop) = &receipt.soul_ring_drop {
+                    document = document.command(format!("吸收魂环 {}", drop.ring.soul_beast_name));
+                }
+                document
+            }
             _ => document.command("魂兽").command("状态"),
         }
     }
@@ -2442,6 +2543,17 @@ fn battle_status_label(status: &str) -> &'static str {
         "escaped" => "已逃跑",
         "defeated" => "战败",
         _ => "未知",
+    }
+}
+
+fn soul_ring_color_label(color: &str) -> &'static str {
+    match color {
+        "white" => "白环",
+        "yellow" => "黄环",
+        "purple" => "紫环",
+        "black" => "黑环",
+        "red" => "红环",
+        _ => "未知魂环",
     }
 }
 

@@ -2166,6 +2166,335 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_V17: &str = r#"
+INSERT INTO skill(
+    skill_key, name, skill_type, wuhun_category, ring_index,
+    soul_power_cost, cooldown_rounds, base_damage,
+    spirit_ratio_percent, strength_ratio_percent, description,
+    enabled, created_at, updated_at
+) VALUES(
+    'sting', '毒刺', 'active', 'all', 1,
+    12, 3, 22, 100, 0,
+    '将魂力凝成尖锐毒刺，造成魂技伤害；吸收哥布林魂环后解锁。',
+    1, 0, 0
+);
+
+CREATE TABLE soul_ring (
+    ring_key TEXT PRIMARY KEY CHECK(
+        length(ring_key) BETWEEN 1 AND 96
+        AND ring_key = trim(ring_key)
+        AND ring_key GLOB '[a-z0-9][a-z0-9._-]*'
+        AND ring_key NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    name TEXT NOT NULL UNIQUE CHECK(length(name) BETWEEN 1 AND 128),
+    soul_beast_id INTEGER NOT NULL UNIQUE REFERENCES soul_beast(id) ON DELETE RESTRICT,
+    skill_key TEXT NOT NULL REFERENCES skill(skill_key) ON DELETE RESTRICT,
+    ring_index INTEGER NOT NULL CHECK(ring_index BETWEEN 1 AND 9),
+    age INTEGER NOT NULL CHECK(age BETWEEN 1 AND 1000000000),
+    color TEXT NOT NULL CHECK(color IN ('white', 'yellow', 'purple', 'black', 'red')),
+    description TEXT NOT NULL CHECK(length(description) BETWEEN 1 AND 2000),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= created_at)
+) STRICT;
+
+CREATE INDEX soul_ring_catalog_page
+    ON soul_ring(enabled, ring_index, age, ring_key);
+
+INSERT INTO soul_ring(
+    ring_key, name, soul_beast_id, skill_key, ring_index, age, color,
+    description, enabled, created_at, updated_at
+)
+SELECT 'slime-ring', '史莱姆魂环', id, 'entangle', 1, age, 'white',
+       '十年史莱姆魂环，适合作为第一魂环。', 1, 0, 0
+  FROM soul_beast
+ WHERE beast_key = 'slime';
+
+INSERT INTO soul_ring(
+    ring_key, name, soul_beast_id, skill_key, ring_index, age, color,
+    description, enabled, created_at, updated_at
+)
+SELECT 'goblin-ring', '哥布林魂环', id, 'sting', 1, age, 'yellow',
+       '四百五十年哥布林魂环，带来穿透性的毒刺魂技。', 1, 0, 0
+  FROM soul_beast
+ WHERE beast_key = 'goblin';
+
+CREATE TRIGGER soul_ring_no_update
+BEFORE UPDATE ON soul_ring
+BEGIN
+    SELECT RAISE(ABORT, 'soul ring catalog is immutable');
+END;
+
+CREATE TRIGGER soul_ring_no_delete
+BEFORE DELETE ON soul_ring
+BEGIN
+    SELECT RAISE(ABORT, 'soul ring catalog is immutable');
+END;
+
+CREATE TRIGGER soul_ring_no_reinsert
+BEFORE INSERT ON soul_ring
+WHEN EXISTS(SELECT 1 FROM soul_ring WHERE ring_key = NEW.ring_key OR name = NEW.name)
+BEGIN
+    SELECT RAISE(ABORT, 'soul ring catalog is append-only');
+END;
+
+CREATE TABLE soul_ring_drop (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    battle_id INTEGER NOT NULL REFERENCES battle(id) ON DELETE RESTRICT,
+    battle_event_id INTEGER NOT NULL UNIQUE REFERENCES battle_event(id) ON DELETE RESTRICT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    ring_key TEXT NOT NULL REFERENCES soul_ring(ring_key) ON DELETE RESTRICT,
+    source_message_id TEXT NOT NULL CHECK(
+        length(source_message_id) <= 256
+        AND instr(source_message_id, char(0)) = 0
+        AND source_message_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    operation_log_id INTEGER NOT NULL UNIQUE REFERENCES operation_log(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'absorbed')),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    absorbed_at INTEGER,
+    absorbed_operation_log_id INTEGER UNIQUE REFERENCES operation_log(id) ON DELETE RESTRICT,
+    CHECK(
+        (status = 'pending' AND absorbed_at IS NULL AND absorbed_operation_log_id IS NULL)
+        OR (status = 'absorbed' AND absorbed_at IS NOT NULL AND absorbed_operation_log_id IS NOT NULL)
+    )
+) STRICT;
+
+CREATE INDEX soul_ring_drop_player_page
+    ON soul_ring_drop(player_id, status, id);
+CREATE INDEX soul_ring_drop_battle_page
+    ON soul_ring_drop(battle_id, id);
+
+CREATE TRIGGER soul_ring_drop_no_delete
+BEFORE DELETE ON soul_ring_drop
+BEGIN
+    SELECT RAISE(ABORT, 'soul ring drop history is immutable');
+END;
+
+CREATE TRIGGER soul_ring_drop_no_reinsert
+BEFORE INSERT ON soul_ring_drop
+WHEN EXISTS(
+    SELECT 1 FROM soul_ring_drop
+     WHERE id = NEW.id OR battle_event_id = NEW.battle_event_id
+        OR operation_log_id = NEW.operation_log_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'soul ring drop is append-only');
+END;
+
+CREATE TRIGGER soul_ring_drop_identity_guard
+BEFORE UPDATE ON soul_ring_drop
+WHEN OLD.status <> 'pending'
+  OR NEW.id <> OLD.id
+  OR NEW.battle_id <> OLD.battle_id
+  OR NEW.battle_event_id <> OLD.battle_event_id
+  OR NEW.player_id <> OLD.player_id
+  OR NEW.ring_key <> OLD.ring_key
+  OR NEW.source_message_id <> OLD.source_message_id
+  OR NEW.operation_log_id <> OLD.operation_log_id
+  OR NEW.created_at <> OLD.created_at
+  OR NEW.status <> 'absorbed'
+  OR NEW.absorbed_at IS NULL
+  OR NEW.absorbed_operation_log_id IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'soul ring drop transition is invalid');
+END;
+
+CREATE TRIGGER soul_ring_drop_scope_guard
+BEFORE INSERT ON soul_ring_drop
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM battle_event event
+      JOIN battle b ON b.id = event.battle_id
+      JOIN soul_ring ring ON ring.soul_beast_id = b.soul_beast_id
+                           AND ring.ring_key = NEW.ring_key
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE event.id = NEW.battle_event_id
+       AND event.battle_id = NEW.battle_id
+       AND event.player_id = NEW.player_id
+       AND event.status_after = 'won'
+       AND event.event_kind = 'attack'
+       AND b.id = NEW.battle_id
+       AND b.player_id = NEW.player_id
+       AND audit.source_message_id = NEW.source_message_id
+       AND audit.outcome = 'ok'
+       AND audit.command IN ('攻击', '释放技能')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'soul ring drop scope or audit mismatch');
+END;
+
+CREATE TABLE player_soul_ring (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    wuhun_id INTEGER NOT NULL REFERENCES wuhun(id) ON DELETE RESTRICT,
+    wuhun_slot INTEGER NOT NULL CHECK(wuhun_slot = 1),
+    ring_index INTEGER NOT NULL CHECK(ring_index BETWEEN 1 AND 9),
+    ring_key TEXT NOT NULL REFERENCES soul_ring(ring_key) ON DELETE RESTRICT,
+    skill_key TEXT NOT NULL REFERENCES skill(skill_key) ON DELETE RESTRICT,
+    soul_ring_drop_id INTEGER NOT NULL UNIQUE REFERENCES soul_ring_drop(id) ON DELETE RESTRICT,
+    obtained_at INTEGER NOT NULL CHECK(obtained_at >= 0),
+    UNIQUE(player_id, wuhun_slot, ring_index),
+    UNIQUE(player_id, ring_key)
+) STRICT;
+
+CREATE INDEX player_soul_ring_player_page
+    ON player_soul_ring(player_id, wuhun_slot, ring_index, id);
+
+CREATE TRIGGER player_soul_ring_no_update
+BEFORE UPDATE ON player_soul_ring
+BEGIN
+    SELECT RAISE(ABORT, 'player soul ring history is immutable');
+END;
+
+CREATE TRIGGER player_soul_ring_no_delete
+BEFORE DELETE ON player_soul_ring
+BEGIN
+    SELECT RAISE(ABORT, 'player soul ring history is immutable');
+END;
+
+CREATE TRIGGER player_soul_ring_no_reinsert
+BEFORE INSERT ON player_soul_ring
+WHEN EXISTS(
+    SELECT 1 FROM player_soul_ring
+     WHERE id = NEW.id
+        OR (player_id = NEW.player_id AND wuhun_slot = NEW.wuhun_slot AND ring_index = NEW.ring_index)
+        OR (player_id = NEW.player_id AND ring_key = NEW.ring_key)
+        OR soul_ring_drop_id = NEW.soul_ring_drop_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'player soul ring is append-only');
+END;
+
+CREATE TRIGGER player_soul_ring_scope_guard
+BEFORE INSERT ON player_soul_ring
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM player_wuhun_state state
+      JOIN soul_ring_drop drop_event ON drop_event.id = NEW.soul_ring_drop_id
+      JOIN soul_ring ring ON ring.ring_key = NEW.ring_key
+      JOIN player_skill learned ON learned.player_id = NEW.player_id
+                             AND learned.skill_key = NEW.skill_key
+     WHERE state.player_id = NEW.player_id
+       AND state.wuhun_id = NEW.wuhun_id
+       AND state.slot = NEW.wuhun_slot
+       AND drop_event.player_id = NEW.player_id
+       AND drop_event.ring_key = NEW.ring_key
+       AND drop_event.status = 'pending'
+       AND ring.enabled = 1
+       AND ring.ring_index = NEW.ring_index
+       AND ring.skill_key = NEW.skill_key
+)
+BEGIN
+    SELECT RAISE(ABORT, 'player soul ring scope mismatch');
+END;
+
+CREATE TABLE soul_ring_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    soul_ring_drop_id INTEGER NOT NULL UNIQUE REFERENCES soul_ring_drop(id) ON DELETE RESTRICT,
+    player_soul_ring_id INTEGER NOT NULL UNIQUE REFERENCES player_soul_ring(id) ON DELETE RESTRICT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    ring_key TEXT NOT NULL REFERENCES soul_ring(ring_key) ON DELETE RESTRICT,
+    ring_index INTEGER NOT NULL CHECK(ring_index BETWEEN 1 AND 9),
+    source_message_id TEXT NOT NULL CHECK(
+        length(source_message_id) <= 256
+        AND instr(source_message_id, char(0)) = 0
+        AND source_message_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    operation_log_id INTEGER NOT NULL UNIQUE REFERENCES operation_log(id) ON DELETE RESTRICT,
+    created_at INTEGER NOT NULL CHECK(created_at >= 0)
+) STRICT;
+
+CREATE INDEX soul_ring_event_player_page
+    ON soul_ring_event(player_id, id);
+
+CREATE TRIGGER soul_ring_event_no_update
+BEFORE UPDATE ON soul_ring_event
+BEGIN
+    SELECT RAISE(ABORT, 'soul ring event is immutable');
+END;
+
+CREATE TRIGGER soul_ring_event_no_delete
+BEFORE DELETE ON soul_ring_event
+BEGIN
+    SELECT RAISE(ABORT, 'soul ring event is immutable');
+END;
+
+CREATE TRIGGER soul_ring_event_no_reinsert
+BEFORE INSERT ON soul_ring_event
+WHEN EXISTS(
+    SELECT 1 FROM soul_ring_event
+     WHERE id = NEW.id
+        OR soul_ring_drop_id = NEW.soul_ring_drop_id
+        OR player_soul_ring_id = NEW.player_soul_ring_id
+        OR operation_log_id = NEW.operation_log_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'soul ring event is append-only');
+END;
+
+CREATE TRIGGER soul_ring_event_scope_guard
+BEFORE INSERT ON soul_ring_event
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM soul_ring_drop drop_event
+      JOIN player_soul_ring learned_ring ON learned_ring.id = NEW.player_soul_ring_id
+      JOIN soul_ring ring ON ring.ring_key = NEW.ring_key
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+      JOIN player p ON p.id = NEW.player_id
+      JOIN identity i ON i.id = p.identity_id
+     WHERE drop_event.id = NEW.soul_ring_drop_id
+       AND drop_event.status = 'absorbed'
+       AND drop_event.absorbed_operation_log_id = NEW.operation_log_id
+       AND learned_ring.player_id = NEW.player_id
+       AND learned_ring.soul_ring_drop_id = NEW.soul_ring_drop_id
+       AND learned_ring.ring_key = NEW.ring_key
+       AND learned_ring.ring_index = NEW.ring_index
+       AND ring.enabled = 1
+       AND audit.protocol = i.protocol
+       AND audit.account_id = i.account_id
+       AND audit.namespace = i.namespace
+       AND audit.subject_kind = i.subject_kind
+       AND audit.subject_id = i.subject_id
+       AND audit.command = '吸收魂环'
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'soul ring event scope or audit mismatch');
+END;
+
+DROP TRIGGER player_skill_scope_guard;
+
+CREATE TRIGGER player_skill_scope_guard
+BEFORE INSERT ON player_skill
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM player_wuhun_state state
+      JOIN wuhun w ON w.id = state.wuhun_id
+      JOIN skill ON skill.skill_key = NEW.skill_key
+     WHERE state.player_id = NEW.player_id
+       AND state.wuhun_id = NEW.wuhun_id
+       AND state.slot = NEW.wuhun_slot
+       AND skill.enabled = 1
+       AND (skill.wuhun_category = 'all' OR skill.wuhun_category = w.category)
+       AND (
+           skill.skill_key = 'entangle'
+           OR EXISTS(
+               SELECT 1
+                 FROM soul_ring_drop pending
+                 JOIN soul_ring ring ON ring.ring_key = pending.ring_key
+                WHERE pending.player_id = NEW.player_id
+                  AND pending.status = 'pending'
+                  AND ring.skill_key = NEW.skill_key
+           )
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'player skill scope mismatch');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -2604,6 +2933,53 @@ pub struct SkillUseRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SoulRingRecord {
+    pub ring_key: String,
+    pub name: String,
+    pub soul_beast_id: i64,
+    pub soul_beast_name: String,
+    pub soul_beast_age: i64,
+    pub skill: SkillRecord,
+    pub ring_index: i64,
+    pub age: i64,
+    pub color: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SoulRingDropRecord {
+    pub id: i64,
+    pub battle_id: i64,
+    pub battle_event_id: i64,
+    pub ring: SoulRingRecord,
+    pub source_message_id: String,
+    pub status: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerSoulRingRecord {
+    pub id: i64,
+    pub ring: SoulRingRecord,
+    pub ring_index: i64,
+    pub obtained_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SoulRingPage {
+    pub rings: Vec<PlayerSoulRingRecord>,
+    pub pending: Vec<SoulRingDropRecord>,
+    pub ring_capacity: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SoulRingAbsorbReceipt {
+    pub ring: PlayerSoulRingRecord,
+    pub skill: SkillRecord,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BattleActionReceipt {
     pub battle: BattleSnapshot,
     pub event: BattleEventRecord,
@@ -2611,6 +2987,7 @@ pub struct BattleActionReceipt {
     pub ground_drop: Option<GroundDropRecord>,
     pub wuhun_effect: Option<WuhunStateEffect>,
     pub skill: Option<SkillUseRecord>,
+    pub soul_ring_drop: Option<SoulRingDropRecord>,
     pub replayed: bool,
 }
 
@@ -2996,6 +3373,10 @@ pub fn full_level_title(level: i64) -> Result<String, String> {
     Ok(format!("{level}级{}", level_title(level)?))
 }
 
+fn soul_ring_capacity(level: i64) -> i64 {
+    (level / 10).clamp(0, 9)
+}
+
 pub fn experience_progress(level: i64, total_exp: i64) -> Result<ExperienceProgress, String> {
     if total_exp < 0 {
         return Err("累计经验不能为负数".to_string());
@@ -3165,7 +3546,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
                     format!(
-                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16 失败：{error}"
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17 失败：{error}"
                     )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
@@ -3417,10 +3798,25 @@ impl Store {
                 validate_v16_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 17)? {
+                transaction
+                    .execute_batch(MIGRATION_V17)
+                    .map_err(|error| format!("执行数据库迁移 v17 失败：{error}"))?;
+                validate_v17_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(17, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v17 失败：{error}"))?;
+            } else {
+                validate_v17_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17 失败：{error}"
                 )
             })?;
             Ok(())
@@ -3444,6 +3840,7 @@ impl Store {
                 validate_v14_schema(connection)?;
                 validate_v15_schema(connection)?;
                 validate_v16_schema(connection)?;
+                validate_v17_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -5284,6 +5681,212 @@ impl Store {
             .map_err(|error| format!("查询魂技详情失败：{error}"))
     }
 
+    pub fn soul_rings_page(&self, key: &IdentityKey<'_>) -> Result<SoulRingPage, String> {
+        validate_identity_key(key)?;
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let (player_id, level) = connection
+            .query_row(
+                r#"
+                SELECT p.id, p.level
+                  FROM identity i
+                  JOIN player p ON p.identity_id = i.id
+                 WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+                   AND i.subject_kind = ?4 AND i.subject_id = ?5
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind,
+                    key.subject_id
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("查询魂环槽位失败：{error}"))?
+            .ok_or_else(|| "你还没有角色，请先使用“开始穿越 <角色名> <男|女>”".to_string())?;
+        let rings = connection
+            .prepare(&format!(
+                "{} WHERE psr.player_id = ?1 ORDER BY psr.ring_index, psr.id",
+                player_soul_ring_select_sql()
+            ))
+            .map_err(|error| format!("准备魂环列表失败：{error}"))?
+            .query_map([player_id], player_soul_ring_record_from_row)
+            .map_err(|error| format!("查询魂环列表失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析魂环列表失败：{error}"))?;
+        let pending = connection
+            .prepare(&format!(
+                "{} WHERE drop_event.player_id = ?1 AND drop_event.status = 'pending' ORDER BY drop_event.id",
+                soul_ring_drop_select_sql()
+            ))
+            .map_err(|error| format!("准备待吸收魂环失败：{error}"))?
+            .query_map([player_id], soul_ring_drop_record_from_row)
+            .map_err(|error| format!("查询待吸收魂环失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析待吸收魂环失败：{error}"))?;
+        Ok(SoulRingPage {
+            rings,
+            pending,
+            ring_capacity: soul_ring_capacity(level),
+        })
+    }
+
+    pub fn absorb_soul_ring_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        soul_beast_name_or_key: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<SoulRingAbsorbReceipt, String> {
+        validate_identity_key(key)?;
+        validate_catalog_lookup(soul_beast_name_or_key, "魂兽名称")?;
+        validate_soul_ring_absorb_operation(operation)?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始吸收魂环事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let player = load_transfer_sender(&transaction, key)?;
+        ensure_transfer_participant_eligible(&player, "你的角色")?;
+        let (wuhun_id, wuhun_state) =
+            load_wuhun_state_with_id_by_player(&transaction, player.player_id)?
+                .ok_or_else(|| "你还没有觉醒武魂，请先使用“武魂觉醒”".to_string())?;
+        if !wuhun_state.enabled || wuhun_state.stability <= 0 {
+            return Err("请先使用“开武魂”开启当前武魂，再吸收魂环".to_string());
+        }
+        if load_active_battle_state(&transaction, player.player_id)?.is_some() {
+            return Err("战斗中不能吸收魂环，请先结束当前战斗".to_string());
+        }
+        if !operation.source_message_id.is_empty()
+            && let Some(existing) = load_soul_ring_event_by_message(
+                &transaction,
+                player.player_id,
+                operation.source_message_id,
+            )?
+        {
+            if existing.ring.ring.soul_beast_name != soul_beast_name_or_key
+                && existing.ring.ring.ring_key != soul_beast_name_or_key
+            {
+                return Err("该消息 ID 已用于不同的魂环操作，拒绝重放".to_string());
+            }
+            transaction
+                .commit()
+                .map_err(|error| format!("提交吸收魂环重放事务失败：{error}"))?;
+            return Ok(SoulRingAbsorbReceipt {
+                ring: existing.ring,
+                skill: existing.skill,
+                replayed: true,
+            });
+        }
+        let capacity = soul_ring_capacity(load_player_level(&transaction, player.player_id)?);
+        let ring_count = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM player_soul_ring WHERE player_id = ?1 AND wuhun_slot = 1",
+                [player.player_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("读取魂环数量失败：{error}"))?;
+        if ring_count >= capacity {
+            return Err(format!(
+                "你的魂环槽位已满（{capacity}/{capacity}），提升等级后才能吸收更多魂环"
+            ));
+        }
+        let drop = load_pending_soul_ring_drop_by_beast(
+            &transaction,
+            player.player_id,
+            soul_beast_name_or_key,
+        )?
+        .ok_or_else(|| "当前没有可吸收的该魂兽魂环；请先击杀对应魂兽".to_string())?;
+        let ring = load_soul_ring_by_key(&transaction, &drop.ring.ring_key)?
+            .ok_or_else(|| "魂环目录缺少对应定义，吸收已拒绝".to_string())?;
+        let ring_index = ring_count
+            .checked_add(1)
+            .ok_or_else(|| "魂环槽位计算溢出".to_string())?;
+        if ring_index != ring.ring_index {
+            return Err(format!(
+                "当前应吸收第 {} 魂环，但该魂环要求第 {} 槽位",
+                ring_index, ring.ring_index
+            ));
+        }
+        let timestamp = now_timestamp()?;
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO player_skill(
+                    player_id, wuhun_id, skill_key, wuhun_slot,
+                    level, proficiency, equipped, learned_at
+                )
+                SELECT ?1, ?2, ring.skill_key, 1, 1, 0, 1, ?3
+                  FROM soul_ring ring
+                 WHERE ring.ring_key = ?4
+                   AND NOT EXISTS(
+                       SELECT 1 FROM player_skill learned
+                        WHERE learned.player_id = ?1 AND learned.skill_key = ring.skill_key
+                   )
+                "#,
+                params![player.player_id, wuhun_id, timestamp, ring.ring_key],
+            )
+            .map_err(|error| format!("学习魂环魂技失败：{error}"))?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO player_soul_ring(
+                    player_id, wuhun_id, wuhun_slot, ring_index,
+                    ring_key, skill_key, soul_ring_drop_id, obtained_at
+                ) VALUES(?1, ?2, 1, ?3, ?4, ?5, ?6, ?7)
+                "#,
+                params![
+                    player.player_id,
+                    wuhun_id,
+                    ring_index,
+                    ring.ring_key,
+                    ring.skill.skill_key,
+                    drop.id,
+                    timestamp
+                ],
+            )
+            .map_err(|error| format!("保存玩家魂环失败：{error}"))?;
+        let player_soul_ring_id = transaction.last_insert_rowid();
+        transaction
+            .execute(
+                "UPDATE soul_ring_drop SET status = 'absorbed', absorbed_at = ?1, absorbed_operation_log_id = ?2 WHERE id = ?3",
+                params![timestamp, operation_log_id, drop.id],
+            )
+            .map_err(|error| format!("更新待吸收魂环状态失败：{error}"))?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO soul_ring_event(
+                    soul_ring_drop_id, player_soul_ring_id, player_id,
+                    ring_key, ring_index, source_message_id, operation_log_id, created_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    drop.id,
+                    player_soul_ring_id,
+                    player.player_id,
+                    ring.ring_key,
+                    ring_index,
+                    operation.source_message_id,
+                    operation_log_id,
+                    timestamp
+                ],
+            )
+            .map_err(|error| format!("保存魂环吸收事件失败：{error}"))?;
+        let player_ring = load_player_soul_ring_by_id(&transaction, player_soul_ring_id)?
+            .ok_or_else(|| "吸收魂环后无法读取玩家魂环".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交吸收魂环事务失败：{error}"))?;
+        Ok(SoulRingAbsorbReceipt {
+            skill: ring.skill,
+            ring: player_ring,
+            replayed: false,
+        })
+    }
+
     pub fn active_battle(&self, key: &IdentityKey<'_>) -> Result<Option<BattleSnapshot>, String> {
         validate_identity_key(key)?;
         let connection = self.open()?;
@@ -5379,6 +5982,7 @@ impl Store {
                 ground_drop: drop,
                 wuhun_effect: None,
                 skill: None,
+                soul_ring_drop: None,
                 replayed: true,
             });
         }
@@ -5482,6 +6086,7 @@ impl Store {
             ground_drop: None,
             wuhun_effect: None,
             skill: None,
+            soul_ring_drop: None,
             replayed: false,
         })
     }
@@ -5554,6 +6159,7 @@ impl Store {
                 .transpose()?
                 .flatten();
             let wuhun_effect = load_wuhun_state_event_by_battle_event(&transaction, existing.id)?;
+            let soul_ring_drop = load_soul_ring_drop_by_battle_event(&transaction, existing.id)?;
             transaction
                 .commit()
                 .map_err(|error| format!("提交{action}重放事务失败：{error}"))?;
@@ -5564,6 +6170,7 @@ impl Store {
                 ground_drop: drop,
                 wuhun_effect,
                 skill: previous_skill,
+                soul_ring_drop,
                 replayed: true,
             });
         }
@@ -5939,6 +6546,20 @@ impl Store {
             },
         )?;
         let event_id = transaction.last_insert_rowid();
+        let soul_ring_drop = if status_after == "won" {
+            insert_soul_ring_drop(
+                &transaction,
+                state.id,
+                event_id,
+                state.player_id,
+                state.soul_beast_id,
+                operation.source_message_id,
+                operation_log_id,
+                timestamp,
+            )?
+        } else {
+            None
+        };
         if let (
             Some(player_skill_id),
             Some(skill_use),
@@ -6009,6 +6630,7 @@ impl Store {
             ground_drop,
             wuhun_effect,
             skill: skill_use,
+            soul_ring_drop,
             replayed: false,
         })
     }
@@ -8582,9 +9204,9 @@ fn seed_player_skills(
                 level, proficiency, equipped, learned_at
             )
             SELECT ?1, ?2, skill.skill_key, 1, 1, 0, 1, ?3
-              FROM skill
+             FROM skill
              WHERE skill.enabled = 1
-               AND skill.wuhun_category = 'all'
+               AND skill.skill_key = 'entangle'
             "#,
             params![player_id, wuhun_id, learned_at],
         )
@@ -8605,6 +9227,47 @@ fn skill_record_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Re
         spirit_ratio_percent: row.get(offset + 8)?,
         strength_ratio_percent: row.get(offset + 9)?,
         description: row.get(offset + 10)?,
+    })
+}
+
+fn soul_ring_record_from_row(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<SoulRingRecord> {
+    Ok(SoulRingRecord {
+        ring_key: row.get(offset)?,
+        name: row.get(offset + 1)?,
+        soul_beast_id: row.get(offset + 2)?,
+        soul_beast_name: row.get(offset + 3)?,
+        soul_beast_age: row.get(offset + 4)?,
+        skill: skill_record_from_row(row, offset + 5)?,
+        ring_index: row.get(offset + 16)?,
+        age: row.get(offset + 17)?,
+        color: row.get(offset + 18)?,
+        description: row.get(offset + 19)?,
+    })
+}
+
+fn player_soul_ring_record_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PlayerSoulRingRecord> {
+    Ok(PlayerSoulRingRecord {
+        id: row.get(0)?,
+        ring: soul_ring_record_from_row(row, 1)?,
+        ring_index: row.get(21)?,
+        obtained_at: row.get(22)?,
+    })
+}
+
+fn soul_ring_drop_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SoulRingDropRecord> {
+    Ok(SoulRingDropRecord {
+        id: row.get(0)?,
+        battle_id: row.get(1)?,
+        battle_event_id: row.get(2)?,
+        ring: soul_ring_record_from_row(row, 3)?,
+        source_message_id: row.get(23)?,
+        status: row.get(24)?,
+        created_at: row.get(25)?,
     })
 }
 
@@ -8631,6 +9294,51 @@ fn player_skill_select_sql() -> &'static str {
     "#
 }
 
+fn soul_ring_select_sql() -> &'static str {
+    r#"
+    SELECT r.ring_key, r.name, r.soul_beast_id, sb.name, sb.age,
+           s.skill_key, s.name, s.skill_type, s.wuhun_category,
+           s.ring_index, s.soul_power_cost, s.cooldown_rounds, s.base_damage,
+           s.spirit_ratio_percent, s.strength_ratio_percent, s.description,
+           r.ring_index, r.age, r.color, r.description
+      FROM soul_ring r
+      JOIN soul_beast sb ON sb.id = r.soul_beast_id
+      JOIN skill s ON s.skill_key = r.skill_key
+    "#
+}
+
+fn player_soul_ring_select_sql() -> &'static str {
+    r#"
+    SELECT psr.id,
+           r.ring_key, r.name, r.soul_beast_id, sb.name, sb.age,
+           s.skill_key, s.name, s.skill_type, s.wuhun_category,
+           s.ring_index, s.soul_power_cost, s.cooldown_rounds, s.base_damage,
+           s.spirit_ratio_percent, s.strength_ratio_percent, s.description,
+           r.ring_index, r.age, r.color, r.description,
+           psr.ring_index, psr.obtained_at
+      FROM player_soul_ring psr
+      JOIN soul_ring r ON r.ring_key = psr.ring_key
+      JOIN soul_beast sb ON sb.id = r.soul_beast_id
+      JOIN skill s ON s.skill_key = psr.skill_key
+    "#
+}
+
+fn soul_ring_drop_select_sql() -> &'static str {
+    r#"
+    SELECT drop_event.id, drop_event.battle_id, drop_event.battle_event_id,
+           r.ring_key, r.name, r.soul_beast_id, sb.name, sb.age,
+           s.skill_key, s.name, s.skill_type, s.wuhun_category,
+           s.ring_index, s.soul_power_cost, s.cooldown_rounds, s.base_damage,
+           s.spirit_ratio_percent, s.strength_ratio_percent, s.description,
+           r.ring_index, r.age, r.color, r.description,
+           drop_event.source_message_id, drop_event.status, drop_event.created_at
+      FROM soul_ring_drop drop_event
+      JOIN soul_ring r ON r.ring_key = drop_event.ring_key
+      JOIN soul_beast sb ON sb.id = r.soul_beast_id
+      JOIN skill s ON s.skill_key = r.skill_key
+    "#
+}
+
 fn load_player_skill_by_name_or_key(
     connection: &Connection,
     player_id: i64,
@@ -8648,6 +9356,147 @@ fn load_player_skill_by_name_or_key(
         .optional()
         .map_err(|error| format!("读取玩家魂技失败：{error}"))
         .and_then(|record| record.ok_or_else(|| format!("你尚未学习魂技“{requested_name_or_key}”")))
+}
+
+fn load_soul_ring_by_key(
+    connection: &Connection,
+    ring_key: &str,
+) -> Result<Option<SoulRingRecord>, String> {
+    connection
+        .query_row(
+            &format!("{} WHERE r.ring_key = ?1", soul_ring_select_sql()),
+            [ring_key],
+            |row| soul_ring_record_from_row(row, 0),
+        )
+        .optional()
+        .map_err(|error| format!("读取魂环目录失败：{error}"))
+}
+
+fn load_player_soul_ring_by_id(
+    connection: &Connection,
+    player_soul_ring_id: i64,
+) -> Result<Option<PlayerSoulRingRecord>, String> {
+    connection
+        .query_row(
+            &format!("{} WHERE psr.id = ?1", player_soul_ring_select_sql()),
+            [player_soul_ring_id],
+            player_soul_ring_record_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取玩家魂环失败：{error}"))
+}
+
+fn load_soul_ring_drop_by_id(
+    connection: &Connection,
+    drop_id: i64,
+) -> Result<Option<SoulRingDropRecord>, String> {
+    connection
+        .query_row(
+            &format!("{} WHERE drop_event.id = ?1", soul_ring_drop_select_sql()),
+            [drop_id],
+            soul_ring_drop_record_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取魂环掉落失败：{error}"))
+}
+
+fn load_soul_ring_drop_by_battle_event(
+    connection: &Connection,
+    battle_event_id: i64,
+) -> Result<Option<SoulRingDropRecord>, String> {
+    connection
+        .query_row(
+            &format!(
+                "{} WHERE drop_event.battle_event_id = ?1",
+                soul_ring_drop_select_sql()
+            ),
+            [battle_event_id],
+            soul_ring_drop_record_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取战斗魂环掉落失败：{error}"))
+}
+
+fn load_pending_soul_ring_drop_by_beast(
+    connection: &Connection,
+    player_id: i64,
+    requested_name_or_key: &str,
+) -> Result<Option<SoulRingDropRecord>, String> {
+    connection
+        .query_row(
+            &format!(
+                "{} WHERE drop_event.player_id = ?1 AND drop_event.status = 'pending' AND (sb.name = ?2 OR sb.beast_key = ?2) ORDER BY drop_event.id LIMIT 1",
+                soul_ring_drop_select_sql()
+            ),
+            params![player_id, requested_name_or_key],
+            soul_ring_drop_record_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("查询待吸收魂环失败：{error}"))
+}
+
+fn load_soul_ring_event_by_message(
+    connection: &Connection,
+    player_id: i64,
+    source_message_id: &str,
+) -> Result<Option<SoulRingAbsorbReceipt>, String> {
+    connection
+        .query_row(
+            &format!(
+                "{} JOIN soul_ring_event event ON event.player_soul_ring_id = psr.id WHERE event.player_id = ?1 AND event.source_message_id = ?2 LIMIT 1",
+                player_soul_ring_select_sql()
+            ),
+            params![player_id, source_message_id],
+            |row| {
+                let ring = player_soul_ring_record_from_row(row)?;
+                Ok(SoulRingAbsorbReceipt {
+                    skill: ring.ring.skill.clone(),
+                    ring,
+                    replayed: true,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取魂环吸收消息幂等记录失败：{error}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_soul_ring_drop(
+    connection: &Connection,
+    battle_id: i64,
+    battle_event_id: i64,
+    player_id: i64,
+    soul_beast_id: i64,
+    source_message_id: &str,
+    operation_log_id: i64,
+    created_at: i64,
+) -> Result<Option<SoulRingDropRecord>, String> {
+    let inserted = connection
+        .execute(
+            r#"
+            INSERT INTO soul_ring_drop(
+                battle_id, battle_event_id, player_id, ring_key,
+                source_message_id, operation_log_id, status, created_at
+            )
+            SELECT ?1, ?2, ?3, ring.ring_key, ?4, ?5, 'pending', ?6
+              FROM soul_ring ring
+             WHERE ring.soul_beast_id = ?7 AND ring.enabled = 1
+            "#,
+            params![
+                battle_id,
+                battle_event_id,
+                player_id,
+                source_message_id,
+                operation_log_id,
+                created_at,
+                soul_beast_id
+            ],
+        )
+        .map_err(|error| format!("保存战斗魂环掉落失败：{error}"))?;
+    if inserted == 0 {
+        return Ok(None);
+    }
+    load_soul_ring_drop_by_id(connection, connection.last_insert_rowid())
 }
 
 fn load_wuhun_state_with_id_by_player(
@@ -9340,6 +10189,14 @@ fn validate_battle_operation(
         return Err(format!(
             "{command}成功审计必须使用规范命令“{command}”和 ok 结果"
         ));
+    }
+    Ok(())
+}
+
+fn validate_soul_ring_absorb_operation(operation: &OperationLogInput<'_>) -> Result<(), String> {
+    validate_operation_input(operation)?;
+    if operation.command != "吸收魂环" || operation.outcome != "ok" {
+        return Err("吸收魂环成功审计必须使用规范命令“吸收魂环”和 ok 结果".to_string());
     }
     Ok(())
 }
@@ -13760,7 +14617,11 @@ fn validate_v13_schema(connection: &Connection) -> Result<(), String> {
             })
             || name == "wuhun_state_event_scope_guard"
             || table == "battle_wuhun_modifier"
-            || name == "player_skill_scope_guard";
+            || name == "player_skill_scope_guard"
+            || matches!(
+                table.as_str(),
+                "soul_ring" | "soul_ring_drop" | "player_soul_ring" | "soul_ring_event"
+            );
         let touches_v13 = table == "player_wuhun_state"
             || sql_mentions_identifier(&trigger_sql, "player_wuhun_state");
         if touches_v13 && !declared {
@@ -14459,7 +15320,19 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
             .any(|(expected_name, expected_table)| {
                 name == *expected_name && table == *expected_table
             })
-            || name == "battle_event_scope_guard";
+            || name == "battle_event_scope_guard"
+            || matches!(
+                table.as_str(),
+                "soul_ring" | "soul_ring_drop" | "player_soul_ring" | "soul_ring_event"
+            )
+            || [
+                "soul_ring",
+                "soul_ring_drop",
+                "player_soul_ring",
+                "soul_ring_event",
+            ]
+            .iter()
+            .any(|identifier| sql_mentions_identifier(&trigger_sql, identifier));
         let touches_v16 = matches!(
             table.as_str(),
             "skill" | "player_skill" | "battle_skill_event"
@@ -14471,6 +15344,394 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn validate_v17_schema(connection: &Connection) -> Result<(), String> {
+    let expected_tables = [
+        (
+            "soul_ring",
+            vec![
+                TableColumnInfo::new("ring_key", "TEXT", true, true, None, 0),
+                TableColumnInfo::new("name", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("soul_beast_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("skill_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("ring_index", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("age", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("color", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("description", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("enabled", "INTEGER", true, false, Some("1"), 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("updated_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+        (
+            "soul_ring_drop",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("battle_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("battle_event_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("ring_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("source_message_id", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("operation_log_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("status", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("absorbed_at", "INTEGER", false, false, None, 0),
+                TableColumnInfo::new(
+                    "absorbed_operation_log_id",
+                    "INTEGER",
+                    false,
+                    false,
+                    None,
+                    0,
+                ),
+            ],
+        ),
+        (
+            "player_soul_ring",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("wuhun_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("wuhun_slot", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("ring_index", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("ring_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("skill_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("soul_ring_drop_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("obtained_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+        (
+            "soul_ring_event",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("soul_ring_drop_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_soul_ring_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("ring_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("ring_index", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("source_message_id", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("operation_log_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+    ];
+    for (table, expected) in expected_tables {
+        let actual = table_columns_with_type(connection, table)?;
+        if actual != expected {
+            return Err(format!(
+                "数据库已标记迁移 v17，但表 {table} 字段不匹配：{actual:?}"
+            ));
+        }
+        let sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v17 表 {table} 建表语句失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v17，但缺少表 {table}"))?
+            .to_ascii_uppercase();
+        if !sql.contains(") STRICT") {
+            return Err(format!("v17 表 {table} 必须是 STRICT"));
+        }
+    }
+    validate_v17_foreign_keys(
+        connection,
+        "soul_ring",
+        &[
+            ("skill", "skill_key", "skill_key", "NO ACTION", "RESTRICT"),
+            ("soul_beast", "soul_beast_id", "id", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+    validate_v17_foreign_keys(
+        connection,
+        "soul_ring_drop",
+        &[
+            ("battle", "battle_id", "id", "NO ACTION", "RESTRICT"),
+            (
+                "battle_event",
+                "battle_event_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            (
+                "operation_log",
+                "operation_log_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            (
+                "operation_log",
+                "absorbed_operation_log_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+            ("soul_ring", "ring_key", "ring_key", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+    validate_v17_foreign_keys(
+        connection,
+        "player_soul_ring",
+        &[
+            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+            ("wuhun", "wuhun_id", "id", "NO ACTION", "RESTRICT"),
+            ("skill", "skill_key", "skill_key", "NO ACTION", "RESTRICT"),
+            ("soul_ring", "ring_key", "ring_key", "NO ACTION", "RESTRICT"),
+            (
+                "soul_ring_drop",
+                "soul_ring_drop_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+        ],
+    )?;
+    validate_v17_foreign_keys(
+        connection,
+        "soul_ring_event",
+        &[
+            (
+                "operation_log",
+                "operation_log_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+            (
+                "player_soul_ring",
+                "player_soul_ring_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("soul_ring", "ring_key", "ring_key", "NO ACTION", "RESTRICT"),
+            (
+                "soul_ring_drop",
+                "soul_ring_drop_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+        ],
+    )?;
+    validate_v17_custom_index_set(connection, "soul_ring", &["soul_ring_catalog_page"])?;
+    validate_v17_custom_index_set(
+        connection,
+        "soul_ring_drop",
+        &["soul_ring_drop_battle_page", "soul_ring_drop_player_page"],
+    )?;
+    validate_v17_custom_index_set(
+        connection,
+        "player_soul_ring",
+        &["player_soul_ring_player_page"],
+    )?;
+    validate_v17_custom_index_set(
+        connection,
+        "soul_ring_event",
+        &["soul_ring_event_player_page"],
+    )?;
+    validate_v17_index(
+        connection,
+        "soul_ring_catalog_page",
+        false,
+        &["enabled", "ring_index", "age", "ring_key"],
+        false,
+    )?;
+    validate_v17_index(
+        connection,
+        "soul_ring_drop_player_page",
+        false,
+        &["player_id", "status", "id"],
+        false,
+    )?;
+    validate_v17_index(
+        connection,
+        "soul_ring_drop_battle_page",
+        false,
+        &["battle_id", "id"],
+        false,
+    )?;
+    validate_v17_index(
+        connection,
+        "player_soul_ring_player_page",
+        false,
+        &["player_id", "wuhun_slot", "ring_index", "id"],
+        false,
+    )?;
+    validate_v17_index(
+        connection,
+        "soul_ring_event_player_page",
+        false,
+        &["player_id", "id"],
+        false,
+    )?;
+
+    let seed_ok = connection
+        .query_row(
+            r#"
+            SELECT
+                EXISTS(
+                    SELECT 1 FROM skill
+                     WHERE skill_key = 'sting' AND name = '毒刺'
+                       AND skill_type = 'active' AND ring_index = 1
+                       AND soul_power_cost = 12 AND cooldown_rounds = 3
+                ),
+                (SELECT COUNT(*) FROM soul_ring WHERE enabled = 1),
+                EXISTS(
+                    SELECT 1 FROM soul_ring ring
+                     JOIN soul_beast beast ON beast.id = ring.soul_beast_id
+                     JOIN skill ON skill.skill_key = ring.skill_key
+                    WHERE beast.beast_key = 'slime' AND skill.skill_key = 'entangle'
+                ),
+                EXISTS(
+                    SELECT 1 FROM soul_ring ring
+                     JOIN soul_beast beast ON beast.id = ring.soul_beast_id
+                     JOIN skill ON skill.skill_key = ring.skill_key
+                    WHERE beast.beast_key = 'goblin' AND skill.skill_key = 'sting'
+                )
+            "#,
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, bool>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            },
+        )
+        .map_err(|error| format!("检查 v17 魂环种子失败：{error}"))?;
+    if !seed_ok.0 || seed_ok.1 < 2 || !seed_ok.2 || !seed_ok.3 {
+        return Err("数据库已标记迁移 v17，但基础魂环或毒刺魂技种子不完整".to_string());
+    }
+
+    let expected_triggers = [
+        ("soul_ring_no_update", "soul_ring"),
+        ("soul_ring_no_delete", "soul_ring"),
+        ("soul_ring_no_reinsert", "soul_ring"),
+        ("soul_ring_drop_no_delete", "soul_ring_drop"),
+        ("soul_ring_drop_no_reinsert", "soul_ring_drop"),
+        ("soul_ring_drop_identity_guard", "soul_ring_drop"),
+        ("soul_ring_drop_scope_guard", "soul_ring_drop"),
+        ("player_soul_ring_no_update", "player_soul_ring"),
+        ("player_soul_ring_no_delete", "player_soul_ring"),
+        ("player_soul_ring_no_reinsert", "player_soul_ring"),
+        ("player_soul_ring_scope_guard", "player_soul_ring"),
+        ("soul_ring_event_no_update", "soul_ring_event"),
+        ("soul_ring_event_no_delete", "soul_ring_event"),
+        ("soul_ring_event_no_reinsert", "soul_ring_event"),
+        ("soul_ring_event_scope_guard", "soul_ring_event"),
+        ("player_skill_scope_guard", "player_skill"),
+    ];
+    for (name, table) in expected_triggers {
+        let (actual_table, trigger_sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v17 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v17，但缺少触发器 {name}"))?;
+        let normalized = trigger_sql.to_ascii_uppercase();
+        if actual_table != table || !normalized.contains("RAISE(ABORT") {
+            return Err(format!("v17 触发器 {name} 契约不匹配"));
+        }
+        if name == "soul_ring_drop_scope_guard"
+            && (!normalized.contains("FROM BATTLE_EVENT EVENT")
+                || !normalized.contains("JOIN SOUL_RING RING")
+                || !normalized.contains("AUDIT.COMMAND IN"))
+        {
+            return Err("v17 魂环掉落范围触发器不完整".to_string());
+        }
+        if name == "player_soul_ring_scope_guard"
+            && (!normalized.contains("FROM PLAYER_WUHUN_STATE")
+                || !normalized.contains("JOIN SOUL_RING_DROP")
+                || !normalized.contains("JOIN PLAYER_SKILL"))
+        {
+            return Err("v17 玩家魂环范围触发器不完整".to_string());
+        }
+        if name == "soul_ring_event_scope_guard"
+            && (!normalized.contains("FROM SOUL_RING_DROP")
+                || !normalized.contains("JOIN PLAYER_SOUL_RING")
+                || !normalized.contains("吸收魂环"))
+        {
+            return Err("v17 魂环吸收事件触发器不完整".to_string());
+        }
+    }
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v17 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v17 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v17 全库触发器失败：{error}"))?;
+    for (name, table, trigger_sql) in triggers {
+        let declared = expected_triggers
+            .iter()
+            .any(|(expected_name, expected_table)| {
+                name == *expected_name && table == *expected_table
+            })
+            || name == "battle_event_scope_guard"
+            || name == "wuhun_state_event_scope_guard";
+        let touches_v17 = matches!(
+            table.as_str(),
+            "soul_ring" | "soul_ring_drop" | "player_soul_ring" | "soul_ring_event"
+        ) || [
+            "soul_ring",
+            "soul_ring_drop",
+            "player_soul_ring",
+            "soul_ring_event",
+        ]
+        .iter()
+        .any(|identifier| sql_mentions_identifier(&trigger_sql, identifier));
+        if touches_v17 && !declared {
+            return Err(format!("v17 触发器 {name} 未声明却引用魂环表 {table}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v17_foreign_keys(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, &str, &str, &str)],
+) -> Result<(), String> {
+    validate_v9_foreign_keys(connection, table, expected)
+        .map_err(|error| error.replace("v9", "v17"))
+}
+
+fn validate_v17_custom_index_set(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), String> {
+    validate_v10_custom_index_set(connection, table, expected)
+        .map_err(|error| error.replace("v10", "v17"))
+}
+
+fn validate_v17_index(
+    connection: &Connection,
+    index_name: &str,
+    unique: bool,
+    columns: &[&str],
+    partial: bool,
+) -> Result<(), String> {
+    validate_v7_index(connection, index_name, unique, columns, partial)
+        .map_err(|error| error.replace("v7", "v17"))
 }
 
 fn validate_v16_foreign_keys(
@@ -14730,6 +15991,10 @@ fn validate_v12_triggers(connection: &Connection) -> Result<(), String> {
     for (name, table, sql) in triggers {
         if table == "battle_wuhun_modifier"
             || table == "battle_skill_event"
+            || matches!(
+                table.as_str(),
+                "soul_ring" | "soul_ring_drop" | "player_soul_ring" | "soul_ring_event"
+            )
             || name == "battle_wuhun_state_guard"
             || name == "wuhun_state_event_scope_guard"
             || name == "battle_wuhun_modifier_event_guard"
@@ -16313,6 +17578,24 @@ mod tests {
         assert!(
             error.contains("v16"),
             "v16 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    fn assert_v17_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v17 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v17 迁移应成功");
+        let connection = store.open().expect("应打开 v17 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v17 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v17 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v17"),
+            "v17 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
         );
     }
 
@@ -20541,6 +21824,154 @@ mod tests {
         assert_eq!(empty_message_count, 2);
         assert_eq!(last_damage, third.event.player_damage);
         assert_eq!(third.battle.id, started.battle.id);
+    }
+
+    #[test]
+    fn v17_battle_victory_persists_ring_drop_absorption_and_skill_binding() {
+        let (directory, store) = test_store();
+        register_awakened_pair(&store);
+        let first_id = player_id_for(&store, &identity());
+        let second_id = player_id_for(&store, &recipient_identity());
+        let connection = store.open().expect("应打开 v17 魂环测试数据库");
+        for player_id in [first_id, second_id] {
+            connection
+                .execute(
+                    "UPDATE player SET level = 10, hp = 100, max_hp = 100, strength = 1000, perception = 0, luck = 0, endurance = 100, soul_power = 50, max_soul_power = 50, updated_at = 1 WHERE id = ?1",
+                    [player_id],
+                )
+                .expect("应设置魂环测试属性");
+        }
+        drop(connection);
+
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "v17-slime-map"),
+            )
+            .expect("第一玩家应进入落日森林");
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "史莱姆",
+                &transfer_operation("挑战", "v17-slime-start"),
+            )
+            .expect("第一玩家应挑战史莱姆");
+        let victory = store
+            .attack_battle_with_operation(&identity(), &transfer_operation("攻击", "v17-slime-win"))
+            .expect("普通攻击应击败史莱姆并生成魂环");
+        assert_eq!(victory.event.status_after, "won");
+        let ring_drop = victory
+            .soul_ring_drop
+            .as_ref()
+            .expect("胜利回执应包含待吸收魂环");
+        assert_eq!(ring_drop.ring.ring_key, "slime-ring");
+        assert_eq!(ring_drop.status, "pending");
+
+        drop(store);
+        let restored = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("热重载后 v17 数据库应恢复");
+        let pending = restored
+            .soul_rings_page(&identity())
+            .expect("应读取待吸收魂环");
+        assert_eq!(pending.ring_capacity, 1);
+        assert_eq!(pending.rings.len(), 0);
+        assert_eq!(pending.pending.len(), 1);
+        let absorbed = restored
+            .absorb_soul_ring_with_operation(
+                &identity(),
+                "史莱姆",
+                &transfer_operation("吸收魂环", "v17-slime-absorb"),
+            )
+            .expect("应吸收史莱姆魂环");
+        assert!(!absorbed.replayed);
+        assert_eq!(absorbed.ring.ring.ring_key, "slime-ring");
+        assert_eq!(absorbed.ring.ring_index, 1);
+        assert_eq!(absorbed.skill.skill_key, "entangle");
+        let replay = restored
+            .absorb_soul_ring_with_operation(
+                &identity(),
+                "史莱姆",
+                &transfer_operation("吸收魂环", "v17-slime-absorb"),
+            )
+            .expect("重复吸收消息应返回原回执");
+        assert!(replay.replayed);
+        assert_eq!(replay.ring.id, absorbed.ring.id);
+        let rings = restored.soul_rings_page(&identity()).unwrap();
+        assert_eq!(rings.rings.len(), 1);
+        assert!(rings.pending.is_empty());
+
+        restored
+            .teleport_with_operation(
+                &recipient_identity(),
+                Some("落日森林"),
+                &map_operation("传送", "v17-goblin-map"),
+            )
+            .expect("第二玩家应进入落日森林");
+        restored
+            .challenge_soul_beast_with_operation(
+                &recipient_identity(),
+                "哥布林",
+                &transfer_operation("挑战", "v17-goblin-start"),
+            )
+            .expect("第二玩家应挑战哥布林");
+        let goblin_victory = restored
+            .attack_battle_with_operation(
+                &recipient_identity(),
+                &transfer_operation("攻击", "v17-goblin-win"),
+            )
+            .expect("第二玩家应击败哥布林并生成魂环");
+        assert_eq!(goblin_victory.event.status_after, "won");
+        assert_eq!(
+            goblin_victory
+                .soul_ring_drop
+                .as_ref()
+                .unwrap()
+                .ring
+                .ring_key,
+            "goblin-ring"
+        );
+        let goblin_ring = restored
+            .absorb_soul_ring_with_operation(
+                &recipient_identity(),
+                "哥布林",
+                &transfer_operation("吸收魂环", "v17-goblin-absorb"),
+            )
+            .expect("应吸收哥布林魂环并学习毒刺");
+        assert_eq!(goblin_ring.skill.skill_key, "sting");
+        let skills = restored.skills_page(&recipient_identity()).unwrap();
+        assert_eq!(skills.entries.len(), 2);
+        assert!(
+            skills
+                .entries
+                .iter()
+                .any(|entry| entry.skill.skill_key == "sting")
+        );
+    }
+
+    #[test]
+    fn recorded_v17_with_damaged_schema_or_trigger_fails_closed() {
+        for mutation in [
+            "DROP TABLE soul_ring_event;",
+            "DROP INDEX soul_ring_drop_player_page;",
+            "DROP TRIGGER soul_ring_drop_scope_guard;",
+        ] {
+            assert_v17_damage_fails_closed(mutation);
+        }
+        assert_v17_damage_fails_closed(
+            r#"
+            CREATE TRIGGER soul_ring_drop_shadow
+            AFTER INSERT ON soul_ring_drop
+            BEGIN SELECT 1; END;
+            "#,
+        );
+        assert_v17_damage_fails_closed(
+            r#"
+            CREATE TRIGGER player_skill_reads_soul_ring
+            AFTER INSERT ON player_skill
+            BEGIN SELECT EXISTS(SELECT 1 FROM soul_ring); END;
+            "#,
+        );
     }
 
     #[test]

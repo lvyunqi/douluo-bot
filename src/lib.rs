@@ -220,6 +220,28 @@ mod plugin {
     }
 
     #[command(
+        name = "魂环",
+        description = "查看已吸收魂环和待吸收魂环",
+        aliases = "查看魂环",
+        category = "斗罗大陆·角色",
+        scope = "all"
+    )]
+    fn soul_rings(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.soul_rings(req))
+    }
+
+    #[command(
+        name = "吸收魂环",
+        description = "吸收击杀魂兽留下的魂环：吸收魂环 <魂兽>",
+        aliases = "附加魂环",
+        category = "斗罗大陆·战斗",
+        scope = "all"
+    )]
+    fn absorb_soul_ring(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.absorb_soul_ring(req))
+    }
+
+    #[command(
         name = "释放技能",
         description = "在魂兽战斗中释放魂技：释放技能 <魂技>",
         aliases = "使用技能,使用魂技,施放魂技",

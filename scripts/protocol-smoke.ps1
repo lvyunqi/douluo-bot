@@ -404,7 +404,8 @@ try {
         "斗罗系统", "开始穿越", "武魂觉醒", "开武魂", "关武魂", "签到", "钱包", "状态", "位置",
         "地图列表", "向", "传送", "掉落", "拾取", "NPC", "对话", "商店", "背包",
         "购买", "出售", "使用", "转账", "发送物品", "任务", "接取任务", "任务进度",
-        "提交任务", "放弃任务", "魂兽", "挑战", "攻击", "技能", "技能详情", "释放技能", "逃跑", "战斗状态", "战斗日志"
+        "提交任务", "放弃任务", "魂兽", "挑战", "攻击", "技能", "技能详情", "魂环", "吸收魂环", "释放技能",
+        "逃跑", "战斗状态", "战斗日志"
     )) {
         $found = $commands | Where-Object { $_ -eq $command }
         Assert-Condition ($null -ne $found) "descriptor is missing command '$command' (commands=$($commands -join ', '))"
@@ -484,6 +485,16 @@ try {
         }
     }
     Assert-Condition $battleFinished "soul beast battle did not finish within five turns"
+    $rings = Invoke-OneBotCommand $endpoint "魂环"
+    Write-Output ("onebot 魂环: {0} [{1}]" -f $rings.ActionName, $rings.Text)
+    Assert-Condition ($rings.Text.Contains("待吸收魂环")) "soul ring list did not expose pending drops"
+    Assert-Condition ($rings.Text.Contains("史莱姆")) "soul ring list did not expose the slime drop"
+    $absorbBlocked = Invoke-OneBotCommand $endpoint "吸收魂环 史莱姆"
+    Write-Output ("onebot 吸收魂环 史莱姆 (低等级): {0} [{1}]" -f $absorbBlocked.ActionName, $absorbBlocked.Text)
+    Assert-Condition ($absorbBlocked.Text.Contains("魂环槽位已满")) "low-level soul ring absorption was not gated by capacity"
+    $skillsAfterVictory = Invoke-OneBotCommand $endpoint "技能"
+    Assert-Condition ($skillsAfterVictory.Text.Contains("缠绕")) "base skill disappeared after a ring drop"
+    Assert-Condition (-not $skillsAfterVictory.Text.Contains("毒刺")) "locked soul skill appeared before ring absorption"
     $toVillage = Invoke-OneBotCommand $endpoint "传送 圣魂村"
     Assert-Condition ($toVillage.Text.Contains("圣魂村")) "could not leave the battle map"
 
