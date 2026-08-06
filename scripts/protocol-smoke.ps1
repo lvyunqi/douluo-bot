@@ -378,7 +378,7 @@ try {
     # PowerShell 5 can wrap a JSON array in a single PSObject; normalize each
     # command explicitly before comparing Unicode command names.
     $commands = @($plugin.commands | ForEach-Object { [string]$_ })
-    foreach ($command in @("斗罗系统", "开始穿越", "武魂觉醒", "签到", "钱包", "状态", "位置")) {
+    foreach ($command in @("斗罗系统", "开始穿越", "武魂觉醒", "签到", "钱包", "状态", "位置", "地图列表", "向", "传送")) {
         $found = $commands | Where-Object { $_ -eq $command }
         Assert-Condition ($null -ne $found) "descriptor is missing command '$command' (commands=$($commands -join ', '))"
     }
