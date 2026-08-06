@@ -13,10 +13,10 @@ use crate::message::{GameDocument, Illustration};
 use crate::store::{
     AuthorizedContextChange, BattleActionReceipt, BattleEventRecord, BattleLog, BattleSnapshot,
     DailyCheckinInput, DailyCheckinResult, GOLD_SOUL_COIN, IdentityKey, LegacyClaimActor,
-    LegacyClaimResult, LegacyIdentityState, MapExit, MapRecord, MapTravelReceipt,
-    OperationLogInput, PlayerStatus, QuestActionReceipt, QuestListEntry, SkillLoadoutReceipt,
-    SkillPage, SoulBeastPage, SoulRingAbsorbReceipt, SoulRingPage, Store, WuhunToggleReceipt,
-    experience_progress,
+    LegacyClaimResult, LegacyIdentityState, MAX_SKILL_LEVEL, MAX_SKILL_PROFICIENCY, MapExit,
+    MapRecord, MapTravelReceipt, OperationLogInput, PlayerStatus, QuestActionReceipt,
+    QuestListEntry, SkillLoadoutReceipt, SkillPage, SoulBeastPage, SoulRingAbsorbReceipt,
+    SoulRingPage, Store, WuhunToggleReceipt, experience_progress, skill_proficiency_threshold,
 };
 
 const MENU_PAGES: &[MenuPage] = &[
@@ -407,6 +407,10 @@ impl GameService {
                 .field("魂环", format!("第{}魂技", skill.skill.ring_index))
                 .field("等级", skill.level.to_string())
                 .field(
+                    "熟练度",
+                    skill_proficiency_label(skill.level, skill.proficiency),
+                )
+                .field(
                     "装备状态",
                     if skill.equipped {
                         "已装备"
@@ -595,6 +599,10 @@ impl GameService {
                     },
                     entry.skill.soul_power_cost,
                     entry.skill.cooldown_rounds
+                ))
+                .line(format!(
+                    "熟练度：{}",
+                    skill_proficiency_label(entry.level, entry.proficiency)
                 ))
                 .line(entry.skill.description.clone())
                 .command(format!("技能详情 {}", entry.skill.name));
@@ -1270,6 +1278,23 @@ impl GameService {
                     format!("{} → {}", skill.soul_power_before, skill.soul_power_after),
                 )
                 .field("魂技冷却", format!("{} 回合", skill.skill.cooldown_rounds));
+            if let Some(progress) = &skill.progress {
+                document = document.field(
+                    "魂技熟练度",
+                    format!(
+                        "{} → {}（+{}）",
+                        progress.proficiency_before,
+                        progress.proficiency_after,
+                        progress.proficiency_gain
+                    ),
+                );
+                if progress.level_after > progress.level_before {
+                    document = document.field(
+                        "魂技升级",
+                        format!("Lv.{} → Lv.{}", progress.level_before, progress.level_after),
+                    );
+                }
+            }
         }
         if event.event_kind == "challenge" {
             document = document
@@ -2646,6 +2671,16 @@ fn soul_ring_color_label(color: &str) -> &'static str {
         "red" => "红环",
         _ => "未知魂环",
     }
+}
+
+fn skill_proficiency_label(level: i64, proficiency: i64) -> String {
+    if level >= MAX_SKILL_LEVEL {
+        return format!("{proficiency}/{MAX_SKILL_PROFICIENCY}（满级）");
+    }
+    skill_proficiency_threshold(level + 1).ok().map_or_else(
+        || proficiency.to_string(),
+        |threshold| format!("{proficiency}/{threshold}"),
+    )
 }
 
 fn format_battle_event(event: &BattleEventRecord) -> String {

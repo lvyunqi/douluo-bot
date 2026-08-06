@@ -471,13 +471,16 @@ try {
     Write-Output ("onebot 技能: {0} [{1}]" -f $skills.ActionName, $skills.Text)
     Assert-Condition ($skills.Text.Contains("缠绕")) "skill list did not expose the base skill"
     Assert-Condition ($skills.Text.Contains("魂力")) "skill list did not expose soul power"
+    Assert-Condition ($skills.Text.Contains("熟练度：0/100")) "skill list did not expose initial proficiency"
     $skillDetail = Invoke-OneBotCommand $endpoint "技能详情 缠绕"
     Write-Output ("onebot 技能详情 缠绕: {0} [{1}]" -f $skillDetail.ActionName, $skillDetail.Text)
     Assert-Condition ($skillDetail.Text.Contains("魂力消耗")) "skill detail did not expose cost"
+    Assert-Condition ($skillDetail.Text.Contains("熟练度")) "skill detail did not expose proficiency"
     $skill = Invoke-OneBotCommand $endpoint "释放技能 缠绕"
     Write-Output ("onebot 释放技能 缠绕: {0} [{1}]" -f $skill.ActionName, $skill.Text)
     Assert-Condition ($skill.Text.Contains("魂技")) "skill release did not expose skill receipt"
     Assert-Condition ($skill.Text.Contains("魂力")) "skill release did not expose soul power receipt"
+    Assert-Condition ($skill.Text.Contains("魂技熟练度")) "skill release did not expose proficiency gain"
     $battleFinished = $skill.Text.Contains("战斗胜利") -or $skill.Text.Contains("战斗失败")
     for ($round = 1; $round -le 5 -and -not $battleFinished; $round++) {
         $attack = Invoke-OneBotCommand $endpoint "攻击"
@@ -497,6 +500,7 @@ try {
     Assert-Condition ($absorbBlocked.Text.Contains("魂环槽位已满")) "low-level soul ring absorption was not gated by capacity"
     $skillsAfterVictory = Invoke-OneBotCommand $endpoint "技能"
     Assert-Condition ($skillsAfterVictory.Text.Contains("缠绕")) "base skill disappeared after a ring drop"
+    Assert-Condition ($skillsAfterVictory.Text.Contains("熟练度：10/100")) "skill proficiency did not persist after battle"
     Assert-Condition (-not $skillsAfterVictory.Text.Contains("毒刺")) "locked soul skill appeared before ring absorption"
     $toVillage = Invoke-OneBotCommand $endpoint "传送 圣魂村"
     Assert-Condition ($toVillage.Text.Contains("圣魂村")) "could not leave the battle map"
@@ -548,7 +552,9 @@ try {
     Assert-Condition ($null -ne $reload.data.message) "dynamic reload did not return a result"
     $afterReload = Invoke-OneBotCommand $endpoint "钱包"
     Assert-Condition ($afterReload.Text.Contains("金魂币")) "command failed after dynamic reload"
-    Write-Output "protocol smoke passed: OneBot tasks/PVE/wuhun stability/modifier/economy, private/group, synthetic QQ payload, descriptor, and reload"
+    $skillsAfterReload = Invoke-OneBotCommand $endpoint "技能"
+    Assert-Condition ($skillsAfterReload.Text.Contains("熟练度：10/100")) "skill proficiency did not survive dynamic reload"
+    Write-Output "protocol smoke passed: OneBot tasks/PVE/wuhun stability/modifier/skill proficiency/economy, private/group, synthetic QQ payload, descriptor, and reload"
 } finally {
     if ($null -ne $process -and -not $process.HasExited) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
