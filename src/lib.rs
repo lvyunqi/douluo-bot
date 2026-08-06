@@ -177,6 +177,28 @@ mod plugin {
     }
 
     #[command(
+        name = "开武魂",
+        description = "开启当前武魂并进入战斗形态",
+        aliases = "武魂开启",
+        category = "斗罗大陆·角色",
+        scope = "all"
+    )]
+    fn open_wuhun(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.open_wuhun(req))
+    }
+
+    #[command(
+        name = "关武魂",
+        description = "关闭当前武魂并退出战斗形态",
+        aliases = "武魂关闭",
+        category = "斗罗大陆·角色",
+        scope = "all"
+    )]
+    fn close_wuhun(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.close_wuhun(req))
+    }
+
+    #[command(
         name = "签到",
         description = "领取每日经验和金魂币",
         aliases = "每日签到,打卡",

@@ -1535,6 +1535,71 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_V13: &str = r#"
+CREATE TABLE player_wuhun_state (
+    player_id INTEGER PRIMARY KEY REFERENCES player(id) ON DELETE CASCADE,
+    wuhun_id INTEGER NOT NULL REFERENCES wuhun(id) ON DELETE RESTRICT,
+    slot INTEGER NOT NULL CHECK(slot = 1),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    stability INTEGER NOT NULL CHECK(stability BETWEEN 0 AND 100),
+    max_stability INTEGER NOT NULL CHECK(max_stability BETWEEN 1 AND 100),
+    last_toggle_at INTEGER NOT NULL CHECK(last_toggle_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= last_toggle_at)
+) STRICT;
+
+CREATE INDEX player_wuhun_state_enabled
+    ON player_wuhun_state(enabled, stability, updated_at, player_id);
+
+INSERT INTO player_wuhun_state(
+    player_id, wuhun_id, slot, enabled, stability, max_stability,
+    last_toggle_at, updated_at
+)
+SELECT player_id, wuhun_id, slot, 1, 100, 100, created_at, created_at
+  FROM player_wuhun
+ WHERE slot = 1;
+
+CREATE TRIGGER player_wuhun_state_seed
+AFTER INSERT ON player_wuhun
+WHEN NEW.slot = 1
+BEGIN
+    INSERT OR IGNORE INTO player_wuhun_state(
+        player_id, wuhun_id, slot, enabled, stability, max_stability,
+        last_toggle_at, updated_at
+    ) VALUES(NEW.player_id, NEW.wuhun_id, NEW.slot, 1, 100, 100, NEW.created_at, NEW.created_at);
+END;
+
+CREATE TRIGGER player_wuhun_state_insert_guard
+BEFORE INSERT ON player_wuhun_state
+WHEN NOT EXISTS(
+    SELECT 1 FROM player_wuhun
+     WHERE player_id = NEW.player_id AND wuhun_id = NEW.wuhun_id AND slot = NEW.slot
+)
+BEGIN
+    SELECT RAISE(ABORT, 'wuhun state scope mismatch');
+END;
+
+CREATE TRIGGER player_wuhun_state_identity_guard
+BEFORE UPDATE ON player_wuhun_state
+WHEN NEW.player_id <> OLD.player_id
+  OR NEW.wuhun_id <> OLD.wuhun_id
+  OR NEW.slot <> OLD.slot
+  OR NEW.max_stability <> OLD.max_stability
+BEGIN
+    SELECT RAISE(ABORT, 'wuhun state identity is immutable');
+END;
+
+CREATE TRIGGER battle_wuhun_state_guard
+BEFORE INSERT ON battle
+WHEN NOT EXISTS(
+    SELECT 1 FROM player_wuhun_state
+     WHERE player_id = NEW.player_id AND slot = 1
+       AND enabled = 1 AND stability > 0
+)
+BEGIN
+    SELECT RAISE(ABORT, 'wuhun must be enabled before battle');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -1592,6 +1657,9 @@ pub struct PlayerStatus {
     pub state: String,
     pub wuhun_name: Option<String>,
     pub wuhun_category: Option<String>,
+    pub wuhun_enabled: Option<bool>,
+    pub wuhun_stability: Option<i64>,
+    pub wuhun_max_stability: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1989,6 +2057,22 @@ pub struct AwakenedWuhun {
     pub category: String,
     pub form: String,
     pub description: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WuhunState {
+    pub name: String,
+    pub category: String,
+    pub form: String,
+    pub enabled: bool,
+    pub stability: i64,
+    pub max_stability: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WuhunToggleReceipt {
+    pub state: WuhunState,
+    pub replayed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2416,7 +2500,7 @@ impl Store {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
-                    format!("开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12 失败：{error}")
+                    format!("开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13 失败：{error}")
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
             if !migration_applied(&transaction, 2)? {
@@ -2607,9 +2691,24 @@ impl Store {
                 validate_v12_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 13)? {
+                transaction
+                    .execute_batch(MIGRATION_V13)
+                    .map_err(|error| format!("执行数据库迁移 v13 失败：{error}"))?;
+                validate_v13_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(13, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v13 失败：{error}"))?;
+            } else {
+                validate_v13_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
-                format!("提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12 失败：{error}")
+                format!("提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13 失败：{error}")
             })?;
             Ok(())
         })();
@@ -2628,6 +2727,7 @@ impl Store {
                 validate_v10_schema(connection)?;
                 validate_v11_schema(connection)?;
                 validate_v12_schema(connection)?;
+                validate_v13_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -2706,13 +2806,14 @@ impl Store {
                 SELECT p.name, p.gender, p.level, p.exp, p.hp, p.max_hp,
                        p.soul_power, p.max_soul_power, COALESCE(m.name, p.map_name),
                        p.life_count, p.state,
-                       w.name, w.category
+                       w.name, w.category, pws.enabled, pws.stability, pws.max_stability
                   FROM identity i
                   JOIN player p ON p.identity_id = i.id
              LEFT JOIN player_map pm ON pm.player_id = p.id
              LEFT JOIN map m ON m.map_key = pm.map_key
              LEFT JOIN player_wuhun pw ON pw.player_id = p.id AND pw.slot = 1
              LEFT JOIN wuhun w ON w.id = pw.wuhun_id
+             LEFT JOIN player_wuhun_state pws ON pws.player_id = p.id AND pws.slot = 1
                  WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
                    AND i.subject_kind = ?4 AND i.subject_id = ?5
                 "#,
@@ -2738,6 +2839,9 @@ impl Store {
                         state: row.get(10)?,
                         wuhun_name: row.get(11)?,
                         wuhun_category: row.get(12)?,
+                        wuhun_enabled: row.get(13)?,
+                        wuhun_stability: row.get(14)?,
+                        wuhun_max_stability: row.get(15)?,
                     })
                 },
             )
@@ -4429,6 +4533,11 @@ impl Store {
         if !player.awakened {
             return Err("角色尚未完成武魂觉醒，不能挑战魂兽".to_string());
         }
+        let wuhun_state = load_wuhun_state_by_player(&transaction, player.player_id)?
+            .ok_or_else(|| "角色缺少武魂状态，请联系管理员".to_string())?;
+        if !wuhun_state.enabled || wuhun_state.stability <= 0 {
+            return Err("请先使用“开武魂”再挑战魂兽".to_string());
+        }
         if player.state != "alive" || player.hp <= 0 {
             return Err("当前角色状态不能挑战魂兽".to_string());
         }
@@ -5461,6 +5570,118 @@ impl Store {
             .commit()
             .map_err(|error| format!("提交武魂觉醒事务失败：{error}"))?;
         Ok(wuhun.1)
+    }
+
+    pub fn set_wuhun_enabled_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        enabled: bool,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<WuhunToggleReceipt, String> {
+        validate_identity_key(key)?;
+        let expected_command = if enabled { "开武魂" } else { "关武魂" };
+        validate_wuhun_toggle_operation(operation, expected_command)?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始{expected_command}事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let player_id = transaction
+            .query_row(
+                r#"
+                SELECT p.id
+                  FROM identity i
+                  JOIN player p ON p.identity_id = i.id
+                 WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+                   AND i.subject_kind = ?4 AND i.subject_id = ?5
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind,
+                    key.subject_id
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("查询武魂角色失败：{error}"))?
+            .ok_or_else(|| "你还没有角色，请先使用“开始穿越 <角色名> <性别>”".to_string())?;
+
+        if !operation.source_message_id.is_empty() {
+            let previous = transaction
+                .query_row(
+                    r#"
+                    SELECT command
+                      FROM operation_log
+                     WHERE protocol = ?1 AND account_id = ?2 AND namespace = ?3
+                       AND subject_kind = ?4 AND subject_id = ?5
+                       AND source_message_id = ?6 AND outcome = 'ok'
+                     ORDER BY id DESC LIMIT 1
+                    "#,
+                    params![
+                        key.protocol.as_str(),
+                        key.account_id,
+                        key.namespace,
+                        key.subject_kind,
+                        key.subject_id,
+                        operation.source_message_id
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| format!("检查武魂操作幂等键失败：{error}"))?;
+            if let Some(previous) = previous {
+                if previous != expected_command {
+                    return Err("该消息 ID 已用于不同的武魂操作，拒绝重放".to_string());
+                }
+                let state = load_wuhun_state_by_player(&transaction, player_id)?
+                    .ok_or_else(|| "角色尚未完成武魂觉醒".to_string())?;
+                transaction
+                    .commit()
+                    .map_err(|error| format!("提交武魂操作重放事务失败：{error}"))?;
+                return Ok(WuhunToggleReceipt {
+                    state,
+                    replayed: true,
+                });
+            }
+        }
+
+        if transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM battle WHERE player_id = ?1 AND status = 'active')",
+                [player_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("检查战斗状态失败：{error}"))?
+        {
+            return Err("战斗中不能切换武魂，请先结束当前战斗".to_string());
+        }
+        let state = load_wuhun_state_by_player(&transaction, player_id)?
+            .ok_or_else(|| "角色尚未完成武魂觉醒".to_string())?;
+        if enabled && state.stability <= 0 {
+            return Err("当前武魂稳定度为 0，暂时无法开启".to_string());
+        }
+        let timestamp = now_timestamp()?;
+        let updated = transaction
+            .execute(
+                "UPDATE player_wuhun_state SET enabled = ?1, last_toggle_at = ?2, updated_at = ?2 WHERE player_id = ?3",
+                params![enabled, timestamp, player_id],
+            )
+            .map_err(|error| format!("保存武魂状态失败：{error}"))?;
+        if updated != 1 {
+            return Err("保存武魂状态时目标行发生变化".to_string());
+        }
+        insert_operation_log(&transaction, key, operation)?;
+        let state = load_wuhun_state_by_player(&transaction, player_id)?
+            .ok_or_else(|| "保存武魂状态后无法读取状态".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交{expected_command}事务失败：{error}"))?;
+        Ok(WuhunToggleReceipt {
+            state,
+            replayed: false,
+        })
     }
 
     pub fn inspect_legacy_identity(
@@ -7217,6 +7438,34 @@ fn soul_beast_record_from_row(
     })
 }
 
+fn load_wuhun_state_by_player(
+    connection: &Connection,
+    player_id: i64,
+) -> Result<Option<WuhunState>, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT w.name, w.category, w.form, s.enabled, s.stability, s.max_stability
+              FROM player_wuhun_state s
+              JOIN wuhun w ON w.id = s.wuhun_id
+             WHERE s.player_id = ?1 AND s.slot = 1
+            "#,
+            [player_id],
+            |row| {
+                Ok(WuhunState {
+                    name: row.get(0)?,
+                    category: row.get(1)?,
+                    form: row.get(2)?,
+                    enabled: row.get(3)?,
+                    stability: row.get(4)?,
+                    max_stability: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取武魂状态失败：{error}"))
+}
+
 fn load_battle_player(
     connection: &Connection,
     key: &IdentityKey<'_>,
@@ -7583,6 +7832,19 @@ fn validate_battle_operation(
     if operation.command != command || operation.outcome != "ok" {
         return Err(format!(
             "{command}成功审计必须使用规范命令“{command}”和 ok 结果"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_wuhun_toggle_operation(
+    operation: &OperationLogInput<'_>,
+    expected_command: &str,
+) -> Result<(), String> {
+    validate_operation_input(operation)?;
+    if operation.command != expected_command || operation.outcome != "ok" {
+        return Err(format!(
+            "{expected_command}成功审计必须使用规范命令“{expected_command}”和 ok 结果"
         ));
     }
     Ok(())
@@ -11831,6 +12093,203 @@ fn validate_v12_schema(connection: &Connection) -> Result<(), String> {
     validate_v12_seeds(connection)
 }
 
+fn validate_v13_schema(connection: &Connection) -> Result<(), String> {
+    let actual = table_columns_with_type(connection, "player_wuhun_state")?;
+    let expected = vec![
+        TableColumnInfo::new("player_id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("wuhun_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("slot", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("enabled", "INTEGER", true, false, Some("1"), 0),
+        TableColumnInfo::new("stability", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("max_stability", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("last_toggle_at", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("updated_at", "INTEGER", true, false, None, 0),
+    ];
+    if actual != expected {
+        return Err(format!(
+            "数据库已标记迁移 v13，但表 player_wuhun_state 字段不匹配：{actual:?}"
+        ));
+    }
+    let sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'player_wuhun_state'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v13 武魂状态建表语句失败：{error}"))?
+        .ok_or_else(|| "数据库已标记迁移 v13，但缺少表 player_wuhun_state".to_string())?
+        .to_ascii_uppercase();
+    if !sql.contains(") STRICT") {
+        return Err("v13 表 player_wuhun_state 必须是 STRICT".to_string());
+    }
+
+    validate_v13_foreign_keys(
+        connection,
+        "player_wuhun_state",
+        &[
+            ("player", "player_id", "id", "NO ACTION", "CASCADE"),
+            ("wuhun", "wuhun_id", "id", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+    validate_v13_custom_index_set(
+        connection,
+        "player_wuhun_state",
+        &["player_wuhun_state_enabled"],
+    )?;
+    validate_v13_index(
+        connection,
+        "player_wuhun_state_enabled",
+        false,
+        &["enabled", "stability", "updated_at", "player_id"],
+        false,
+    )?;
+
+    let missing = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                       SELECT 1
+                         FROM player_wuhun pw
+                         LEFT JOIN player_wuhun_state s
+                           ON s.player_id = pw.player_id AND s.slot = pw.slot
+                        WHERE pw.slot = 1
+                          AND (s.player_id IS NULL OR s.wuhun_id <> pw.wuhun_id)
+                   )
+                OR EXISTS(
+                       SELECT 1
+                         FROM player_wuhun_state s
+                         LEFT JOIN player_wuhun pw
+                           ON pw.player_id = s.player_id AND pw.slot = s.slot
+                        WHERE pw.id IS NULL OR pw.wuhun_id <> s.wuhun_id
+                   )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("校验 v13 武魂状态种子失败：{error}"))?;
+    if missing {
+        return Err("v13 武魂状态种子与觉醒武魂不一致".to_string());
+    }
+
+    let expected_triggers = [
+        ("player_wuhun_state_seed", "player_wuhun", false),
+        (
+            "player_wuhun_state_insert_guard",
+            "player_wuhun_state",
+            true,
+        ),
+        (
+            "player_wuhun_state_identity_guard",
+            "player_wuhun_state",
+            true,
+        ),
+        ("battle_wuhun_state_guard", "battle", true),
+    ];
+    for (name, table, requires_abort) in expected_triggers {
+        let (actual_table, trigger_sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v13 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v13，但缺少触发器 {name}"))?;
+        let normalized = trigger_sql.to_ascii_uppercase();
+        if actual_table != table || (requires_abort && !normalized.contains("RAISE(ABORT")) {
+            return Err(format!("v13 触发器 {name} 契约不匹配"));
+        }
+        if name == "player_wuhun_state_seed"
+            && (!normalized.contains("INSERT OR IGNORE INTO PLAYER_WUHUN_STATE")
+                || !normalized.contains("NEW.WUHUN_ID")
+                || !normalized.contains("NEW.CREATED_AT"))
+        {
+            return Err("v13 武魂状态自动补写触发器不完整".to_string());
+        }
+        if name == "player_wuhun_state_insert_guard" && !normalized.contains("FROM PLAYER_WUHUN") {
+            return Err("v13 武魂状态范围触发器不完整".to_string());
+        }
+        if name == "player_wuhun_state_insert_guard"
+            && (!normalized.contains("WUHUN_ID = NEW.WUHUN_ID")
+                || !normalized.contains("SLOT = NEW.SLOT"))
+        {
+            return Err("v13 武魂状态范围触发器缺少武魂或槽位约束".to_string());
+        }
+        if name == "player_wuhun_state_identity_guard"
+            && (!normalized.contains("MAX_STABILITY")
+                || !normalized.contains("NEW.WUHUN_ID <> OLD.WUHUN_ID")
+                || !normalized.contains("NEW.SLOT <> OLD.SLOT"))
+        {
+            return Err("v13 武魂状态身份触发器不完整".to_string());
+        }
+        if name == "battle_wuhun_state_guard"
+            && (!normalized.contains("FROM PLAYER_WUHUN_STATE")
+                || !normalized.contains("ENABLED = 1")
+                || !normalized.contains("STABILITY > 0"))
+        {
+            return Err("v13 战斗武魂开关触发器不完整".to_string());
+        }
+    }
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v13 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v13 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v13 全库触发器失败：{error}"))?;
+    for (name, table, trigger_sql) in triggers {
+        let declared = expected_triggers
+            .iter()
+            .any(|(expected_name, expected_table, _)| {
+                name == *expected_name && table == *expected_table
+            });
+        let touches_v13 = table == "player_wuhun_state"
+            || sql_mentions_identifier(&trigger_sql, "player_wuhun_state");
+        if touches_v13 && !declared {
+            return Err(format!(
+                "v13 触发器 {name} 未声明却引用武魂状态或战斗表 {table}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v13_foreign_keys(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, &str, &str, &str)],
+) -> Result<(), String> {
+    validate_v9_foreign_keys(connection, table, expected)
+        .map_err(|error| error.replace("v9", "v13"))
+}
+
+fn validate_v13_custom_index_set(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), String> {
+    validate_v10_custom_index_set(connection, table, expected)
+        .map_err(|error| error.replace("v10", "v13"))
+}
+
+fn validate_v13_index(
+    connection: &Connection,
+    index_name: &str,
+    unique: bool,
+    columns: &[&str],
+    partial: bool,
+) -> Result<(), String> {
+    validate_v7_index(connection, index_name, unique, columns, partial)
+        .map_err(|error| error.replace("v7", "v13"))
+}
+
 fn validate_v12_foreign_keys(
     connection: &Connection,
     table: &str,
@@ -11999,6 +12458,9 @@ fn validate_v12_triggers(connection: &Connection) -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("解析 v12 全库触发器失败：{error}"))?;
     for (name, table, sql) in triggers {
+        if name == "battle_wuhun_state_guard" {
+            continue;
+        }
         let declared = expected.iter().any(|(expected_name, expected_table)| {
             name == *expected_name && table == *expected_table
         });
@@ -13504,6 +13966,24 @@ mod tests {
         assert!(
             error.contains("v12"),
             "v12 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    fn assert_v13_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v13 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v13 迁移应成功");
+        let connection = store.open().expect("应打开 v13 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v13 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v13 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v13"),
+            "v13 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
         );
     }
 
@@ -16940,6 +17420,111 @@ mod tests {
             AFTER INSERT ON player_wuhun
             BEGIN
                 SELECT EXISTS(SELECT 1 FROM battle);
+            END;
+            "#,
+        );
+    }
+
+    #[test]
+    fn v13_wuhun_toggle_is_replay_safe_and_gates_battle() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        let initial = store
+            .player_status(&identity())
+            .expect("应读取初始武魂状态")
+            .expect("角色应存在");
+        assert_eq!(initial.wuhun_enabled, Some(true));
+        assert_eq!(initial.wuhun_stability, Some(100));
+
+        let closed = store
+            .set_wuhun_enabled_with_operation(
+                &identity(),
+                false,
+                &transfer_operation("关武魂", "wuhun-close"),
+            )
+            .expect("应关闭武魂");
+        assert!(!closed.replayed);
+        assert!(!closed.state.enabled);
+        let replay = store
+            .set_wuhun_enabled_with_operation(
+                &identity(),
+                false,
+                &transfer_operation("关武魂", "wuhun-close"),
+            )
+            .expect("相同关闭消息应重放");
+        assert!(replay.replayed);
+        assert!(!replay.state.enabled);
+        assert!(
+            store
+                .set_wuhun_enabled_with_operation(
+                    &identity(),
+                    true,
+                    &transfer_operation("开武魂", "wuhun-close"),
+                )
+                .expect_err("同消息改成开启必须冲突")
+                .contains("不同的武魂操作")
+        );
+
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "wuhun-battle-map"),
+            )
+            .expect("关闭武魂不应阻断移动");
+        assert!(
+            store
+                .challenge_soul_beast_with_operation(
+                    &identity(),
+                    "史莱姆",
+                    &transfer_operation("挑战", "wuhun-closed-challenge"),
+                )
+                .expect_err("关闭武魂不能挑战")
+                .contains("开武魂")
+        );
+        let opened = store
+            .set_wuhun_enabled_with_operation(
+                &identity(),
+                true,
+                &transfer_operation("开武魂", "wuhun-open"),
+            )
+            .expect("应重新开启武魂");
+        assert!(opened.state.enabled);
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "史莱姆",
+                &transfer_operation("挑战", "wuhun-open-challenge"),
+            )
+            .expect("开启武魂后应可挑战");
+        assert!(
+            store
+                .set_wuhun_enabled_with_operation(
+                    &identity(),
+                    false,
+                    &transfer_operation("关武魂", "wuhun-active-close"),
+                )
+                .expect_err("战斗中不能切换武魂")
+                .contains("战斗中")
+        );
+    }
+
+    #[test]
+    fn recorded_v13_with_damaged_schema_or_cross_table_trigger_fails_closed() {
+        for mutation in [
+            "DROP TABLE player_wuhun_state;",
+            "DROP INDEX player_wuhun_state_enabled;",
+            "DROP TRIGGER battle_wuhun_state_guard;",
+        ] {
+            assert_v13_damage_fails_closed(mutation);
+        }
+        assert_v13_damage_fails_closed(
+            r#"
+            DROP TRIGGER battle_wuhun_state_guard;
+            CREATE TRIGGER battle_wuhun_state_guard
+            AFTER INSERT ON battle
+            BEGIN
+                SELECT EXISTS(SELECT 1 FROM player_wuhun_state);
             END;
             "#,
         );

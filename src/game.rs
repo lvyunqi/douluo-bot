@@ -15,7 +15,7 @@ use crate::store::{
     DailyCheckinInput, DailyCheckinResult, GOLD_SOUL_COIN, IdentityKey, LegacyClaimActor,
     LegacyClaimResult, LegacyIdentityState, MapExit, MapRecord, MapTravelReceipt,
     OperationLogInput, PlayerStatus, QuestActionReceipt, QuestListEntry, SoulBeastPage, Store,
-    experience_progress,
+    WuhunToggleReceipt, experience_progress,
 };
 
 const MENU_PAGES: &[MenuPage] = &[
@@ -34,6 +34,14 @@ const MENU_PAGES: &[MenuPage] = &[
             MenuEntry {
                 command: "武魂觉醒",
                 description: "觉醒第一武魂",
+            },
+            MenuEntry {
+                command: "开武魂",
+                description: "开启当前武魂并进入战斗形态",
+            },
+            MenuEntry {
+                command: "关武魂",
+                description: "关闭当前武魂并退出战斗形态",
             },
             MenuEntry {
                 command: "状态",
@@ -355,6 +363,65 @@ impl GameService {
     }
 
     /// 按北京时间每日 04:00 划分游戏日，并由 Store 在单事务内发放奖励。
+    pub fn open_wuhun(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        self.toggle_wuhun(req, true)
+    }
+
+    pub fn close_wuhun(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        self.toggle_wuhun(req, false)
+    }
+
+    fn toggle_wuhun(&self, req: &CommandRequest, enabled: bool) -> Result<GameDocument, String> {
+        if !req.args.as_str().trim().is_empty() {
+            return Err(format!("用法：{}武魂", if enabled { "开" } else { "关" }));
+        }
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self
+            .store
+            .set_wuhun_enabled_with_operation(&key, enabled, &operation)?;
+        Ok(self.wuhun_toggle_document(receipt, enabled))
+    }
+
+    fn wuhun_toggle_document(&self, receipt: WuhunToggleReceipt, enabled: bool) -> GameDocument {
+        let mut document = GameDocument::new(if enabled {
+            "武魂开启"
+        } else {
+            "武魂关闭"
+        })
+        .field("武魂", receipt.state.name.clone())
+        .field(
+            "状态",
+            if receipt.state.enabled {
+                "开启"
+            } else {
+                "关闭"
+            },
+        )
+        .field(
+            "稳定度",
+            format!(
+                "{}/{}",
+                receipt.state.stability, receipt.state.max_stability
+            ),
+        )
+        .notice(if receipt.replayed {
+            "检测到相同消息的重复请求，已返回原武魂状态，未重复执行"
+        } else if enabled {
+            "武魂已进入战斗形态；稳定度消耗和技能效果将在后续战斗纵切接入"
+        } else {
+            "武魂已收回；关闭状态下不能发起魂兽挑战"
+        });
+        document = document.illustration_if(self.wuhun_illustration(&receipt.state.name));
+        if receipt.state.enabled {
+            document.command("关武魂").command("状态")
+        } else {
+            document.command("开武魂").command("状态")
+        }
+    }
+
     pub fn daily_checkin(&self, req: &CommandRequest) -> Result<GameDocument, String> {
         if !req.args.as_str().trim().is_empty() {
             return Err("用法：签到".to_string());
@@ -1626,7 +1693,7 @@ impl GameService {
             },
             None => "不可用".to_string(),
         };
-        GameDocument::new("角色状态")
+        let mut document = GameDocument::new("角色状态")
             .field("角色", player.name)
             .field("性别", player.gender)
             .field("境界", realm)
@@ -1640,8 +1707,16 @@ impl GameService {
             .field("武魂", wuhun)
             .field("位置", player.map_name)
             .field("转生", format!("第 {} 世", player.life_count))
-            .field("状态", player.state)
-            .illustration_if(illustration)
+            .field("状态", player.state);
+        if let Some(enabled) = player.wuhun_enabled {
+            document = document.field("武魂状态", if enabled { "开启" } else { "关闭" });
+            if let (Some(stability), Some(max_stability)) =
+                (player.wuhun_stability, player.wuhun_max_stability)
+            {
+                document = document.field("武魂稳定度", format!("{stability}/{max_stability}"));
+            }
+        }
+        document.illustration_if(illustration)
     }
 
     fn wuhun_illustration(&self, name: &str) -> Option<Illustration> {

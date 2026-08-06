@@ -401,7 +401,7 @@ try {
     # command explicitly before comparing Unicode command names.
     $commands = @($plugin.commands | ForEach-Object { [string]$_ })
     foreach ($command in @(
-        "斗罗系统", "开始穿越", "武魂觉醒", "签到", "钱包", "状态", "位置",
+        "斗罗系统", "开始穿越", "武魂觉醒", "开武魂", "关武魂", "签到", "钱包", "状态", "位置",
         "地图列表", "向", "传送", "掉落", "拾取", "NPC", "对话", "商店", "背包",
         "购买", "出售", "使用", "转账", "发送物品", "任务", "接取任务", "任务进度",
         "提交任务", "放弃任务", "魂兽", "挑战", "攻击", "逃跑", "战斗状态", "战斗日志"
@@ -416,6 +416,7 @@ try {
         @{ Message = "斗罗系统"; Contains = "欢迎来到斗罗大陆" },
         @{ Message = "开始穿越 协议冒烟 男"; Contains = "穿越成功" },
         @{ Message = "武魂觉醒"; Contains = "觉醒仪式完成" },
+        @{ Message = "状态"; Contains = "武魂稳定度" },
         @{ Message = "签到"; Contains = "签到成功" },
         @{ Message = "签到"; Contains = "今日已签到" },
         @{ Message = "钱包"; Contains = "金魂币" },
@@ -440,9 +441,17 @@ try {
         Assert-Condition ($result.Text.Contains($check.Contains)) "response for '$($check.Message)' did not contain '$($check.Contains)': $($result.ActionJson)"
     }
 
+    $closeWuhun = Invoke-OneBotCommand $endpoint "关武魂"
+    Write-Output ("onebot 关武魂: {0} [{1}]" -f $closeWuhun.ActionName, $closeWuhun.Text)
+    Assert-Condition ($closeWuhun.Text.Contains("武魂关闭")) "could not close wuhun"
     $toForest = Invoke-OneBotCommand $endpoint "传送 落日森林"
     Write-Output ("onebot 传送 落日森林: {0} [{1}]" -f $toForest.ActionName, $toForest.Text)
     Assert-Condition ($toForest.Text.Contains("落日森林")) "could not enter the battle map"
+    $blockedChallenge = Invoke-OneBotCommand $endpoint "挑战 史莱姆"
+    Assert-Condition ($blockedChallenge.Text.Contains("开武魂")) "closed wuhun did not block battle"
+    $openWuhun = Invoke-OneBotCommand $endpoint "开武魂"
+    Write-Output ("onebot 开武魂: {0} [{1}]" -f $openWuhun.ActionName, $openWuhun.Text)
+    Assert-Condition ($openWuhun.Text.Contains("武魂开启")) "could not reopen wuhun"
     $beasts = Invoke-OneBotCommand $endpoint "魂兽"
     Write-Output ("onebot 魂兽: {0} [{1}]" -f $beasts.ActionName, $beasts.Text)
     Assert-Condition ($beasts.Text.Contains("史莱姆")) "soul beast list did not expose slime"
@@ -509,7 +518,7 @@ try {
     Assert-Condition ($null -ne $reload.data.message) "dynamic reload did not return a result"
     $afterReload = Invoke-OneBotCommand $endpoint "钱包"
     Assert-Condition ($afterReload.Text.Contains("金魂币")) "command failed after dynamic reload"
-    Write-Output "protocol smoke passed: OneBot tasks/PVE/economy, private/group, synthetic QQ payload, descriptor, and reload"
+    Write-Output "protocol smoke passed: OneBot tasks/PVE/wuhun/economy, private/group, synthetic QQ payload, descriptor, and reload"
 } finally {
     if ($null -ne $process -and -not $process.HasExited) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
