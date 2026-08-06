@@ -428,6 +428,71 @@ mod plugin {
     }
 
     #[command(
+        name = "魂兽",
+        description = "查看当前地图可挑战的魂兽：魂兽 [页码]",
+        aliases = "魂兽列表,当前魂兽",
+        category = "斗罗大陆·战斗",
+        scope = "all"
+    )]
+    fn soul_beasts(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.soul_beasts(req))
+    }
+
+    #[command(
+        name = "挑战",
+        description = "挑战当前地图魂兽：挑战 <魂兽>",
+        aliases = "挑战魂兽",
+        category = "斗罗大陆·战斗",
+        scope = "all"
+    )]
+    fn challenge(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.challenge(req))
+    }
+
+    #[command(
+        name = "攻击",
+        description = "进行一次普通攻击并承受魂兽反击",
+        aliases = "打",
+        category = "斗罗大陆·战斗",
+        scope = "all"
+    )]
+    fn attack(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.attack(req))
+    }
+
+    #[command(
+        name = "逃跑",
+        description = "尝试结束当前魂兽战斗",
+        aliases = "撤退",
+        category = "斗罗大陆·战斗",
+        scope = "all"
+    )]
+    fn flee(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.flee(req))
+    }
+
+    #[command(
+        name = "战斗状态",
+        description = "查看当前战斗快照",
+        aliases = "战斗,查看战斗",
+        category = "斗罗大陆·战斗",
+        scope = "all"
+    )]
+    fn battle_status(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.battle_status(req))
+    }
+
+    #[command(
+        name = "战斗日志",
+        description = "查看最近战斗事件：战斗日志 [数量]",
+        category = "斗罗大陆·战斗",
+        scope = "all"
+    )]
+    fn battle_logs(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.battle_logs(req))
+    }
+
+    #[command(
         name = "旧档检查",
         description = "检查指定用户的旧版存档认领状态",
         category = "斗罗大陆·管理",

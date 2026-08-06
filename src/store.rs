@@ -1275,6 +1275,266 @@ BEGIN
 END;
 "#;
 
+// v12 恢复旧版史莱姆/哥布林 PVE 入口，但将进程内实时战斗改为
+// 可恢复的确定性回合快照。每次聊天动作、玩家生命、经验、掉落、
+// 操作日志和不可变战斗事件都在同一个 BEGIN IMMEDIATE 中提交。
+const MIGRATION_V12: &str = r#"
+CREATE TABLE soul_beast (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    beast_key TEXT NOT NULL UNIQUE CHECK(
+        length(beast_key) BETWEEN 1 AND 96
+        AND beast_key = trim(beast_key)
+        AND beast_key GLOB '[a-z0-9][a-z0-9._-]*'
+        AND beast_key NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    name TEXT NOT NULL UNIQUE CHECK(length(name) BETWEEN 1 AND 128),
+    description TEXT NOT NULL CHECK(length(description) <= 2000),
+    map_key TEXT NOT NULL REFERENCES map(map_key) ON DELETE RESTRICT,
+    age INTEGER NOT NULL CHECK(age BETWEEN 1 AND 999999),
+    level_required INTEGER NOT NULL CHECK(level_required BETWEEN 1 AND 120),
+    max_hp INTEGER NOT NULL CHECK(max_hp BETWEEN 1 AND 1000000000),
+    attack INTEGER NOT NULL CHECK(attack BETWEEN 1 AND 1000000000),
+    defense INTEGER NOT NULL CHECK(defense BETWEEN 0 AND 1000000000),
+    speed INTEGER NOT NULL CHECK(speed BETWEEN 0 AND 1000000000),
+    exp_reward INTEGER NOT NULL CHECK(exp_reward BETWEEN 1 AND 999999999),
+    drop_item_key TEXT NOT NULL REFERENCES item(item_key) ON DELETE RESTRICT,
+    drop_quantity INTEGER NOT NULL CHECK(drop_quantity BETWEEN 1 AND 99),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= created_at)
+) STRICT;
+
+CREATE INDEX soul_beast_map_page
+    ON soul_beast(map_key, enabled, level_required, id);
+
+CREATE TABLE battle (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    soul_beast_id INTEGER NOT NULL REFERENCES soul_beast(id) ON DELETE RESTRICT,
+    map_key TEXT NOT NULL REFERENCES map(map_key) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK(status IN ('active', 'won', 'escaped', 'defeated')),
+    player_level INTEGER NOT NULL CHECK(player_level BETWEEN 1 AND 120),
+    player_max_hp INTEGER NOT NULL CHECK(player_max_hp > 0),
+    player_hp INTEGER NOT NULL CHECK(player_hp BETWEEN 1 AND player_max_hp),
+    player_strength INTEGER NOT NULL CHECK(player_strength >= 0),
+    player_agility INTEGER NOT NULL CHECK(player_agility >= 0),
+    player_endurance INTEGER NOT NULL CHECK(player_endurance >= 0),
+    player_perception INTEGER NOT NULL CHECK(player_perception >= 0),
+    player_luck INTEGER NOT NULL CHECK(player_luck >= 0),
+    beast_max_hp INTEGER NOT NULL CHECK(beast_max_hp > 0),
+    beast_hp INTEGER NOT NULL CHECK(beast_hp BETWEEN 0 AND beast_max_hp),
+    beast_attack INTEGER NOT NULL CHECK(beast_attack > 0),
+    beast_defense INTEGER NOT NULL CHECK(beast_defense >= 0),
+    beast_speed INTEGER NOT NULL CHECK(beast_speed >= 0),
+    random_seed INTEGER NOT NULL CHECK(random_seed >= 0),
+    action_count INTEGER NOT NULL DEFAULT 0 CHECK(action_count >= 0),
+    exp_reward INTEGER NOT NULL CHECK(exp_reward > 0),
+    drop_item_key TEXT NOT NULL REFERENCES item(item_key) ON DELETE RESTRICT,
+    drop_quantity INTEGER NOT NULL CHECK(drop_quantity BETWEEN 1 AND 99),
+    started_at INTEGER NOT NULL CHECK(started_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= started_at),
+    ended_at INTEGER CHECK(ended_at IS NULL OR ended_at >= started_at),
+    CHECK((status = 'active' AND ended_at IS NULL AND beast_hp > 0)
+       OR (status = 'won' AND ended_at IS NOT NULL AND beast_hp = 0)
+       OR (status IN ('escaped', 'defeated') AND ended_at IS NOT NULL AND beast_hp > 0))
+) STRICT;
+
+CREATE UNIQUE INDEX battle_player_active
+    ON battle(player_id) WHERE status = 'active';
+CREATE INDEX battle_player_history
+    ON battle(player_id, id);
+CREATE INDEX battle_map_status_page
+    ON battle(map_key, status, id);
+
+CREATE TABLE battle_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    battle_id INTEGER NOT NULL REFERENCES battle(id) ON DELETE RESTRICT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    sequence INTEGER NOT NULL CHECK(sequence >= 0),
+    event_kind TEXT NOT NULL CHECK(event_kind IN ('challenge', 'attack', 'flee')),
+    status_after TEXT NOT NULL CHECK(status_after IN ('active', 'won', 'escaped', 'defeated')),
+    player_hp_before INTEGER NOT NULL CHECK(player_hp_before > 0),
+    player_hp_after INTEGER NOT NULL CHECK(player_hp_after > 0),
+    beast_hp_before INTEGER NOT NULL CHECK(beast_hp_before >= 0),
+    beast_hp_after INTEGER NOT NULL CHECK(beast_hp_after >= 0),
+    player_damage INTEGER NOT NULL CHECK(player_damage >= 0),
+    beast_damage INTEGER NOT NULL CHECK(beast_damage >= 0),
+    player_critical INTEGER NOT NULL CHECK(player_critical IN (0, 1)),
+    beast_critical INTEGER NOT NULL CHECK(beast_critical IN (0, 1)),
+    flee_success INTEGER CHECK(flee_success IS NULL OR flee_success IN (0, 1)),
+    experience_awarded INTEGER NOT NULL DEFAULT 0 CHECK(experience_awarded >= 0),
+    ground_drop_id INTEGER REFERENCES ground_drop(id) ON DELETE RESTRICT,
+    source_message_id TEXT NOT NULL CHECK(
+        length(source_message_id) <= 256
+        AND instr(source_message_id, char(0)) = 0
+        AND source_message_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    operation_log_id INTEGER NOT NULL REFERENCES operation_log(id) ON DELETE RESTRICT,
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    UNIQUE(battle_id, sequence),
+    CHECK(
+        (event_kind = 'challenge' AND sequence = 0 AND status_after = 'active'
+         AND player_hp_before = player_hp_after AND beast_hp_before = beast_hp_after
+         AND player_damage = 0 AND beast_damage = 0
+         AND player_critical = 0 AND beast_critical = 0 AND flee_success IS NULL
+         AND experience_awarded = 0 AND ground_drop_id IS NULL)
+        OR
+        (event_kind = 'attack' AND sequence > 0 AND flee_success IS NULL
+         AND player_damage > 0
+         AND ((status_after = 'won' AND beast_hp_after = 0
+               AND experience_awarded > 0 AND ground_drop_id IS NOT NULL)
+              OR (status_after IN ('active', 'defeated') AND beast_hp_after > 0
+                  AND experience_awarded = 0 AND ground_drop_id IS NULL)))
+        OR
+        (event_kind = 'flee' AND sequence > 0 AND player_damage = 0
+         AND player_critical = 0 AND experience_awarded = 0 AND ground_drop_id IS NULL
+         AND ((flee_success = 1 AND status_after = 'escaped' AND beast_damage = 0
+               AND player_hp_before = player_hp_after AND beast_hp_before = beast_hp_after)
+              OR (flee_success = 0 AND status_after IN ('active', 'defeated')
+                  AND beast_damage > 0 AND beast_hp_before = beast_hp_after)))
+    )
+) STRICT;
+
+CREATE UNIQUE INDEX battle_event_operation
+    ON battle_event(operation_log_id);
+CREATE UNIQUE INDEX battle_event_player_message
+    ON battle_event(player_id, source_message_id) WHERE length(source_message_id) > 0;
+CREATE INDEX battle_event_battle_page
+    ON battle_event(battle_id, sequence, id);
+
+INSERT INTO soul_beast(
+    beast_key, name, description, map_key, age, level_required, max_hp,
+    attack, defense, speed, exp_reward, drop_item_key, drop_quantity,
+    enabled, created_at, updated_at
+) VALUES
+    ('slime', '史莱姆', '十年魂兽，行动迟缓，适合初次实战。', 'sunset-forest', 10, 1, 20, 3, 1, 8, 25, 'small-healing-potion', 1, 1, 0, 0),
+    ('goblin', '哥布林', '四百五十年魂兽，会利用武器进行连续突袭。', 'sunset-forest', 450, 3, 70, 12, 8, 18, 90, 'soul-power-potion', 1, 1, 0, 0);
+
+CREATE TRIGGER soul_beast_no_update
+BEFORE UPDATE ON soul_beast
+BEGIN
+    SELECT RAISE(ABORT, 'soul beast catalog is immutable');
+END;
+CREATE TRIGGER soul_beast_no_delete
+BEFORE DELETE ON soul_beast
+BEGIN
+    SELECT RAISE(ABORT, 'soul beast catalog is immutable');
+END;
+CREATE TRIGGER soul_beast_no_reinsert
+BEFORE INSERT ON soul_beast
+WHEN EXISTS(SELECT 1 FROM soul_beast WHERE beast_key = NEW.beast_key OR name = NEW.name)
+BEGIN
+    SELECT RAISE(ABORT, 'soul beast catalog is immutable');
+END;
+
+CREATE TRIGGER battle_scope_guard
+BEFORE INSERT ON battle
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM player p
+      JOIN player_map pm ON pm.player_id = p.id
+      JOIN map m ON m.map_key = pm.map_key
+      JOIN soul_beast sb ON sb.id = NEW.soul_beast_id
+     WHERE p.id = NEW.player_id
+       AND p.state = 'alive' AND p.hp > 0
+       AND EXISTS(SELECT 1 FROM player_wuhun pw WHERE pw.player_id = p.id)
+       AND p.level >= sb.level_required AND sb.enabled = 1
+       AND m.safe = 0 AND pm.map_key = sb.map_key AND pm.map_key = NEW.map_key
+       AND NEW.status = 'active' AND NEW.action_count = 0
+       AND NEW.player_level = p.level AND NEW.player_max_hp = p.max_hp AND NEW.player_hp = p.hp
+       AND NEW.player_strength = p.strength AND NEW.player_agility = p.agility
+       AND NEW.player_endurance = p.endurance AND NEW.player_perception = p.perception
+       AND NEW.player_luck = p.luck
+       AND NEW.beast_max_hp = sb.max_hp AND NEW.beast_hp = sb.max_hp
+       AND NEW.beast_attack = sb.attack AND NEW.beast_defense = sb.defense
+       AND NEW.beast_speed = sb.speed AND NEW.exp_reward = sb.exp_reward
+       AND NEW.drop_item_key = sb.drop_item_key AND NEW.drop_quantity = sb.drop_quantity
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle scope or snapshot mismatch');
+END;
+
+CREATE TRIGGER battle_transition_guard
+BEFORE UPDATE ON battle
+WHEN OLD.status <> 'active'
+  OR NEW.player_id <> OLD.player_id OR NEW.soul_beast_id <> OLD.soul_beast_id
+  OR NEW.map_key <> OLD.map_key OR NEW.player_level <> OLD.player_level
+  OR NEW.player_max_hp <> OLD.player_max_hp OR NEW.player_strength <> OLD.player_strength
+  OR NEW.player_agility <> OLD.player_agility OR NEW.player_endurance <> OLD.player_endurance
+  OR NEW.player_perception <> OLD.player_perception OR NEW.player_luck <> OLD.player_luck
+  OR NEW.beast_max_hp <> OLD.beast_max_hp OR NEW.beast_attack <> OLD.beast_attack
+  OR NEW.beast_defense <> OLD.beast_defense OR NEW.beast_speed <> OLD.beast_speed
+  OR NEW.random_seed <> OLD.random_seed OR NEW.exp_reward <> OLD.exp_reward
+  OR NEW.drop_item_key <> OLD.drop_item_key OR NEW.drop_quantity <> OLD.drop_quantity
+  OR NEW.started_at <> OLD.started_at OR NEW.action_count <> OLD.action_count + 1
+  OR NEW.updated_at < OLD.updated_at
+  OR NEW.status NOT IN ('active', 'won', 'escaped', 'defeated')
+BEGIN
+    SELECT RAISE(ABORT, 'invalid battle transition');
+END;
+
+CREATE TRIGGER battle_no_delete
+BEFORE DELETE ON battle
+BEGIN
+    SELECT RAISE(ABORT, 'battle history is immutable');
+END;
+
+CREATE TRIGGER battle_event_no_update
+BEFORE UPDATE ON battle_event
+BEGIN
+    SELECT RAISE(ABORT, 'battle event is immutable');
+END;
+CREATE TRIGGER battle_event_no_delete
+BEFORE DELETE ON battle_event
+BEGIN
+    SELECT RAISE(ABORT, 'battle event is immutable');
+END;
+CREATE TRIGGER battle_event_no_reinsert
+BEFORE INSERT ON battle_event
+WHEN EXISTS(SELECT 1 FROM battle_event WHERE operation_log_id = NEW.operation_log_id)
+  OR (length(NEW.source_message_id) > 0 AND EXISTS(
+      SELECT 1 FROM battle_event
+       WHERE player_id = NEW.player_id AND source_message_id = NEW.source_message_id
+  ))
+BEGIN
+    SELECT RAISE(ABORT, 'battle event is immutable');
+END;
+
+CREATE TRIGGER battle_event_scope_guard
+BEFORE INSERT ON battle_event
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM battle b
+      JOIN player p ON p.id = b.player_id
+      JOIN identity i ON i.id = p.identity_id
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE b.id = NEW.battle_id AND b.player_id = NEW.player_id
+       AND b.action_count = NEW.sequence AND b.status = NEW.status_after
+       AND b.player_hp = NEW.player_hp_after AND b.beast_hp = NEW.beast_hp_after
+       AND i.protocol = audit.protocol AND i.account_id = audit.account_id
+       AND i.namespace = audit.namespace AND i.subject_kind = audit.subject_kind
+       AND i.subject_id = audit.subject_id
+       AND audit.command = CASE NEW.event_kind
+           WHEN 'challenge' THEN '挑战'
+           WHEN 'attack' THEN '攻击'
+           WHEN 'flee' THEN '逃跑'
+       END
+       AND audit.outcome = 'ok' AND audit.source_message_id = NEW.source_message_id
+       AND (NEW.ground_drop_id IS NULL OR EXISTS(
+           SELECT 1 FROM ground_drop d
+            WHERE d.id = NEW.ground_drop_id AND d.map_key = b.map_key
+              AND d.item_key = b.drop_item_key AND d.quantity = b.drop_quantity
+              AND d.owner_identity_id = i.id AND d.owner_subject_id = i.subject_id
+              AND d.source_kind = 'battle' AND d.source_event_id = 'battle:' || b.id
+       ))
+       AND ((b.status = 'won' AND NEW.experience_awarded = b.exp_reward)
+            OR (b.status <> 'won' AND NEW.experience_awarded = 0))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle event scope, reward, or audit mismatch');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -1596,6 +1856,86 @@ pub struct QuestActionReceipt {
     pub experience: Option<ExperienceGrantReceipt>,
     pub currency_balance_after: Option<i64>,
     pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SoulBeastRecord {
+    pub id: i64,
+    pub beast_key: String,
+    pub name: String,
+    pub description: String,
+    pub map_key: String,
+    pub map_name: String,
+    pub age: i64,
+    pub level_required: i64,
+    pub max_hp: i64,
+    pub attack: i64,
+    pub defense: i64,
+    pub speed: i64,
+    pub exp_reward: i64,
+    pub drop_item: ItemRecord,
+    pub drop_quantity: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SoulBeastPage {
+    pub entries: Vec<SoulBeastRecord>,
+    pub map_name: String,
+    pub page: usize,
+    pub page_count: usize,
+    pub total: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BattleSnapshot {
+    pub id: i64,
+    pub player_name: String,
+    pub beast: SoulBeastRecord,
+    pub status: String,
+    pub player_hp: i64,
+    pub player_max_hp: i64,
+    pub beast_hp: i64,
+    pub beast_max_hp: i64,
+    pub action_count: i64,
+    pub started_at: i64,
+    pub updated_at: i64,
+    pub ended_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BattleEventRecord {
+    pub id: i64,
+    pub battle_id: i64,
+    pub sequence: i64,
+    pub event_kind: String,
+    pub status_after: String,
+    pub player_hp_before: i64,
+    pub player_hp_after: i64,
+    pub beast_hp_before: i64,
+    pub beast_hp_after: i64,
+    pub player_damage: i64,
+    pub beast_damage: i64,
+    pub player_critical: bool,
+    pub beast_critical: bool,
+    pub flee_success: Option<bool>,
+    pub experience_awarded: i64,
+    pub ground_drop_id: Option<i64>,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BattleActionReceipt {
+    pub battle: BattleSnapshot,
+    pub event: BattleEventRecord,
+    pub experience: Option<ExperienceGrantReceipt>,
+    pub ground_drop: Option<GroundDropRecord>,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BattleLog {
+    pub battle: BattleSnapshot,
+    pub events: Vec<BattleEventRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2007,7 +2347,19 @@ impl Store {
         };
         let mut connection = store.open()?;
         store.ensure_wal_mode(&connection)?;
-        store.migrate(&mut connection)?;
+        let migration_deadline = Instant::now() + store.busy_timeout.max(Duration::from_secs(30));
+        loop {
+            match store.migrate(&mut connection) {
+                Ok(()) => break,
+                Err(error)
+                    if error.contains("database is locked")
+                        && Instant::now() < migration_deadline =>
+                {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Ok(store)
     }
 
@@ -2064,7 +2416,7 @@ impl Store {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
-                    format!("开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10 失败：{error}")
+                    format!("开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12 失败：{error}")
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
             if !migration_applied(&transaction, 2)? {
@@ -2240,9 +2592,24 @@ impl Store {
                 validate_v11_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 12)? {
+                transaction
+                    .execute_batch(MIGRATION_V12)
+                    .map_err(|error| format!("执行数据库迁移 v12 失败：{error}"))?;
+                validate_v12_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(12, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v12 失败：{error}"))?;
+            } else {
+                validate_v12_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
-                format!("提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10 失败：{error}")
+                format!("提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12 失败：{error}")
             })?;
             Ok(())
         })();
@@ -2260,6 +2627,7 @@ impl Store {
                 validate_v9_schema(connection)?;
                 validate_v10_schema(connection)?;
                 validate_v11_schema(connection)?;
+                validate_v12_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -2523,6 +2891,7 @@ impl Store {
             .map_err(|error| format!("开始移动事务失败：{error}"))?;
         ensure_no_legacy_identity(&transaction, key)?;
         let (player_id, level, from) = load_player_map_for_identity(&transaction, key)?;
+        ensure_no_active_battle_for_player(&transaction, player_id)?;
         let (to, edge_level) = transaction
             .query_row(
                 r#"
@@ -2589,6 +2958,7 @@ impl Store {
             .map_err(|error| format!("开始传送事务失败：{error}"))?;
         ensure_no_legacy_identity(&transaction, key)?;
         let (player_id, level, from) = load_player_map_for_identity(&transaction, key)?;
+        ensure_no_active_battle_for_player(&transaction, player_id)?;
         if !from.teleport_enabled {
             return Err("当前地图没有传送阵，无法传送".to_string());
         }
@@ -3958,6 +4328,550 @@ impl Store {
         })
     }
 
+    pub fn soul_beasts_page(
+        &self,
+        key: &IdentityKey<'_>,
+        page: usize,
+        limit: usize,
+    ) -> Result<SoulBeastPage, String> {
+        validate_identity_key(key)?;
+        validate_catalog_page(page, limit, "魂兽")?;
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let player = load_battle_player(&connection, key)?;
+        let total = connection
+            .query_row(
+                "SELECT COUNT(*) FROM soul_beast WHERE map_key = ?1 AND enabled = 1 AND level_required <= ?2",
+                params![player.map_key, player.level],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("统计当前地图魂兽失败：{error}"))?;
+        let total = usize::try_from(total).map_err(|_| "魂兽数量超出分页范围".to_string())?;
+        let page_count = total.div_ceil(limit).max(1);
+        if page > page_count {
+            return Err(format!("魂兽页码必须在 1 到 {page_count} 之间"));
+        }
+        let offset = page
+            .checked_sub(1)
+            .and_then(|value| value.checked_mul(limit))
+            .ok_or_else(|| "魂兽分页偏移量溢出".to_string())?;
+        let entries = query_soul_beasts(
+            &connection,
+            Some(&player.map_key),
+            Some(player.level),
+            i64::try_from(limit).map_err(|_| "魂兽分页数量无法转换".to_string())?,
+            i64::try_from(offset).map_err(|_| "魂兽分页偏移量无法转换".to_string())?,
+        )?;
+        Ok(SoulBeastPage {
+            entries,
+            map_name: player.map_name,
+            page,
+            page_count,
+            total,
+        })
+    }
+
+    pub fn active_battle(&self, key: &IdentityKey<'_>) -> Result<Option<BattleSnapshot>, String> {
+        validate_identity_key(key)?;
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let player = load_battle_player(&connection, key)?;
+        let Some(state) = load_active_battle_state(&connection, player.player_id)? else {
+            return Ok(None);
+        };
+        load_battle_snapshot(&connection, state.id)
+    }
+
+    pub fn battle_log(
+        &self,
+        key: &IdentityKey<'_>,
+        limit: usize,
+    ) -> Result<Option<BattleLog>, String> {
+        validate_identity_key(key)?;
+        if !(1..=100).contains(&limit) {
+            return Err("战斗日志数量必须在 1 到 100 之间".to_string());
+        }
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let player = load_battle_player(&connection, key)?;
+        let Some(battle_id) = connection
+            .query_row(
+                "SELECT id FROM battle WHERE player_id = ?1 ORDER BY id DESC LIMIT 1",
+                [player.player_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("读取最近战斗失败：{error}"))?
+        else {
+            return Ok(None);
+        };
+        let battle = load_battle_snapshot(&connection, battle_id)?
+            .ok_or_else(|| "战斗记录不存在".to_string())?;
+        let events = load_battle_events(&connection, battle_id, limit)?;
+        Ok(Some(BattleLog { battle, events }))
+    }
+
+    pub fn challenge_soul_beast_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        requested_name_or_key: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<BattleActionReceipt, String> {
+        validate_identity_key(key)?;
+        validate_battle_operation(operation, "挑战")?;
+        validate_catalog_lookup(requested_name_or_key, "魂兽名称")?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始挑战魂兽事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let player = load_battle_player(&transaction, key)?;
+        if !player.awakened {
+            return Err("角色尚未完成武魂觉醒，不能挑战魂兽".to_string());
+        }
+        if player.state != "alive" || player.hp <= 0 {
+            return Err("当前角色状态不能挑战魂兽".to_string());
+        }
+        if let Some(existing) = load_battle_event_by_message(
+            &transaction,
+            player.player_id,
+            operation.source_message_id,
+        )? {
+            let battle = load_battle_snapshot(&transaction, existing.battle_id)?
+                .ok_or_else(|| "原战斗记录不存在".to_string())?;
+            if existing.event_kind != "challenge"
+                || (requested_name_or_key != battle.beast.beast_key
+                    && requested_name_or_key != battle.beast.name)
+            {
+                return Err("该消息 ID 已用于不同的战斗操作，拒绝重放".to_string());
+            }
+            let drop = existing
+                .ground_drop_id
+                .map(|id| load_ground_drop_by_id(&transaction, id))
+                .transpose()?
+                .flatten();
+            transaction
+                .commit()
+                .map_err(|error| format!("提交挑战魂兽重放事务失败：{error}"))?;
+            return Ok(BattleActionReceipt {
+                battle,
+                event: existing,
+                experience: None,
+                ground_drop: drop,
+                replayed: true,
+            });
+        }
+        if load_active_battle_state(&transaction, player.player_id)?.is_some() {
+            return Err("你正在战斗中，请先使用“攻击”或“逃跑”结束当前战斗".to_string());
+        }
+        let beast = load_soul_beast_by_name_or_key(
+            &transaction,
+            requested_name_or_key,
+            &player.map_key,
+            player.level,
+        )?;
+        let timestamp = now_timestamp()?;
+        let random_seed = battle_seed(timestamp, player.player_id, beast.id);
+        transaction
+            .execute(
+                r#"
+                INSERT INTO battle(
+                    player_id, soul_beast_id, map_key, status, player_level,
+                    player_max_hp, player_hp, player_strength, player_agility,
+                    player_endurance, player_perception, player_luck,
+                    beast_max_hp, beast_hp, beast_attack, beast_defense, beast_speed,
+                    random_seed, action_count, exp_reward, drop_item_key,
+                    drop_quantity, started_at, updated_at, ended_at
+                ) VALUES(
+                    ?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                    ?12, ?12, ?13, ?14, ?15, ?16, 0, ?17, ?18, ?19, ?20, ?20, NULL
+                )
+                "#,
+                params![
+                    player.player_id,
+                    beast.id,
+                    player.map_key,
+                    player.level,
+                    player.max_hp,
+                    player.hp,
+                    player.strength,
+                    player.agility,
+                    player.endurance,
+                    player.perception,
+                    player.luck,
+                    beast.max_hp,
+                    beast.attack,
+                    beast.defense,
+                    beast.speed,
+                    random_seed,
+                    beast.exp_reward,
+                    beast.drop_item.item_key,
+                    beast.drop_quantity,
+                    timestamp
+                ],
+            )
+            .map_err(|error| format!("创建战斗快照失败：{error}"))?;
+        let battle_id = transaction.last_insert_rowid();
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        insert_battle_event(
+            &transaction,
+            BattleEventInsert {
+                battle_id,
+                player_id: player.player_id,
+                sequence: 0,
+                event_kind: "challenge",
+                status_after: "active",
+                player_hp_before: player.hp,
+                player_hp_after: player.hp,
+                beast_hp_before: beast.max_hp,
+                beast_hp_after: beast.max_hp,
+                player_damage: 0,
+                beast_damage: 0,
+                player_critical: false,
+                beast_critical: false,
+                flee_success: None,
+                experience_awarded: 0,
+                ground_drop_id: None,
+                source_message_id: operation.source_message_id,
+                operation_log_id,
+                created_at: timestamp,
+            },
+        )?;
+        let event_id = transaction.last_insert_rowid();
+        let battle = load_battle_snapshot(&transaction, battle_id)?
+            .ok_or_else(|| "创建战斗后无法读取快照".to_string())?;
+        let event = load_battle_event_by_id(&transaction, event_id)?
+            .ok_or_else(|| "创建战斗后无法读取事件".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交挑战魂兽事务失败：{error}"))?;
+        Ok(BattleActionReceipt {
+            battle,
+            event,
+            experience: None,
+            ground_drop: None,
+            replayed: false,
+        })
+    }
+
+    pub fn attack_battle_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<BattleActionReceipt, String> {
+        self.resolve_battle_action(key, operation, "攻击")
+    }
+
+    pub fn flee_battle_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<BattleActionReceipt, String> {
+        self.resolve_battle_action(key, operation, "逃跑")
+    }
+
+    fn resolve_battle_action(
+        &self,
+        key: &IdentityKey<'_>,
+        operation: &OperationLogInput<'_>,
+        action: &str,
+    ) -> Result<BattleActionReceipt, String> {
+        validate_identity_key(key)?;
+        validate_battle_operation(operation, action)?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始{action}事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let player = load_battle_player(&transaction, key)?;
+        if let Some(existing) = load_battle_event_by_message(
+            &transaction,
+            player.player_id,
+            operation.source_message_id,
+        )? {
+            if existing.event_kind != action_event_kind(action) {
+                return Err("该消息 ID 已用于不同的战斗操作，拒绝重放".to_string());
+            }
+            let battle = load_battle_snapshot(&transaction, existing.battle_id)?
+                .ok_or_else(|| "原战斗记录不存在".to_string())?;
+            let drop = existing
+                .ground_drop_id
+                .map(|id| load_ground_drop_by_id(&transaction, id))
+                .transpose()?
+                .flatten();
+            transaction
+                .commit()
+                .map_err(|error| format!("提交{action}重放事务失败：{error}"))?;
+            return Ok(BattleActionReceipt {
+                battle,
+                event: existing,
+                experience: None,
+                ground_drop: drop,
+                replayed: true,
+            });
+        }
+        let state = load_active_battle_state(&transaction, player.player_id)?
+            .ok_or_else(|| "你当前不在战斗中，请先使用“挑战 <魂兽>”".to_string())?;
+        if player.state != "alive" || player.hp != state.player_hp {
+            return Err("角色生命状态与战斗快照不一致，战斗已暂停，请联系管理员".to_string());
+        }
+        let sequence = state
+            .action_count
+            .checked_add(1)
+            .ok_or_else(|| "战斗行动次数溢出".to_string())?;
+        let timestamp = now_timestamp()?;
+        let event_kind = action_event_kind(action);
+        let (
+            status_after,
+            player_hp_after,
+            beast_hp_after,
+            player_damage,
+            beast_damage,
+            player_critical,
+            beast_critical,
+            flee_success,
+            experience_awarded,
+            ground_drop_id,
+            experience,
+        ) = if action == "攻击" {
+            let player_roll = battle_roll(state.random_seed, sequence, 0);
+            let player_critical = battle_is_critical(
+                state.player_perception,
+                state.player_luck,
+                battle_roll(state.random_seed, sequence, 1),
+            );
+            let mut player_damage = battle_damage(
+                state
+                    .player_strength
+                    .checked_mul(2)
+                    .ok_or_else(|| "玩家攻击力计算溢出".to_string())?,
+                state.beast_defense,
+                state.player_level,
+                player_roll,
+            )?;
+            if player_critical {
+                player_damage = battle_critical_damage(player_damage, state.player_luck)?;
+            }
+            let beast_hp_after = state.beast_hp.saturating_sub(player_damage).max(0);
+            if beast_hp_after == 0 {
+                let exp = apply_experience_in_transaction(
+                    &transaction,
+                    state.player_id,
+                    state.player_level,
+                    transaction
+                        .query_row(
+                            "SELECT exp FROM player WHERE id = ?1",
+                            [state.player_id],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(|error| format!("读取战斗经验状态失败：{error}"))?,
+                    state.exp_reward,
+                    timestamp,
+                )?;
+                transaction
+                    .execute(
+                        "UPDATE player SET hp = ?1, updated_at = ?2 WHERE id = ?3",
+                        params![state.player_hp, timestamp, state.player_id],
+                    )
+                    .map_err(|error| format!("保存战斗胜利生命失败：{error}"))?;
+                let expires_at = timestamp
+                    .checked_add(3_600)
+                    .ok_or_else(|| "战斗掉落过期时间溢出".to_string())?;
+                transaction
+                    .execute(
+                        r#"INSERT INTO ground_drop(
+                            map_key, item_key, quantity, owner_identity_id, owner_subject_id,
+                            source_kind, source_event_id, expires_at, created_at
+                        ) VALUES(?1, ?2, ?3, ?4, ?5, 'battle', ?6, ?7, ?8)"#,
+                        params![
+                            state.map_key,
+                            state.drop_item_key,
+                            state.drop_quantity,
+                            player.identity_id,
+                            player.subject_id,
+                            format!("battle:{}", state.id),
+                            expires_at,
+                            timestamp
+                        ],
+                    )
+                    .map_err(|error| format!("写入战斗掉落失败：{error}"))?;
+                let drop_id = transaction.last_insert_rowid();
+                transaction
+                    .execute(
+                        "UPDATE battle SET status = 'won', player_hp = ?1, beast_hp = 0, action_count = ?2, updated_at = ?3, ended_at = ?3 WHERE id = ?4",
+                        params![state.player_hp, sequence, timestamp, state.id],
+                    )
+                    .map_err(|error| format!("保存战斗胜利状态失败：{error}"))?;
+                (
+                    "won",
+                    state.player_hp,
+                    0,
+                    player_damage,
+                    0,
+                    player_critical,
+                    false,
+                    None,
+                    state.exp_reward,
+                    Some(drop_id),
+                    Some(exp),
+                )
+            } else {
+                let beast_critical =
+                    battle_is_critical(10, 10, battle_roll(state.random_seed, sequence, 3));
+                let mut beast_damage = battle_damage(
+                    state.beast_attack,
+                    state.player_endurance,
+                    state.player_level,
+                    battle_roll(state.random_seed, sequence, 2),
+                )?;
+                if beast_critical {
+                    beast_damage = battle_critical_damage(beast_damage, 10)?;
+                }
+                let player_hp_after = state.player_hp.saturating_sub(beast_damage).max(1);
+                let status = if player_hp_after == 1 && beast_damage >= state.player_hp {
+                    "defeated"
+                } else {
+                    "active"
+                };
+                transaction
+                    .execute(
+                        "UPDATE player SET hp = ?1, updated_at = ?2 WHERE id = ?3",
+                        params![player_hp_after, timestamp, state.player_id],
+                    )
+                    .map_err(|error| format!("保存战斗生命失败：{error}"))?;
+                transaction
+                    .execute(
+                        "UPDATE battle SET status = ?1, player_hp = ?2, beast_hp = ?3, action_count = ?4, updated_at = ?5, ended_at = CASE WHEN ?1 = 'active' THEN NULL ELSE ?5 END WHERE id = ?6",
+                        params![status, player_hp_after, beast_hp_after, sequence, timestamp, state.id],
+                    )
+                    .map_err(|error| format!("保存战斗回合状态失败：{error}"))?;
+                (
+                    status,
+                    player_hp_after,
+                    beast_hp_after,
+                    player_damage,
+                    beast_damage,
+                    player_critical,
+                    beast_critical,
+                    None,
+                    0,
+                    None,
+                    None,
+                )
+            }
+        } else {
+            let flee_success = battle_roll(state.random_seed, sequence, 4) % 100 < 50;
+            if flee_success {
+                transaction
+                    .execute(
+                        "UPDATE battle SET status = 'escaped', action_count = ?1, updated_at = ?2, ended_at = ?2 WHERE id = ?3",
+                        params![sequence, timestamp, state.id],
+                    )
+                    .map_err(|error| format!("保存逃跑状态失败：{error}"))?;
+                (
+                    "escaped",
+                    state.player_hp,
+                    state.beast_hp,
+                    0,
+                    0,
+                    false,
+                    false,
+                    Some(true),
+                    0,
+                    None,
+                    None,
+                )
+            } else {
+                let beast_critical =
+                    battle_is_critical(10, 10, battle_roll(state.random_seed, sequence, 6));
+                let mut beast_damage = battle_damage(
+                    state.beast_attack,
+                    state.player_endurance,
+                    state.player_level,
+                    battle_roll(state.random_seed, sequence, 5),
+                )?;
+                if beast_critical {
+                    beast_damage = battle_critical_damage(beast_damage, 10)?;
+                }
+                let player_hp_after = state.player_hp.saturating_sub(beast_damage).max(1);
+                let status = if player_hp_after == 1 && beast_damage >= state.player_hp {
+                    "defeated"
+                } else {
+                    "active"
+                };
+                transaction
+                    .execute(
+                        "UPDATE player SET hp = ?1, updated_at = ?2 WHERE id = ?3",
+                        params![player_hp_after, timestamp, state.player_id],
+                    )
+                    .map_err(|error| format!("保存逃跑失败生命状态失败：{error}"))?;
+                transaction
+                    .execute(
+                        "UPDATE battle SET status = ?1, player_hp = ?2, action_count = ?3, updated_at = ?4, ended_at = CASE WHEN ?1 = 'active' THEN NULL ELSE ?4 END WHERE id = ?5",
+                        params![status, player_hp_after, sequence, timestamp, state.id],
+                    )
+                    .map_err(|error| format!("保存逃跑反击状态失败：{error}"))?;
+                (
+                    status,
+                    player_hp_after,
+                    state.beast_hp,
+                    0,
+                    beast_damage,
+                    false,
+                    beast_critical,
+                    Some(false),
+                    0,
+                    None,
+                    None,
+                )
+            }
+        };
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        insert_battle_event(
+            &transaction,
+            BattleEventInsert {
+                battle_id: state.id,
+                player_id: state.player_id,
+                sequence,
+                event_kind,
+                status_after,
+                player_hp_before: state.player_hp,
+                player_hp_after,
+                beast_hp_before: state.beast_hp,
+                beast_hp_after,
+                player_damage,
+                beast_damage,
+                player_critical,
+                beast_critical,
+                flee_success,
+                experience_awarded,
+                ground_drop_id,
+                source_message_id: operation.source_message_id,
+                operation_log_id,
+                created_at: timestamp,
+            },
+        )?;
+        let event_id = transaction.last_insert_rowid();
+        let battle = load_battle_snapshot(&transaction, state.id)?
+            .ok_or_else(|| "战斗结算后无法读取快照".to_string())?;
+        let event = load_battle_event_by_id(&transaction, event_id)?
+            .ok_or_else(|| "战斗结算后无法读取事件".to_string())?;
+        let ground_drop = ground_drop_id
+            .map(|id| load_ground_drop_by_id(&transaction, id))
+            .transpose()?
+            .flatten();
+        transaction
+            .commit()
+            .map_err(|error| format!("提交{action}事务失败：{error}"))?;
+        Ok(BattleActionReceipt {
+            battle,
+            event,
+            experience,
+            ground_drop,
+            replayed: false,
+        })
+    }
+
     pub fn buy_item_with_operation(
         &self,
         key: &IdentityKey<'_>,
@@ -4272,6 +5186,7 @@ impl Store {
                 .optional()
                 .map_err(|error| format!("读取使用物品角色失败：{error}"))?
                 .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())?;
+        ensure_no_active_battle_for_player(&transaction, player_id)?;
         if state_before == "deleted" {
             return Err("角色已封存，不能使用物品".to_string());
         }
@@ -5747,6 +6662,79 @@ struct PlayerQuestActionRecord {
     action_kind: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BattlePlayerSnapshot {
+    identity_id: i64,
+    player_id: i64,
+    subject_id: String,
+    name: String,
+    state: String,
+    level: i64,
+    hp: i64,
+    max_hp: i64,
+    strength: i64,
+    agility: i64,
+    endurance: i64,
+    perception: i64,
+    luck: i64,
+    map_key: String,
+    map_name: String,
+    awakened: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BattleState {
+    id: i64,
+    player_id: i64,
+    soul_beast_id: i64,
+    map_key: String,
+    status: String,
+    player_level: i64,
+    player_max_hp: i64,
+    player_hp: i64,
+    player_strength: i64,
+    player_agility: i64,
+    player_endurance: i64,
+    player_perception: i64,
+    player_luck: i64,
+    beast_max_hp: i64,
+    beast_hp: i64,
+    beast_attack: i64,
+    beast_defense: i64,
+    beast_speed: i64,
+    random_seed: i64,
+    action_count: i64,
+    exp_reward: i64,
+    drop_item_key: String,
+    drop_quantity: i64,
+    started_at: i64,
+    updated_at: i64,
+    ended_at: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BattleEventInsert<'a> {
+    battle_id: i64,
+    player_id: i64,
+    sequence: i64,
+    event_kind: &'a str,
+    status_after: &'a str,
+    player_hp_before: i64,
+    player_hp_after: i64,
+    beast_hp_before: i64,
+    beast_hp_after: i64,
+    player_damage: i64,
+    beast_damage: i64,
+    player_critical: bool,
+    beast_critical: bool,
+    flee_success: Option<bool>,
+    experience_awarded: i64,
+    ground_drop_id: Option<i64>,
+    source_message_id: &'a str,
+    operation_log_id: i64,
+    created_at: i64,
+}
+
 fn quest_record_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<QuestRecord> {
     Ok(QuestRecord {
         id: row.get(offset)?,
@@ -6204,6 +7192,483 @@ fn item_record_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Res
         usable: row.get(offset + 14)?,
         description: row.get(offset + 15)?,
     })
+}
+
+fn soul_beast_record_from_row(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<SoulBeastRecord> {
+    Ok(SoulBeastRecord {
+        id: row.get(offset)?,
+        beast_key: row.get(offset + 1)?,
+        name: row.get(offset + 2)?,
+        description: row.get(offset + 3)?,
+        map_key: row.get(offset + 4)?,
+        map_name: row.get(offset + 5)?,
+        age: row.get(offset + 6)?,
+        level_required: row.get(offset + 7)?,
+        max_hp: row.get(offset + 8)?,
+        attack: row.get(offset + 9)?,
+        defense: row.get(offset + 10)?,
+        speed: row.get(offset + 11)?,
+        exp_reward: row.get(offset + 12)?,
+        drop_quantity: row.get(offset + 13)?,
+        drop_item: item_record_from_row(row, offset + 14)?,
+    })
+}
+
+fn load_battle_player(
+    connection: &Connection,
+    key: &IdentityKey<'_>,
+) -> Result<BattlePlayerSnapshot, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT i.id, p.id, i.subject_id, p.name, p.state, p.level, p.hp,
+                   p.max_hp, p.strength, p.agility, p.endurance, p.perception, p.luck,
+                   pm.map_key, m.name,
+                   EXISTS(SELECT 1 FROM player_wuhun pw WHERE pw.player_id = p.id)
+              FROM identity i
+              JOIN player p ON p.identity_id = i.id
+              JOIN player_map pm ON pm.player_id = p.id
+              JOIN map m ON m.map_key = pm.map_key
+             WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+               AND i.subject_kind = ?4 AND i.subject_id = ?5
+            "#,
+            params![
+                key.protocol.as_str(),
+                key.account_id,
+                key.namespace,
+                key.subject_kind,
+                key.subject_id
+            ],
+            |row| {
+                Ok(BattlePlayerSnapshot {
+                    identity_id: row.get(0)?,
+                    player_id: row.get(1)?,
+                    subject_id: row.get(2)?,
+                    name: row.get(3)?,
+                    state: row.get(4)?,
+                    level: row.get(5)?,
+                    hp: row.get(6)?,
+                    max_hp: row.get(7)?,
+                    strength: row.get(8)?,
+                    agility: row.get(9)?,
+                    endurance: row.get(10)?,
+                    perception: row.get(11)?,
+                    luck: row.get(12)?,
+                    map_key: row.get(13)?,
+                    map_name: row.get(14)?,
+                    awakened: row.get(15)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取战斗角色失败：{error}"))?
+        .ok_or_else(|| "你还没有角色，请先使用“开始穿越 <角色名> <性别>”".to_string())
+}
+
+fn soul_beast_select_sql() -> &'static str {
+    r#"
+    SELECT sb.id, sb.beast_key, sb.name, sb.description, sb.map_key, m.name,
+           sb.age, sb.level_required, sb.max_hp, sb.attack, sb.defense, sb.speed,
+           sb.exp_reward, sb.drop_quantity,
+           i.item_key, i.name, i.category, i.quality, i.stackable, i.max_stack,
+           i.buy_price, i.sell_price, i.level_required, i.effect_kind,
+           i.effect_amount, i.revive_hp_percent, i.purchasable, i.sellable,
+           i.usable, i.description
+      FROM soul_beast sb
+      JOIN map m ON m.map_key = sb.map_key
+      JOIN item i ON i.item_key = sb.drop_item_key
+    "#
+}
+
+fn load_soul_beast_by_id(
+    connection: &Connection,
+    id: i64,
+) -> Result<Option<SoulBeastRecord>, String> {
+    connection
+        .query_row(
+            &format!("{} WHERE sb.id = ?1", soul_beast_select_sql()),
+            [id],
+            |row| soul_beast_record_from_row(row, 0),
+        )
+        .optional()
+        .map_err(|error| format!("读取魂兽定义失败：{error}"))
+}
+
+fn load_soul_beast_by_name_or_key(
+    connection: &Connection,
+    requested_name_or_key: &str,
+    map_key: &str,
+    level: i64,
+) -> Result<SoulBeastRecord, String> {
+    connection
+        .query_row(
+            &format!(
+                "{} WHERE sb.map_key = ?1 AND sb.enabled = 1 AND sb.level_required <= ?2 AND (sb.name = ?3 OR sb.beast_key = ?3) LIMIT 1",
+                soul_beast_select_sql()
+            ),
+            params![map_key, level, requested_name_or_key],
+            |row| soul_beast_record_from_row(row, 0),
+        )
+        .optional()
+        .map_err(|error| format!("查询当前地图魂兽失败：{error}"))?
+        .ok_or_else(|| format!("当前地图没有可挑战的魂兽“{requested_name_or_key}”，请先使用“魂兽”查看"))
+}
+
+fn query_soul_beasts(
+    connection: &Connection,
+    map_key: Option<&str>,
+    level: Option<i64>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<SoulBeastRecord>, String> {
+    connection
+        .prepare(&format!(
+            "{} WHERE sb.enabled = 1 AND (?1 IS NULL OR sb.map_key = ?1) AND (?2 IS NULL OR sb.level_required <= ?2) ORDER BY sb.level_required, sb.age, sb.id LIMIT ?3 OFFSET ?4",
+            soul_beast_select_sql()
+        ))
+        .map_err(|error| format!("准备魂兽分页查询失败：{error}"))?
+        .query_map(params![map_key, level, limit, offset], |row| {
+            soul_beast_record_from_row(row, 0)
+        })
+        .map_err(|error| format!("查询魂兽分页失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析魂兽分页失败：{error}"))
+}
+
+fn battle_state_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BattleState> {
+    Ok(BattleState {
+        id: row.get(0)?,
+        player_id: row.get(1)?,
+        soul_beast_id: row.get(2)?,
+        map_key: row.get(3)?,
+        status: row.get(4)?,
+        player_level: row.get(5)?,
+        player_max_hp: row.get(6)?,
+        player_hp: row.get(7)?,
+        player_strength: row.get(8)?,
+        player_agility: row.get(9)?,
+        player_endurance: row.get(10)?,
+        player_perception: row.get(11)?,
+        player_luck: row.get(12)?,
+        beast_max_hp: row.get(13)?,
+        beast_hp: row.get(14)?,
+        beast_attack: row.get(15)?,
+        beast_defense: row.get(16)?,
+        beast_speed: row.get(17)?,
+        random_seed: row.get(18)?,
+        action_count: row.get(19)?,
+        exp_reward: row.get(20)?,
+        drop_item_key: row.get(21)?,
+        drop_quantity: row.get(22)?,
+        started_at: row.get(23)?,
+        updated_at: row.get(24)?,
+        ended_at: row.get(25)?,
+    })
+}
+
+fn load_active_battle_state(
+    connection: &Connection,
+    player_id: i64,
+) -> Result<Option<BattleState>, String> {
+    connection
+        .query_row(
+            r#"SELECT id, player_id, soul_beast_id, map_key, status, player_level,
+                      player_max_hp, player_hp, player_strength, player_agility,
+                      player_endurance, player_perception, player_luck,
+                      beast_max_hp, beast_hp, beast_attack, beast_defense, beast_speed,
+                      random_seed, action_count, exp_reward, drop_item_key, drop_quantity,
+                      started_at, updated_at, ended_at
+                 FROM battle WHERE player_id = ?1 AND status = 'active'"#,
+            [player_id],
+            battle_state_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取进行中战斗失败：{error}"))
+}
+
+fn ensure_no_active_battle_for_player(
+    connection: &Connection,
+    player_id: i64,
+) -> Result<(), String> {
+    let active = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM battle WHERE player_id = ?1 AND status = 'active')",
+            [player_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查当前战斗状态失败：{error}"))?;
+    if active {
+        return Err("当前正在魂兽战斗中，不能移动、传送或使用物品".to_string());
+    }
+    Ok(())
+}
+
+fn load_battle_state_by_id(
+    connection: &Connection,
+    battle_id: i64,
+) -> Result<Option<BattleState>, String> {
+    connection
+        .query_row(
+            r#"SELECT id, player_id, soul_beast_id, map_key, status, player_level,
+                      player_max_hp, player_hp, player_strength, player_agility,
+                      player_endurance, player_perception, player_luck,
+                      beast_max_hp, beast_hp, beast_attack, beast_defense, beast_speed,
+                      random_seed, action_count, exp_reward, drop_item_key, drop_quantity,
+                      started_at, updated_at, ended_at
+                 FROM battle WHERE id = ?1"#,
+            [battle_id],
+            battle_state_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取战斗快照失败：{error}"))
+}
+
+fn load_battle_snapshot(
+    connection: &Connection,
+    battle_id: i64,
+) -> Result<Option<BattleSnapshot>, String> {
+    let Some(state) = load_battle_state_by_id(connection, battle_id)? else {
+        return Ok(None);
+    };
+    let player_name = connection
+        .query_row(
+            "SELECT name FROM player WHERE id = ?1",
+            [state.player_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| format!("读取战斗角色名称失败：{error}"))?;
+    let beast = load_soul_beast_by_id(connection, state.soul_beast_id)?
+        .ok_or_else(|| "战斗关联的魂兽定义不存在".to_string())?;
+    Ok(Some(BattleSnapshot {
+        id: state.id,
+        player_name,
+        beast,
+        status: state.status,
+        player_hp: state.player_hp,
+        player_max_hp: state.player_max_hp,
+        beast_hp: state.beast_hp,
+        beast_max_hp: state.beast_max_hp,
+        action_count: state.action_count,
+        started_at: state.started_at,
+        updated_at: state.updated_at,
+        ended_at: state.ended_at,
+    }))
+}
+
+fn battle_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BattleEventRecord> {
+    Ok(BattleEventRecord {
+        id: row.get(0)?,
+        battle_id: row.get(1)?,
+        sequence: row.get(2)?,
+        event_kind: row.get(3)?,
+        status_after: row.get(4)?,
+        player_hp_before: row.get(5)?,
+        player_hp_after: row.get(6)?,
+        beast_hp_before: row.get(7)?,
+        beast_hp_after: row.get(8)?,
+        player_damage: row.get(9)?,
+        beast_damage: row.get(10)?,
+        player_critical: row.get(11)?,
+        beast_critical: row.get(12)?,
+        flee_success: row.get(13)?,
+        experience_awarded: row.get(14)?,
+        ground_drop_id: row.get(15)?,
+        created_at: row.get(16)?,
+    })
+}
+
+const BATTLE_EVENT_SELECT: &str = "SELECT id, battle_id, sequence, event_kind, status_after, player_hp_before, player_hp_after, beast_hp_before, beast_hp_after, player_damage, beast_damage, player_critical, beast_critical, flee_success, experience_awarded, ground_drop_id, created_at FROM battle_event";
+
+fn load_battle_event_by_id(
+    connection: &Connection,
+    event_id: i64,
+) -> Result<Option<BattleEventRecord>, String> {
+    connection
+        .query_row(
+            &format!("{BATTLE_EVENT_SELECT} WHERE id = ?1"),
+            [event_id],
+            battle_event_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取战斗事件失败：{error}"))
+}
+
+fn load_battle_event_by_message(
+    connection: &Connection,
+    player_id: i64,
+    source_message_id: &str,
+) -> Result<Option<BattleEventRecord>, String> {
+    if source_message_id.is_empty() {
+        return Ok(None);
+    }
+    connection
+        .query_row(
+            &format!("{BATTLE_EVENT_SELECT} WHERE player_id = ?1 AND source_message_id = ?2"),
+            params![player_id, source_message_id],
+            battle_event_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取战斗消息幂等记录失败：{error}"))
+}
+
+fn load_battle_events(
+    connection: &Connection,
+    battle_id: i64,
+    limit: usize,
+) -> Result<Vec<BattleEventRecord>, String> {
+    let limit = i64::try_from(limit).map_err(|_| "战斗日志数量无法转换".to_string())?;
+    let mut events = connection
+        .prepare(&format!(
+            "{BATTLE_EVENT_SELECT} WHERE battle_id = ?1 ORDER BY sequence DESC, id DESC LIMIT ?2"
+        ))
+        .map_err(|error| format!("准备战斗日志查询失败：{error}"))?
+        .query_map(params![battle_id, limit], battle_event_from_row)
+        .map_err(|error| format!("查询战斗日志失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析战斗日志失败：{error}"))?;
+    events.reverse();
+    Ok(events)
+}
+
+fn insert_battle_event(
+    connection: &Connection,
+    event: BattleEventInsert<'_>,
+) -> Result<(), String> {
+    connection
+        .execute(
+            r#"INSERT INTO battle_event(
+                battle_id, player_id, sequence, event_kind, status_after,
+                player_hp_before, player_hp_after, beast_hp_before, beast_hp_after,
+                player_damage, beast_damage, player_critical, beast_critical,
+                flee_success, experience_awarded, ground_drop_id, source_message_id,
+                operation_log_id, created_at
+            ) VALUES(
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17, ?18, ?19
+            )"#,
+            params![
+                event.battle_id,
+                event.player_id,
+                event.sequence,
+                event.event_kind,
+                event.status_after,
+                event.player_hp_before,
+                event.player_hp_after,
+                event.beast_hp_before,
+                event.beast_hp_after,
+                event.player_damage,
+                event.beast_damage,
+                event.player_critical,
+                event.beast_critical,
+                event.flee_success,
+                event.experience_awarded,
+                event.ground_drop_id,
+                event.source_message_id,
+                event.operation_log_id,
+                event.created_at
+            ],
+        )
+        .map_err(|error| format!("写入战斗事件失败：{error}"))?;
+    Ok(())
+}
+
+fn validate_battle_operation(
+    operation: &OperationLogInput<'_>,
+    command: &str,
+) -> Result<(), String> {
+    validate_operation_input(operation)?;
+    if operation.command != command || operation.outcome != "ok" {
+        return Err(format!(
+            "{command}成功审计必须使用规范命令“{command}”和 ok 结果"
+        ));
+    }
+    Ok(())
+}
+
+fn action_event_kind(action: &str) -> &'static str {
+    match action {
+        "挑战" => "challenge",
+        "攻击" => "attack",
+        "逃跑" => "flee",
+        _ => unreachable!("已校验战斗动作"),
+    }
+}
+
+fn battle_seed(timestamp: i64, player_id: i64, beast_id: i64) -> i64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or_default();
+    let value = nanos
+        ^ (timestamp as u64).rotate_left(17)
+        ^ (player_id as u64).rotate_left(31)
+        ^ (beast_id as u64).rotate_left(47);
+    (value & i64::MAX as u64).max(1) as i64
+}
+
+fn battle_roll(seed: i64, sequence: i64, lane: u64) -> u64 {
+    let mut value = (seed as u64)
+        .wrapping_add((sequence as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_add(lane.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+fn battle_damage(
+    raw_damage: i64,
+    defense: i64,
+    attacker_level: i64,
+    roll: u64,
+) -> Result<i64, String> {
+    if raw_damage <= 0 || defense < 0 || attacker_level <= 0 {
+        return Err("战斗伤害参数无效".to_string());
+    }
+    let denominator = i128::from(defense)
+        .checked_add(100)
+        .and_then(|value| value.checked_add(i128::from(attacker_level).checked_mul(5)?))
+        .ok_or_else(|| "战斗防御计算溢出".to_string())?;
+    let numerator = i128::from(100_i64)
+        .checked_add(
+            i128::from(attacker_level)
+                .checked_mul(5)
+                .ok_or_else(|| "战斗伤害倍率计算溢出".to_string())?,
+        )
+        .ok_or_else(|| "战斗伤害倍率计算溢出".to_string())?;
+    let mitigated = i128::from(raw_damage)
+        .checked_mul(numerator)
+        .ok_or_else(|| "战斗基础伤害计算溢出".to_string())?
+        / denominator;
+    let fluctuated = mitigated
+        .checked_mul(i128::from(90 + (roll % 21)))
+        .ok_or_else(|| "战斗伤害浮动计算溢出".to_string())?
+        / 100;
+    i64::try_from(fluctuated.max(1)).map_err(|_| "战斗伤害超出整数范围".to_string())
+}
+
+fn battle_is_critical(perception: i64, luck: i64, roll: u64) -> bool {
+    let rate = perception
+        .saturating_mul(5)
+        .saturating_add(luck.saturating_mul(3))
+        .min(1000);
+    roll % 1000 < rate as u64
+}
+
+fn battle_critical_damage(damage: i64, luck: i64) -> Result<i64, String> {
+    let multiplier = 150_i128
+        .checked_add(i128::from(luck.max(0)))
+        .ok_or_else(|| "战斗暴击倍率计算溢出".to_string())?;
+    i64::try_from(
+        i128::from(damage)
+            .checked_mul(multiplier)
+            .ok_or_else(|| "战斗暴击伤害计算溢出".to_string())?
+            / 100,
+    )
+    .map(|value| value.max(1))
+    .map_err(|_| "战斗暴击伤害超出整数范围".to_string())
 }
 
 fn npc_record_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<NpcRecord> {
@@ -9301,6 +10766,9 @@ fn validate_v8_triggers(connection: &Connection) -> Result<(), String> {
                 | "ground_drop"
                 | "ground_drop_claim"
                 | "ground_drop_expiration"
+                | "soul_beast"
+                | "battle"
+                | "battle_event"
         ) {
             continue;
         }
@@ -10116,6 +11584,9 @@ fn validate_v11_triggers(connection: &Connection) -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("解析 v11 全库触发器失败：{error}"))?;
     for (name, table, sql) in triggers {
+        if matches!(table.as_str(), "soul_beast" | "battle" | "battle_event") {
+            continue;
+        }
         let declared = expected.iter().any(|(expected_name, expected_table)| {
             name == *expected_name && table == *expected_table
         });
@@ -10139,6 +11610,404 @@ fn validate_v11_triggers(connection: &Connection) -> Result<(), String> {
         .any(|identifier| sql_mentions_identifier(&sql, identifier));
         if touches_v11 && !declared {
             return Err(format!("v11 触发器 {name} 未声明却引用任务表 {table}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v12_schema(connection: &Connection) -> Result<(), String> {
+    let expected = [
+        (
+            "soul_beast",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("beast_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("name", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("description", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("map_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("age", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("level_required", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("max_hp", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("attack", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("defense", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("speed", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("exp_reward", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("drop_item_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("drop_quantity", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("enabled", "INTEGER", true, false, Some("1"), 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("updated_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+        (
+            "battle",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("soul_beast_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("map_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("status", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("player_level", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_max_hp", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_hp", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_strength", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_agility", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_endurance", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_perception", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_luck", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("beast_max_hp", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("beast_hp", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("beast_attack", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("beast_defense", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("beast_speed", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("random_seed", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("action_count", "INTEGER", true, false, Some("0"), 0),
+                TableColumnInfo::new("exp_reward", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("drop_item_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("drop_quantity", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("started_at", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("updated_at", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("ended_at", "INTEGER", false, false, None, 0),
+            ],
+        ),
+        (
+            "battle_event",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("battle_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("sequence", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("event_kind", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("status_after", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("player_hp_before", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_hp_after", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("beast_hp_before", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("beast_hp_after", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_damage", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("beast_damage", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_critical", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("beast_critical", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("flee_success", "INTEGER", false, false, None, 0),
+                TableColumnInfo::new("experience_awarded", "INTEGER", true, false, Some("0"), 0),
+                TableColumnInfo::new("ground_drop_id", "INTEGER", false, false, None, 0),
+                TableColumnInfo::new("source_message_id", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("operation_log_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+    ];
+    for (table, columns) in expected {
+        let actual = table_columns_with_type(connection, table)?;
+        if actual != columns {
+            return Err(format!(
+                "数据库已标记迁移 v12，但表 {table} 字段不匹配：{actual:?}"
+            ));
+        }
+        let sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v12 表 {table} 建表语句失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v12，但缺少表 {table}"))?
+            .to_ascii_uppercase();
+        if !sql.contains(") STRICT") {
+            return Err(format!("v12 表 {table} 必须是 STRICT"));
+        }
+    }
+
+    validate_v12_foreign_keys(
+        connection,
+        "soul_beast",
+        &[
+            ("item", "drop_item_key", "item_key", "NO ACTION", "RESTRICT"),
+            ("map", "map_key", "map_key", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+    validate_v12_foreign_keys(
+        connection,
+        "battle",
+        &[
+            ("item", "drop_item_key", "item_key", "NO ACTION", "RESTRICT"),
+            ("map", "map_key", "map_key", "NO ACTION", "RESTRICT"),
+            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+            ("soul_beast", "soul_beast_id", "id", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+    validate_v12_foreign_keys(
+        connection,
+        "battle_event",
+        &[
+            ("battle", "battle_id", "id", "NO ACTION", "RESTRICT"),
+            (
+                "ground_drop",
+                "ground_drop_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            (
+                "operation_log",
+                "operation_log_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+
+    validate_v12_custom_index_set(connection, "soul_beast", &["soul_beast_map_page"])?;
+    validate_v12_custom_index_set(
+        connection,
+        "battle",
+        &[
+            "battle_map_status_page",
+            "battle_player_active",
+            "battle_player_history",
+        ],
+    )?;
+    validate_v12_custom_index_set(
+        connection,
+        "battle_event",
+        &[
+            "battle_event_battle_page",
+            "battle_event_operation",
+            "battle_event_player_message",
+        ],
+    )?;
+    validate_v12_index(
+        connection,
+        "soul_beast_map_page",
+        false,
+        &["map_key", "enabled", "level_required", "id"],
+        false,
+    )?;
+    validate_v12_index(
+        connection,
+        "battle_player_active",
+        true,
+        &["player_id"],
+        true,
+    )?;
+    validate_v12_index(
+        connection,
+        "battle_player_history",
+        false,
+        &["player_id", "id"],
+        false,
+    )?;
+    validate_v12_index(
+        connection,
+        "battle_map_status_page",
+        false,
+        &["map_key", "status", "id"],
+        false,
+    )?;
+    validate_v12_index(
+        connection,
+        "battle_event_operation",
+        true,
+        &["operation_log_id"],
+        false,
+    )?;
+    validate_v12_index(
+        connection,
+        "battle_event_player_message",
+        true,
+        &["player_id", "source_message_id"],
+        true,
+    )?;
+    validate_v12_index(
+        connection,
+        "battle_event_battle_page",
+        false,
+        &["battle_id", "sequence", "id"],
+        false,
+    )?;
+    validate_v12_triggers(connection)?;
+    validate_v12_seeds(connection)
+}
+
+fn validate_v12_foreign_keys(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, &str, &str, &str)],
+) -> Result<(), String> {
+    validate_v9_foreign_keys(connection, table, expected)
+        .map_err(|error| error.replace("v9", "v12"))
+}
+
+fn validate_v12_custom_index_set(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), String> {
+    validate_v10_custom_index_set(connection, table, expected)
+        .map_err(|error| error.replace("v10", "v12"))
+}
+
+fn validate_v12_index(
+    connection: &Connection,
+    index_name: &str,
+    unique: bool,
+    columns: &[&str],
+    partial: bool,
+) -> Result<(), String> {
+    validate_v7_index(connection, index_name, unique, columns, partial)
+        .map_err(|error| error.replace("v7", "v12"))
+}
+
+fn validate_v12_seeds(connection: &Connection) -> Result<(), String> {
+    let count = connection
+        .query_row("SELECT COUNT(*) FROM soul_beast", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|error| format!("统计 v12 魂兽种子失败：{error}"))?;
+    if count != 2 {
+        return Err(format!("v12 魂兽种子数量不匹配：{count}"));
+    }
+    for (
+        beast_key,
+        name,
+        age,
+        level_required,
+        max_hp,
+        attack,
+        defense,
+        speed,
+        exp_reward,
+        drop_item_key,
+    ) in [
+        (
+            "goblin",
+            "哥布林",
+            450,
+            3,
+            70,
+            12,
+            8,
+            18,
+            90,
+            "soul-power-potion",
+        ),
+        (
+            "slime",
+            "史莱姆",
+            10,
+            1,
+            20,
+            3,
+            1,
+            8,
+            25,
+            "small-healing-potion",
+        ),
+    ] {
+        let matches_contract = connection
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM soul_beast
+                     WHERE beast_key = ?1 AND name = ?2 AND map_key = 'sunset-forest'
+                       AND age = ?3 AND level_required = ?4 AND max_hp = ?5
+                       AND attack = ?6 AND defense = ?7 AND speed = ?8
+                       AND exp_reward = ?9 AND drop_item_key = ?10
+                       AND drop_quantity = 1 AND enabled = 1
+                )
+                "#,
+                params![
+                    beast_key,
+                    name,
+                    age,
+                    level_required,
+                    max_hp,
+                    attack,
+                    defense,
+                    speed,
+                    exp_reward,
+                    drop_item_key
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("读取 v12 魂兽种子 {beast_key} 失败：{error}"))?;
+        if !matches_contract {
+            return Err(format!("v12 魂兽种子 {beast_key} 不完整或被篡改"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v12_triggers(connection: &Connection) -> Result<(), String> {
+    let expected = [
+        ("soul_beast_no_update", "soul_beast"),
+        ("soul_beast_no_delete", "soul_beast"),
+        ("soul_beast_no_reinsert", "soul_beast"),
+        ("battle_scope_guard", "battle"),
+        ("battle_transition_guard", "battle"),
+        ("battle_no_delete", "battle"),
+        ("battle_event_no_update", "battle_event"),
+        ("battle_event_no_delete", "battle_event"),
+        ("battle_event_no_reinsert", "battle_event"),
+        ("battle_event_scope_guard", "battle_event"),
+    ];
+    for (name, table) in expected {
+        let (actual_table, sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v12 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v12，但缺少触发器 {name}"))?;
+        let normalized = sql.to_ascii_uppercase();
+        if actual_table != table || !normalized.contains("RAISE(ABORT") {
+            return Err(format!("v12 触发器 {name} 契约不匹配"));
+        }
+        if name == "battle_scope_guard"
+            && (!normalized.contains("JOIN PLAYER_MAP")
+                || !normalized.contains("JOIN SOUL_BEAST")
+                || !normalized.contains("P.STATE = 'ALIVE'")
+                || !normalized.contains("M.SAFE = 0"))
+        {
+            return Err("v12 战斗创建范围触发器不完整".to_string());
+        }
+        if name == "battle_event_scope_guard"
+            && (!normalized.contains("JOIN OPERATION_LOG AUDIT")
+                || !normalized.contains("AUDIT.SOURCE_MESSAGE_ID = NEW.SOURCE_MESSAGE_ID")
+                || !normalized.contains("D.SOURCE_KIND = 'BATTLE'")
+                || !normalized.contains("NEW.EXPERIENCE_AWARDED = B.EXP_REWARD"))
+        {
+            return Err("v12 战斗事件审计/奖励触发器不完整".to_string());
+        }
+    }
+
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v12 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v12 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v12 全库触发器失败：{error}"))?;
+    for (name, table, sql) in triggers {
+        let declared = expected.iter().any(|(expected_name, expected_table)| {
+            name == *expected_name && table == *expected_table
+        });
+        let touches_v12 = matches!(table.as_str(), "soul_beast" | "battle" | "battle_event")
+            || ["soul_beast", "battle", "battle_event"]
+                .iter()
+                .any(|identifier| sql_mentions_identifier(&sql, identifier));
+        if touches_v12 && !declared {
+            return Err(format!("v12 触发器 {name} 未声明却引用战斗表 {table}"));
         }
     }
     Ok(())
@@ -10297,6 +12166,9 @@ fn validate_v10_triggers(connection: &Connection) -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("解析 v10 全库触发器集合失败：{error}"))?;
     for (name, table, sql) in triggers {
+        if matches!(table.as_str(), "soul_beast" | "battle" | "battle_event") {
+            continue;
+        }
         let declared = expected.iter().any(|(expected_name, expected_table)| {
             name == *expected_name && table == *expected_table
         });
@@ -10613,6 +12485,9 @@ fn validate_v9_triggers(connection: &Connection) -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("解析 v9 全库触发器集合失败：{error}"))?;
     for (name, table, sql) in triggers {
+        if matches!(table.as_str(), "soul_beast" | "battle" | "battle_event") {
+            continue;
+        }
         let declared = expected
             .iter()
             .any(|(expected_name, _)| name == *expected_name && table == "asset_transfer");
@@ -11021,6 +12896,9 @@ fn validate_v7_triggers(connection: &Connection) -> Result<(), String> {
                 | "player_quest"
                 | "player_quest_progress"
                 | "player_quest_action"
+                | "soul_beast"
+                | "battle"
+                | "battle_event"
         ) {
             continue;
         }
@@ -11608,6 +13486,24 @@ mod tests {
         assert!(
             error.contains("v11"),
             "v11 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    fn assert_v12_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v12 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v12 迁移应成功");
+        let connection = store.open().expect("应打开 v12 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v12 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v12 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v12"),
+            "v12 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
         );
     }
 
@@ -14878,6 +16774,172 @@ mod tests {
             AFTER INSERT ON player_wuhun
             BEGIN
                 SELECT EXISTS(SELECT 1 FROM quest);
+            END;
+            "#,
+        );
+    }
+
+    #[test]
+    fn v12_pve_challenge_attack_victory_drop_and_replay_are_atomic() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        let empty = store
+            .soul_beasts_page(&identity(), 1, 8)
+            .expect("安全出生地图应可查询魂兽空列表");
+        assert_eq!(empty.total, 0);
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "battle-map"),
+            )
+            .expect("应传送到落日森林");
+        let beasts = store
+            .soul_beasts_page(&identity(), 1, 8)
+            .expect("应读取当前等级可挑战魂兽");
+        assert_eq!(beasts.total, 1);
+        assert_eq!(beasts.entries[0].beast_key, "slime");
+
+        let started = store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "史莱姆",
+                &transfer_operation("挑战", "battle-start"),
+            )
+            .expect("应挑战史莱姆");
+        assert_eq!(started.event.event_kind, "challenge");
+        assert_eq!(started.battle.status, "active");
+        let replay = store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "slime",
+                &transfer_operation("挑战", "battle-start"),
+            )
+            .expect("重复挑战消息应返回原回执");
+        assert!(replay.replayed);
+        assert_eq!(replay.battle.id, started.battle.id);
+        assert!(
+            store
+                .teleport_with_operation(
+                    &identity(),
+                    Some("圣魂村"),
+                    &map_operation("传送", "battle-blocked-map"),
+                )
+                .expect_err("战斗中不能传送")
+                .contains("战斗中")
+        );
+
+        let mut final_receipt = None;
+        for turn in 1..=5 {
+            let message = format!("battle-attack-{turn}");
+            let receipt = store
+                .attack_battle_with_operation(&identity(), &transfer_operation("攻击", &message))
+                .expect("攻击应结算");
+            if receipt.battle.status == "won" {
+                final_receipt = Some((message, receipt));
+                break;
+            }
+        }
+        let (final_message, won) = final_receipt.expect("五次内应击败史莱姆");
+        assert_eq!(won.event.experience_awarded, 25);
+        assert_eq!(won.experience.as_ref().expect("应发放经验").amount, 25);
+        let drop = won.ground_drop.as_ref().expect("胜利应产生归属掉落");
+        assert_eq!(drop.item.item_key, "small-healing-potion");
+        assert_eq!(drop.quantity, 1);
+        assert_eq!(
+            drop.owner_subject_id.as_deref(),
+            Some(identity().subject_id)
+        );
+        assert!(store.active_battle(&identity()).unwrap().is_none());
+        let replay = store
+            .attack_battle_with_operation(&identity(), &transfer_operation("攻击", &final_message))
+            .expect("胜利攻击重放应返回原回执");
+        assert!(replay.replayed);
+        assert_eq!(replay.event.ground_drop_id, won.event.ground_drop_id);
+        let connection = store.open().expect("应检查战斗奖励唯一性");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT exp FROM player WHERE id = ?1",
+                    [player_id_for(&store, &identity())],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            25
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM ground_drop WHERE source_kind = 'battle' AND source_event_id = ?1",
+                    [format!("battle:{}", won.battle.id)],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let log = store
+            .battle_log(&identity(), 20)
+            .expect("应读取战斗日志")
+            .expect("应存在战斗日志");
+        assert_eq!(log.events.first().unwrap().event_kind, "challenge");
+        assert_eq!(log.events.last().unwrap().status_after, "won");
+    }
+
+    #[test]
+    fn v12_flee_is_deterministic_and_message_conflicts_fail_closed() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "flee-map"),
+            )
+            .expect("应传送到落日森林");
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "史莱姆",
+                &transfer_operation("挑战", "flee-start"),
+            )
+            .expect("应开始逃跑测试战斗");
+        let result = store
+            .flee_battle_with_operation(&identity(), &transfer_operation("逃跑", "flee-action"))
+            .expect("逃跑应确定性结算");
+        assert_eq!(result.event.event_kind, "flee");
+        assert!(result.event.flee_success.is_some());
+        let replay = store
+            .flee_battle_with_operation(&identity(), &transfer_operation("逃跑", "flee-action"))
+            .expect("相同逃跑消息应重放");
+        assert!(replay.replayed);
+        assert_eq!(replay.event, result.event);
+        assert!(
+            store
+                .attack_battle_with_operation(
+                    &identity(),
+                    &transfer_operation("攻击", "flee-action"),
+                )
+                .expect_err("同消息改动作必须拒绝")
+                .contains("不同的战斗操作")
+        );
+    }
+
+    #[test]
+    fn recorded_v12_with_damaged_schema_seed_or_cross_table_trigger_fails_closed() {
+        for mutation in [
+            "DROP TABLE battle_event;",
+            "DROP INDEX battle_player_active;",
+            "DROP TRIGGER battle_event_scope_guard;",
+            "DROP TRIGGER soul_beast_no_update; UPDATE soul_beast SET exp_reward = 1 WHERE beast_key = 'slime';",
+        ] {
+            assert_v12_damage_fails_closed(mutation);
+        }
+        assert_v12_damage_fails_closed(
+            r#"
+            CREATE TRIGGER player_wuhun_reads_battle
+            AFTER INSERT ON player_wuhun
+            BEGIN
+                SELECT EXISTS(SELECT 1 FROM battle);
             END;
             "#,
         );

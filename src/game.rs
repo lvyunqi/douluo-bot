@@ -11,9 +11,10 @@ use crate::identity::{
 };
 use crate::message::{GameDocument, Illustration};
 use crate::store::{
-    AuthorizedContextChange, DailyCheckinInput, DailyCheckinResult, GOLD_SOUL_COIN, IdentityKey,
-    LegacyClaimActor, LegacyClaimResult, LegacyIdentityState, MapExit, MapRecord, MapTravelReceipt,
-    OperationLogInput, PlayerStatus, QuestActionReceipt, QuestListEntry, Store,
+    AuthorizedContextChange, BattleActionReceipt, BattleEventRecord, BattleLog, BattleSnapshot,
+    DailyCheckinInput, DailyCheckinResult, GOLD_SOUL_COIN, IdentityKey, LegacyClaimActor,
+    LegacyClaimResult, LegacyIdentityState, MapExit, MapRecord, MapTravelReceipt,
+    OperationLogInput, PlayerStatus, QuestActionReceipt, QuestListEntry, SoulBeastPage, Store,
     experience_progress,
 };
 
@@ -143,6 +144,36 @@ const MENU_PAGES: &[MenuPage] = &[
             MenuEntry {
                 command: "放弃任务 <任务>",
                 description: "放弃进行中的任务",
+            },
+        ],
+    },
+    MenuPage {
+        key: "战斗",
+        title: "魂兽战斗",
+        entries: &[
+            MenuEntry {
+                command: "魂兽 [页码]",
+                description: "查看当前地图可挑战的魂兽",
+            },
+            MenuEntry {
+                command: "挑战 <魂兽>",
+                description: "发起一场魂兽挑战",
+            },
+            MenuEntry {
+                command: "攻击",
+                description: "进行一次普通攻击并承受魂兽反击",
+            },
+            MenuEntry {
+                command: "逃跑",
+                description: "尝试结束当前战斗",
+            },
+            MenuEntry {
+                command: "战斗状态",
+                description: "查看当前战斗快照",
+            },
+            MenuEntry {
+                command: "战斗日志",
+                description: "查看最近战斗事件",
             },
         ],
     },
@@ -766,6 +797,228 @@ impl GameService {
             .store
             .abandon_quest_with_operation(&key, quest_name, &operation)?;
         Ok(self.quest_action_document(receipt))
+    }
+
+    pub fn soul_beasts(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let page = parse_single_page(req.args.as_str(), "魂兽")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let beasts = self.store.soul_beasts_page(&key, page, 8)?;
+        Ok(self.soul_beasts_document(beasts))
+    }
+
+    pub fn challenge(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let beast_name = parse_required_catalog_name(req.args.as_str(), "挑战 <魂兽>")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self
+            .store
+            .challenge_soul_beast_with_operation(&key, beast_name, &operation)?;
+        Ok(self.battle_action_document(receipt))
+    }
+
+    pub fn attack(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        if !req.args.as_str().trim().is_empty() {
+            return Err("用法：攻击".to_string());
+        }
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self.store.attack_battle_with_operation(&key, &operation)?;
+        Ok(self.battle_action_document(receipt))
+    }
+
+    pub fn flee(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        if !req.args.as_str().trim().is_empty() {
+            return Err("用法：逃跑".to_string());
+        }
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self.store.flee_battle_with_operation(&key, &operation)?;
+        Ok(self.battle_action_document(receipt))
+    }
+
+    pub fn battle_status(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        if !req.args.as_str().trim().is_empty() {
+            return Err("用法：战斗状态".to_string());
+        }
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let battle = self
+            .store
+            .active_battle(&key)?
+            .ok_or_else(|| "你当前不在战斗中，请先使用“挑战 <魂兽>”".to_string())?;
+        Ok(self.battle_snapshot_document(battle, "当前战斗"))
+    }
+
+    pub fn battle_logs(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let limit = parse_optional_log_limit(req.args.as_str())?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let log = self
+            .store
+            .battle_log(&key, limit)?
+            .ok_or_else(|| "还没有战斗记录，请先使用“挑战 <魂兽>”".to_string())?;
+        Ok(self.battle_log_document(log))
+    }
+
+    fn soul_beasts_document(&self, beasts: SoulBeastPage) -> GameDocument {
+        let mut document = GameDocument::new(format!("可挑战魂兽 · {}", beasts.map_name))
+            .field("页码", format!("{} / {}", beasts.page, beasts.page_count))
+            .field("魂兽数量", beasts.total.to_string());
+        if beasts.entries.is_empty() {
+            document = document.line("当前地图没有达到等级要求的魂兽");
+        } else {
+            for beast in &beasts.entries {
+                document = document
+                    .line(format!(
+                        "#{} · {} · {}年 · Lv.{}",
+                        beast.id, beast.name, beast.age, beast.level_required
+                    ))
+                    .line(format!(
+                        "生命 {} · 攻击 {} · 防御 {} · 经验 {} · 掉落 {} x{}",
+                        beast.max_hp,
+                        beast.attack,
+                        beast.defense,
+                        beast.exp_reward,
+                        beast.drop_item.name,
+                        beast.drop_quantity
+                    ))
+                    .line(beast.description.clone())
+                    .command(format!("挑战 {}", beast.name));
+            }
+        }
+        if beasts.page > 1 {
+            document = document.command(format!("魂兽 {}", beasts.page - 1));
+        }
+        if beasts.page < beasts.page_count {
+            document = document.command(format!("魂兽 {}", beasts.page + 1));
+        }
+        document.command("位置").command("战斗状态")
+    }
+
+    fn battle_action_document(&self, receipt: BattleActionReceipt) -> GameDocument {
+        let event = &receipt.event;
+        let beast = &receipt.battle.beast;
+        let title = match event.event_kind.as_str() {
+            "challenge" => "战斗开始",
+            "attack" if event.status_after == "won" => "战斗胜利",
+            "attack" if event.status_after == "defeated" => "战斗失败",
+            "attack" => "攻击结算",
+            "flee" if event.flee_success == Some(true) => "逃跑成功",
+            "flee" if event.status_after == "defeated" => "逃跑失败",
+            "flee" => "逃跑失败",
+            _ => "战斗回执",
+        };
+        let mut document = GameDocument::new(if receipt.replayed {
+            format!("{title}回执")
+        } else {
+            title.to_string()
+        })
+        .field("对手", format!("{} · {}年", beast.name, beast.age))
+        .field("回合", event.sequence.to_string())
+        .field(
+            "玩家生命",
+            format!(
+                "{} → {}/{}",
+                event.player_hp_before, event.player_hp_after, receipt.battle.player_max_hp
+            ),
+        )
+        .field(
+            "魂兽生命",
+            format!(
+                "{} → {}/{}",
+                event.beast_hp_before, event.beast_hp_after, receipt.battle.beast_max_hp
+            ),
+        );
+        if event.event_kind == "challenge" {
+            document = document
+                .line(beast.description.clone())
+                .line("魂兽会在你的每次行动后反击");
+        } else if event.event_kind == "attack" {
+            document = document.line(format!(
+                "你造成 {} 点{}伤害",
+                event.player_damage,
+                if event.player_critical { "暴击" } else { "" }
+            ));
+            if event.beast_damage > 0 {
+                document = document.line(format!(
+                    "魂兽反击造成 {} 点{}伤害",
+                    event.beast_damage,
+                    if event.beast_critical { "暴击" } else { "" }
+                ));
+            }
+        } else if event.flee_success == Some(true) {
+            document = document.line("你脱离了战斗，魂兽没有追击");
+        } else {
+            document = document.line(format!(
+                "逃跑失败，魂兽反击造成 {} 点{}伤害",
+                event.beast_damage,
+                if event.beast_critical { "暴击" } else { "" }
+            ));
+        }
+        if event.status_after == "won" {
+            document = document
+                .field("获得经验", event.experience_awarded.to_string())
+                .line("魂兽倒下，地面出现了新的掉落")
+                .notice(if receipt.replayed {
+                    "检测到相同消息的重复请求，已返回原战斗回执，未重复发放经验或掉落"
+                } else {
+                    "战斗状态、生命、经验、掉落、操作日志和战斗事件已在同一事务完成"
+                });
+        } else if event.status_after == "defeated" {
+            document = document
+                .line("你被魂兽击败，系统将你救回到濒死状态")
+                .notice("死亡与复活系统尚未开放，本阶段不会删除角色或扣除转生次数");
+        } else if receipt.replayed {
+            document = document.notice("检测到相同消息的重复请求，已返回原战斗回执，未重复执行");
+        } else {
+            document = document.notice("本回合已在同一事务内结算，战斗快照可在热重载后继续");
+        }
+        document =
+            document.illustration_if(self.asset_illustration("soul_beast", &beast.name, "battle"));
+        match event.status_after.as_str() {
+            "active" => document.command("攻击").command("逃跑").command("战斗状态"),
+            "won" => document.command("掉落").command("魂兽"),
+            _ => document.command("魂兽").command("状态"),
+        }
+    }
+
+    fn battle_snapshot_document(&self, battle: BattleSnapshot, title: &str) -> GameDocument {
+        GameDocument::new(title)
+            .field(
+                "对手",
+                format!("{} · {}年", battle.beast.name, battle.beast.age),
+            )
+            .field("状态", battle_status_label(&battle.status))
+            .field("回合", battle.action_count.to_string())
+            .field(
+                "玩家生命",
+                format!("{}/{}", battle.player_hp, battle.player_max_hp),
+            )
+            .field(
+                "魂兽生命",
+                format!("{}/{}", battle.beast_hp, battle.beast_max_hp),
+            )
+            .illustration_if(self.asset_illustration("soul_beast", &battle.beast.name, "battle"))
+            .command("攻击")
+            .command("逃跑")
+            .command("战斗日志")
+    }
+
+    fn battle_log_document(&self, log: BattleLog) -> GameDocument {
+        let mut document = self
+            .battle_snapshot_document(log.battle.clone(), "战斗日志")
+            .line("事件记录：");
+        for event in &log.events {
+            document = document.line(format_battle_event(event));
+        }
+        document
     }
 
     fn append_quest_entry(
@@ -1927,7 +2180,7 @@ fn parse_menu_page(args: &str) -> Result<usize, String> {
     let mut parts = args.split_whitespace();
     let token = parts.next().unwrap_or_default();
     if parts.next().is_some() {
-        return Err("用法：斗罗系统 [页码|开始|角色|世界|经济|任务]".to_string());
+        return Err("用法：斗罗系统 [页码|开始|角色|世界|经济|任务|战斗]".to_string());
     }
     if let Some(page) = token
         .parse::<usize>()
@@ -1942,7 +2195,64 @@ fn parse_menu_page(args: &str) -> Result<usize, String> {
     MENU_PAGES
         .iter()
         .position(|page| page.key == token)
-        .ok_or_else(|| "用法：斗罗系统 [页码|开始|角色|世界|经济|任务]".to_string())
+        .ok_or_else(|| "用法：斗罗系统 [页码|开始|角色|世界|经济|任务|战斗]".to_string())
+}
+
+fn parse_optional_log_limit(args: &str) -> Result<usize, String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Ok(20);
+    }
+    let limit = args
+        .parse::<usize>()
+        .map_err(|_| "用法：战斗日志 [数量]".to_string())?;
+    if !(1..=100).contains(&limit) {
+        return Err("战斗日志数量必须在 1 到 100 之间".to_string());
+    }
+    Ok(limit)
+}
+
+fn battle_status_label(status: &str) -> &'static str {
+    match status {
+        "active" => "进行中",
+        "won" => "胜利",
+        "escaped" => "已逃跑",
+        "defeated" => "战败",
+        _ => "未知",
+    }
+}
+
+fn format_battle_event(event: &BattleEventRecord) -> String {
+    let action = match event.event_kind.as_str() {
+        "challenge" => "挑战",
+        "attack" => "攻击",
+        "flee" => "逃跑",
+        _ => "未知动作",
+    };
+    let mut text = format!(
+        "#{} · {} · 玩家 {}/{} · 魂兽 {}/{}",
+        event.sequence,
+        action,
+        event.player_hp_before,
+        event.player_hp_after,
+        event.beast_hp_before,
+        event.beast_hp_after
+    );
+    if event.player_damage > 0 || event.beast_damage > 0 {
+        text.push_str(&format!(
+            " · 伤害 {}/{}",
+            event.player_damage, event.beast_damage
+        ));
+    }
+    if let Some(success) = event.flee_success {
+        text.push_str(if success {
+            " · 逃跑成功"
+        } else {
+            " · 逃跑失败"
+        });
+    }
+    text.push_str(&format!(" · {}", battle_status_label(&event.status_after)));
+    text
 }
 
 #[cfg(test)]
@@ -2349,7 +2659,8 @@ mod tests {
         assert_eq!(parse_menu_page("世界").expect("世界分类应有效"), 2);
         assert_eq!(parse_menu_page("经济").expect("经济分类应有效"), 3);
         assert_eq!(parse_menu_page("任务").expect("任务分类应有效"), 4);
-        assert!(parse_menu_page("6").is_err());
+        assert_eq!(parse_menu_page("战斗").expect("战斗分类应有效"), 5);
+        assert!(parse_menu_page("7").is_err());
         assert!(parse_menu_page("角色 多余").is_err());
     }
 
@@ -2393,6 +2704,12 @@ mod tests {
         assert!(fifth.contains("任务 [页码]：查看当前地图可接取的任务"));
         assert!(fifth.contains("提交任务 <任务>：提交已完成任务并领取奖励"));
         assert!(fifth.contains("斗罗系统 4"));
+
+        let sixth = crate::message::render_text(&service.menu("战斗").expect("战斗页应有效"));
+        assert!(sixth.contains("魂兽 [页码]：查看当前地图可挑战的魂兽"));
+        assert!(sixth.contains("挑战 <魂兽>：发起一场魂兽挑战"));
+        assert!(sixth.contains("攻击：进行一次普通攻击并承受魂兽反击"));
+        assert!(sixth.contains("斗罗系统 5"));
     }
 
     #[test]

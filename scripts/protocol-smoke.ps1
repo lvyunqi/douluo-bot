@@ -404,7 +404,7 @@ try {
         "斗罗系统", "开始穿越", "武魂觉醒", "签到", "钱包", "状态", "位置",
         "地图列表", "向", "传送", "掉落", "拾取", "NPC", "对话", "商店", "背包",
         "购买", "出售", "使用", "转账", "发送物品", "任务", "接取任务", "任务进度",
-        "提交任务", "放弃任务"
+        "提交任务", "放弃任务", "魂兽", "挑战", "攻击", "逃跑", "战斗状态", "战斗日志"
     )) {
         $found = $commands | Where-Object { $_ -eq $command }
         Assert-Condition ($null -ne $found) "descriptor is missing command '$command' (commands=$($commands -join ', '))"
@@ -439,6 +439,28 @@ try {
         Write-Output ("onebot {0}: {1} [{2}]" -f $result.Command, $result.ActionName, $result.Text)
         Assert-Condition ($result.Text.Contains($check.Contains)) "response for '$($check.Message)' did not contain '$($check.Contains)': $($result.ActionJson)"
     }
+
+    $toForest = Invoke-OneBotCommand $endpoint "传送 落日森林"
+    Write-Output ("onebot 传送 落日森林: {0} [{1}]" -f $toForest.ActionName, $toForest.Text)
+    Assert-Condition ($toForest.Text.Contains("落日森林")) "could not enter the battle map"
+    $beasts = Invoke-OneBotCommand $endpoint "魂兽"
+    Write-Output ("onebot 魂兽: {0} [{1}]" -f $beasts.ActionName, $beasts.Text)
+    Assert-Condition ($beasts.Text.Contains("史莱姆")) "soul beast list did not expose slime"
+    $challenge = Invoke-OneBotCommand $endpoint "挑战 史莱姆"
+    Write-Output ("onebot 挑战 史莱姆: {0} [{1}]" -f $challenge.ActionName, $challenge.Text)
+    Assert-Condition ($challenge.Text.Contains("战斗开始")) "soul beast challenge did not start"
+    $battleFinished = $false
+    for ($round = 1; $round -le 5; $round++) {
+        $attack = Invoke-OneBotCommand $endpoint "攻击"
+        Write-Output ("onebot 攻击 {0}: {1} [{2}]" -f $round, $attack.ActionName, $attack.Text)
+        if ($attack.Text.Contains("战斗胜利") -or $attack.Text.Contains("战斗失败")) {
+            $battleFinished = $true
+            break
+        }
+    }
+    Assert-Condition $battleFinished "soul beast battle did not finish within five turns"
+    $toVillage = Invoke-OneBotCommand $endpoint "传送 圣魂村"
+    Assert-Condition ($toVillage.Text.Contains("圣魂村")) "could not leave the battle map"
 
     $secondStart = Invoke-OneBotCommand $endpoint "开始穿越 协议接收方 女" -UserId "20002"
     Write-Output ("onebot second player start: {0} [{1}]" -f $secondStart.ActionName, $secondStart.Text)
@@ -487,7 +509,7 @@ try {
     Assert-Condition ($null -ne $reload.data.message) "dynamic reload did not return a result"
     $afterReload = Invoke-OneBotCommand $endpoint "钱包"
     Assert-Condition ($afterReload.Text.Contains("金魂币")) "command failed after dynamic reload"
-    Write-Output "protocol smoke passed: OneBot tasks/economy, private/group, synthetic QQ payload, descriptor, and reload"
+    Write-Output "protocol smoke passed: OneBot tasks/PVE/economy, private/group, synthetic QQ payload, descriptor, and reload"
 } finally {
     if ($null -ne $process -and -not $process.HasExited) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
