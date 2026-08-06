@@ -66,6 +66,40 @@ const MENU_PAGES: &[MenuPage] = &[
             },
         ],
     },
+    MenuPage {
+        key: "经济",
+        title: "NPC 与物品",
+        entries: &[
+            MenuEntry {
+                command: "NPC",
+                description: "查看当前地图的 NPC",
+            },
+            MenuEntry {
+                command: "对话 <NPC>",
+                description: "与当前地图的 NPC 对话",
+            },
+            MenuEntry {
+                command: "商店 [页码]",
+                description: "查看已对话商人的商品",
+            },
+            MenuEntry {
+                command: "背包 [页码]",
+                description: "查看随身物品",
+            },
+            MenuEntry {
+                command: "购买 <物品> [数量]",
+                description: "从当前商店购买物品",
+            },
+            MenuEntry {
+                command: "出售 <物品> [数量]",
+                description: "向当前商店出售物品",
+            },
+            MenuEntry {
+                command: "使用 <物品>",
+                description: "使用背包中的消耗品",
+            },
+        ],
+    },
 ];
 
 const MAP_PAGE_SIZE: usize = 5;
@@ -327,6 +361,217 @@ impl GameService {
             .notice("当前展示签到使用的金魂币余额"))
     }
 
+    pub fn npcs(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        if !req.args.as_str().trim().is_empty() {
+            return Err("用法：NPC".to_string());
+        }
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let page = self.store.npcs_at_current_map(&key)?;
+        let mut document = GameDocument::new(format!("当前 NPC · {}", page.map_name))
+            .field("地图", &page.map_name)
+            .field("数量", page.entries.len().to_string());
+        if page.entries.is_empty() {
+            document = document.line("当前地图没有可互动的 NPC");
+        } else {
+            for npc in page.entries {
+                let kind = if npc.has_shop { "商人" } else { "NPC" };
+                document = document.line(format!("{} · {}\n{}", npc.name, kind, npc.description));
+                document = document.command(format!("对话 {}", npc.name));
+            }
+        }
+        Ok(document.command("位置"))
+    }
+
+    pub fn talk(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let npc_name = parse_required_catalog_name(req.args.as_str(), "对话 <NPC>")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let npc = self
+            .store
+            .talk_to_npc_with_operation(&key, npc_name, &operation)?;
+        let mut document = GameDocument::new(format!("与 {} 对话", npc.name))
+            .field("地图", &npc.map_name)
+            .field("NPC", &npc.name)
+            .field("身份", npc_kind_label(&npc.npc_kind))
+            .line(&npc.dialogue)
+            .line(&npc.description)
+            .command("NPC")
+            .command("位置");
+        if npc.has_shop {
+            document = document.command("商店").command("购买 <物品> [数量]");
+        }
+        Ok(document.notice("当前对话已绑定；移动到其他地图后需要重新对话"))
+    }
+
+    pub fn shop(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let (npc_name, page) = parse_shop_args(req.args.as_str())?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let shop = self.store.shop_items_page(&key, npc_name, page, 8)?;
+        let mut document = GameDocument::new(format!("{}的商店", shop.npc.name))
+            .field("地图", &shop.npc.map_name)
+            .field("页码", format!("{} / {}", shop.page, shop.page_count))
+            .field("商品总数", shop.total.to_string());
+        if shop.entries.is_empty() {
+            document = document.line("商店暂时没有商品");
+        } else {
+            for entry in &shop.entries {
+                let stock = entry
+                    .stock
+                    .map_or_else(|| "不限量".to_string(), |value| format!("库存 {}", value));
+                document = document.line(format!(
+                    "{} · {} 金魂币 · 回收 {} · {}\n{}",
+                    entry.item.name,
+                    entry.price,
+                    entry.item.sell_price,
+                    stock,
+                    item_effect_description(&entry.item)
+                ));
+            }
+        }
+        if page > 1 {
+            document = document.command(format!("商店 {}", page - 1));
+        }
+        if page < shop.page_count {
+            document = document.command(format!("商店 {}", page + 1));
+        }
+        Ok(document
+            .command("购买 <物品> [数量]")
+            .command("出售 <物品> [数量]")
+            .command("背包"))
+    }
+
+    pub fn inventory(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let page = parse_single_page(req.args.as_str(), "背包")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let inventory = self.store.inventory_page(&key, page, 8)?;
+        let balance = self
+            .store
+            .wallet_balance(&key, CHECKIN_CURRENCY_CODE)?
+            .unwrap_or(0);
+        let mut document = GameDocument::new("随身物品")
+            .field(
+                "页码",
+                format!("{} / {}", inventory.page, inventory.page_count),
+            )
+            .field("物品种类", inventory.total.to_string())
+            .field(CHECKIN_CURRENCY_NAME, balance.to_string());
+        if inventory.entries.is_empty() {
+            document = document.line("背包为空");
+        } else {
+            for entry in &inventory.entries {
+                document = document.line(format!(
+                    "{} x{} · {}\n{}",
+                    entry.item.name,
+                    entry.quantity,
+                    item_quality_label(entry.item.quality),
+                    item_effect_description(&entry.item)
+                ));
+            }
+        }
+        if page > 1 {
+            document = document.command(format!("背包 {}", page - 1));
+        }
+        if page < inventory.page_count {
+            document = document.command(format!("背包 {}", page + 1));
+        }
+        Ok(document
+            .command("使用 <物品>")
+            .command("商店")
+            .command("钱包"))
+    }
+
+    pub fn buy(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let (item_name, quantity) = parse_item_quantity(
+            req.args.as_str(),
+            self.config.messages.legacy_hyphen_arguments,
+            "购买 <物品> [数量]",
+        )?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self
+            .store
+            .buy_item_with_operation(&key, item_name, quantity, &operation)?;
+        Ok(GameDocument::new("购买成功")
+            .field("NPC", receipt.npc_name)
+            .field(
+                "物品",
+                format!("{} x{}", receipt.item.name, receipt.quantity),
+            )
+            .field("花费", format!("{} 金魂币", receipt.total_price))
+            .field("钱包余额", receipt.balance_after.to_string())
+            .field("背包数量", receipt.inventory_after.to_string())
+            .notice("购买、扣款和背包入账已在同一事务完成")
+            .command("背包")
+            .command("商店"))
+    }
+
+    pub fn sell(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let (item_name, quantity) = parse_item_quantity(
+            req.args.as_str(),
+            self.config.messages.legacy_hyphen_arguments,
+            "出售 <物品> [数量]",
+        )?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self
+            .store
+            .sell_item_with_operation(&key, item_name, quantity, &operation)?;
+        Ok(GameDocument::new("出售成功")
+            .field("NPC", receipt.npc_name)
+            .field(
+                "物品",
+                format!("{} x{}", receipt.item.name, receipt.quantity),
+            )
+            .field("收入", format!("{} 金魂币", receipt.total_price))
+            .field("钱包余额", receipt.balance_after.to_string())
+            .field("背包数量", receipt.inventory_after.to_string())
+            .notice("出售、背包扣除和钱包入账已在同一事务完成")
+            .command("背包")
+            .command("商店"))
+    }
+
+    pub fn use_item(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let item_name = parse_required_catalog_name(req.args.as_str(), "使用 <物品>")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self
+            .store
+            .use_item_with_operation(&key, item_name, &operation)?;
+        let mut document = GameDocument::new(format!("使用{}", receipt.item.name))
+            .field("背包数量", receipt.inventory_after.to_string())
+            .field(
+                "生命",
+                format!(
+                    "{} → {}/{}",
+                    receipt.hp_before, receipt.hp_after, receipt.max_hp
+                ),
+            )
+            .field(
+                "魂力",
+                format!(
+                    "{} → {}/{}",
+                    receipt.soul_power_before, receipt.soul_power_after, receipt.max_soul_power
+                ),
+            );
+        if receipt.consumed {
+            document = document.notice("物品已消耗");
+        } else {
+            document = document.notice("当前属性已满，物品未消耗");
+        }
+        Ok(document.command("背包").command("状态"))
+    }
+
     pub fn status(&self, req: &CommandRequest) -> Result<GameDocument, String> {
         let identity = resolve_identity(req, &self.config.identity)?;
         let key = self.identity_key(&identity, &identity.subject_id);
@@ -506,6 +751,7 @@ impl GameService {
         document
             .illustration_if(self.asset_illustration("map", &map.name, "cover"))
             .command("状态")
+            .command("NPC")
             .command("地图列表")
             .command("向 <上|下|左|右>")
             .command("传送 <地图>")
@@ -920,6 +1166,130 @@ fn parse_optional_map_name(args: &str) -> Result<Option<&str>, String> {
     Ok(Some(args))
 }
 
+fn parse_required_catalog_name<'a>(args: &'a str, usage: &str) -> Result<&'a str, String> {
+    let name = args.trim();
+    if name.is_empty() {
+        return Err(format!("用法：{usage}"));
+    }
+    if name.chars().count() > 128 || name.chars().any(char::is_control) {
+        return Err("名称不能超过 128 个字符且不能包含控制字符".to_string());
+    }
+    Ok(name)
+}
+
+fn parse_single_page(args: &str, label: &str) -> Result<usize, String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Ok(1);
+    }
+    let mut parts = args.split_whitespace();
+    let page = parts
+        .next()
+        .ok_or_else(|| format!("用法：{label} [页码]"))?
+        .parse::<usize>()
+        .map_err(|_| format!("用法：{label} [页码]"))?;
+    if parts.next().is_some() || page == 0 || page > 100 {
+        return Err(format!("{label}页码必须在 1 到 100 之间"));
+    }
+    Ok(page)
+}
+
+fn parse_shop_args(args: &str) -> Result<(Option<&str>, usize), String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Ok((None, 1));
+    }
+    if let Ok(page) = args.parse::<usize>() {
+        if (1..=100).contains(&page) {
+            return Ok((None, page));
+        }
+        return Err("商店页码必须在 1 到 100 之间".to_string());
+    }
+    let mut parts = args.split_whitespace();
+    let npc = parts.next().unwrap_or_default();
+    let rest = parts.next();
+    if rest.is_none() {
+        return Ok((Some(args), 1));
+    }
+    if parts.next().is_some() {
+        return Err("用法：商店 [页码]；如需指定 NPC，请先使用“对话 NPC”".to_string());
+    }
+    let page = rest
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| "用法：商店 [页码]；如需指定 NPC，请先使用“对话 NPC”".to_string())?;
+    if !(1..=100).contains(&page) {
+        return Err("商店页码必须在 1 到 100 之间".to_string());
+    }
+    Ok((Some(npc), page))
+}
+
+fn parse_item_quantity<'a>(
+    args: &'a str,
+    legacy_hyphen: bool,
+    usage: &str,
+) -> Result<(&'a str, i64), String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Err(format!("用法：{usage}"));
+    }
+
+    // 新格式允许“物品名 数量”，并保留旧版“物品名-数量”。物品名本身
+    // 可以包含空格，因此只把末尾的纯数字片段当作数量。
+    let mut end = args.len();
+    while end > 0 && args.as_bytes()[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let number_end = end;
+    let mut start = number_end;
+    while start > 0 && !args.as_bytes()[start - 1].is_ascii_whitespace() {
+        start -= 1;
+    }
+    if start < number_end
+        && let Ok(quantity) = args[start..number_end].parse::<i64>()
+    {
+        let item_name = args[..start].trim_end();
+        if !item_name.is_empty() {
+            if !(1..=9999).contains(&quantity) {
+                return Err("数量必须在 1 到 9999 之间".to_string());
+            }
+            return Ok((item_name, quantity));
+        }
+    }
+
+    if legacy_hyphen
+        && let Some((item_name, quantity_text)) = args.rsplit_once('-')
+        && let Ok(quantity) = quantity_text.trim().parse::<i64>()
+        && !item_name.trim().is_empty()
+    {
+        if !(1..=9999).contains(&quantity) {
+            return Err("数量必须在 1 到 9999 之间".to_string());
+        }
+        return Ok((item_name.trim(), quantity));
+    }
+    Ok((args, 1))
+}
+
+fn item_quality_label(quality: i64) -> String {
+    format!("品质 {}", quality)
+}
+
+fn npc_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "merchant" => "商人",
+        "elder" => "长者",
+        _ => "NPC",
+    }
+}
+
+fn item_effect_description(item: &crate::store::ItemRecord) -> String {
+    match item.effect_kind.as_str() {
+        "restore_hp" => format!("恢复 {} 点生命", item.effect_amount),
+        "restore_soul" => format!("恢复 {} 点魂力", item.effect_amount),
+        "revive" => format!("复活并恢复 {}% 生命", item.revive_hp_percent),
+        _ => item.description.clone(),
+    }
+}
+
 fn display_direction(direction: &str) -> &'static str {
     match direction {
         "north" => "上",
@@ -1007,7 +1377,7 @@ fn parse_menu_page(args: &str) -> Result<usize, String> {
     let mut parts = args.split_whitespace();
     let token = parts.next().unwrap_or_default();
     if parts.next().is_some() {
-        return Err("用法：斗罗系统 [页码|开始|角色|世界]".to_string());
+        return Err("用法：斗罗系统 [页码|开始|角色|世界|经济]".to_string());
     }
     if let Some(page) = token
         .parse::<usize>()
@@ -1022,12 +1392,29 @@ fn parse_menu_page(args: &str) -> Result<usize, String> {
     MENU_PAGES
         .iter()
         .position(|page| page.key == token)
-        .ok_or_else(|| "用法：斗罗系统 [页码|开始|角色|世界]".to_string())
+        .ok_or_else(|| "用法：斗罗系统 [页码|开始|角色|世界|经济]".to_string())
 }
 
 #[cfg(test)]
 mod tests {
+    use abi_stable::std_types::RString;
+
     use super::*;
+
+    fn command_request(command: &str, args: &str, message_id: &str) -> CommandRequest {
+        CommandRequest {
+            args: RString::from(args),
+            command_name: RString::from(command),
+            sender_id: RString::from("economy-user"),
+            group_id: RString::new(),
+            raw_event_json: RString::from(
+                r#"{"self_id":"10001","qimen_context":{"version":1,"protocol":"onebot11","account_id":"10001"}}"#,
+            ),
+            sender_nickname: RString::from("经济测试"),
+            message_id: RString::from(message_id),
+            timestamp: 0,
+        }
+    }
 
     #[test]
     fn accepts_space_and_legacy_hyphen_arguments() {
@@ -1410,7 +1797,8 @@ mod tests {
                 .any(|entry| entry.command == "钱包")
         );
         assert_eq!(parse_menu_page("世界").expect("世界分类应有效"), 2);
-        assert!(parse_menu_page("4").is_err());
+        assert_eq!(parse_menu_page("经济").expect("经济分类应有效"), 3);
+        assert!(parse_menu_page("5").is_err());
         assert!(parse_menu_page("角色 多余").is_err());
     }
 
@@ -1440,6 +1828,130 @@ mod tests {
         let third = crate::message::render_text(&service.menu("世界").expect("世界页应有效"));
         assert!(third.contains("位置：查看当前地图"));
         assert!(third.contains("斗罗系统 2"));
+        assert!(third.contains("斗罗系统 4"));
+
+        let fourth = crate::message::render_text(&service.menu("经济").expect("经济页应有效"));
+        assert!(fourth.contains("NPC：查看当前地图的 NPC"));
+        assert!(fourth.contains("购买 <物品> [数量]：从当前商店购买物品"));
+        assert!(fourth.contains("使用 <物品>：使用背包中的消耗品"));
+        assert!(fourth.contains("斗罗系统 3"));
+    }
+
+    #[test]
+    fn economy_command_arguments_keep_new_and_legacy_shapes() {
+        assert_eq!(parse_single_page("", "背包"), Ok(1));
+        assert_eq!(parse_single_page("2", "背包"), Ok(2));
+        assert!(parse_single_page("0", "背包").is_err());
+        assert!(parse_single_page("2 extra", "背包").is_err());
+
+        assert_eq!(parse_shop_args(""), Ok((None, 1)));
+        assert_eq!(parse_shop_args("2"), Ok((None, 2)));
+        assert_eq!(parse_shop_args("杂货商人"), Ok((Some("杂货商人"), 1)));
+        assert_eq!(parse_shop_args("杂货商人 2"), Ok((Some("杂货商人"), 2)));
+        assert!(parse_shop_args("杂货商人 2 extra").is_err());
+
+        assert_eq!(
+            parse_item_quantity("小回复药 2", true, "购买 <物品> [数量]"),
+            Ok(("小回复药", 2))
+        );
+        assert_eq!(
+            parse_item_quantity("小回复药-2", true, "购买 <物品> [数量]"),
+            Ok(("小回复药", 2))
+        );
+        assert_eq!(
+            parse_item_quantity("小回复药-2", false, "购买 <物品> [数量]"),
+            Ok(("小回复药-2", 1))
+        );
+        assert_eq!(
+            parse_item_quantity("魂力 恢复药 3", true, "购买 <物品> [数量]"),
+            Ok(("魂力 恢复药", 3))
+        );
+        assert!(parse_item_quantity("小回复药 0", true, "购买").is_err());
+        assert!(parse_item_quantity("", true, "购买").is_err());
+        assert_eq!(
+            parse_required_catalog_name(" 村长 ", "对话 <NPC>"),
+            Ok("村长")
+        );
+    }
+
+    #[test]
+    fn economy_commands_render_the_complete_npc_shop_inventory_flow() {
+        let directory = tempfile::tempdir().expect("临时目录应创建");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("数据库应初始化");
+        let service = GameService::with_assets(
+            store,
+            PluginConfig::default(),
+            IllustrationAssets::default(),
+        );
+        service
+            .register(&command_request(
+                "开始穿越",
+                "经济命令 男",
+                "economy-register",
+            ))
+            .expect("应创建经济测试角色");
+        service
+            .daily_checkin(&command_request("签到", "", "economy-checkin"))
+            .expect("应获得购买资金");
+
+        let npcs = crate::message::render_text(
+            &service
+                .npcs(&command_request("NPC", "", "economy-npcs"))
+                .expect("应列出当前 NPC"),
+        );
+        assert!(npcs.contains("村长"));
+        assert!(npcs.contains("杂货商人"));
+
+        let talk = crate::message::render_text(
+            &service
+                .talk(&command_request("对话", "杂货商人", "economy-talk"))
+                .expect("应与商人对话"),
+        );
+        assert!(talk.contains("这里有旅途中用得上的药剂"));
+        assert!(talk.contains("商店"));
+
+        let shop_document = service
+            .shop(&command_request("商店", "", "economy-shop"))
+            .expect("应打开当前商店");
+        let shop = crate::message::render_text(&shop_document);
+        assert!(shop.contains("小回复药 · 10 金魂币"));
+        assert!(shop.contains("魂力恢复药"));
+        let markdown = crate::message::render_markdown(&shop_document, None);
+        assert!(markdown.contains("# 杂货商人的商店"));
+        assert!(markdown.contains("购买 \\<物品\\> \\[数量\\]"));
+
+        let purchase = crate::message::render_text(
+            &service
+                .buy(&command_request("购买", "小回复药 2", "economy-buy"))
+                .expect("应购买恢复药"),
+        );
+        assert!(purchase.contains("小回复药 x2"));
+        assert!(purchase.contains("20 金魂币"));
+
+        let inventory = crate::message::render_text(
+            &service
+                .inventory(&command_request("背包", "", "economy-inventory"))
+                .expect("应读取背包"),
+        );
+        assert!(inventory.contains("小回复药 x2"));
+        assert!(inventory.contains("恢复 50 点生命"));
+
+        let full = crate::message::render_text(
+            &service
+                .use_item(&command_request("使用", "小回复药", "economy-use-full"))
+                .expect("满生命应保留药剂"),
+        );
+        assert!(full.contains("当前属性已满，物品未消耗"));
+        assert!(full.contains("背包数量：2"));
+
+        let sale = crate::message::render_text(
+            &service
+                .sell(&command_request("出售", "小回复药-1", "economy-sell"))
+                .expect("旧横线格式应可出售"),
+        );
+        assert!(sale.contains("小回复药 x1"));
+        assert!(sale.contains("背包数量：1"));
     }
 
     #[test]

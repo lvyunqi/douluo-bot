@@ -199,6 +199,83 @@ mod plugin {
     }
 
     #[command(
+        name = "NPC",
+        description = "查看当前地图的 NPC",
+        aliases = "人物,当前NPC",
+        category = "斗罗大陆·经济",
+        scope = "all"
+    )]
+    fn npcs(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.npcs(req))
+    }
+
+    #[command(
+        name = "对话",
+        description = "与当前地图的 NPC 对话：对话 <NPC>",
+        aliases = "交谈,聊天",
+        category = "斗罗大陆·经济",
+        scope = "all"
+    )]
+    fn talk(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.talk(req))
+    }
+
+    #[command(
+        name = "商店",
+        description = "查看已对话商人的商品：商店 [页码]",
+        aliases = "店铺",
+        category = "斗罗大陆·经济",
+        scope = "all"
+    )]
+    fn shop(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.shop(req))
+    }
+
+    #[command(
+        name = "背包",
+        description = "分页查看随身物品：背包 [页码]",
+        aliases = "随身物品,物品,道具",
+        category = "斗罗大陆·经济",
+        scope = "all"
+    )]
+    fn inventory(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.inventory(req))
+    }
+
+    #[command(
+        name = "购买",
+        description = "从当前商店购买物品：购买 <物品> [数量]",
+        aliases = "购买物品,买",
+        category = "斗罗大陆·经济",
+        scope = "all"
+    )]
+    fn buy(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.buy(req))
+    }
+
+    #[command(
+        name = "出售",
+        description = "向当前商店出售物品：出售 <物品> [数量]",
+        aliases = "卖出,卖",
+        category = "斗罗大陆·经济",
+        scope = "all"
+    )]
+    fn sell(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.sell(req))
+    }
+
+    #[command(
+        name = "使用",
+        description = "使用背包中的物品：使用 <物品>",
+        aliases = "使用物品,用",
+        category = "斗罗大陆·经济",
+        scope = "all"
+    )]
+    fn use_item(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.use_item(req))
+    }
+
+    #[command(
         name = "状态",
         description = "查看自己的角色状态",
         aliases = "我的状态,属性",

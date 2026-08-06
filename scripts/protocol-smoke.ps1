@@ -378,7 +378,10 @@ try {
     # PowerShell 5 can wrap a JSON array in a single PSObject; normalize each
     # command explicitly before comparing Unicode command names.
     $commands = @($plugin.commands | ForEach-Object { [string]$_ })
-    foreach ($command in @("斗罗系统", "开始穿越", "武魂觉醒", "签到", "钱包", "状态", "位置", "地图列表", "向", "传送")) {
+    foreach ($command in @(
+        "斗罗系统", "开始穿越", "武魂觉醒", "签到", "钱包", "状态", "位置",
+        "地图列表", "向", "传送", "NPC", "对话", "商店", "背包", "购买", "出售", "使用"
+    )) {
         $found = $commands | Where-Object { $_ -eq $command }
         Assert-Condition ($null -ne $found) "descriptor is missing command '$command' (commands=$($commands -join ', '))"
     }
@@ -393,7 +396,14 @@ try {
         @{ Message = "签到"; Contains = "今日已签到" },
         @{ Message = "钱包"; Contains = "金魂币" },
         @{ Message = "位置"; Contains = "圣魂村" },
-        @{ Message = "余额"; Contains = "金魂币" }
+        @{ Message = "余额"; Contains = "金魂币" },
+        @{ Message = "NPC"; Contains = "杂货商人" },
+        @{ Message = "对话 杂货商人"; Contains = "当前对话已绑定" },
+        @{ Message = "商店"; Contains = "小回复药" },
+        @{ Message = "购买 小回复药 2"; Contains = "购买成功" },
+        @{ Message = "背包"; Contains = "小回复药 x2" },
+        @{ Message = "使用 小回复药"; Contains = "物品未消耗" },
+        @{ Message = "出售 小回复药-1"; Contains = "出售成功" }
     )
     foreach ($check in $checks) {
         $result = Invoke-OneBotCommand $endpoint $check.Message

@@ -462,6 +462,205 @@ SELECT p.id, m.map_key, p.updated_at
   JOIN map m ON m.name = p.map_name;
 "#;
 
+// v8 恢复首批旧版物品、NPC 和商店数据。经济写入仍由 Store 在
+// BEGIN IMMEDIATE 事务中执行；这里的触发器只负责跨表不变量，避免
+// 管理导入或未来功能绕过 max_stack/复活物品不上架规则。
+const MIGRATION_V8: &str = r#"
+CREATE TABLE item (
+    item_key TEXT PRIMARY KEY CHECK(
+        length(item_key) BETWEEN 1 AND 96
+        AND item_key = trim(item_key)
+        AND item_key GLOB '[a-z0-9][a-z0-9._-]*'
+        AND item_key NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 128),
+    category TEXT NOT NULL CHECK(category IN ('revival', 'consumable')),
+    quality INTEGER NOT NULL CHECK(quality BETWEEN 1 AND 5),
+    stackable INTEGER NOT NULL CHECK(stackable IN (0, 1)),
+    max_stack INTEGER NOT NULL CHECK(max_stack BETWEEN 1 AND 9999),
+    buy_price INTEGER NOT NULL CHECK(buy_price >= 0),
+    sell_price INTEGER NOT NULL CHECK(sell_price >= 0 AND sell_price <= buy_price),
+    level_required INTEGER NOT NULL DEFAULT 1 CHECK(level_required BETWEEN 1 AND 120),
+    effect_kind TEXT NOT NULL CHECK(effect_kind IN ('revive', 'restore_hp', 'restore_soul')),
+    effect_amount INTEGER NOT NULL DEFAULT 0 CHECK(effect_amount >= 0),
+    revive_hp_percent INTEGER NOT NULL DEFAULT 0 CHECK(revive_hp_percent BETWEEN 0 AND 100),
+    purchasable INTEGER NOT NULL DEFAULT 1 CHECK(purchasable IN (0, 1)),
+    sellable INTEGER NOT NULL DEFAULT 1 CHECK(sellable IN (0, 1)),
+    usable INTEGER NOT NULL DEFAULT 1 CHECK(usable IN (0, 1)),
+    description TEXT NOT NULL DEFAULT '' CHECK(length(description) <= 2000),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+    CHECK(
+        (stackable = 1 OR max_stack = 1)
+        AND (
+            (effect_kind = 'revive' AND effect_amount = 0 AND revive_hp_percent > 0)
+            OR (effect_kind IN ('restore_hp', 'restore_soul')
+                AND effect_amount > 0 AND revive_hp_percent = 0)
+        )
+    )
+) STRICT;
+
+CREATE UNIQUE INDEX item_name_unique ON item(name);
+
+CREATE TABLE inventory (
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE CASCADE,
+    item_key TEXT NOT NULL REFERENCES item(item_key) ON DELETE RESTRICT,
+    quantity INTEGER NOT NULL CHECK(quantity BETWEEN 1 AND 999999),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+    PRIMARY KEY(player_id, item_key)
+) STRICT;
+
+CREATE INDEX inventory_player_page ON inventory(player_id, item_key);
+
+CREATE TABLE npc (
+    npc_key TEXT PRIMARY KEY CHECK(
+        length(npc_key) BETWEEN 1 AND 96
+        AND npc_key = trim(npc_key)
+        AND npc_key GLOB '[a-z0-9][a-z0-9._-]*'
+        AND npc_key NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    map_key TEXT NOT NULL REFERENCES map(map_key) ON DELETE RESTRICT,
+    name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 128),
+    npc_kind TEXT NOT NULL CHECK(npc_kind IN ('elder', 'merchant')),
+    dialogue TEXT NOT NULL DEFAULT '' CHECK(length(dialogue) <= 2000),
+    description TEXT NOT NULL DEFAULT '' CHECK(length(description) <= 2000),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    sort_order INTEGER NOT NULL DEFAULT 0 CHECK(sort_order >= 0),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+) STRICT;
+
+CREATE UNIQUE INDEX npc_map_name_unique ON npc(map_key, name);
+CREATE INDEX npc_map_page ON npc(map_key, enabled, sort_order, npc_key);
+
+CREATE TABLE shop_item (
+    npc_key TEXT NOT NULL REFERENCES npc(npc_key) ON DELETE CASCADE,
+    item_key TEXT NOT NULL REFERENCES item(item_key) ON DELETE RESTRICT,
+    buy_price INTEGER NOT NULL CHECK(buy_price >= 0),
+    stock INTEGER NOT NULL DEFAULT -1 CHECK(stock = -1 OR stock >= 0),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+    PRIMARY KEY(npc_key, item_key)
+) STRICT;
+
+CREATE INDEX shop_item_npc_page ON shop_item(npc_key, enabled, item_key);
+
+CREATE TABLE player_npc (
+    player_id INTEGER PRIMARY KEY REFERENCES player(id) ON DELETE CASCADE,
+    npc_key TEXT NOT NULL REFERENCES npc(npc_key) ON DELETE RESTRICT,
+    updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+) STRICT;
+
+CREATE TRIGGER inventory_item_stack_insert
+BEFORE INSERT ON inventory
+WHEN NEW.quantity > COALESCE((SELECT max_stack FROM item WHERE item_key = NEW.item_key), 0)
+BEGIN
+    SELECT RAISE(ABORT, 'inventory quantity exceeds item max_stack');
+END;
+
+CREATE TRIGGER inventory_item_stack_update
+BEFORE UPDATE OF item_key, quantity ON inventory
+WHEN NEW.quantity > COALESCE((SELECT max_stack FROM item WHERE item_key = NEW.item_key), 0)
+BEGIN
+    SELECT RAISE(ABORT, 'inventory quantity exceeds item max_stack');
+END;
+
+CREATE TRIGGER shop_item_revival_insert
+BEFORE INSERT ON shop_item
+WHEN NOT EXISTS(SELECT 1 FROM item WHERE item_key = NEW.item_key)
+  OR EXISTS(
+      SELECT 1 FROM item
+       WHERE item_key = NEW.item_key
+         AND (
+             category = 'revival' OR purchasable = 0 OR usable = 0
+             OR NEW.buy_price < sell_price
+         )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid item cannot be listed in a shop');
+END;
+
+CREATE TRIGGER shop_item_revival_update
+BEFORE UPDATE OF item_key, buy_price ON shop_item
+WHEN NOT EXISTS(SELECT 1 FROM item WHERE item_key = NEW.item_key)
+  OR EXISTS(
+      SELECT 1 FROM item
+       WHERE item_key = NEW.item_key
+         AND (
+             category = 'revival' OR purchasable = 0 OR usable = 0
+             OR NEW.buy_price < sell_price
+         )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid item cannot be listed in a shop');
+END;
+
+CREATE TRIGGER item_shop_contract_update
+BEFORE UPDATE OF category, purchasable, usable, sell_price ON item
+WHEN EXISTS(
+    SELECT 1 FROM shop_item
+     WHERE shop_item.item_key = OLD.item_key
+       AND (
+           NEW.category = 'revival' OR NEW.purchasable = 0 OR NEW.usable = 0
+           OR shop_item.buy_price < NEW.sell_price
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'item update would invalidate a shop listing');
+END;
+
+CREATE TRIGGER item_inventory_stack_update
+BEFORE UPDATE OF max_stack ON item
+WHEN EXISTS(
+    SELECT 1 FROM inventory
+     WHERE inventory.item_key = OLD.item_key
+       AND inventory.quantity > NEW.max_stack
+)
+BEGIN
+    SELECT RAISE(ABORT, 'item max_stack is below existing inventory');
+END;
+
+INSERT INTO item(
+    item_key, name, category, quality, stackable, max_stack,
+    buy_price, sell_price, level_required, effect_kind, effect_amount,
+    revive_hp_percent, purchasable, sellable, usable, description,
+    created_at, updated_at
+) VALUES
+    ('revival-grass', '复活草', 'revival', 2, 1, 10,
+     1000, 500, 1, 'revive', 0, 30, 0, 0, 0,
+     '使用后可以复活，恢复30%生命值', 0, 0),
+    ('nine-leaf-zhi-grass', '九叶芝草', 'revival', 4, 1, 5,
+     10000, 5000, 1, 'revive', 0, 100, 0, 0, 0,
+     '传说中的仙草，使用后满血复活', 0, 0),
+    ('small-healing-potion', '小回复药', 'consumable', 1, 1, 99,
+     10, 2, 1, 'restore_hp', 50, 0, 1, 1, 1,
+     '恢复50点生命值', 0, 0),
+    ('medium-healing-potion', '中回复药', 'consumable', 2, 1, 99,
+     50, 10, 10, 'restore_hp', 200, 0, 1, 1, 1,
+     '恢复200点生命值', 0, 0),
+    ('soul-power-potion', '魂力恢复药', 'consumable', 2, 1, 99,
+     30, 6, 1, 'restore_soul', 100, 0, 1, 1, 1,
+     '恢复100点魂力值', 0, 0);
+
+INSERT INTO npc(
+    npc_key, map_key, name, npc_kind, dialogue, description,
+    enabled, sort_order, created_at, updated_at
+) VALUES
+    ('holy-soul-village-chief', 'holy-soul-village', '村长', 'elder',
+     '年轻人，欢迎来到圣魂村。愿你在魂师之路上平安成长。',
+     '圣魂村的村长，可以接待初来乍到的魂师。', 1, 10, 0, 0),
+    ('holy-soul-village-grocer', 'holy-soul-village', '杂货商人', 'merchant',
+     '看看吧，这里有旅途中用得上的药剂。',
+     '出售基础恢复药剂。', 1, 20, 0, 0);
+
+INSERT INTO shop_item(npc_key, item_key, buy_price, stock, enabled, created_at, updated_at)
+VALUES
+    ('holy-soul-village-grocer', 'small-healing-potion', 10, -1, 1, 0, 0),
+    ('holy-soul-village-grocer', 'medium-healing-potion', 50, -1, 1, 0, 0),
+    ('holy-soul-village-grocer', 'soul-power-potion', 30, -1, 1, 0, 0);
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -555,6 +754,112 @@ pub struct MapTravelReceipt {
     pub to: MapRecord,
     pub travel_kind: String,
     pub direction: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemRecord {
+    pub item_key: String,
+    pub name: String,
+    pub category: String,
+    pub quality: i64,
+    pub stackable: bool,
+    pub max_stack: i64,
+    pub buy_price: i64,
+    pub sell_price: i64,
+    pub level_required: i64,
+    pub effect_kind: String,
+    pub effect_amount: i64,
+    pub revive_hp_percent: i64,
+    pub purchasable: bool,
+    pub sellable: bool,
+    pub usable: bool,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InventoryEntry {
+    pub item: ItemRecord,
+    pub quantity: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InventoryPage {
+    pub entries: Vec<InventoryEntry>,
+    pub page: usize,
+    pub page_count: usize,
+    pub total: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NpcRecord {
+    pub npc_key: String,
+    pub map_key: String,
+    pub map_name: String,
+    pub name: String,
+    pub npc_kind: String,
+    pub dialogue: String,
+    pub description: String,
+    pub has_shop: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NpcPage {
+    pub entries: Vec<NpcRecord>,
+    pub map_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShopItemEntry {
+    pub npc_key: String,
+    pub npc_name: String,
+    pub item: ItemRecord,
+    pub price: i64,
+    pub stock: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShopPage {
+    pub npc: NpcRecord,
+    pub entries: Vec<ShopItemEntry>,
+    pub page: usize,
+    pub page_count: usize,
+    pub total: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PurchaseReceipt {
+    pub npc_name: String,
+    pub item: ItemRecord,
+    pub quantity: i64,
+    pub total_price: i64,
+    pub balance_after: i64,
+    pub inventory_after: i64,
+    pub stock_after: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SaleReceipt {
+    pub npc_name: String,
+    pub item: ItemRecord,
+    pub quantity: i64,
+    pub total_price: i64,
+    pub balance_after: i64,
+    pub inventory_after: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UseItemReceipt {
+    pub item: ItemRecord,
+    pub consumed: bool,
+    pub inventory_after: i64,
+    pub hp_before: i64,
+    pub hp_after: i64,
+    pub max_hp: i64,
+    pub soul_power_before: i64,
+    pub soul_power_after: i64,
+    pub max_soul_power: i64,
+    pub state_before: String,
+    pub state_after: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -976,7 +1281,7 @@ impl Store {
         let migration_result = (|| -> Result<(), String> {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|error| format!("开始数据库迁移 v2/v3/v4/v5/v6/v7 失败：{error}"))?;
+                .map_err(|error| format!("开始数据库迁移 v2/v3/v4/v5/v6/v7/v8 失败：{error}"))?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
             if !migration_applied(&transaction, 2)? {
                 let old_identity_sequence = transaction
@@ -1091,10 +1396,25 @@ impl Store {
                 validate_v7_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 8)? {
+                transaction
+                    .execute_batch(MIGRATION_V8)
+                    .map_err(|error| format!("执行数据库迁移 v8 失败：{error}"))?;
+                validate_v8_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(8, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v8 失败：{error}"))?;
+            } else {
+                validate_v8_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction
                 .commit()
-                .map_err(|error| format!("提交数据库迁移 v2/v3/v4/v5/v6/v7 失败：{error}"))?;
+                .map_err(|error| format!("提交数据库迁移 v2/v3/v4/v5/v6/v7/v8 失败：{error}"))?;
             Ok(())
         })();
         let restore_result = set_foreign_keys(connection, true);
@@ -1107,6 +1427,7 @@ impl Store {
                 validate_v5_schema(connection)?;
                 validate_v6_schema(connection)?;
                 validate_v7_schema(connection)?;
+                validate_v8_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -1531,6 +1852,687 @@ impl Store {
             )
             .optional()
             .map_err(|error| format!("查询钱包余额失败：{error}"))
+    }
+
+    pub fn talk_to_npc_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        npc_name_or_key: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<NpcRecord, String> {
+        validate_identity_key(key)?;
+        validate_catalog_lookup(npc_name_or_key, "NPC 名称")?;
+        validate_operation_input(operation)?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始 NPC 对话事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        reject_replayed_operation(&transaction, key, operation)?;
+        let (player_id, _, map) = load_player_map_for_identity(&transaction, key)?;
+        let npc = transaction
+            .query_row(
+                r#"
+                SELECT n.npc_key, n.map_key, m.name, n.name, n.npc_kind,
+                       n.dialogue, n.description,
+                       EXISTS(
+                           SELECT 1 FROM shop_item si
+                            WHERE si.npc_key = n.npc_key AND si.enabled = 1
+                       )
+                  FROM npc n
+                  JOIN map m ON m.map_key = n.map_key
+                 WHERE n.map_key = ?1 AND n.enabled = 1
+                   AND (n.name = ?2 OR n.npc_key = ?2)
+                 LIMIT 1
+                "#,
+                params![map.map_key, npc_name_or_key],
+                |row| npc_record_from_row(row, 0),
+            )
+            .optional()
+            .map_err(|error| format!("查询对话 NPC 失败：{error}"))?
+            .ok_or_else(|| "当前地图不存在这位 NPC".to_string())?;
+        let timestamp = now_timestamp()?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO player_npc(player_id, npc_key, updated_at)
+                VALUES(?1, ?2, ?3)
+                ON CONFLICT(player_id) DO UPDATE SET
+                    npc_key = excluded.npc_key,
+                    updated_at = excluded.updated_at
+                "#,
+                params![player_id, npc.npc_key, timestamp],
+            )
+            .map_err(|error| format!("保存当前对话 NPC 失败：{error}"))?;
+        insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交 NPC 对话事务失败：{error}"))?;
+        Ok(npc)
+    }
+
+    pub fn npcs_at_current_map(&self, key: &IdentityKey<'_>) -> Result<NpcPage, String> {
+        validate_identity_key(key)?;
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let (_, _, map) = load_player_map_for_identity(&connection, key)?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT n.npc_key, n.map_key, m.name, n.name, n.npc_kind,
+                       n.dialogue, n.description,
+                       EXISTS(
+                           SELECT 1 FROM shop_item si
+                            WHERE si.npc_key = n.npc_key AND si.enabled = 1
+                       )
+                  FROM npc n
+                  JOIN map m ON m.map_key = n.map_key
+                 WHERE n.map_key = ?1 AND n.enabled = 1
+                 ORDER BY n.sort_order, n.npc_key
+                "#,
+            )
+            .map_err(|error| format!("准备当前地图 NPC 查询失败：{error}"))?;
+        let entries = statement
+            .query_map([map.map_key.as_str()], |row| npc_record_from_row(row, 0))
+            .map_err(|error| format!("查询当前地图 NPC 失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析当前地图 NPC 失败：{error}"))?;
+        Ok(NpcPage {
+            entries,
+            map_name: map.name,
+        })
+    }
+
+    pub fn shop_items_page(
+        &self,
+        key: &IdentityKey<'_>,
+        npc_name_or_key: Option<&str>,
+        page: usize,
+        limit: usize,
+    ) -> Result<ShopPage, String> {
+        validate_identity_key(key)?;
+        validate_catalog_page(page, limit, "商店")?;
+        if let Some(npc_name_or_key) = npc_name_or_key {
+            validate_catalog_lookup(npc_name_or_key, "NPC 名称")?;
+        }
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let (player_id, _, map) = load_player_map_for_identity(&connection, key)?;
+        let npc = load_bound_npc_for_player(&connection, player_id, &map.map_key, npc_name_or_key)?;
+        if npc.npc_kind != "merchant" || !npc.has_shop {
+            return Err(format!("当前对话 NPC“{}”没有可用商店", npc.name));
+        }
+        let total = connection
+            .query_row(
+                "SELECT COUNT(*) FROM shop_item WHERE npc_key = ?1 AND enabled = 1",
+                [npc.npc_key.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("统计商店商品失败：{error}"))?;
+        let total = usize::try_from(total).map_err(|_| "商店商品数量超出分页范围".to_string())?;
+        let page_count = total.div_ceil(limit).max(1);
+        if page > page_count {
+            return Err(format!("商店页码必须在 1 到 {page_count} 之间"));
+        }
+        let offset = page
+            .checked_sub(1)
+            .and_then(|page| page.checked_mul(limit))
+            .ok_or_else(|| "商店分页偏移量溢出".to_string())?;
+        let fetch_limit = i64::try_from(limit).map_err(|_| "商店分页数量无法转换".to_string())?;
+        let offset = i64::try_from(offset).map_err(|_| "商店分页偏移量无法转换".to_string())?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT si.npc_key, n.name,
+                       i.item_key, i.name, i.category, i.quality, i.stackable,
+                       i.max_stack, i.buy_price, i.sell_price, i.level_required,
+                       i.effect_kind, i.effect_amount, i.revive_hp_percent,
+                       i.purchasable, i.sellable, i.usable, i.description,
+                       si.buy_price, si.stock
+                  FROM shop_item si
+                  JOIN npc n ON n.npc_key = si.npc_key
+                  JOIN item i ON i.item_key = si.item_key
+                 WHERE si.npc_key = ?1 AND si.enabled = 1
+                 ORDER BY i.level_required, i.name, i.item_key
+                 LIMIT ?2 OFFSET ?3
+                "#,
+            )
+            .map_err(|error| format!("准备商店商品分页失败：{error}"))?;
+        let entries = statement
+            .query_map(params![npc.npc_key, fetch_limit, offset], |row| {
+                let stock = row.get::<_, i64>(19)?;
+                Ok(ShopItemEntry {
+                    npc_key: row.get(0)?,
+                    npc_name: row.get(1)?,
+                    item: item_record_from_row(row, 2)?,
+                    price: row.get(18)?,
+                    stock: (stock >= 0).then_some(stock),
+                })
+            })
+            .map_err(|error| format!("查询商店商品分页失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析商店商品分页失败：{error}"))?;
+        Ok(ShopPage {
+            npc,
+            entries,
+            page,
+            page_count,
+            total,
+        })
+    }
+
+    pub fn inventory_page(
+        &self,
+        key: &IdentityKey<'_>,
+        page: usize,
+        limit: usize,
+    ) -> Result<InventoryPage, String> {
+        validate_identity_key(key)?;
+        validate_catalog_page(page, limit, "背包")?;
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let (player_id, _, _) = load_player_map_for_identity(&connection, key)?;
+        let total = connection
+            .query_row(
+                "SELECT COUNT(*) FROM inventory WHERE player_id = ?1",
+                [player_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("统计背包物品失败：{error}"))?;
+        let total = usize::try_from(total).map_err(|_| "背包物品数量超出分页范围".to_string())?;
+        let page_count = total.div_ceil(limit).max(1);
+        if page > page_count {
+            return Err(format!("背包页码必须在 1 到 {page_count} 之间"));
+        }
+        let offset = page
+            .checked_sub(1)
+            .and_then(|page| page.checked_mul(limit))
+            .ok_or_else(|| "背包分页偏移量溢出".to_string())?;
+        let fetch_limit = i64::try_from(limit).map_err(|_| "背包分页数量无法转换".to_string())?;
+        let offset = i64::try_from(offset).map_err(|_| "背包分页偏移量无法转换".to_string())?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT i.item_key, i.name, i.category, i.quality, i.stackable,
+                       i.max_stack, i.buy_price, i.sell_price, i.level_required,
+                       i.effect_kind, i.effect_amount, i.revive_hp_percent,
+                       i.purchasable, i.sellable, i.usable, i.description,
+                       inv.quantity
+                  FROM inventory inv
+                  JOIN item i ON i.item_key = inv.item_key
+                 WHERE inv.player_id = ?1
+                 ORDER BY i.quality DESC, i.name, i.item_key
+                 LIMIT ?2 OFFSET ?3
+                "#,
+            )
+            .map_err(|error| format!("准备背包分页查询失败：{error}"))?;
+        let entries = statement
+            .query_map(params![player_id, fetch_limit, offset], |row| {
+                Ok(InventoryEntry {
+                    item: item_record_from_row(row, 0)?,
+                    quantity: row.get(16)?,
+                })
+            })
+            .map_err(|error| format!("查询背包分页失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析背包分页失败：{error}"))?;
+        Ok(InventoryPage {
+            entries,
+            page,
+            page_count,
+            total,
+        })
+    }
+
+    pub fn buy_item_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        item_name_or_key: &str,
+        quantity: i64,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<PurchaseReceipt, String> {
+        validate_identity_key(key)?;
+        validate_catalog_lookup(item_name_or_key, "物品名称")?;
+        validate_trade_quantity(quantity)?;
+        validate_operation_input(operation)?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始购买事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        reject_replayed_operation(&transaction, key, operation)?;
+        let (player_id, level, map) = load_player_map_for_identity(&transaction, key)?;
+        let bound_npc = load_bound_npc_for_player(&transaction, player_id, &map.map_key, None)?;
+        if bound_npc.npc_kind != "merchant" || !bound_npc.has_shop {
+            return Err(format!("当前对话 NPC“{}”没有可用商店", bound_npc.name));
+        }
+        let (npc_name, stock, unit_price, item) = transaction
+            .query_row(
+                r#"
+                SELECT n.name, si.stock, si.buy_price,
+                       i.item_key, i.name, i.category, i.quality, i.stackable,
+                       i.max_stack, i.buy_price, i.sell_price, i.level_required,
+                       i.effect_kind, i.effect_amount, i.revive_hp_percent,
+                       i.purchasable, i.sellable, i.usable, i.description
+                  FROM npc n
+                  JOIN shop_item si ON si.npc_key = n.npc_key
+                  JOIN item i ON i.item_key = si.item_key
+                 WHERE n.npc_key = ?1 AND n.enabled = 1 AND n.npc_kind = 'merchant'
+                   AND si.enabled = 1 AND (i.name = ?2 OR i.item_key = ?2)
+                 LIMIT 1
+                "#,
+                params![bound_npc.npc_key, item_name_or_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        item_record_from_row(row, 3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("查询可购买物品失败：{error}"))?
+            .ok_or_else(|| "当前地图的商店没有该物品".to_string())?;
+        if !item.purchasable || item.category == "revival" {
+            return Err("该物品不可购买".to_string());
+        }
+        if level < item.level_required {
+            return Err(format!(
+                "购买{}需要{}级，当前为{}级",
+                item.name, item.level_required, level
+            ));
+        }
+        if stock >= 0 && stock < quantity {
+            return Err(format!("{}库存不足，当前剩余{}件", item.name, stock));
+        }
+        let inventory_before = inventory_quantity(&transaction, player_id, &item.item_key)?;
+        let inventory_after = inventory_before
+            .checked_add(quantity)
+            .ok_or_else(|| "购买后背包数量溢出".to_string())?;
+        if inventory_after > item.max_stack {
+            return Err(format!(
+                "{}最多堆叠{}件，背包已有{}件",
+                item.name, item.max_stack, inventory_before
+            ));
+        }
+        let total_price = unit_price
+            .checked_mul(quantity)
+            .ok_or_else(|| "购买总价溢出".to_string())?;
+        let timestamp = now_timestamp()?;
+        ensure_wallet(&transaction, player_id, "gold_soul_coin", timestamp)?;
+        let balance_before =
+            wallet_balance_in_transaction(&transaction, player_id, "gold_soul_coin")?;
+        if balance_before < total_price {
+            return Err(format!(
+                "金魂币不足：需要{}，当前{}",
+                total_price, balance_before
+            ));
+        }
+        let balance_after = balance_before
+            .checked_sub(total_price)
+            .ok_or_else(|| "购买扣款下溢".to_string())?;
+        update_wallet_balance(
+            &transaction,
+            player_id,
+            "gold_soul_coin",
+            balance_after,
+            timestamp,
+        )?;
+        set_inventory_quantity(
+            &transaction,
+            player_id,
+            &item.item_key,
+            inventory_after,
+            timestamp,
+        )?;
+        let stock_after = if stock < 0 {
+            None
+        } else {
+            let stock_after = stock
+                .checked_sub(quantity)
+                .ok_or_else(|| "商店库存扣减下溢".to_string())?;
+            let updated = transaction
+                .execute(
+                    r#"
+                    UPDATE shop_item
+                       SET stock = ?1, updated_at = ?2
+                     WHERE npc_key = ?3 AND item_key = ?4 AND stock = ?5 AND enabled = 1
+                    "#,
+                    params![
+                        stock_after,
+                        timestamp,
+                        bound_npc.npc_key,
+                        item.item_key,
+                        stock
+                    ],
+                )
+                .map_err(|error| format!("更新商店库存失败：{error}"))?;
+            if updated != 1 {
+                return Err("购买时商店库存状态发生变化".to_string());
+            }
+            Some(stock_after)
+        };
+        insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交购买事务失败：{error}"))?;
+        Ok(PurchaseReceipt {
+            npc_name,
+            item,
+            quantity,
+            total_price,
+            balance_after,
+            inventory_after,
+            stock_after,
+        })
+    }
+
+    pub fn sell_item_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        item_name_or_key: &str,
+        quantity: i64,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<SaleReceipt, String> {
+        validate_identity_key(key)?;
+        validate_catalog_lookup(item_name_or_key, "物品名称")?;
+        validate_trade_quantity(quantity)?;
+        validate_operation_input(operation)?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始出售事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        reject_replayed_operation(&transaction, key, operation)?;
+        let (player_id, level, map) = load_player_map_for_identity(&transaction, key)?;
+        let bound_npc = load_bound_npc_for_player(&transaction, player_id, &map.map_key, None)?;
+        if bound_npc.npc_kind != "merchant" || !bound_npc.has_shop {
+            return Err(format!("当前对话 NPC“{}”没有可用商店", bound_npc.name));
+        }
+        let (npc_key, npc_name, stock, item) = transaction
+            .query_row(
+                r#"
+                SELECT n.npc_key, n.name, si.stock,
+                       i.item_key, i.name, i.category, i.quality, i.stackable,
+                       i.max_stack, i.buy_price, i.sell_price, i.level_required,
+                       i.effect_kind, i.effect_amount, i.revive_hp_percent,
+                       i.purchasable, i.sellable, i.usable, i.description
+                  FROM npc n
+                  JOIN shop_item si ON si.npc_key = n.npc_key
+                  JOIN item i ON i.item_key = si.item_key
+                 WHERE n.npc_key = ?1 AND n.enabled = 1 AND n.npc_kind = 'merchant'
+                   AND si.enabled = 1 AND (i.name = ?2 OR i.item_key = ?2)
+                 LIMIT 1
+                "#,
+                params![bound_npc.npc_key, item_name_or_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        item_record_from_row(row, 3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("查询可出售物品失败：{error}"))?
+            .ok_or_else(|| "当前地图的商店不收购该物品".to_string())?;
+        if !item.sellable || item.sell_price <= 0 {
+            return Err("该物品不可出售".to_string());
+        }
+        if level < item.level_required {
+            return Err(format!(
+                "出售{}需要{}级，当前为{}级",
+                item.name, item.level_required, level
+            ));
+        }
+        let inventory_before = inventory_quantity(&transaction, player_id, &item.item_key)?;
+        if inventory_before < quantity {
+            return Err(format!(
+                "背包中的{}不足：需要{}件，当前{}件",
+                item.name, quantity, inventory_before
+            ));
+        }
+        let inventory_after = inventory_before
+            .checked_sub(quantity)
+            .ok_or_else(|| "出售后背包数量下溢".to_string())?;
+        let total_price = item
+            .sell_price
+            .checked_mul(quantity)
+            .ok_or_else(|| "出售总价溢出".to_string())?;
+        let timestamp = now_timestamp()?;
+        ensure_wallet(&transaction, player_id, "gold_soul_coin", timestamp)?;
+        let balance_before =
+            wallet_balance_in_transaction(&transaction, player_id, "gold_soul_coin")?;
+        let balance_after = balance_before
+            .checked_add(total_price)
+            .ok_or_else(|| "出售入账后钱包余额溢出".to_string())?;
+        set_inventory_quantity(
+            &transaction,
+            player_id,
+            &item.item_key,
+            inventory_after,
+            timestamp,
+        )?;
+        update_wallet_balance(
+            &transaction,
+            player_id,
+            "gold_soul_coin",
+            balance_after,
+            timestamp,
+        )?;
+        if stock >= 0 {
+            let stock_after = stock
+                .checked_add(quantity)
+                .ok_or_else(|| "回收后商店库存溢出".to_string())?;
+            let updated = transaction
+                .execute(
+                    "UPDATE shop_item SET stock = ?1, updated_at = ?2 WHERE npc_key = ?3 AND item_key = ?4 AND stock = ?5 AND enabled = 1",
+                    params![stock_after, timestamp, npc_key, item.item_key, stock],
+                )
+                .map_err(|error| format!("更新回收库存失败：{error}"))?;
+            if updated != 1 {
+                return Err("出售时商店库存状态发生变化".to_string());
+            }
+        }
+        insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交出售事务失败：{error}"))?;
+        Ok(SaleReceipt {
+            npc_name,
+            item,
+            quantity,
+            total_price,
+            balance_after,
+            inventory_after,
+        })
+    }
+
+    pub fn use_item_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        item_name_or_key: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<UseItemReceipt, String> {
+        validate_identity_key(key)?;
+        validate_catalog_lookup(item_name_or_key, "物品名称")?;
+        validate_operation_input(operation)?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始使用物品事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        reject_replayed_operation(&transaction, key, operation)?;
+        let (player_id, level, hp_before, max_hp, soul_power_before, max_soul_power, state_before) =
+            transaction
+                .query_row(
+                    r#"
+                    SELECT p.id, p.level, p.hp, p.max_hp,
+                           p.soul_power, p.max_soul_power, p.state
+                      FROM identity i
+                      JOIN player p ON p.identity_id = i.id
+                     WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+                       AND i.subject_kind = ?4 AND i.subject_id = ?5
+                    "#,
+                    params![
+                        key.protocol.as_str(),
+                        key.account_id,
+                        key.namespace,
+                        key.subject_kind,
+                        key.subject_id
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, String>(6)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| format!("读取使用物品角色失败：{error}"))?
+                .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())?;
+        if state_before == "deleted" {
+            return Err("角色已封存，不能使用物品".to_string());
+        }
+        let item = transaction
+            .query_row(
+                r#"
+                SELECT item_key, name, category, quality, stackable, max_stack,
+                       buy_price, sell_price, level_required, effect_kind,
+                       effect_amount, revive_hp_percent, purchasable, sellable,
+                       usable, description
+                  FROM item
+                 WHERE name = ?1 OR item_key = ?1
+                 LIMIT 1
+                "#,
+                [item_name_or_key],
+                |row| item_record_from_row(row, 0),
+            )
+            .optional()
+            .map_err(|error| format!("查询使用物品定义失败：{error}"))?
+            .ok_or_else(|| "当前世界不存在该物品".to_string())?;
+        if !item.usable {
+            return Err("该物品不能直接使用".to_string());
+        }
+        if level < item.level_required {
+            return Err(format!(
+                "使用{}需要{}级，当前为{}级",
+                item.name, item.level_required, level
+            ));
+        }
+        let inventory_before = inventory_quantity(&transaction, player_id, &item.item_key)?;
+        if inventory_before < 1 {
+            return Err(format!("你的背包中没有{}", item.name));
+        }
+
+        let mut hp_after = hp_before;
+        let mut soul_power_after = soul_power_before;
+        let mut state_after = state_before.clone();
+        let consumed = match item.effect_kind.as_str() {
+            "restore_hp" => {
+                if state_before != "alive" {
+                    return Err("当前状态无法使用生命恢复药".to_string());
+                }
+                if hp_before >= max_hp {
+                    false
+                } else {
+                    hp_after = hp_before
+                        .checked_add(item.effect_amount)
+                        .ok_or_else(|| "生命恢复计算溢出".to_string())?
+                        .min(max_hp);
+                    true
+                }
+            }
+            "restore_soul" => {
+                if state_before != "alive" {
+                    return Err("当前状态无法使用魂力恢复药".to_string());
+                }
+                if soul_power_before >= max_soul_power {
+                    false
+                } else {
+                    soul_power_after = soul_power_before
+                        .checked_add(item.effect_amount)
+                        .ok_or_else(|| "魂力恢复计算溢出".to_string())?
+                        .min(max_soul_power);
+                    true
+                }
+            }
+            "revive" => {
+                if state_before != "dead" {
+                    return Err("复活物品只能在角色死亡时使用".to_string());
+                }
+                hp_after = max_hp
+                    .checked_mul(item.revive_hp_percent)
+                    .ok_or_else(|| "复活生命计算溢出".to_string())?
+                    .div_euclid(100)
+                    .max(1)
+                    .min(max_hp);
+                state_after = "alive".to_string();
+                true
+            }
+            _ => return Err("该物品的使用效果不受当前版本支持".to_string()),
+        };
+
+        let inventory_after = if consumed {
+            inventory_before
+                .checked_sub(1)
+                .ok_or_else(|| "消耗物品后背包数量下溢".to_string())?
+        } else {
+            inventory_before
+        };
+        let timestamp = now_timestamp()?;
+        if consumed {
+            let updated = transaction
+                .execute(
+                    r#"
+                    UPDATE player
+                       SET hp = ?1, soul_power = ?2, state = ?3, updated_at = ?4
+                     WHERE id = ?5
+                    "#,
+                    params![
+                        hp_after,
+                        soul_power_after,
+                        state_after,
+                        timestamp,
+                        player_id
+                    ],
+                )
+                .map_err(|error| format!("应用物品效果失败：{error}"))?;
+            if updated != 1 {
+                return Err("使用物品时角色状态发生变化".to_string());
+            }
+            set_inventory_quantity(
+                &transaction,
+                player_id,
+                &item.item_key,
+                inventory_after,
+                timestamp,
+            )?;
+        }
+        insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交使用物品事务失败：{error}"))?;
+        Ok(UseItemReceipt {
+            item,
+            consumed,
+            inventory_after,
+            hp_before,
+            hp_after,
+            max_hp,
+            soul_power_before,
+            soul_power_after,
+            max_soul_power,
+            state_before,
+            state_after,
+        })
     }
 
     /// 在单个 SQLite 事务内增加累计经验并推进等级，供签到和后续 PVE/任务奖励复用。
@@ -2381,6 +3383,175 @@ fn load_player_map_for_identity(
         .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())
 }
 
+fn load_bound_npc_for_player(
+    connection: &Connection,
+    player_id: i64,
+    map_key: &str,
+    requested_name_or_key: Option<&str>,
+) -> Result<NpcRecord, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT n.npc_key, n.map_key, m.name, n.name, n.npc_kind,
+                   n.dialogue, n.description,
+                   EXISTS(
+                       SELECT 1 FROM shop_item si
+                        WHERE si.npc_key = n.npc_key AND si.enabled = 1
+                   )
+              FROM player_npc pn
+              JOIN npc n ON n.npc_key = pn.npc_key
+              JOIN map m ON m.map_key = n.map_key
+             WHERE pn.player_id = ?1 AND n.map_key = ?2 AND n.enabled = 1
+               AND (?3 IS NULL OR n.name = ?3 OR n.npc_key = ?3)
+             LIMIT 1
+            "#,
+            params![player_id, map_key, requested_name_or_key],
+            |row| npc_record_from_row(row, 0),
+        )
+        .optional()
+        .map_err(|error| format!("查询当前对话 NPC 失败：{error}"))?
+        .ok_or_else(|| match requested_name_or_key {
+            Some(name) => format!("尚未与当前地图的“{name}”对话，请先使用“对话 {name}”"),
+            None => "请先与当前地图的商人对话，再使用“商店”".to_string(),
+        })
+}
+
+fn item_record_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<ItemRecord> {
+    Ok(ItemRecord {
+        item_key: row.get(offset)?,
+        name: row.get(offset + 1)?,
+        category: row.get(offset + 2)?,
+        quality: row.get(offset + 3)?,
+        stackable: row.get(offset + 4)?,
+        max_stack: row.get(offset + 5)?,
+        buy_price: row.get(offset + 6)?,
+        sell_price: row.get(offset + 7)?,
+        level_required: row.get(offset + 8)?,
+        effect_kind: row.get(offset + 9)?,
+        effect_amount: row.get(offset + 10)?,
+        revive_hp_percent: row.get(offset + 11)?,
+        purchasable: row.get(offset + 12)?,
+        sellable: row.get(offset + 13)?,
+        usable: row.get(offset + 14)?,
+        description: row.get(offset + 15)?,
+    })
+}
+
+fn npc_record_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<NpcRecord> {
+    Ok(NpcRecord {
+        npc_key: row.get(offset)?,
+        map_key: row.get(offset + 1)?,
+        map_name: row.get(offset + 2)?,
+        name: row.get(offset + 3)?,
+        npc_kind: row.get(offset + 4)?,
+        dialogue: row.get(offset + 5)?,
+        description: row.get(offset + 6)?,
+        has_shop: row.get(offset + 7)?,
+    })
+}
+
+fn inventory_quantity(
+    connection: &Connection,
+    player_id: i64,
+    item_key: &str,
+) -> Result<i64, String> {
+    connection
+        .query_row(
+            "SELECT COALESCE(quantity, 0) FROM inventory WHERE player_id = ?1 AND item_key = ?2",
+            params![player_id, item_key],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(0))
+        .map_err(|error| format!("读取背包数量失败：{error}"))
+}
+
+fn set_inventory_quantity(
+    connection: &Connection,
+    player_id: i64,
+    item_key: &str,
+    quantity: i64,
+    timestamp: i64,
+) -> Result<(), String> {
+    if quantity < 0 {
+        return Err("背包数量不能为负数".to_string());
+    }
+    if quantity == 0 {
+        connection
+            .execute(
+                "DELETE FROM inventory WHERE player_id = ?1 AND item_key = ?2",
+                params![player_id, item_key],
+            )
+            .map_err(|error| format!("清理背包物品失败：{error}"))?;
+        return Ok(());
+    }
+    connection
+        .execute(
+            r#"
+            INSERT INTO inventory(player_id, item_key, quantity, updated_at)
+            VALUES(?1, ?2, ?3, ?4)
+            ON CONFLICT(player_id, item_key) DO UPDATE SET
+                quantity = excluded.quantity,
+                updated_at = excluded.updated_at
+            "#,
+            params![player_id, item_key, quantity, timestamp],
+        )
+        .map_err(|error| format!("更新背包物品失败：{error}"))?;
+    Ok(())
+}
+
+fn ensure_wallet(
+    connection: &Connection,
+    player_id: i64,
+    currency_code: &str,
+    timestamp: i64,
+) -> Result<(), String> {
+    connection
+        .execute(
+            r#"
+            INSERT OR IGNORE INTO wallet(
+                player_id, currency_code, balance, created_at, updated_at
+            ) VALUES(?1, ?2, 0, ?3, ?3)
+            "#,
+            params![player_id, currency_code, timestamp],
+        )
+        .map_err(|error| format!("创建经济钱包失败：{error}"))?;
+    Ok(())
+}
+
+fn wallet_balance_in_transaction(
+    connection: &Connection,
+    player_id: i64,
+    currency_code: &str,
+) -> Result<i64, String> {
+    connection
+        .query_row(
+            "SELECT balance FROM wallet WHERE player_id = ?1 AND currency_code = ?2",
+            params![player_id, currency_code],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("读取经济钱包余额失败：{error}"))
+}
+
+fn update_wallet_balance(
+    connection: &Connection,
+    player_id: i64,
+    currency_code: &str,
+    balance: i64,
+    timestamp: i64,
+) -> Result<(), String> {
+    let updated = connection
+        .execute(
+            "UPDATE wallet SET balance = ?1, updated_at = ?2 WHERE player_id = ?3 AND currency_code = ?4",
+            params![balance, timestamp, player_id, currency_code],
+        )
+        .map_err(|error| format!("更新经济钱包余额失败：{error}"))?;
+    if updated != 1 {
+        return Err("更新经济钱包时记录状态发生变化".to_string());
+    }
+    Ok(())
+}
+
 fn update_player_map(
     connection: &Connection,
     player_id: i64,
@@ -2405,6 +3576,10 @@ fn update_player_map(
     if player_updates != 1 {
         return Err("同步角色地图名称时角色状态发生变化".to_string());
     }
+    // 对话只对当前停留阶段有效；移动或传送后必须重新与目标地图 NPC 对话。
+    connection
+        .execute("DELETE FROM player_npc WHERE player_id = ?1", [player_id])
+        .map_err(|error| format!("移动后清理 NPC 对话绑定失败：{error}"))?;
     Ok(())
 }
 
@@ -2434,6 +3609,34 @@ fn validate_map_page(page: usize, limit: usize) -> Result<(), String> {
     }
     if !(1..=50).contains(&limit) {
         return Err("地图分页数量必须在 1 到 50 之间".to_string());
+    }
+    Ok(())
+}
+
+fn validate_catalog_page(page: usize, limit: usize, label: &str) -> Result<(), String> {
+    if page == 0 || page > 100 {
+        return Err(format!("{label}页码必须在 1 到 100 之间"));
+    }
+    if !(1..=50).contains(&limit) {
+        return Err(format!("{label}分页数量必须在 1 到 50 之间"));
+    }
+    Ok(())
+}
+
+fn validate_catalog_lookup(value: &str, label: &str) -> Result<(), String> {
+    if value != value.trim()
+        || value.is_empty()
+        || value.chars().count() > 128
+        || value.chars().any(char::is_control)
+    {
+        return Err(format!("{label}必须是 1 到 128 个无控制字符的非空字符串"));
+    }
+    Ok(())
+}
+
+fn validate_trade_quantity(quantity: i64) -> Result<(), String> {
+    if !(1..=9999).contains(&quantity) {
+        return Err("交易数量必须在 1 到 9999 之间".to_string());
     }
     Ok(())
 }
@@ -4627,6 +5830,818 @@ fn validate_v7_schema(connection: &Connection) -> Result<(), String> {
     probe_v7_map_guards(connection)
 }
 
+// v8 独立校验经济表元数据、固定种子和代表性约束行为，损坏时拒绝启动。
+fn validate_v8_schema(connection: &Connection) -> Result<(), String> {
+    validate_column_names_and_types(
+        "item",
+        &table_columns_with_type(connection, "item")?,
+        &[
+            ("item_key", "TEXT"),
+            ("name", "TEXT"),
+            ("category", "TEXT"),
+            ("quality", "INTEGER"),
+            ("stackable", "INTEGER"),
+            ("max_stack", "INTEGER"),
+            ("buy_price", "INTEGER"),
+            ("sell_price", "INTEGER"),
+            ("level_required", "INTEGER"),
+            ("effect_kind", "TEXT"),
+            ("effect_amount", "INTEGER"),
+            ("revive_hp_percent", "INTEGER"),
+            ("purchasable", "INTEGER"),
+            ("sellable", "INTEGER"),
+            ("usable", "INTEGER"),
+            ("description", "TEXT"),
+            ("created_at", "INTEGER"),
+            ("updated_at", "INTEGER"),
+        ],
+    )?;
+    validate_column_names_and_types(
+        "inventory",
+        &table_columns_with_type(connection, "inventory")?,
+        &[
+            ("player_id", "INTEGER"),
+            ("item_key", "TEXT"),
+            ("quantity", "INTEGER"),
+            ("updated_at", "INTEGER"),
+        ],
+    )?;
+    validate_column_names_and_types(
+        "npc",
+        &table_columns_with_type(connection, "npc")?,
+        &[
+            ("npc_key", "TEXT"),
+            ("map_key", "TEXT"),
+            ("name", "TEXT"),
+            ("npc_kind", "TEXT"),
+            ("dialogue", "TEXT"),
+            ("description", "TEXT"),
+            ("enabled", "INTEGER"),
+            ("sort_order", "INTEGER"),
+            ("created_at", "INTEGER"),
+            ("updated_at", "INTEGER"),
+        ],
+    )?;
+    validate_column_names_and_types(
+        "shop_item",
+        &table_columns_with_type(connection, "shop_item")?,
+        &[
+            ("npc_key", "TEXT"),
+            ("item_key", "TEXT"),
+            ("buy_price", "INTEGER"),
+            ("stock", "INTEGER"),
+            ("enabled", "INTEGER"),
+            ("created_at", "INTEGER"),
+            ("updated_at", "INTEGER"),
+        ],
+    )?;
+    validate_column_names_and_types(
+        "player_npc",
+        &table_columns_with_type(connection, "player_npc")?,
+        &[
+            ("player_id", "INTEGER"),
+            ("npc_key", "TEXT"),
+            ("updated_at", "INTEGER"),
+        ],
+    )?;
+
+    validate_v8_table_sql(
+        connection,
+        "item",
+        &[
+            ") STRICT",
+            "ITEM_KEY TEXT PRIMARY KEY",
+            "LENGTH(ITEM_KEY) BETWEEN 1 AND 96",
+            "ITEM_KEY = TRIM(ITEM_KEY)",
+            "ITEM_KEY GLOB",
+            "NAME TEXT NOT NULL CHECK(LENGTH(NAME) BETWEEN 1 AND 128)",
+            "CATEGORY TEXT NOT NULL CHECK(CATEGORY IN ('REVIVAL', 'CONSUMABLE'))",
+            "QUALITY INTEGER NOT NULL CHECK(QUALITY BETWEEN 1 AND 5)",
+            "STACKABLE INTEGER NOT NULL CHECK(STACKABLE IN (0, 1))",
+            "MAX_STACK INTEGER NOT NULL CHECK(MAX_STACK BETWEEN 1 AND 9999)",
+            "BUY_PRICE INTEGER NOT NULL CHECK(BUY_PRICE >= 0)",
+            "SELL_PRICE INTEGER NOT NULL CHECK(SELL_PRICE >= 0 AND SELL_PRICE <= BUY_PRICE)",
+            "LEVEL_REQUIRED INTEGER NOT NULL DEFAULT 1 CHECK(LEVEL_REQUIRED BETWEEN 1 AND 120)",
+            "EFFECT_KIND TEXT NOT NULL CHECK(EFFECT_KIND IN ('REVIVE', 'RESTORE_HP', 'RESTORE_SOUL'))",
+            "EFFECT_AMOUNT INTEGER NOT NULL DEFAULT 0 CHECK(EFFECT_AMOUNT >= 0)",
+            "REVIVE_HP_PERCENT INTEGER NOT NULL DEFAULT 0 CHECK(REVIVE_HP_PERCENT BETWEEN 0 AND 100)",
+            "PURCHASABLE INTEGER NOT NULL DEFAULT 1 CHECK(PURCHASABLE IN (0, 1))",
+            "SELLABLE INTEGER NOT NULL DEFAULT 1 CHECK(SELLABLE IN (0, 1))",
+            "USABLE INTEGER NOT NULL DEFAULT 1 CHECK(USABLE IN (0, 1))",
+            "DESCRIPTION TEXT NOT NULL DEFAULT '' CHECK(LENGTH(DESCRIPTION) <= 2000)",
+            "CREATED_AT INTEGER NOT NULL CHECK(CREATED_AT >= 0)",
+            "UPDATED_AT INTEGER NOT NULL CHECK(UPDATED_AT >= 0)",
+            "STACKABLE = 1 OR MAX_STACK = 1",
+            "EFFECT_KIND = 'REVIVE' AND EFFECT_AMOUNT = 0 AND REVIVE_HP_PERCENT > 0",
+            "EFFECT_KIND IN ('RESTORE_HP', 'RESTORE_SOUL')",
+        ],
+    )?;
+    validate_v8_table_sql(
+        connection,
+        "inventory",
+        &[
+            ") STRICT",
+            "PLAYER_ID INTEGER NOT NULL REFERENCES PLAYER(ID) ON DELETE CASCADE",
+            "ITEM_KEY TEXT NOT NULL REFERENCES ITEM(ITEM_KEY) ON DELETE RESTRICT",
+            "QUANTITY INTEGER NOT NULL CHECK(QUANTITY BETWEEN 1 AND 999999)",
+            "UPDATED_AT INTEGER NOT NULL CHECK(UPDATED_AT >= 0)",
+            "PRIMARY KEY(PLAYER_ID, ITEM_KEY)",
+        ],
+    )?;
+    validate_v8_table_sql(
+        connection,
+        "npc",
+        &[
+            ") STRICT",
+            "NPC_KEY TEXT PRIMARY KEY",
+            "LENGTH(NPC_KEY) BETWEEN 1 AND 96",
+            "NPC_KEY = TRIM(NPC_KEY)",
+            "NPC_KEY GLOB",
+            "MAP_KEY TEXT NOT NULL REFERENCES MAP(MAP_KEY) ON DELETE RESTRICT",
+            "NAME TEXT NOT NULL CHECK(LENGTH(NAME) BETWEEN 1 AND 128)",
+            "NPC_KIND TEXT NOT NULL CHECK(NPC_KIND IN ('ELDER', 'MERCHANT'))",
+            "DIALOGUE TEXT NOT NULL DEFAULT '' CHECK(LENGTH(DIALOGUE) <= 2000)",
+            "DESCRIPTION TEXT NOT NULL DEFAULT '' CHECK(LENGTH(DESCRIPTION) <= 2000)",
+            "ENABLED INTEGER NOT NULL DEFAULT 1 CHECK(ENABLED IN (0, 1))",
+            "SORT_ORDER INTEGER NOT NULL DEFAULT 0 CHECK(SORT_ORDER >= 0)",
+            "CREATED_AT INTEGER NOT NULL CHECK(CREATED_AT >= 0)",
+            "UPDATED_AT INTEGER NOT NULL CHECK(UPDATED_AT >= 0)",
+        ],
+    )?;
+    validate_v8_table_sql(
+        connection,
+        "shop_item",
+        &[
+            ") STRICT",
+            "NPC_KEY TEXT NOT NULL REFERENCES NPC(NPC_KEY) ON DELETE CASCADE",
+            "ITEM_KEY TEXT NOT NULL REFERENCES ITEM(ITEM_KEY) ON DELETE RESTRICT",
+            "BUY_PRICE INTEGER NOT NULL CHECK(BUY_PRICE >= 0)",
+            "STOCK INTEGER NOT NULL DEFAULT -1 CHECK(STOCK = -1 OR STOCK >= 0)",
+            "ENABLED INTEGER NOT NULL DEFAULT 1 CHECK(ENABLED IN (0, 1))",
+            "CREATED_AT INTEGER NOT NULL CHECK(CREATED_AT >= 0)",
+            "UPDATED_AT INTEGER NOT NULL CHECK(UPDATED_AT >= 0)",
+            "PRIMARY KEY(NPC_KEY, ITEM_KEY)",
+        ],
+    )?;
+    validate_v8_table_sql(
+        connection,
+        "player_npc",
+        &[
+            ") STRICT",
+            "PLAYER_ID INTEGER PRIMARY KEY REFERENCES PLAYER(ID) ON DELETE CASCADE",
+            "NPC_KEY TEXT NOT NULL REFERENCES NPC(NPC_KEY) ON DELETE RESTRICT",
+            "UPDATED_AT INTEGER NOT NULL CHECK(UPDATED_AT >= 0)",
+        ],
+    )?;
+
+    validate_v8_foreign_keys(
+        connection,
+        "inventory",
+        &[
+            ("item", "item_key", "item_key", "NO ACTION", "RESTRICT"),
+            ("player", "player_id", "id", "NO ACTION", "CASCADE"),
+        ],
+    )?;
+    validate_v8_foreign_keys(
+        connection,
+        "npc",
+        &[("map", "map_key", "map_key", "NO ACTION", "RESTRICT")],
+    )?;
+    validate_v8_foreign_keys(
+        connection,
+        "shop_item",
+        &[
+            ("item", "item_key", "item_key", "NO ACTION", "RESTRICT"),
+            ("npc", "npc_key", "npc_key", "NO ACTION", "CASCADE"),
+        ],
+    )?;
+    validate_v8_foreign_keys(
+        connection,
+        "player_npc",
+        &[
+            ("npc", "npc_key", "npc_key", "NO ACTION", "RESTRICT"),
+            ("player", "player_id", "id", "NO ACTION", "CASCADE"),
+        ],
+    )?;
+
+    validate_named_index(connection, "item", "item_name_unique", true, &["name"])?;
+    validate_named_index(
+        connection,
+        "inventory",
+        "inventory_player_page",
+        false,
+        &["player_id", "item_key"],
+    )?;
+    validate_named_index(
+        connection,
+        "npc",
+        "npc_map_name_unique",
+        true,
+        &["map_key", "name"],
+    )?;
+    validate_named_index(
+        connection,
+        "npc",
+        "npc_map_page",
+        false,
+        &["map_key", "enabled", "sort_order", "npc_key"],
+    )?;
+    validate_named_index(
+        connection,
+        "shop_item",
+        "shop_item_npc_page",
+        false,
+        &["npc_key", "enabled", "item_key"],
+    )?;
+    validate_v8_custom_index_set(connection, "item", &["item_name_unique"])?;
+    validate_v8_custom_index_set(connection, "inventory", &["inventory_player_page"])?;
+    validate_v8_custom_index_set(connection, "npc", &["npc_map_name_unique", "npc_map_page"])?;
+    validate_v8_custom_index_set(connection, "shop_item", &["shop_item_npc_page"])?;
+    validate_v8_custom_index_set(connection, "player_npc", &[])?;
+    validate_v8_triggers(connection)?;
+
+    validate_v8_seed_rows(connection)?;
+    probe_v8_economy_guards(connection)
+}
+
+fn validate_v8_seed_rows(connection: &Connection) -> Result<(), String> {
+    let expected_items = [
+        (
+            "revival-grass",
+            "复活草",
+            "revival",
+            2,
+            1,
+            1000,
+            500,
+            10,
+            1,
+            "revive",
+            0,
+            30,
+            0,
+            0,
+            0,
+            "使用后可以复活，恢复30%生命值",
+        ),
+        (
+            "nine-leaf-zhi-grass",
+            "九叶芝草",
+            "revival",
+            4,
+            1,
+            10000,
+            5000,
+            5,
+            1,
+            "revive",
+            0,
+            100,
+            0,
+            0,
+            0,
+            "传说中的仙草，使用后满血复活",
+        ),
+        (
+            "small-healing-potion",
+            "小回复药",
+            "consumable",
+            1,
+            1,
+            10,
+            2,
+            99,
+            1,
+            "restore_hp",
+            50,
+            0,
+            1,
+            1,
+            1,
+            "恢复50点生命值",
+        ),
+        (
+            "medium-healing-potion",
+            "中回复药",
+            "consumable",
+            2,
+            1,
+            50,
+            10,
+            99,
+            10,
+            "restore_hp",
+            200,
+            0,
+            1,
+            1,
+            1,
+            "恢复200点生命值",
+        ),
+        (
+            "soul-power-potion",
+            "魂力恢复药",
+            "consumable",
+            2,
+            1,
+            30,
+            6,
+            99,
+            1,
+            "restore_soul",
+            100,
+            0,
+            1,
+            1,
+            1,
+            "恢复100点魂力值",
+        ),
+    ];
+    for (
+        key,
+        name,
+        category,
+        quality,
+        stackable,
+        buy,
+        sell,
+        max_stack,
+        level,
+        effect,
+        amount,
+        percent,
+        purchasable,
+        sellable,
+        usable,
+        description,
+    ) in expected_items
+    {
+        let matches_contract = connection
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM item
+                     WHERE item_key = ?1 AND name = ?2 AND category = ?3
+                       AND quality = ?4 AND stackable = ?5 AND buy_price = ?6
+                       AND sell_price = ?7 AND max_stack = ?8 AND level_required = ?9
+                       AND effect_kind = ?10 AND effect_amount = ?11
+                       AND revive_hp_percent = ?12 AND purchasable = ?13
+                       AND sellable = ?14 AND usable = ?15 AND description = ?16
+                )
+                "#,
+                params![
+                    key,
+                    name,
+                    category,
+                    quality,
+                    stackable,
+                    buy,
+                    sell,
+                    max_stack,
+                    level,
+                    effect,
+                    amount,
+                    percent,
+                    purchasable,
+                    sellable,
+                    usable,
+                    description
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("读取 v8 物品种子失败：{error}"))?;
+        if !matches_contract {
+            return Err(format!("数据库已标记迁移 v8，但物品种子 {name} 不匹配"));
+        }
+    }
+
+    let expected_npcs = [
+        (
+            "holy-soul-village-chief",
+            "holy-soul-village",
+            "村长",
+            "elder",
+            "年轻人，欢迎来到圣魂村。愿你在魂师之路上平安成长。",
+            "圣魂村的村长，可以接待初来乍到的魂师。",
+            1,
+            10,
+        ),
+        (
+            "holy-soul-village-grocer",
+            "holy-soul-village",
+            "杂货商人",
+            "merchant",
+            "看看吧，这里有旅途中用得上的药剂。",
+            "出售基础恢复药剂。",
+            1,
+            20,
+        ),
+    ];
+    for (key, map_key, name, kind, dialogue, description, enabled, sort_order) in expected_npcs {
+        let matches_contract = connection
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM npc
+                     WHERE npc_key = ?1 AND map_key = ?2 AND name = ?3
+                       AND npc_kind = ?4 AND dialogue = ?5 AND description = ?6
+                       AND enabled = ?7 AND sort_order = ?8
+                )
+                "#,
+                params![
+                    key,
+                    map_key,
+                    name,
+                    kind,
+                    dialogue,
+                    description,
+                    enabled,
+                    sort_order
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("读取 v8 NPC 种子失败：{error}"))?;
+        if !matches_contract {
+            return Err(format!("数据库已标记迁移 v8，但 NPC 种子 {name} 不匹配"));
+        }
+    }
+
+    let expected_shop_items = [
+        ("small-healing-potion", 10, -1, 1),
+        ("medium-healing-potion", 50, -1, 1),
+        ("soul-power-potion", 30, -1, 1),
+    ];
+    for (item_key, buy_price, stock, enabled) in expected_shop_items {
+        let matches_contract = connection
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM shop_item
+                     WHERE npc_key = 'holy-soul-village-grocer'
+                       AND item_key = ?1 AND buy_price = ?2
+                       AND stock = ?3 AND enabled = ?4
+                )
+                "#,
+                params![item_key, buy_price, stock, enabled],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("读取 v8 商店种子失败：{error}"))?;
+        if !matches_contract {
+            return Err(format!(
+                "数据库已标记迁移 v8，但杂货商人商品种子 {item_key} 不匹配"
+            ));
+        }
+    }
+    let revival_listed = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM shop_item si JOIN item i ON i.item_key = si.item_key WHERE i.category = 'revival')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v8 复活物品上架状态失败：{error}"))?;
+    if revival_listed {
+        return Err("数据库已标记迁移 v8，但复活物品被错误上架".to_string());
+    }
+    Ok(())
+}
+
+fn validate_v8_table_sql(
+    connection: &Connection,
+    table: &str,
+    markers: &[&str],
+) -> Result<(), String> {
+    let sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v8 表 {table} 建表语句失败：{error}"))?
+        .ok_or_else(|| format!("数据库已标记迁移 v8，但缺少表 {table}"))?
+        .to_ascii_uppercase();
+    for marker in markers {
+        if !sql.contains(marker) {
+            return Err(format!(
+                "数据库已标记迁移 v8，但表 {table} 缺少约束：{marker}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v8_foreign_keys(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, &str, &str, &str)],
+) -> Result<(), String> {
+    let escaped_table = table.replace('"', "\"\"");
+    let mut actual = connection
+        .prepare(&format!("PRAGMA foreign_key_list(\"{escaped_table}\")"))
+        .map_err(|error| format!("读取 v8 表 {table} 外键失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v8 表 {table} 外键失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v8 表 {table} 外键失败：{error}"))?;
+    let mut expected = expected
+        .iter()
+        .map(|(parent, from, to, update, delete)| {
+            (
+                (*parent).to_string(),
+                (*from).to_string(),
+                (*to).to_string(),
+                (*update).to_string(),
+                (*delete).to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    actual.sort();
+    expected.sort();
+    if actual != expected {
+        return Err(format!(
+            "数据库已标记迁移 v8，但表 {table} 外键不匹配：实际 {actual:?}，期望 {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v8_custom_index_set(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), String> {
+    let escaped_table = table.replace('"', "\"\"");
+    let mut actual = connection
+        .prepare(&format!("PRAGMA index_list(\"{escaped_table}\")"))
+        .map_err(|error| format!("读取 v8 表 {table} 索引集合失败：{error}"))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, String>(3)?))
+        })
+        .map_err(|error| format!("查询 v8 表 {table} 索引集合失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v8 表 {table} 索引集合失败：{error}"))?
+        .into_iter()
+        .filter_map(|(name, origin)| (origin == "c").then_some(name))
+        .collect::<Vec<_>>();
+    let mut expected = expected
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    actual.sort();
+    expected.sort();
+    if actual != expected {
+        return Err(format!(
+            "数据库已标记迁移 v8，但表 {table} 自定义索引集合不匹配：实际 {actual:?}，期望 {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v8_triggers(connection: &Connection) -> Result<(), String> {
+    let expected = [
+        ("inventory_item_stack_insert", "inventory"),
+        ("inventory_item_stack_update", "inventory"),
+        ("shop_item_revival_insert", "shop_item"),
+        ("shop_item_revival_update", "shop_item"),
+        ("item_shop_contract_update", "item"),
+        ("item_inventory_stack_update", "item"),
+    ];
+    for (name, table) in expected {
+        let (actual_table, sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v8 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v8，但缺少触发器 {name}"))?;
+        let normalized = sql.to_ascii_uppercase();
+        let markers: &[&str] = match name {
+            "inventory_item_stack_insert" => &[
+                "BEFORE INSERT ON INVENTORY",
+                "NEW.QUANTITY > COALESCE",
+                "SELECT MAX_STACK FROM ITEM WHERE ITEM_KEY = NEW.ITEM_KEY",
+                "RAISE(ABORT",
+            ],
+            "inventory_item_stack_update" => &[
+                "BEFORE UPDATE OF ITEM_KEY, QUANTITY ON INVENTORY",
+                "NEW.QUANTITY > COALESCE",
+                "SELECT MAX_STACK FROM ITEM WHERE ITEM_KEY = NEW.ITEM_KEY",
+                "RAISE(ABORT",
+            ],
+            "shop_item_revival_insert" => &[
+                "BEFORE INSERT ON SHOP_ITEM",
+                "CATEGORY = 'REVIVAL'",
+                "PURCHASABLE = 0",
+                "USABLE = 0",
+                "NEW.BUY_PRICE < SELL_PRICE",
+                "RAISE(ABORT",
+            ],
+            "shop_item_revival_update" => &[
+                "BEFORE UPDATE OF ITEM_KEY, BUY_PRICE ON SHOP_ITEM",
+                "CATEGORY = 'REVIVAL'",
+                "PURCHASABLE = 0",
+                "USABLE = 0",
+                "NEW.BUY_PRICE < SELL_PRICE",
+                "RAISE(ABORT",
+            ],
+            "item_shop_contract_update" => &[
+                "BEFORE UPDATE OF CATEGORY, PURCHASABLE, USABLE, SELL_PRICE ON ITEM",
+                "SHOP_ITEM.ITEM_KEY = OLD.ITEM_KEY",
+                "SHOP_ITEM.BUY_PRICE < NEW.SELL_PRICE",
+                "RAISE(ABORT",
+            ],
+            "item_inventory_stack_update" => &[
+                "BEFORE UPDATE OF MAX_STACK ON ITEM",
+                "INVENTORY.ITEM_KEY = OLD.ITEM_KEY",
+                "INVENTORY.QUANTITY > NEW.MAX_STACK",
+                "RAISE(ABORT",
+            ],
+            _ => return Err(format!("未知的 v8 触发器契约：{name}")),
+        };
+        if actual_table != table || markers.iter().any(|marker| !normalized.contains(marker)) {
+            return Err(format!("数据库已标记迁移 v8，但触发器 {name} 契约不匹配"));
+        }
+    }
+    let triggers = connection
+        .prepare(
+            "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name",
+        )
+        .map_err(|error| format!("读取 v8 全库触发器集合失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v8 全库触发器集合失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v8 全库触发器集合失败：{error}"))?;
+    for (name, table, sql) in triggers {
+        let declared = expected.iter().any(|(expected_name, expected_table)| {
+            name == *expected_name && table == *expected_table
+        });
+        let touches_v8 = matches!(
+            table.as_str(),
+            "item" | "inventory" | "npc" | "shop_item" | "player_npc"
+        ) || ["item", "inventory", "npc", "shop_item", "player_npc"]
+            .iter()
+            .any(|identifier| sql_mentions_identifier(&sql, identifier));
+        if touches_v8 && !declared {
+            return Err(format!(
+                "数据库已标记迁移 v8，但触发器 {name}（目标表 {table}）未声明却引用了经济表"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn probe_v8_economy_guards(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch("SAVEPOINT qimen_v8_economy_probe;")
+        .map_err(|error| format!("开始 v8 经济约束探针失败：{error}"))?;
+    let probe_result = (|| -> Result<(), String> {
+        let token = connection
+            .query_row("SELECT lower(hex(randomblob(16)))", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("生成 v8 经济探针标识失败：{error}"))?;
+        let account_id = format!("v8-economy-probe-{token}");
+        connection
+            .execute(
+                "INSERT INTO identity(protocol, account_id, namespace, subject_kind, subject_id, created_at) VALUES('onebot11', ?1, 'v8-probe', 'user', ?1, 0)",
+                [&account_id],
+            )
+            .map_err(|error| format!("v8 经济探针无法创建身份：{error}"))?;
+        let identity_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO player(identity_id, name, gender, created_at, updated_at) VALUES(?1, 'v8-probe', '男', 0, 0)",
+                [identity_id],
+            )
+            .map_err(|error| format!("v8 经济探针无法创建角色：{error}"))?;
+        let player_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO player_map(player_id, map_key, updated_at) VALUES(?1, 'holy-soul-village', 0)",
+                [player_id],
+            )
+            .map_err(|error| format!("v8 经济探针无法绑定地图：{error}"))?;
+        connection
+            .execute(
+                r#"INSERT INTO item(
+                    item_key, name, category, quality, stackable, max_stack,
+                    buy_price, sell_price, level_required, effect_kind, effect_amount,
+                    revive_hp_percent, purchasable, sellable, usable, description,
+                    created_at, updated_at
+                ) VALUES('v8-probe-item', 'v8-probe-item', 'consumable', 1, 1, 2,
+                         1, 0, 1, 'restore_hp', 1, 0, 1, 1, 1, '', 0, 0)"#,
+                [],
+            )
+            .map_err(|error| format!("v8 经济探针无法插入合法物品：{error}"))?;
+        connection
+            .execute(
+                "INSERT INTO inventory(player_id, item_key, quantity, updated_at) VALUES(?1, 'v8-probe-item', 2, 0)",
+                [player_id],
+            )
+            .map_err(|error| format!("v8 经济探针无法插入合法背包：{error}"))?;
+        if connection
+            .execute(
+                "UPDATE inventory SET quantity = 3 WHERE player_id = ?1 AND item_key = 'v8-probe-item'",
+                [player_id],
+            )
+            .is_ok()
+        {
+            return Err("v8 max_stack 更新触发器探针被绕过".to_string());
+        }
+        connection
+            .execute(
+                "DELETE FROM inventory WHERE player_id = ?1 AND item_key = 'v8-probe-item'",
+                [player_id],
+            )
+            .map_err(|error| format!("v8 经济探针无法重置背包：{error}"))?;
+        if connection
+            .execute(
+                "INSERT INTO inventory(player_id, item_key, quantity, updated_at) VALUES(?1, 'v8-probe-item', 3, 0)",
+                [player_id],
+            )
+            .is_ok()
+        {
+            return Err("v8 max_stack 插入触发器探针被绕过".to_string());
+        }
+        connection
+            .execute(
+                "INSERT INTO inventory(player_id, item_key, quantity, updated_at) VALUES(?1, 'v8-probe-item', 2, 0)",
+                [player_id],
+            )
+            .map_err(|error| format!("v8 经济探针无法恢复合法背包：{error}"))?;
+        if connection
+            .execute(
+                "UPDATE item SET max_stack = 1 WHERE item_key = 'v8-probe-item'",
+                [],
+            )
+            .is_ok()
+        {
+            return Err("v8 物品 max_stack 更新保护探针被绕过".to_string());
+        }
+        if connection
+            .execute(
+                "INSERT INTO shop_item(npc_key, item_key, buy_price, stock, enabled, created_at, updated_at) VALUES('holy-soul-village-grocer', 'revival-grass', 1000, -1, 1, 0, 0)",
+                [],
+            )
+            .is_ok()
+        {
+            return Err("v8 复活物品上架触发器探针被绕过".to_string());
+        }
+        if connection
+            .execute(
+                "UPDATE item SET purchasable = 0 WHERE item_key = 'small-healing-potion'",
+                [],
+            )
+            .is_ok()
+        {
+            return Err("v8 商店物品可购买性保护探针被绕过".to_string());
+        }
+        if connection
+            .execute(
+                "UPDATE shop_item SET buy_price = 1 WHERE npc_key = 'holy-soul-village-grocer' AND item_key = 'small-healing-potion'",
+                [],
+            )
+            .is_ok()
+        {
+            return Err("v8 商店买价低于回收价保护探针被绕过".to_string());
+        }
+        if connection
+            .execute(
+                "UPDATE item SET buy_price = 20, sell_price = 11 WHERE item_key = 'small-healing-potion'",
+                [],
+            )
+            .is_ok()
+        {
+            return Err("v8 物品回收价破坏商店价格保护探针被绕过".to_string());
+        }
+        Ok(())
+    })();
+    let rollback_result = connection
+        .execute_batch("ROLLBACK TO qimen_v8_economy_probe; RELEASE qimen_v8_economy_probe;")
+        .map_err(|error| format!("回滚 v8 经济约束探针失败：{error}"));
+    match (probe_result, rollback_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(probe_error), Err(rollback_error)) => Err(format!("{probe_error}；{rollback_error}")),
+    }
+}
+
 fn validate_column_names_and_types(
     table: &str,
     actual: &[TableColumnInfo],
@@ -4643,7 +6658,7 @@ fn validate_column_names_and_types(
             .map(|(name, sql_type)| format!("{name}:{sql_type}"))
             .collect::<Vec<_>>();
         return Err(format!(
-            "数据库已标记迁移 v7，但表 {table} 字段不匹配：实际 {actual:?}，期望 {expected:?}"
+            "数据库迁移记录存在，但表 {table} 字段不匹配：实际 {actual:?}，期望 {expected:?}"
         ));
     }
     Ok(())
@@ -4957,6 +6972,44 @@ fn insert_operation_log(
         )
         .map_err(|error| format!("写入操作日志失败：{error}"))?;
     Ok(connection.last_insert_rowid())
+}
+
+fn reject_replayed_operation(
+    connection: &Connection,
+    key: &IdentityKey<'_>,
+    operation: &OperationLogInput<'_>,
+) -> Result<(), String> {
+    // Host 可能因重试重复投递同一消息；空 message_id 是协议允许的无 ID 场景，
+    // 仍由调用方负责避免重放。非空 ID 在同一写事务锁内检查，防止重复扣款/消耗。
+    if operation.source_message_id.is_empty() {
+        return Ok(());
+    }
+    let replayed = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM operation_log
+                 WHERE protocol = ?1 AND account_id = ?2 AND namespace = ?3
+                   AND subject_kind = ?4 AND subject_id = ?5
+                   AND command = ?6 AND source_message_id = ?7 AND outcome = 'ok'
+            )
+            "#,
+            params![
+                key.protocol.as_str(),
+                key.account_id,
+                key.namespace,
+                key.subject_kind,
+                key.subject_id,
+                operation.command,
+                operation.source_message_id
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查经济操作幂等键失败：{error}"))?;
+    if replayed {
+        return Err("该消息对应的操作已经处理，拒绝重复执行".to_string());
+    }
+    Ok(())
 }
 
 fn validate_operation_input(operation: &OperationLogInput<'_>) -> Result<(), String> {
@@ -6961,5 +9014,495 @@ mod tests {
                 .expect_err("记录 v7 后损坏地图 schema 必须拒绝")
                 .contains("v7")
         );
+    }
+
+    #[test]
+    fn v8_seeds_npcs_and_requires_current_conversation_for_shop_access() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "商店角色", "男")
+            .expect("应创建商店角色");
+        let npcs = store
+            .npcs_at_current_map(&identity())
+            .expect("圣魂村 NPC 应可查询");
+        assert_eq!(npcs.map_name, "圣魂村");
+        assert_eq!(
+            npcs.entries
+                .iter()
+                .map(|npc| npc.name.as_str())
+                .collect::<Vec<_>>(),
+            ["村长", "杂货商人"]
+        );
+        assert!(store.shop_items_page(&identity(), None, 1, 10).is_err());
+
+        let talk = map_operation("对话", "talk-v8-1");
+        let merchant = store
+            .talk_to_npc_with_operation(&identity(), "杂货商人", &talk)
+            .expect("当前地图应可与杂货商人对话");
+        assert_eq!(merchant.npc_key, "holy-soul-village-grocer");
+        assert!(merchant.has_shop);
+        let shop = store
+            .shop_items_page(&identity(), None, 1, 10)
+            .expect("对话后裸商店应使用当前 NPC");
+        assert_eq!(shop.npc.name, "杂货商人");
+        assert_eq!(shop.total, 3);
+        assert!(
+            shop.entries
+                .iter()
+                .any(|entry| entry.item.name == "魂力恢复药")
+        );
+        assert!(
+            shop.entries
+                .iter()
+                .all(|entry| entry.item.category != "revival")
+        );
+
+        assert!(
+            store
+                .talk_to_npc_with_operation(&identity(), "杂货商人", &talk)
+                .expect_err("同一消息不得重复写对话绑定")
+                .contains("已经处理")
+        );
+        store
+            .move_direction_with_operation(&identity(), "上", &map_operation("向", "leave-shop"))
+            .expect("应离开圣魂村");
+        assert!(
+            store
+                .shop_items_page(&identity(), None, 1, 10)
+                .expect_err("离开地图后旧 NPC 绑定不得继续交易")
+                .contains("先与当前地图")
+        );
+        store
+            .move_direction_with_operation(&identity(), "下", &map_operation("向", "return-shop"))
+            .expect("应返回圣魂村");
+        assert!(
+            store
+                .shop_items_page(&identity(), None, 1, 10)
+                .expect_err("返回原地图后也必须重新对话")
+                .contains("先与当前地图")
+        );
+    }
+
+    #[test]
+    fn v8_allows_additional_catalog_rows_without_relaxing_schema_contract() {
+        let (directory, store) = test_store();
+        let connection = store.open().expect("应打开经济数据库");
+        connection
+            .execute(
+                r#"INSERT INTO item(
+                    item_key, name, category, quality, stackable, max_stack,
+                    buy_price, sell_price, level_required, effect_kind, effect_amount,
+                    revive_hp_percent, purchasable, sellable, usable, description,
+                    created_at, updated_at
+                ) VALUES('custom-healing', '自定义恢复药', 'consumable', 3, 1, 20,
+                         100, 20, 1, 'restore_hp', 300, 0, 1, 1, 1, '测试商品', 0, 0)"#,
+                [],
+            )
+            .expect("应允许新增物品种子");
+        connection
+            .execute(
+                r#"INSERT INTO npc(
+                    npc_key, map_key, name, npc_kind, dialogue, description,
+                    enabled, sort_order, created_at, updated_at
+                ) VALUES('holy-soul-village-apothecary', 'holy-soul-village', '药师',
+                         'merchant', '需要药剂吗？', '新增测试商人', 1, 30, 0, 0)"#,
+                [],
+            )
+            .expect("应允许新增 NPC");
+        connection
+            .execute(
+                "INSERT INTO shop_item(npc_key, item_key, buy_price, stock, enabled, created_at, updated_at) VALUES('holy-soul-village-apothecary', 'custom-healing', 100, -1, 1, 0, 0)",
+                [],
+            )
+            .expect("应允许新增商店商品");
+        drop(connection);
+
+        Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("新增合法目录数据不应破坏 v8 启动校验");
+    }
+
+    #[test]
+    fn v8_purchase_and_sale_are_atomic_checked_and_replay_safe() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "经济角色", "女")
+            .expect("应创建经济角色");
+        store
+            .daily_checkin(
+                &identity(),
+                &DailyCheckinInput {
+                    game_day: 1,
+                    currency_code: "gold_soul_coin",
+                    currency_reward_override: Some(199),
+                },
+                &checkin_operation("economy-fund"),
+            )
+            .expect("应发放交易资金");
+        store
+            .talk_to_npc_with_operation(
+                &identity(),
+                "杂货商人",
+                &map_operation("对话", "economy-talk"),
+            )
+            .expect("应建立商人对话绑定");
+
+        let buy_operation = map_operation("购买", "economy-buy-1");
+        let bought = store
+            .buy_item_with_operation(&identity(), "小回复药", 5, &buy_operation)
+            .expect("应购买五瓶小回复药");
+        assert_eq!(
+            (
+                bought.total_price,
+                bought.balance_after,
+                bought.inventory_after
+            ),
+            (50, 149, 5)
+        );
+        assert!(bought.stock_after.is_none());
+        assert!(
+            store
+                .buy_item_with_operation(&identity(), "小回复药", 5, &buy_operation)
+                .expect_err("同一消息不得重复扣款")
+                .contains("已经处理")
+        );
+        assert_eq!(
+            store.wallet_balance(&identity(), "gold_soul_coin").unwrap(),
+            Some(149)
+        );
+
+        let sold = store
+            .sell_item_with_operation(
+                &identity(),
+                "小回复药",
+                2,
+                &map_operation("出售", "economy-sell-1"),
+            )
+            .expect("应出售两瓶小回复药");
+        assert_eq!(
+            (sold.total_price, sold.balance_after, sold.inventory_after),
+            (4, 153, 3)
+        );
+        assert!(
+            store
+                .buy_item_with_operation(
+                    &identity(),
+                    "中回复药",
+                    1,
+                    &map_operation("购买", "economy-level"),
+                )
+                .expect_err("一级玩家不得购买十级物品")
+                .contains("需要10级")
+        );
+        assert!(
+            store
+                .buy_item_with_operation(
+                    &identity(),
+                    "小回复药",
+                    97,
+                    &map_operation("购买", "economy-stack"),
+                )
+                .expect_err("购买后不得超过 max_stack")
+                .contains("最多堆叠99件")
+        );
+    }
+
+    #[test]
+    fn concurrent_v8_purchase_with_same_message_is_applied_once() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "并发经济", "男")
+            .expect("应创建并发经济角色");
+        store
+            .daily_checkin(
+                &identity(),
+                &DailyCheckinInput {
+                    game_day: 1,
+                    currency_code: "gold_soul_coin",
+                    currency_reward_override: Some(199),
+                },
+                &checkin_operation("concurrent-economy-fund"),
+            )
+            .expect("应发放并发交易资金");
+        store
+            .talk_to_npc_with_operation(
+                &identity(),
+                "杂货商人",
+                &map_operation("对话", "concurrent-economy-talk"),
+            )
+            .expect("应建立并发商人绑定");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.buy_item_with_operation(
+                        &identity(),
+                        "小回复药",
+                        1,
+                        &map_operation("购买", "concurrent-economy-buy"),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("购买线程不应 panic"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result
+                    .as_ref()
+                    .is_err_and(|error| error.contains("已经处理")))
+                .count(),
+            1
+        );
+        assert_eq!(
+            store.wallet_balance(&identity(), "gold_soul_coin").unwrap(),
+            Some(189)
+        );
+        let inventory = store.inventory_page(&identity(), 1, 10).unwrap();
+        assert_eq!(inventory.entries.len(), 1);
+        assert_eq!(inventory.entries[0].quantity, 1);
+    }
+
+    #[test]
+    fn v8_economy_and_use_roll_back_when_atomic_audit_fails() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "回滚经济", "男")
+            .expect("应创建回滚角色");
+        store
+            .daily_checkin(
+                &identity(),
+                &DailyCheckinInput {
+                    game_day: 1,
+                    currency_code: "gold_soul_coin",
+                    currency_reward_override: Some(199),
+                },
+                &checkin_operation("rollback-fund"),
+            )
+            .expect("应发放回滚测试资金");
+        store
+            .talk_to_npc_with_operation(
+                &identity(),
+                "杂货商人",
+                &map_operation("对话", "rollback-talk"),
+            )
+            .expect("应建立回滚商人绑定");
+        let connection = store.open().expect("应打开数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER operation_log_v8_buy_abort
+                BEFORE INSERT ON operation_log
+                WHEN NEW.command = '购买'
+                BEGIN SELECT RAISE(ABORT, 'test v8 buy audit failure'); END;
+                "#,
+            )
+            .expect("应安装购买审计失败触发器");
+        drop(connection);
+        assert!(
+            store
+                .buy_item_with_operation(
+                    &identity(),
+                    "小回复药",
+                    1,
+                    &map_operation("购买", "rollback-buy"),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.wallet_balance(&identity(), "gold_soul_coin").unwrap(),
+            Some(199)
+        );
+        assert!(
+            store
+                .inventory_page(&identity(), 1, 10)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn v8_restore_items_apply_atomically_and_full_state_does_not_consume() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "药剂角色", "女")
+            .expect("应创建药剂角色");
+        store
+            .daily_checkin(
+                &identity(),
+                &DailyCheckinInput {
+                    game_day: 1,
+                    currency_code: "gold_soul_coin",
+                    currency_reward_override: Some(199),
+                },
+                &checkin_operation("potion-fund"),
+            )
+            .expect("应发放药剂资金");
+        store
+            .talk_to_npc_with_operation(
+                &identity(),
+                "杂货商人",
+                &map_operation("对话", "potion-talk"),
+            )
+            .expect("应建立药剂商人绑定");
+        store
+            .buy_item_with_operation(
+                &identity(),
+                "小回复药",
+                2,
+                &map_operation("购买", "potion-buy-hp"),
+            )
+            .expect("应购买生命药剂");
+        store
+            .buy_item_with_operation(
+                &identity(),
+                "魂力恢复药",
+                1,
+                &map_operation("购买", "potion-buy-soul"),
+            )
+            .expect("应购买魂力药剂");
+        let connection = store.open().expect("应打开数据库");
+        connection
+            .execute(
+                "UPDATE player SET hp = 25, soul_power = 10 WHERE identity_id = (SELECT id FROM identity WHERE protocol = 'onebot11' AND account_id = '10001' AND namespace = 'test' AND subject_kind = 'user' AND subject_id = '1875390189')",
+                [],
+            )
+            .expect("应设置受伤状态");
+        drop(connection);
+
+        let hp = store
+            .use_item_with_operation(
+                &identity(),
+                "小回复药",
+                &map_operation("使用", "potion-use-hp"),
+            )
+            .expect("应使用生命药剂");
+        assert!(hp.consumed);
+        assert_eq!((hp.hp_before, hp.hp_after, hp.inventory_after), (25, 75, 1));
+        let soul = store
+            .use_item_with_operation(
+                &identity(),
+                "魂力恢复药",
+                &map_operation("使用", "potion-use-soul"),
+            )
+            .expect("应使用魂力药剂");
+        assert!(soul.consumed);
+        assert_eq!((soul.soul_power_before, soul.soul_power_after), (10, 50));
+
+        let connection = store.open().expect("应再次打开数据库");
+        connection
+            .execute(
+                "UPDATE player SET hp = max_hp WHERE identity_id = (SELECT id FROM identity WHERE protocol = 'onebot11' AND account_id = '10001' AND namespace = 'test' AND subject_kind = 'user' AND subject_id = '1875390189')",
+                [],
+            )
+            .expect("应设置满生命");
+        drop(connection);
+        let full = store
+            .use_item_with_operation(
+                &identity(),
+                "小回复药",
+                &map_operation("使用", "potion-use-full"),
+            )
+            .expect("满生命应返回未消耗结果");
+        assert!(!full.consumed);
+        assert_eq!(full.inventory_after, 1);
+
+        let connection = store.open().expect("应打开复活目录测试数据库");
+        let player_id = connection
+            .query_row(
+                "SELECT p.id FROM identity i JOIN player p ON p.identity_id = i.id WHERE i.protocol = 'onebot11' AND i.account_id = '10001' AND i.namespace = 'test' AND i.subject_kind = 'user' AND i.subject_id = '1875390189'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("应读取角色 ID");
+        connection
+            .execute(
+                "INSERT INTO inventory(player_id, item_key, quantity, updated_at) VALUES(?1, 'revival-grass', 1, 0)",
+                [player_id],
+            )
+            .expect("测试可直接放入复活 catalog 物品");
+        drop(connection);
+        assert!(
+            store
+                .use_item_with_operation(
+                    &identity(),
+                    "复活草",
+                    &map_operation("使用", "revival-disabled"),
+                )
+                .expect_err("死亡系统完成前复活物品必须 fail closed")
+                .contains("不能直接使用")
+        );
+    }
+
+    #[test]
+    fn recorded_v8_with_damaged_economy_schema_fails_closed() {
+        let directory = tempdir().expect("应创建测试目录");
+        let store =
+            Store::initialize(directory.path(), &DatabaseConfig::default()).expect("v8 迁移应成功");
+        let connection = store.open().expect("应打开数据库");
+        connection
+            .execute("DROP TRIGGER shop_item_revival_insert", [])
+            .expect("应破坏复活物品上架保护");
+        drop(connection);
+        assert!(
+            Store::initialize(directory.path(), &DatabaseConfig::default())
+                .expect_err("记录 v8 后损坏经济 schema 必须拒绝")
+                .contains("v8")
+        );
+    }
+
+    #[test]
+    fn recorded_v8_with_mutated_required_seeds_fails_closed() {
+        let mutations = [
+            "UPDATE item SET sellable = 0 WHERE item_key = 'small-healing-potion'",
+            "UPDATE npc SET name = '伪装商人' WHERE npc_key = 'holy-soul-village-grocer'",
+            "UPDATE shop_item SET buy_price = 999999 WHERE npc_key = 'holy-soul-village-grocer' AND item_key = 'small-healing-potion'",
+            "DELETE FROM shop_item WHERE npc_key = 'holy-soul-village-grocer' AND item_key = 'small-healing-potion'",
+        ];
+        for mutation in mutations {
+            let directory = tempdir().expect("应创建种子损坏测试目录");
+            let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+                .expect("v8 迁移应成功");
+            let connection = store.open().expect("应打开种子损坏测试数据库");
+            connection.execute(mutation, []).expect("应能构造种子损坏");
+            drop(connection);
+            assert!(
+                Store::initialize(directory.path(), &DatabaseConfig::default())
+                    .expect_err("必需 v8 种子损坏必须拒绝启动")
+                    .contains("v8"),
+                "未拒绝种子损坏：{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn recorded_v8_with_cross_table_trigger_reference_fails_closed() {
+        let directory = tempdir().expect("应创建跨表触发器测试目录");
+        let store =
+            Store::initialize(directory.path(), &DatabaseConfig::default()).expect("v8 迁移应成功");
+        let connection = store.open().expect("应打开跨表触发器测试数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER player_wuhun_erases_inventory
+                AFTER INSERT ON player_wuhun
+                BEGIN
+                    DELETE FROM inventory;
+                END;
+                "#,
+            )
+            .expect("应能在旧表挂载引用经济表的恶意触发器");
+        drop(connection);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("跨表触发器引用 v8 经济表必须拒绝启动");
+        assert!(error.contains("v8") && error.contains("触发器"));
     }
 }
