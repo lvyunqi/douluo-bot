@@ -11,13 +11,13 @@ use crate::identity::{
 };
 use crate::message::{GameDocument, Illustration};
 use crate::store::{
-    AuthorizedContextChange, BattleActionReceipt, BattleEventRecord, BattleLog, BattleSnapshot,
-    DailyCheckinInput, DailyCheckinResult, GOLD_SOUL_COIN, IdentityKey, LegacyClaimActor,
-    LegacyClaimResult, LegacyIdentityState, MAX_SKILL_LEVEL, MAX_SKILL_PROFICIENCY, MapExit,
-    MapRecord, MapTravelReceipt, OperationLogInput, PlayerStatus, QuestActionReceipt,
-    QuestListEntry, SkillDamageModifierRecord, SkillLoadoutReceipt, SkillPage, SoulBeastPage,
-    SoulRingAbsorbReceipt, SoulRingPage, Store, WuhunToggleReceipt, experience_progress,
-    skill_damage_percent, skill_proficiency_threshold,
+    AuthorizedContextChange, BattleActionReceipt, BattleEventRecord, BattleLog,
+    BattleSkillEffectRecord, BattleSnapshot, DailyCheckinInput, DailyCheckinResult, GOLD_SOUL_COIN,
+    IdentityKey, LegacyClaimActor, LegacyClaimResult, LegacyIdentityState, MAX_SKILL_LEVEL,
+    MAX_SKILL_PROFICIENCY, MapExit, MapRecord, MapTravelReceipt, OperationLogInput, PlayerStatus,
+    QuestActionReceipt, QuestListEntry, SkillDamageModifierRecord, SkillEffectRecord,
+    SkillLoadoutReceipt, SkillPage, SoulBeastPage, SoulRingAbsorbReceipt, SoulRingPage, Store,
+    WuhunToggleReceipt, experience_progress, skill_damage_percent, skill_proficiency_threshold,
 };
 
 const MENU_PAGES: &[MenuPage] = &[
@@ -403,31 +403,33 @@ impl GameService {
             .skill_detail(&key, skill_name)?
             .ok_or_else(|| format!("你尚未学习魂技“{skill_name}”"))?;
         let damage_percent = skill_damage_percent(skill.level)?;
-        Ok(
-            GameDocument::new(format!("魂技详情 · {}", skill.skill.name))
-                .field("类型", skill.skill.skill_type.clone())
-                .field("魂环", format!("第{}魂技", skill.skill.ring_index))
-                .field("等级", skill.level.to_string())
-                .field(
-                    "熟练度",
-                    skill_proficiency_label(skill.level, skill.proficiency),
-                )
-                .field(
-                    "装备状态",
-                    if skill.equipped {
-                        "已装备"
-                    } else {
-                        "未装备"
-                    },
-                )
-                .field("魂力消耗", skill.skill.soul_power_cost.to_string())
-                .field("冷却", format!("{} 回合", skill.skill.cooldown_rounds))
-                .field("基础伤害", skill.skill.base_damage.to_string())
-                .field("等级伤害倍率", format!("{damage_percent}%"))
-                .line(skill.skill.description)
-                .command("技能")
-                .command(format!("释放技能 {}", skill.skill.name)),
-        )
+        let mut document = GameDocument::new(format!("魂技详情 · {}", skill.skill.name))
+            .field("类型", skill.skill.skill_type.clone())
+            .field("魂环", format!("第{}魂技", skill.skill.ring_index))
+            .field("等级", skill.level.to_string())
+            .field(
+                "熟练度",
+                skill_proficiency_label(skill.level, skill.proficiency),
+            )
+            .field(
+                "装备状态",
+                if skill.equipped {
+                    "已装备"
+                } else {
+                    "未装备"
+                },
+            )
+            .field("魂力消耗", skill.skill.soul_power_cost.to_string())
+            .field("冷却", format!("{} 回合", skill.skill.cooldown_rounds))
+            .field("基础伤害", skill.skill.base_damage.to_string())
+            .field("等级伤害倍率", format!("{damage_percent}%"));
+        for effect in &skill.effects {
+            document = document.field("附加效果", skill_effect_label(effect));
+        }
+        Ok(document
+            .line(skill.skill.description)
+            .command("技能")
+            .command(format!("释放技能 {}", skill.skill.name)))
     }
 
     pub fn equip_skill(&self, req: &CommandRequest) -> Result<GameDocument, String> {
@@ -1302,6 +1304,9 @@ impl GameService {
                     );
                 }
             }
+            for effect in &skill.effects {
+                document = document.field("附加效果", battle_skill_effect_label(effect));
+            }
         }
         if event.event_kind == "challenge" {
             document = document
@@ -1342,6 +1347,19 @@ impl GameService {
             document = document.field(
                 "武魂稳定度",
                 format!("{} → {}", effect.stability_before, effect.stability_after),
+            );
+        }
+        for effect in &receipt.expired_effects {
+            document = document.line(format!(
+                "效果结束：{}（{}）",
+                effect.skill_name,
+                battle_skill_effect_short_label(effect)
+            ));
+        }
+        for effect in &receipt.battle.active_effects {
+            document = document.field(
+                "生效中",
+                active_battle_skill_effect_label(effect, receipt.battle.action_count),
             );
         }
         if event.status_after == "won" {
@@ -1403,7 +1421,7 @@ impl GameService {
     }
 
     fn battle_snapshot_document(&self, battle: BattleSnapshot, title: &str) -> GameDocument {
-        GameDocument::new(title)
+        let mut document = GameDocument::new(title)
             .field(
                 "对手",
                 format!("{} · {}年", battle.beast.name, battle.beast.age),
@@ -1424,7 +1442,14 @@ impl GameService {
             .field(
                 "魂兽生命",
                 format!("{}/{}", battle.beast_hp, battle.beast_max_hp),
-            )
+            );
+        for effect in &battle.active_effects {
+            document = document.field(
+                "生效中",
+                active_battle_skill_effect_label(effect, battle.action_count),
+            );
+        }
+        document
             .illustration_if(self.asset_illustration("soul_beast", &battle.beast.name, "battle"))
             .command("攻击")
             .command("释放技能 <魂技>")
@@ -2699,6 +2724,49 @@ fn skill_damage_modifier_label(modifier: &SkillDamageModifierRecord) -> String {
     format!(
         "Lv.{} · {}%{legacy}",
         modifier.skill_level, modifier.damage_percent
+    )
+}
+
+fn skill_effect_label(effect: &SkillEffectRecord) -> String {
+    match (effect.effect_kind.as_str(), effect.target_kind.as_str()) {
+        ("beast_attack_reduction", "enemy") => format!(
+            "魂兽攻击 -{}% · {} 回合",
+            effect.magnitude_percent, effect.duration_rounds
+        ),
+        _ => effect.description.clone(),
+    }
+}
+
+fn battle_skill_effect_short_label(effect: &BattleSkillEffectRecord) -> String {
+    match (effect.effect_kind.as_str(), effect.target_kind.as_str()) {
+        ("beast_attack_reduction", "enemy") => {
+            format!("魂兽攻击 -{}%", effect.magnitude_percent)
+        }
+        _ => effect.description.clone(),
+    }
+}
+
+fn battle_skill_effect_label(effect: &BattleSkillEffectRecord) -> String {
+    format!(
+        "{} · {} 回合",
+        battle_skill_effect_short_label(effect),
+        effect.duration_rounds
+    )
+}
+
+fn active_battle_skill_effect_label(
+    effect: &BattleSkillEffectRecord,
+    current_sequence: i64,
+) -> String {
+    let remaining = effect
+        .expires_after_sequence
+        .saturating_sub(current_sequence)
+        .max(0);
+    format!(
+        "{} · {} · 剩余 {} 回合",
+        effect.skill_name,
+        battle_skill_effect_short_label(effect),
+        remaining
     )
 }
 
