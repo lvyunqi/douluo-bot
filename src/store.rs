@@ -2698,6 +2698,119 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_V20: &str = r#"
+CREATE TABLE battle_skill_modifier (
+    battle_skill_event_id INTEGER PRIMARY KEY REFERENCES battle_skill_event(id) ON DELETE RESTRICT,
+    skill_level INTEGER NOT NULL CHECK(skill_level BETWEEN 1 AND 10),
+    damage_percent INTEGER NOT NULL CHECK(damage_percent BETWEEN 100 AND 145),
+    rule_version TEXT NOT NULL CHECK(rule_version IN ('legacy', 'level-v1')),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    CHECK(
+        (rule_version = 'legacy' AND damage_percent = 100)
+        OR (
+            rule_version = 'level-v1'
+            AND damage_percent = 100 + ((skill_level - 1) * 5)
+        )
+    )
+) STRICT;
+
+INSERT INTO battle_skill_modifier(
+    battle_skill_event_id, skill_level, damage_percent, rule_version, created_at
+)
+SELECT use_event.id,
+       COALESCE(
+           progress.level_before,
+           (
+               SELECT later_progress.level_before
+                 FROM battle_skill_event later_use
+                 JOIN skill_progress_event later_progress
+                   ON later_progress.battle_skill_event_id = later_use.id
+                WHERE later_use.player_skill_id = use_event.player_skill_id
+                  AND later_use.id > use_event.id
+                ORDER BY later_use.id
+                LIMIT 1
+           ),
+           (
+               SELECT previous_progress.level_after
+                 FROM battle_skill_event previous_use
+                 JOIN skill_progress_event previous_progress
+                   ON previous_progress.battle_skill_event_id = previous_use.id
+                WHERE previous_use.player_skill_id = use_event.player_skill_id
+                  AND previous_use.id < use_event.id
+                ORDER BY previous_use.id DESC
+                LIMIT 1
+           ),
+           learned.level
+       ),
+       100,
+       'legacy',
+       use_event.created_at
+  FROM battle_skill_event use_event
+  JOIN player_skill learned ON learned.id = use_event.player_skill_id
+  LEFT JOIN skill_progress_event progress
+    ON progress.battle_skill_event_id = use_event.id;
+
+CREATE TRIGGER battle_skill_modifier_no_update
+BEFORE UPDATE ON battle_skill_modifier
+BEGIN
+    SELECT RAISE(ABORT, 'battle skill modifier is immutable');
+END;
+
+CREATE TRIGGER battle_skill_modifier_no_delete
+BEFORE DELETE ON battle_skill_modifier
+BEGIN
+    SELECT RAISE(ABORT, 'battle skill modifier is immutable');
+END;
+
+CREATE TRIGGER battle_skill_modifier_no_reinsert
+BEFORE INSERT ON battle_skill_modifier
+WHEN EXISTS(
+    SELECT 1 FROM battle_skill_modifier
+     WHERE battle_skill_event_id = NEW.battle_skill_event_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle skill modifier is append-only');
+END;
+
+CREATE TRIGGER battle_skill_modifier_scope_guard
+BEFORE INSERT ON battle_skill_modifier
+WHEN NEW.rule_version <> 'level-v1'
+ OR NOT EXISTS(
+    SELECT 1
+      FROM battle_skill_event use_event
+      JOIN player_skill learned ON learned.id = use_event.player_skill_id
+     WHERE use_event.id = NEW.battle_skill_event_id
+       AND learned.player_id = use_event.player_id
+       AND learned.skill_key = use_event.skill_key
+       AND learned.level = NEW.skill_level
+       AND NEW.damage_percent = 100 + ((NEW.skill_level - 1) * 5)
+       AND NEW.created_at = use_event.created_at
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle skill modifier scope or formula mismatch');
+END;
+
+CREATE TRIGGER battle_skill_event_modifier_snapshot
+AFTER INSERT ON battle_skill_event
+BEGIN
+    INSERT INTO battle_skill_modifier(
+        battle_skill_event_id, skill_level, damage_percent, rule_version, created_at
+    )
+    SELECT NEW.id,
+           learned.level,
+           100 + ((learned.level - 1) * 5),
+           'level-v1',
+           NEW.created_at
+      FROM player_skill learned
+     WHERE learned.id = NEW.player_skill_id
+       AND learned.player_id = NEW.player_id
+       AND learned.skill_key = NEW.skill_key;
+    SELECT CASE WHEN changes() <> 1
+        THEN RAISE(ABORT, 'battle skill modifier snapshot is missing')
+    END;
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -3131,6 +3244,13 @@ pub struct SkillProgressRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillDamageModifierRecord {
+    pub skill_level: i64,
+    pub damage_percent: i64,
+    pub rule_version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillPage {
     pub entries: Vec<PlayerSkillRecord>,
     pub soul_power: i64,
@@ -3142,6 +3262,7 @@ pub struct SkillUseRecord {
     pub skill: SkillRecord,
     pub soul_power_before: i64,
     pub soul_power_after: i64,
+    pub damage_modifier: SkillDamageModifierRecord,
     pub progress: Option<SkillProgressRecord>,
 }
 
@@ -3443,6 +3564,9 @@ pub const GOLD_SOUL_COIN: &str = "gold_soul_coin";
 pub const MAX_EQUIPPED_SKILLS: i64 = 4;
 pub const MAX_SKILL_LEVEL: i64 = 10;
 pub const MAX_SKILL_PROFICIENCY: i64 = 4_500;
+pub const BASE_SKILL_DAMAGE_PERCENT: i64 = 100;
+pub const SKILL_DAMAGE_PERCENT_PER_LEVEL: i64 = 5;
+const SKILL_DAMAGE_RULE_LEVEL_V1: &str = "level-v1";
 
 const LEVEL_TIERS: [LevelTier; 14] = [
     LevelTier {
@@ -3771,7 +3895,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
                     format!(
-                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19 失败：{error}"
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20 失败：{error}"
                     )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
@@ -4068,10 +4192,25 @@ impl Store {
                 validate_v19_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 20)? {
+                transaction
+                    .execute_batch(MIGRATION_V20)
+                    .map_err(|error| format!("执行数据库迁移 v20 失败：{error}"))?;
+                validate_v20_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(20, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v20 失败：{error}"))?;
+            } else {
+                validate_v20_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20 失败：{error}"
                 )
             })?;
             Ok(())
@@ -4098,6 +4237,7 @@ impl Store {
                 validate_v17_schema(connection)?;
                 validate_v18_schema(connection)?;
                 validate_v19_schema(connection)?;
+                validate_v20_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -6582,6 +6722,7 @@ impl Store {
             if !learned.equipped {
                 return Err(format!("魂技“{}”尚未装备", learned.skill.name));
             }
+            let damage_modifier = skill_damage_modifier(learned.level)?;
             let progress =
                 skill_progress_after_use(&learned.skill, learned.level, learned.proficiency)?;
             let soul_power_before = transaction
@@ -6627,6 +6768,7 @@ impl Store {
                     skill: learned.skill,
                     soul_power_before,
                     soul_power_after,
+                    damage_modifier,
                     progress,
                 }),
                 Some(soul_power_before),
@@ -6664,7 +6806,12 @@ impl Store {
                 ),
             );
             let raw_damage = if let Some(skill) = skill_use.as_ref() {
-                skill_raw_damage(&skill.skill, state.player_strength, state.player_perception)?
+                skill_raw_damage(
+                    &skill.skill,
+                    state.player_strength,
+                    state.player_perception,
+                    skill.damage_modifier.damage_percent,
+                )?
             } else {
                 state
                     .player_strength
@@ -6971,6 +7118,12 @@ impl Store {
                 },
             )?;
             let battle_skill_event_id = transaction.last_insert_rowid();
+            let persisted_modifier =
+                load_battle_skill_modifier(&transaction, battle_skill_event_id)?
+                    .ok_or_else(|| "保存战斗魂技事件后缺少等级伤害倍率快照".to_string())?;
+            if persisted_modifier != skill_use.damage_modifier {
+                return Err("战斗魂技等级伤害倍率快照与结算参数不一致".to_string());
+            }
             if let Some(progress) = &skill_use.progress {
                 apply_skill_progress(
                     &transaction,
@@ -10049,7 +10202,31 @@ fn scale_combat_value(value: i64, percent: i64, label: &str) -> Result<i64, Stri
     .map_err(|_| format!("{label}超出整数范围"))
 }
 
-fn skill_raw_damage(skill: &SkillRecord, strength: i64, spirit: i64) -> Result<i64, String> {
+pub fn skill_damage_percent(level: i64) -> Result<i64, String> {
+    if !(1..=MAX_SKILL_LEVEL).contains(&level) {
+        return Err("魂技等级必须在 1 到 10 之间".to_string());
+    }
+    level
+        .checked_sub(1)
+        .and_then(|value| value.checked_mul(SKILL_DAMAGE_PERCENT_PER_LEVEL))
+        .and_then(|value| value.checked_add(BASE_SKILL_DAMAGE_PERCENT))
+        .ok_or_else(|| "魂技等级伤害倍率计算溢出".to_string())
+}
+
+fn skill_damage_modifier(level: i64) -> Result<SkillDamageModifierRecord, String> {
+    Ok(SkillDamageModifierRecord {
+        skill_level: level,
+        damage_percent: skill_damage_percent(level)?,
+        rule_version: SKILL_DAMAGE_RULE_LEVEL_V1.to_string(),
+    })
+}
+
+fn skill_raw_damage(
+    skill: &SkillRecord,
+    strength: i64,
+    spirit: i64,
+    damage_percent: i64,
+) -> Result<i64, String> {
     if strength < 0 || spirit < 0 {
         return Err("魂技属性参数无效".to_string());
     }
@@ -10066,7 +10243,8 @@ fn skill_raw_damage(skill: &SkillRecord, strength: i64, spirit: i64) -> Result<i
             )
         })
         .ok_or_else(|| "魂技精神加成计算溢出".to_string())?;
-    i64::try_from(value).map_err(|_| "魂技基础伤害超出整数范围".to_string())
+    let value = i64::try_from(value).map_err(|_| "魂技基础伤害超出整数范围".to_string())?;
+    scale_combat_value(value, damage_percent, "魂技等级伤害倍率")
 }
 
 pub fn skill_proficiency_threshold(level: i64) -> Result<i64, String> {
@@ -10587,24 +10765,27 @@ fn load_battle_skill_use_by_event(
                    s.ring_index, s.soul_power_cost, s.cooldown_rounds, s.base_damage,
                    s.spirit_ratio_percent, s.strength_ratio_percent, s.description,
                    use_event.soul_power_before, use_event.soul_power_after,
+                   modifier.skill_level, modifier.damage_percent, modifier.rule_version,
                    progress.level_before, progress.level_after,
                    progress.proficiency_before, progress.proficiency_after,
                    progress.proficiency_gain
               FROM battle_skill_event use_event
               JOIN skill s ON s.skill_key = use_event.skill_key
+              JOIN battle_skill_modifier modifier
+                ON modifier.battle_skill_event_id = use_event.id
               LEFT JOIN skill_progress_event progress
                 ON progress.battle_skill_event_id = use_event.id
              WHERE use_event.battle_event_id = ?1
             "#,
             [battle_event_id],
             |row| {
-                let progress_gain = row.get::<_, Option<i64>>(17)?;
+                let progress_gain = row.get::<_, Option<i64>>(20)?;
                 let progress = match progress_gain {
                     Some(proficiency_gain) => Some(SkillProgressRecord {
-                        level_before: row.get(13)?,
-                        level_after: row.get(14)?,
-                        proficiency_before: row.get(15)?,
-                        proficiency_after: row.get(16)?,
+                        level_before: row.get(16)?,
+                        level_after: row.get(17)?,
+                        proficiency_before: row.get(18)?,
+                        proficiency_after: row.get(19)?,
                         proficiency_gain,
                     }),
                     None => None,
@@ -10613,12 +10794,41 @@ fn load_battle_skill_use_by_event(
                     skill: skill_record_from_row(row, 0)?,
                     soul_power_before: row.get(11)?,
                     soul_power_after: row.get(12)?,
+                    damage_modifier: SkillDamageModifierRecord {
+                        skill_level: row.get(13)?,
+                        damage_percent: row.get(14)?,
+                        rule_version: row.get(15)?,
+                    },
                     progress,
                 })
             },
         )
         .optional()
         .map_err(|error| format!("读取战斗魂技事件失败：{error}"))
+}
+
+fn load_battle_skill_modifier(
+    connection: &Connection,
+    battle_skill_event_id: i64,
+) -> Result<Option<SkillDamageModifierRecord>, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT skill_level, damage_percent, rule_version
+              FROM battle_skill_modifier
+             WHERE battle_skill_event_id = ?1
+            "#,
+            [battle_skill_event_id],
+            |row| {
+                Ok(SkillDamageModifierRecord {
+                    skill_level: row.get(0)?,
+                    damage_percent: row.get(1)?,
+                    rule_version: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取魂技伤害倍率快照失败：{error}"))
 }
 
 fn insert_battle_event(
@@ -15908,8 +16118,10 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
             || name == "battle_event_scope_guard"
             || table == "skill_loadout_event"
             || table == "skill_progress_event"
+            || table == "battle_skill_modifier"
             || sql_mentions_identifier(&trigger_sql, "skill_loadout_event")
             || sql_mentions_identifier(&trigger_sql, "skill_progress_event")
+            || sql_mentions_identifier(&trigger_sql, "battle_skill_modifier")
             || matches!(
                 table.as_str(),
                 "soul_ring" | "soul_ring_drop" | "player_soul_ring" | "soul_ring_event"
@@ -16695,6 +16907,212 @@ fn validate_v19_index(
         .map_err(|error| error.replace("v7", "v19"))
 }
 
+fn validate_v20_schema(connection: &Connection) -> Result<(), String> {
+    let expected = vec![
+        TableColumnInfo::new("battle_skill_event_id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("skill_level", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("damage_percent", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("rule_version", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+    ];
+    let actual = table_columns_with_type(connection, "battle_skill_modifier")?;
+    if actual != expected {
+        return Err(format!(
+            "数据库已标记迁移 v20，但表 battle_skill_modifier 字段不匹配：{actual:?}"
+        ));
+    }
+    let sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'battle_skill_modifier'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v20 魂技伤害倍率快照表建表语句失败：{error}"))?
+        .ok_or_else(|| "数据库已标记迁移 v20，但缺少表 battle_skill_modifier".to_string())?
+        .to_ascii_uppercase();
+    for marker in [
+        ") STRICT",
+        "SKILL_LEVEL BETWEEN 1 AND 10",
+        "DAMAGE_PERCENT BETWEEN 100 AND 145",
+        "RULE_VERSION IN ('LEGACY', 'LEVEL-V1')",
+        "RULE_VERSION = 'LEGACY' AND DAMAGE_PERCENT = 100",
+        "RULE_VERSION = 'LEVEL-V1'",
+    ] {
+        if !sql.contains(marker) {
+            return Err(format!(
+                "数据库已标记迁移 v20，但魂技伤害倍率快照表缺少约束：{marker}"
+            ));
+        }
+    }
+    validate_v20_foreign_keys(
+        connection,
+        &[(
+            "battle_skill_event",
+            "battle_skill_event_id",
+            "id",
+            "NO ACTION",
+            "RESTRICT",
+        )],
+    )?;
+    validate_v20_custom_index_set(connection, &[])?;
+
+    let invalid_modifiers = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM battle_skill_event use_event
+                  LEFT JOIN battle_skill_modifier modifier
+                    ON modifier.battle_skill_event_id = use_event.id
+                  LEFT JOIN skill_progress_event progress
+                    ON progress.battle_skill_event_id = use_event.id
+                 WHERE modifier.battle_skill_event_id IS NULL
+                    OR modifier.created_at <> use_event.created_at
+                    OR modifier.skill_level NOT BETWEEN 1 AND 10
+                    OR modifier.damage_percent NOT BETWEEN 100 AND 145
+                    OR modifier.rule_version NOT IN ('legacy', 'level-v1')
+                    OR (
+                        modifier.rule_version = 'legacy'
+                        AND modifier.damage_percent <> 100
+                    )
+                    OR (
+                        modifier.rule_version = 'level-v1'
+                        AND modifier.damage_percent <> 100 + ((modifier.skill_level - 1) * 5)
+                    )
+                    OR (
+                        modifier.rule_version = 'level-v1'
+                        AND progress.id IS NOT NULL
+                        AND modifier.skill_level <> progress.level_before
+                    )
+                    OR (
+                        modifier.rule_version = 'level-v1'
+                        AND progress.id IS NULL
+                        AND modifier.skill_level <> 10
+                    )
+            ) OR EXISTS(
+                SELECT 1
+                  FROM battle_skill_modifier modifier
+                  LEFT JOIN battle_skill_event use_event
+                    ON use_event.id = modifier.battle_skill_event_id
+                 WHERE use_event.id IS NULL
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v20 魂技伤害倍率快照失败：{error}"))?;
+    if invalid_modifiers {
+        return Err("数据库已标记迁移 v20，但存在缺失、孤立或不一致的魂技伤害倍率快照".to_string());
+    }
+
+    let expected_triggers = [
+        ("battle_skill_modifier_no_update", "battle_skill_modifier"),
+        ("battle_skill_modifier_no_delete", "battle_skill_modifier"),
+        ("battle_skill_modifier_no_reinsert", "battle_skill_modifier"),
+        ("battle_skill_modifier_scope_guard", "battle_skill_modifier"),
+        ("battle_skill_event_modifier_snapshot", "battle_skill_event"),
+    ];
+    for (name, table) in expected_triggers {
+        let (actual_table, trigger_sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v20 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v20，但缺少触发器 {name}"))?;
+        let normalized = trigger_sql.to_ascii_uppercase();
+        if actual_table != table || !normalized.contains("RAISE(ABORT") {
+            return Err(format!("v20 触发器 {name} 契约不匹配"));
+        }
+        if name == "battle_skill_modifier_scope_guard"
+            && (!normalized.contains("FROM BATTLE_SKILL_EVENT USE_EVENT")
+                || !normalized.contains("JOIN PLAYER_SKILL LEARNED")
+                || !normalized.contains("NEW.SKILL_LEVEL")
+                || !normalized.contains("NEW.DAMAGE_PERCENT")
+                || !normalized.contains("'LEVEL-V1'"))
+        {
+            return Err("v20 魂技伤害倍率范围触发器不完整".to_string());
+        }
+        if name == "battle_skill_event_modifier_snapshot"
+            && (!normalized.contains("INSERT INTO BATTLE_SKILL_MODIFIER")
+                || !normalized.contains("LEARNED.LEVEL")
+                || !normalized.contains("'LEVEL-V1'")
+                || !normalized.contains("CHANGES()"))
+        {
+            return Err("v20 战斗魂技倍率快照触发器不完整".to_string());
+        }
+    }
+
+    let modifier_trigger_names = connection
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'battle_skill_modifier'",
+        )
+        .map_err(|error| format!("读取 v20 魂技伤害倍率快照触发器失败：{error}"))?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("查询 v20 魂技伤害倍率快照触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v20 魂技伤害倍率快照触发器失败：{error}"))?;
+    let mut expected_modifier_names = expected_triggers
+        .iter()
+        .filter_map(|(name, table)| {
+            (*table == "battle_skill_modifier").then_some((*name).to_string())
+        })
+        .collect::<Vec<_>>();
+    let mut actual_modifier_names = modifier_trigger_names;
+    expected_modifier_names.sort();
+    actual_modifier_names.sort();
+    if actual_modifier_names != expected_modifier_names {
+        return Err(format!(
+            "数据库已标记迁移 v20，但魂技伤害倍率快照触发器集合不匹配：实际 {actual_modifier_names:?}，期望 {expected_modifier_names:?}"
+        ));
+    }
+
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v20 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v20 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v20 全库触发器失败：{error}"))?;
+    for (name, table, trigger_sql) in triggers {
+        let declared = expected_triggers
+            .iter()
+            .any(|(expected_name, expected_table)| {
+                name == *expected_name && table == *expected_table
+            });
+        let touches_v20 = table == "battle_skill_modifier"
+            || sql_mentions_identifier(&trigger_sql, "battle_skill_modifier");
+        if touches_v20 && !declared {
+            return Err(format!(
+                "v20 触发器 {name} 未声明却引用魂技伤害倍率快照表 {table}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v20_foreign_keys(
+    connection: &Connection,
+    expected: &[(&str, &str, &str, &str, &str)],
+) -> Result<(), String> {
+    validate_v9_foreign_keys(connection, "battle_skill_modifier", expected)
+        .map_err(|error| error.replace("v9", "v20"))
+}
+
+fn validate_v20_custom_index_set(connection: &Connection, expected: &[&str]) -> Result<(), String> {
+    validate_v10_custom_index_set(connection, "battle_skill_modifier", expected)
+        .map_err(|error| error.replace("v10", "v20"))
+}
+
 fn validate_v17_foreign_keys(
     connection: &Connection,
     table: &str,
@@ -16981,6 +17399,7 @@ fn validate_v12_triggers(connection: &Connection) -> Result<(), String> {
     for (name, table, sql) in triggers {
         if table == "battle_wuhun_modifier"
             || table == "battle_skill_event"
+            || table == "battle_skill_modifier"
             || table == "skill_progress_event"
             || matches!(
                 table.as_str(),
@@ -16989,6 +17408,7 @@ fn validate_v12_triggers(connection: &Connection) -> Result<(), String> {
             || name == "battle_wuhun_state_guard"
             || name == "wuhun_state_event_scope_guard"
             || name == "battle_wuhun_modifier_event_guard"
+            || sql_mentions_identifier(&sql, "battle_skill_modifier")
         {
             continue;
         }
@@ -18374,6 +18794,46 @@ mod tests {
             .expect("应读取测试角色 ID")
     }
 
+    fn set_skill_progress_for_test(store: &Store, player_id: i64, level: i64, proficiency: i64) {
+        let connection = store.open().expect("应打开魂技等级测试数据库");
+        connection
+            .execute_batch("DROP TRIGGER player_skill_progress_guard;")
+            .expect("应暂时移除成长更新门控");
+        connection
+            .execute(
+                "UPDATE player_skill SET level = ?1, proficiency = ?2 WHERE player_id = ?3 AND skill_key = 'entangle'",
+                params![level, proficiency, player_id],
+            )
+            .expect("应设置测试魂技成长状态");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER player_skill_progress_guard
+                BEFORE UPDATE OF level, proficiency ON player_skill
+                WHEN NEW.level <> OLD.level OR NEW.proficiency <> OLD.proficiency
+                BEGIN
+                    SELECT CASE WHEN NOT EXISTS(
+                        SELECT 1
+                          FROM skill_progress_event progress
+                         WHERE progress.player_id = OLD.player_id
+                           AND progress.player_skill_id = OLD.id
+                           AND progress.skill_key = OLD.skill_key
+                           AND progress.level_before = OLD.level
+                           AND progress.level_after = NEW.level
+                           AND progress.proficiency_before = OLD.proficiency
+                           AND progress.proficiency_after = NEW.proficiency
+                           AND progress.id = (
+                               SELECT MAX(latest.id)
+                                 FROM skill_progress_event latest
+                                WHERE latest.player_skill_id = OLD.id
+                           )
+                    ) THEN RAISE(ABORT, 'player skill progress must follow an event') END;
+                END;
+                "#,
+            )
+            .expect("应恢复成长更新门控");
+    }
+
     fn transfer_operation<'a>(command: &'a str, message_id: &'a str) -> OperationLogInput<'a> {
         OperationLogInput {
             command,
@@ -18623,6 +19083,24 @@ mod tests {
         assert!(
             error.contains("v19"),
             "v19 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    fn assert_v20_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v20 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v20 迁移应成功");
+        let connection = store.open().expect("应打开 v20 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v20 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v20 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v20"),
+            "v20 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
         );
     }
 
@@ -22752,6 +23230,300 @@ mod tests {
     }
 
     #[test]
+    fn v20_skill_damage_curve_scales_raw_damage_by_release_level() {
+        assert_eq!(skill_damage_percent(1), Ok(100));
+        assert_eq!(skill_damage_percent(2), Ok(105));
+        assert_eq!(skill_damage_percent(10), Ok(145));
+        assert!(skill_damage_percent(0).is_err());
+        assert!(skill_damage_percent(11).is_err());
+
+        let skill = SkillRecord {
+            skill_key: "damage-curve-test".to_string(),
+            name: "伤害曲线测试".to_string(),
+            skill_type: "active".to_string(),
+            wuhun_category: "all".to_string(),
+            ring_index: 1,
+            soul_power_cost: 10,
+            cooldown_rounds: 1,
+            base_damage: 200,
+            spirit_ratio_percent: 0,
+            strength_ratio_percent: 0,
+            description: "测试".to_string(),
+        };
+        assert_eq!(skill_raw_damage(&skill, 0, 0, 100), Ok(200));
+        assert_eq!(skill_raw_damage(&skill, 0, 0, 105), Ok(210));
+        assert_eq!(skill_raw_damage(&skill, 0, 0, 145), Ok(290));
+    }
+
+    #[test]
+    fn v20_release_freezes_level_modifier_and_replay_survives_current_level_change() {
+        let (directory, store) = test_store();
+        register_awakened_pair(&store);
+        let player_id = player_id_for(&store, &identity());
+        let connection = store.open().expect("应打开 v20 等级伤害测试数据库");
+        connection
+            .execute(
+                "UPDATE player SET level = 3, hp = 100, max_hp = 100, soul_power = 100, max_soul_power = 100, strength = 1, perception = 20, luck = 0, endurance = 100, updated_at = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置 v20 等级伤害测试属性");
+        drop(connection);
+        set_skill_progress_for_test(&store, player_id, 2, 100);
+
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "v20-damage-map"),
+            )
+            .expect("应进入 v20 等级伤害测试地图");
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "哥布林",
+                &transfer_operation("挑战", "v20-damage-start"),
+            )
+            .expect("应创建 v20 等级伤害测试战斗");
+
+        let state =
+            load_active_battle_state(&store.open().expect("应读取 v20 战斗状态"), player_id)
+                .expect("应查询 v20 战斗状态")
+                .expect("v20 战斗应处于 active");
+        let learned = store
+            .skill_detail(&identity(), "缠绕")
+            .expect("应读取 v20 测试魂技")
+            .expect("应已学习缠绕");
+        let sequence = state.action_count + 1;
+        let raw_damage = skill_raw_damage(
+            &learned.skill,
+            state.player_strength,
+            state.player_perception,
+            105,
+        )
+        .expect("应计算二级魂技原始伤害");
+        let mut expected_damage = battle_damage(
+            scale_combat_value(
+                raw_damage,
+                state.wuhun_attack_percent,
+                "测试武魂魂技攻击修正",
+            )
+            .expect("应应用测试武魂修正"),
+            state.beast_defense,
+            state.player_level,
+            battle_roll(state.random_seed, sequence, 10),
+        )
+        .expect("应计算 v20 预期战斗伤害");
+        let expected_critical = battle_is_critical(
+            state.player_perception,
+            state.player_luck,
+            battle_roll(state.random_seed, sequence, 11),
+        );
+        if expected_critical {
+            expected_damage = battle_critical_damage(expected_damage, state.player_luck)
+                .expect("应计算 v20 预期暴击伤害");
+        }
+
+        let operation = transfer_operation("释放技能", "v20-damage-use");
+        let first = store
+            .use_skill_battle_with_operation(&identity(), "缠绕", &operation)
+            .expect("二级魂技释放应成功");
+        assert_eq!(first.event.player_damage, expected_damage);
+        assert_eq!(first.event.player_critical, expected_critical);
+        assert_eq!(
+            first.skill.as_ref().map(|skill| &skill.damage_modifier),
+            Some(&SkillDamageModifierRecord {
+                skill_level: 2,
+                damage_percent: 105,
+                rule_version: "level-v1".to_string(),
+            })
+        );
+
+        set_skill_progress_for_test(&store, player_id, 3, 300);
+        drop(store);
+        let restored = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v20 快照应通过热重载校验");
+        let replay = restored
+            .use_skill_battle_with_operation(&identity(), "缠绕", &operation)
+            .expect("当前等级变化后仍应重放原技能事件");
+        assert!(replay.replayed);
+        assert_eq!(replay.event.id, first.event.id);
+        assert_eq!(replay.event.player_damage, first.event.player_damage);
+        assert_eq!(replay.skill, first.skill);
+        assert_eq!(
+            replay
+                .skill
+                .as_ref()
+                .map(|skill| skill.damage_modifier.skill_level),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn v20_migrates_existing_skill_events_with_legacy_neutral_damage() {
+        let (directory, store) = test_store();
+        register_awakened_pair(&store);
+        let player_id = player_id_for(&store, &identity());
+        let connection = store.open().expect("应打开 v20 旧事件迁移测试数据库");
+        connection
+            .execute(
+                "UPDATE player SET level = 3, hp = 100, max_hp = 100, soul_power = 50, max_soul_power = 50, strength = 1, perception = 0, luck = 0, endurance = 100, updated_at = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置 v20 旧事件迁移测试属性");
+        drop(connection);
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "v20-legacy-map"),
+            )
+            .expect("应进入 v20 旧事件迁移测试地图");
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "哥布林",
+                &transfer_operation("挑战", "v20-legacy-start"),
+            )
+            .expect("应创建 v20 旧事件迁移测试战斗");
+        let operation = transfer_operation("释放技能", "v20-legacy-use");
+        let original = store
+            .use_skill_battle_with_operation(&identity(), "缠绕", &operation)
+            .expect("应创建待模拟为 v19 的魂技事件");
+
+        let connection = store.open().expect("应移除 v20 结构模拟 v19 数据库");
+        connection
+            .execute_batch(
+                r#"
+                DROP TRIGGER battle_skill_event_modifier_snapshot;
+                DROP TRIGGER battle_skill_modifier_scope_guard;
+                DROP TRIGGER battle_skill_modifier_no_reinsert;
+                DROP TRIGGER battle_skill_modifier_no_delete;
+                DROP TRIGGER battle_skill_modifier_no_update;
+                DROP TABLE battle_skill_modifier;
+                DELETE FROM schema_migration WHERE version = 20;
+                "#,
+            )
+            .expect("应移除 v20 结构并保留 v19 战斗技能事件");
+        drop(connection);
+        drop(store);
+
+        let restored = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v19 战斗技能事件应迁移到 v20");
+        let replay = restored
+            .use_skill_battle_with_operation(&identity(), "缠绕", &operation)
+            .expect("迁移后应按原消息重放技能事件");
+        assert!(replay.replayed);
+        assert_eq!(replay.event.id, original.event.id);
+        assert_eq!(replay.event.player_damage, original.event.player_damage);
+        assert_eq!(
+            replay.skill.as_ref().map(|skill| &skill.damage_modifier),
+            Some(&SkillDamageModifierRecord {
+                skill_level: 1,
+                damage_percent: 100,
+                rule_version: "legacy".to_string(),
+            })
+        );
+        let modifier_count = restored
+            .open()
+            .expect("应读取 v20 旧事件快照")
+            .query_row("SELECT COUNT(*) FROM battle_skill_modifier", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("应统计 v20 旧事件快照");
+        assert_eq!(modifier_count, 1);
+    }
+
+    #[test]
+    fn v20_modifier_snapshot_failure_rolls_back_the_battle_action() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        let player_id = player_id_for(&store, &identity());
+        let connection = store.open().expect("应打开 v20 回滚测试数据库");
+        connection
+            .execute(
+                "UPDATE player SET level = 3, hp = 100, max_hp = 100, soul_power = 50, max_soul_power = 50, strength = 1, perception = 0, luck = 0, endurance = 100, updated_at = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置 v20 回滚测试属性");
+        drop(connection);
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "v20-rollback-map"),
+            )
+            .expect("应进入 v20 回滚测试地图");
+        let started = store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "哥布林",
+                &transfer_operation("挑战", "v20-rollback-start"),
+            )
+            .expect("应创建 v20 回滚测试战斗");
+        let connection = store.open().expect("应安装 v20 快照失败触发器");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER battle_skill_modifier_test_abort
+                BEFORE INSERT ON battle_skill_modifier
+                BEGIN SELECT RAISE(ABORT, 'test skill modifier failure'); END;
+                "#,
+            )
+            .expect("应安装 v20 快照失败触发器");
+        drop(connection);
+
+        let error = store
+            .use_skill_battle_with_operation(
+                &identity(),
+                "缠绕",
+                &transfer_operation("释放技能", "v20-rollback-use"),
+            )
+            .expect_err("倍率快照失败必须回滚整个战斗动作");
+        assert!(error.contains("战斗魂技事件"));
+        assert_eq!(
+            store
+                .player_status(&identity())
+                .expect("应读取 v20 回滚后玩家")
+                .expect("v20 回滚后玩家应存在")
+                .soul_power,
+            50
+        );
+        let battle = store
+            .active_battle(&identity())
+            .expect("应读取 v20 回滚后的战斗")
+            .expect("v20 回滚后战斗仍应存在");
+        assert_eq!(battle.id, started.battle.id);
+        assert_eq!(battle.action_count, 0);
+        let counts = store
+            .open()
+            .expect("应检查 v20 回滚结果")
+            .query_row(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM battle_event WHERE source_message_id = 'v20-rollback-use'),
+                    (SELECT COUNT(*) FROM operation_log WHERE source_message_id = 'v20-rollback-use'),
+                    (SELECT COUNT(*) FROM battle_skill_event WHERE source_message_id = 'v20-rollback-use'),
+                    (SELECT COUNT(*)
+                       FROM battle_skill_modifier modifier
+                       JOIN battle_skill_event use_event
+                         ON use_event.id = modifier.battle_skill_event_id
+                      WHERE use_event.source_message_id = 'v20-rollback-use')
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .expect("应统计 v20 回滚结果");
+        assert_eq!(counts, (0, 0, 0, 0));
+    }
+
+    #[test]
     fn v19_progress_event_failure_rolls_back_the_battle_action() {
         let (_directory, store) = test_store();
         register_awakened_pair(&store);
@@ -23407,6 +24179,31 @@ mod tests {
             CREATE TRIGGER skill_progress_event_shadow
             AFTER INSERT ON skill_progress_event
             BEGIN SELECT 1; END;
+            "#,
+        );
+    }
+
+    #[test]
+    fn recorded_v20_with_damaged_schema_or_trigger_fails_closed() {
+        for mutation in [
+            "DROP TABLE battle_skill_modifier;",
+            "DROP TRIGGER battle_skill_modifier_scope_guard;",
+            "DROP TRIGGER battle_skill_event_modifier_snapshot;",
+        ] {
+            assert_v20_damage_fails_closed(mutation);
+        }
+        assert_v20_damage_fails_closed(
+            r#"
+            CREATE TRIGGER battle_skill_modifier_shadow
+            AFTER INSERT ON battle_skill_modifier
+            BEGIN SELECT 1; END;
+            "#,
+        );
+        assert_v20_damage_fails_closed(
+            r#"
+            CREATE TRIGGER battle_event_reads_skill_modifier
+            AFTER INSERT ON battle_event
+            BEGIN SELECT EXISTS(SELECT 1 FROM battle_skill_modifier); END;
             "#,
         );
     }

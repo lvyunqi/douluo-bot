@@ -476,11 +476,15 @@ try {
     Write-Output ("onebot 技能详情 缠绕: {0} [{1}]" -f $skillDetail.ActionName, $skillDetail.Text)
     Assert-Condition ($skillDetail.Text.Contains("魂力消耗")) "skill detail did not expose cost"
     Assert-Condition ($skillDetail.Text.Contains("熟练度")) "skill detail did not expose proficiency"
+    Assert-Condition ($skillDetail.Text.Contains("等级伤害倍率")) "skill detail did not expose level damage modifier"
+    Assert-Condition ($skillDetail.Text.Contains("100%")) "level-one skill detail did not expose a 100% damage modifier"
     $skill = Invoke-OneBotCommand $endpoint "释放技能 缠绕"
     Write-Output ("onebot 释放技能 缠绕: {0} [{1}]" -f $skill.ActionName, $skill.Text)
     Assert-Condition ($skill.Text.Contains("魂技")) "skill release did not expose skill receipt"
     Assert-Condition ($skill.Text.Contains("魂力")) "skill release did not expose soul power receipt"
     Assert-Condition ($skill.Text.Contains("魂技熟练度")) "skill release did not expose proficiency gain"
+    Assert-Condition ($skill.Text.Contains("等级伤害倍率")) "skill release did not expose the frozen damage modifier"
+    Assert-Condition ($skill.Text.Contains("Lv.1 · 100%")) "level-one skill release did not freeze a 100% damage modifier"
     $battleFinished = $skill.Text.Contains("战斗胜利") -or $skill.Text.Contains("战斗失败")
     for ($round = 1; $round -le 5 -and -not $battleFinished; $round++) {
         $attack = Invoke-OneBotCommand $endpoint "攻击"
@@ -554,7 +558,7 @@ try {
     Assert-Condition ($afterReload.Text.Contains("金魂币")) "command failed after dynamic reload"
     $skillsAfterReload = Invoke-OneBotCommand $endpoint "技能"
     Assert-Condition ($skillsAfterReload.Text.Contains("熟练度：10/100")) "skill proficiency did not survive dynamic reload"
-    Write-Output "protocol smoke passed: OneBot tasks/PVE/wuhun stability/modifier/skill proficiency/economy, private/group, synthetic QQ payload, descriptor, and reload"
+    Write-Output "protocol smoke passed: OneBot tasks/PVE/wuhun stability/modifier/skill level damage/proficiency/economy, private/group, synthetic QQ payload, descriptor, and reload"
 } finally {
     if ($null -ne $process -and -not $process.HasExited) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue

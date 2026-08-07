@@ -15,8 +15,9 @@ use crate::store::{
     DailyCheckinInput, DailyCheckinResult, GOLD_SOUL_COIN, IdentityKey, LegacyClaimActor,
     LegacyClaimResult, LegacyIdentityState, MAX_SKILL_LEVEL, MAX_SKILL_PROFICIENCY, MapExit,
     MapRecord, MapTravelReceipt, OperationLogInput, PlayerStatus, QuestActionReceipt,
-    QuestListEntry, SkillLoadoutReceipt, SkillPage, SoulBeastPage, SoulRingAbsorbReceipt,
-    SoulRingPage, Store, WuhunToggleReceipt, experience_progress, skill_proficiency_threshold,
+    QuestListEntry, SkillDamageModifierRecord, SkillLoadoutReceipt, SkillPage, SoulBeastPage,
+    SoulRingAbsorbReceipt, SoulRingPage, Store, WuhunToggleReceipt, experience_progress,
+    skill_damage_percent, skill_proficiency_threshold,
 };
 
 const MENU_PAGES: &[MenuPage] = &[
@@ -401,6 +402,7 @@ impl GameService {
             .store
             .skill_detail(&key, skill_name)?
             .ok_or_else(|| format!("你尚未学习魂技“{skill_name}”"))?;
+        let damage_percent = skill_damage_percent(skill.level)?;
         Ok(
             GameDocument::new(format!("魂技详情 · {}", skill.skill.name))
                 .field("类型", skill.skill.skill_type.clone())
@@ -421,6 +423,7 @@ impl GameService {
                 .field("魂力消耗", skill.skill.soul_power_cost.to_string())
                 .field("冷却", format!("{} 回合", skill.skill.cooldown_rounds))
                 .field("基础伤害", skill.skill.base_damage.to_string())
+                .field("等级伤害倍率", format!("{damage_percent}%"))
                 .line(skill.skill.description)
                 .command("技能")
                 .command(format!("释放技能 {}", skill.skill.name)),
@@ -1277,7 +1280,11 @@ impl GameService {
                     "魂力",
                     format!("{} → {}", skill.soul_power_before, skill.soul_power_after),
                 )
-                .field("魂技冷却", format!("{} 回合", skill.skill.cooldown_rounds));
+                .field("魂技冷却", format!("{} 回合", skill.skill.cooldown_rounds))
+                .field(
+                    "等级伤害倍率",
+                    skill_damage_modifier_label(&skill.damage_modifier),
+                );
             if let Some(progress) = &skill.progress {
                 document = document.field(
                     "魂技熟练度",
@@ -2680,6 +2687,18 @@ fn skill_proficiency_label(level: i64, proficiency: i64) -> String {
     skill_proficiency_threshold(level + 1).ok().map_or_else(
         || proficiency.to_string(),
         |threshold| format!("{proficiency}/{threshold}"),
+    )
+}
+
+fn skill_damage_modifier_label(modifier: &SkillDamageModifierRecord) -> String {
+    let legacy = if modifier.rule_version == "legacy" {
+        "（历史规则）"
+    } else {
+        ""
+    };
+    format!(
+        "Lv.{} · {}%{legacy}",
+        modifier.skill_level, modifier.damage_percent
     )
 }
 
