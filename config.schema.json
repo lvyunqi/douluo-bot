@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "斗罗大陆文字游戏",
-  "description": "插件启动、身份命名空间、插图和跨协议消息配置。",
+  "description": "插件启动、内容包、身份命名空间、插图和跨协议消息配置。",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -29,6 +29,41 @@
           "default": 3000
         }
       }
+    },
+    "content": {
+      "title": "内容发布",
+      "description": "从 QimenBot data_dir 内的 JSON/TOML 文件创建并校验内容草稿；默认不会自动发布。",
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "package_file": {
+          "title": "内容包相对路径",
+          "description": "相对 data_dir 的 .json 或 .toml 文件；留空时不加载外部内容包。",
+          "type": "string",
+          "maxLength": 200,
+          "pattern": "^(?:|(?!.*/(?:\\.|\\.\\.)(?:/|$))[^\\\\:]+\\.(?:json|toml))$",
+          "default": ""
+        },
+        "auto_publish": {
+          "title": "校验通过后自动发布",
+          "description": "开启后在插件 reload/init 时原子发布新 revision；同键同 revision 内容变化会拒绝启动。",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "auto_publish": { "const": true } },
+            "required": ["auto_publish"]
+          },
+          "then": {
+            "properties": { "package_file": { "minLength": 1 } },
+            "required": ["package_file"]
+          }
+        }
+      ]
     },
     "identity": {
       "title": "身份",

@@ -3,6 +3,7 @@
 mod assets;
 mod catalog;
 pub mod config;
+mod content;
 mod context;
 mod game;
 mod identity;
@@ -39,6 +40,18 @@ fn initialize(config: PluginInitConfig) -> Result<(), String> {
     }
     let data_dir = Path::new(data_dir);
     let store = Store::initialize(data_dir, &parsed.database)?;
+    if !parsed.content.package_file.is_empty() {
+        let loaded = content::load_package_file(data_dir, &parsed.content.package_file)?;
+        store.stage_content_package(&loaded)?;
+        let report =
+            store.validate_content_draft(&loaded.package.package_key, loaded.package.revision)?;
+        if !report.errors.is_empty() {
+            return Err(format!("内容包校验失败：{}", report.errors.join("；")));
+        }
+        if parsed.content.auto_publish {
+            store.publish_content_draft(&loaded.package.package_key, loaded.package.revision)?;
+        }
+    }
     let illustration_assets = IllustrationAssets::load(data_dir, &parsed.illustrations)?;
     let service = Arc::new(GameService::with_assets(store, parsed, illustration_assets));
     let mut slot = runtime_slot()
@@ -114,7 +127,7 @@ fn execute_service_operation(
     api = "0.6",
     config_schema = "../config.schema.json",
     config_ui = "../config.ui.json",
-    config_version = 4,
+    config_version = 5,
     config_apply = "reload"
 )]
 mod plugin {

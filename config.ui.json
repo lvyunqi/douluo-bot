@@ -1,11 +1,15 @@
 {
   "": {
-    "ui:order": ["database", "identity", "authorization", "illustrations", "messages"]
+    "ui:order": ["database", "content", "identity", "authorization", "illustrations", "messages"]
   },
   "/database/busy_timeout_ms": {
     "ui:widget": "slider",
     "unit": "毫秒",
     "step": 100
+  },
+  "/content/package_file": {
+    "placeholder": "douluo-game/content/package.toml",
+    "width": "full"
   },
   "/identity/max_character_name_chars": {
     "ui:widget": "slider",

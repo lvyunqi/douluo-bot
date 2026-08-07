@@ -8,10 +8,19 @@ use url::{Host, Url};
 #[serde(default, deny_unknown_fields)]
 pub struct PluginConfig {
     pub database: DatabaseConfig,
+    pub content: ContentConfig,
     pub identity: IdentityConfig,
     pub authorization: AuthorizationConfig,
     pub illustrations: IllustrationConfig,
     pub messages: MessageConfig,
+}
+
+/// 内容包文件导入与启动时发布开关。
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContentConfig {
+    pub package_file: String,
+    pub auto_publish: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -145,6 +154,20 @@ pub fn validate_config(config: &PluginConfig) -> Result<(), String> {
     }
     if !(100..=30_000).contains(&config.database.busy_timeout_ms) {
         return Err("database.busy_timeout_ms 必须在 100 到 30000 之间".to_string());
+    }
+    if !config.content.package_file.is_empty() {
+        if !is_safe_data_relative_path(&config.content.package_file) {
+            return Err("content.package_file 必须是 data_dir 内的安全相对路径".to_string());
+        }
+        let extension = Path::new(&config.content.package_file)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase());
+        if !matches!(extension.as_deref(), Some("json" | "toml")) {
+            return Err("content.package_file 必须使用 .json 或 .toml 扩展名".to_string());
+        }
+    } else if config.content.auto_publish {
+        return Err("content.auto_publish=true 时必须配置 package_file".to_string());
     }
     if !valid_namespace(&config.identity.namespace) {
         return Err(
@@ -455,6 +478,35 @@ mod tests {
                 "不安全数据库路径 {path} 不应通过校验"
             );
         }
+    }
+
+    #[test]
+    fn content_package_path_is_safe_and_auto_publish_requires_it() {
+        let config = parse_config(
+            r#"{"content":{"package_file":"douluo-game/content/example.toml","auto_publish":true}}"#,
+        )
+        .expect("safe content package config should parse");
+        assert_eq!(
+            config.content.package_file,
+            "douluo-game/content/example.toml"
+        );
+        assert!(config.content.auto_publish);
+
+        for path in [
+            "../package.toml",
+            "douluo-game/content/package.txt",
+            "C:/package.json",
+        ] {
+            assert!(
+                parse_config(&format!(
+                    r#"{{"content":{{"package_file":{}}}}}"#,
+                    serde_json::to_string(path).expect("content path JSON")
+                ))
+                .is_err(),
+                "unsafe content package path {path} should be rejected"
+            );
+        }
+        assert!(parse_config(r#"{"content":{"auto_publish":true}}"#).is_err());
     }
 
     #[test]

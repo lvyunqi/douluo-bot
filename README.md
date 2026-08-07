@@ -1,112 +1,94 @@
 # douluo-bot
 
-基于 [QimenBot](https://github.com/lvyunqi/QimenBot) 动态插件 API 0.6 开发的斗罗大陆文字游戏，支持 OneBot 11 与 QQ 官方机器人。
+QimenBot 动态插件版斗罗大陆文字游戏，插件 ID 为 `douluo-game`，面向 QimenBot 动态插件 API `0.6` 开发。
 
-## 安装
+## Features
 
-运行要求：
+- 文本 RPG 基础流程：注册、武魂觉醒、地图、任务、经济、背包、PVE 战斗、魂环与魂技。
+- 内容包扩展：武魂、魂技、效果、魂兽和魂环可通过 JSON/TOML 内容包发布为版本化目录数据。
+- 跨协议消息：兼容 OneBot 11 与 QQ 官方机器人，回复优先使用通用消息段。
+- 插图支持：支持本地 Base64 图片和公网 HTTPS 图片地址；未配置图片时仍返回完整文本。
+- 可选媒体服务：仓库包含一个独立的静态图片服务示例，可用于向 QQ 官方 Markdown 暴露公网图片。
+
+## Requirements
 
 - QimenBot `0.1.18+`，推荐 `0.1.20+`。
-- Windows x64 MSVC 或 Linux x64/ARM64 GNU。
-- Linux musl 不支持动态插件加载。
+- Rust stable，项目使用 `Cargo.lock` 固定依赖。
+- Windows x64 MSVC、Linux x64 GNU 或 Linux ARM64 GNU。
+- Linux musl 宿主不支持动态插件加载。
 
-构建插件：
+## Build
+
+构建动态插件：
 
 ```powershell
 cargo build --release --locked
 ```
 
-Windows 产物为 `target/release/qimen_dynamic_plugin_douluo_game.dll`，Linux 产物为 `target/release/libqimen_dynamic_plugin_douluo_game.so`。
+平台产物：
 
-将对应平台的动态库复制到 QimenBot `plugin_bin_dir`，然后在 Web 插件页重新扫描并启用 `douluo-game`。
+- Windows：`target/release/qimen_dynamic_plugin_douluo_game.dll`
+- Linux：`target/release/libqimen_dynamic_plugin_douluo_game.so`
 
-可选图片服务：
+可选构建静态图片服务：
 
 ```powershell
 cargo build --manifest-path services/douluo-media/Cargo.toml --release --locked
 ```
 
-## 命令
+## Load In QimenBot
 
-| 命令 | 别名 | 说明 |
-|---|---|---|
-| `斗罗系统 [页码\|开始\|角色\|世界\|经济\|任务\|战斗]` | `斗罗菜单`、`菜单` | 查看游戏菜单 |
-| `开始穿越 <角色名> <男\|女>` | `开始转生` | 创建角色 |
-| `武魂觉醒` | `觉醒` | 觉醒第一武魂 |
-| `开武魂` | `武魂开启` | 按当前生命校准稳定度并进入战斗形态 |
-| `关武魂` | `武魂关闭` | 关闭当前武魂；关闭状态下不能挑战魂兽 |
-| `签到` | `每日签到`、`打卡` | 领取每日经验和金魂币 |
-| `钱包` | `我的钱包`、`余额` | 查看金魂币余额 |
-| `转账 <用户ID> <金额>` | `转钱`、`汇款` | 向同一协议、Bot account_id 和 namespace 内的玩家转账；支持 `@用户 <金额>` |
-| `状态` | `我的状态`、`属性` | 查看角色状态 |
-| `位置` | `地图`、`当前位置` | 查看当前地图 |
-| `地图列表 [页码]` | `地图清单` | 分页查看地图和等级要求 |
-| `向 <上\|下\|左\|右>` | — | 沿当前地图出口移动 |
-| `传送 [地图]` | — | 使用传送阵前往可达地图 |
-| `掉落 [页码]` | `查看掉落`、`地面掉落` | 查看当前地图可拾取的地面掉落 |
-| `拾取 <掉落ID>` | `捡取`、`拾取物品` | 拾取当前地图的一整堆物品 |
-| `任务 [页码]` | `任务列表`、`任务清单` | 查看当前地图可接取的任务 |
-| `接取任务 <任务>` | `接受任务`、`接任务` | 接取一项可用任务 |
-| `任务进度 [任务]` | `我的任务`、`进行中任务` | 查看进行中的任务进度 |
-| `提交任务 <任务>` | `完成任务`、`交任务` | 提交已完成任务并领取奖励 |
-| `放弃任务 <任务>` | `取消任务` | 放弃进行中的任务 |
-| `魂兽 [页码]` | `魂兽列表`、`当前魂兽` | 查看当前地图可挑战的魂兽 |
-| `挑战 <魂兽>` | `挑战魂兽` | 发起一场魂兽挑战 |
-| `攻击` | `打` | 按当前武魂战斗修正进行普通攻击；受击会降低稳定度，过低时武魂可能自动脱落 |
-| `技能` | `魂技`、`技能列表` | 查看已学习魂技、等级、熟练度、魂力和冷却 |
-| `技能详情 <魂技>` | — | 查看魂技类型、魂环、等级、熟练度、消耗、冷却、基础伤害和等级伤害倍率 |
-| `装备魂技 <魂技>` | `装备技能` | 将已学习魂技加入战斗可用列表；最多装备 4 个 |
-| `卸下魂技 <魂技>` | `卸下技能` | 从战斗可用列表移除魂技；至少保留 1 个已装备魂技 |
-| `魂环` | `查看魂环` | 查看已吸收魂环、槽位和待吸收魂环 |
-| `吸收魂环 <魂兽>` | `附加魂环` | 吸收战斗胜利留下的魂环，并在同一事务中绑定对应魂技 |
-| `释放技能 <魂技>` | `使用技能`、`使用魂技`、`施放魂技` | 在魂兽战斗中消耗魂力，并按本次释放等级倍率与附加效果施放主动魂技 |
-| `逃跑` | `撤退` | 尝试结束当前魂兽战斗 |
-| `战斗状态` | `战斗`、`查看战斗` | 查看当前战斗快照 |
-| `战斗日志 [数量]` | — | 查看最近战斗事件 |
-| `NPC` | `人物`、`当前NPC` | 查看当前地图的 NPC |
-| `对话 <NPC>` | `交谈`、`聊天` | 与当前地图的 NPC 对话 |
-| `商店 [页码]` | `店铺` | 查看已对话商人的商品 |
-| `背包 [页码]` | `随身物品`、`物品`、`道具` | 查看随身物品 |
-| `购买 <物品> [数量]` | `购买物品`、`买` | 从当前商店购买物品 |
-| `出售 <物品> [数量]` | `卖出`、`卖` | 向当前商店出售物品 |
-| `使用 <物品>` | `使用物品`、`用` | 使用背包中的消耗品；生命恢复会同步武魂稳定度 |
-| `发送物品 <用户ID> <物品> [数量]` | `赠送`、`赠送物品` | 向同一协议、Bot account_id 和 namespace 内的玩家赠送物品；支持 `@用户` |
-| `授权上下文 <group\|channel> <ID> [标签]` | `新增授权`、`授权群` | Owner 私聊授权群或频道 |
-| `取消授权 <group\|channel> <ID> 确认` | `撤销授权`、`删除授权` | Owner 私聊撤销授权 |
-| `查看授权 [下一页游标]` | `授权列表` | Owner 私聊查看授权列表 |
+1. 将当前平台的动态库复制到 QimenBot `plugin_bin_dir`。
+2. 在 QimenBot Web 插件页重新扫描动态插件。
+3. 启用 `douluo-game`。
+4. 按需在 `config/plugins/douluo-game.toml` 中配置数据库、授权上下文、内容包和插图。
 
-战斗胜利会为对应魂兽生成一个待吸收魂环。魂环槽位按角色等级计算（`floor(level / 10)`，最多 9 个）；吸收前需要觉醒并开启武魂，战斗中不能吸收。魂环吸收和魂技学习支持非空消息 ID 幂等，空消息 ID 不会被当作重放键。
-
-魂技默认在学习时装备；战斗只允许使用已装备魂技。装备管理最多保留 4 个槽位，且不能卸下最后一个已装备魂技。
-
-每次成功释放主动魂技都会增加熟练度并自动提升魂技等级；重复消息只返回原战斗回执，不会重复增加熟练度。魂技最高 10 级，达到满级后仍可正常释放。
-
-魂技等级会提高原始伤害：1 级为 100%，之后每级增加 5%，10 级为 145%。每次释放使用并显示当时的等级倍率；若本次熟练度触发升级，该回合仍按升级前等级结算，重复消息和动态重载不会改变原伤害结果。
-
-“缠绕”命中后会使魂兽攻击降低 30%，效果覆盖释放当次及后续两个玩家行动回合。战斗回执和战斗状态会显示当前效果与剩余回合；效果到期或战斗提前结束时会给出结束提示。
-
-## 协议与插图
-
-- OneBot 11 使用通用文本以及 URL 或 Base64 图片消息段。
-- QQ 官方机器人使用平台 Markdown 图片语法与公网 HTTPS 插图；图片地址必须能被 QQ 平台直接访问。
-- 图片不可用或未启用时，游戏仍返回完整文本。
-- 图片支持 `direct` 本地预加载和 `remote` 逻辑资源地址两种模式；远程模式可由独立图片服务承载，后续上传接口不改变聊天侧资源键。
-- 命令前缀、群聊 @ 和私聊裸命令由 QimenBot 统一配置。
-
-插件配置页提供两种插图模式：`direct` 读取本地资源，`remote` 使用可公开访问的图片服务。
+## Minimal Config
 
 ```toml
+[database]
+relative_path = "douluo-game/douluo.db"
+busy_timeout_ms = 3000
+
+[content]
+package_file = ""
+auto_publish = false
+
 [illustrations]
-enabled = true
-mode = "direct" # direct 或 remote
+enabled = false
+mode = "direct"
 direct_asset_root = "douluo-game/assets"
 remote_base_url = ""
 ```
 
-QQ 官方 Markdown 使用 `remote` 模式时，`remote_base_url` 必须是 QQ 平台可访问的 HTTPS 地址。
+说明：
 
-仓库内的 `services/douluo-media` 是当前的只读图片服务实现。它通过 `DOULUO_MEDIA_ROOT` 指向已发布图片目录，默认监听 `127.0.0.1:18182`（可用 `DOULUO_MEDIA_BIND` 修改）；生产环境应放在 HTTPS 反向代理之后。上传、鉴权和审核接口留待后续版本。
+- `content.package_file` 必须是插件 `data_dir` 内的安全相对路径，支持 `.json` 和 `.toml`。
+- `illustrations.mode = "direct"` 会读取本地图片并交给宿主按协议发送。
+- `illustrations.mode = "remote"` 会拼接 `remote_base_url` 生成公网图片地址，适合 QQ 官方 Markdown。
+- QQ 官方机器人使用远程图片时，地址必须是平台可访问的 HTTPS URL。
 
-## 许可证
+## Common Commands
+
+插件会在 QimenBot 命令系统中注册游戏命令。常用入口包括：
+
+- `斗罗系统`：查看游戏菜单。
+- `开始穿越 <角色名> <男|女>`：创建角色。
+- `武魂觉醒`：觉醒武魂。
+- `状态`、`位置`、`背包`、`任务`、`魂兽`、`技能`、`魂环`：查看主要玩法状态。
+- `挑战 <魂兽>`、`攻击`、`释放技能 <魂技>`、`逃跑`：进行 PVE 战斗。
+
+命令前缀、群聊 @、私聊裸命令和管理员入口由 QimenBot 宿主统一配置。
+
+## Development Checks
+
+```powershell
+cargo fmt --all -- --check
+cargo check --locked --offline
+cargo test --locked --offline --lib
+cargo clippy --locked --offline --all-targets -- -D warnings
+```
+
+## License
 
 [Apache License 2.0](LICENSE)

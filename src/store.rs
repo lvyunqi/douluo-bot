@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -8,6 +9,9 @@ use rusqlite::{
 };
 
 use crate::config::DatabaseConfig;
+use crate::content::{
+    ContentPackage, LoadedContentPackage, canonical_json, content_hash, validate_shape,
+};
 use crate::message::Protocol;
 
 const MIGRATION_V1: &str = r#"
@@ -3547,6 +3551,315 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_V23: &str = r#"
+CREATE TABLE content_revision (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_key TEXT NOT NULL CHECK(
+        length(package_key) BETWEEN 1 AND 96
+        AND package_key = trim(package_key)
+        AND package_key GLOB '[a-z0-9][a-z0-9._-]*'
+        AND package_key NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    package_revision INTEGER NOT NULL CHECK(package_revision > 0),
+    parent_revision_id INTEGER REFERENCES content_revision(id) ON DELETE RESTRICT,
+    source_format TEXT NOT NULL CHECK(source_format IN ('builtin', 'json', 'toml')),
+    content_hash TEXT NOT NULL CHECK(
+        length(content_hash) = 64
+        AND content_hash = lower(content_hash)
+        AND content_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    author TEXT NOT NULL CHECK(length(author) BETWEEN 1 AND 200),
+    minimum_runtime TEXT NOT NULL CHECK(length(minimum_runtime) <= 64),
+    manifest_json TEXT NOT NULL CHECK(
+        json_valid(manifest_json) = 1 AND json_type(manifest_json) = 'object'
+    ),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    published_at INTEGER NOT NULL CHECK(published_at >= created_at),
+    UNIQUE(package_key, package_revision),
+    CHECK(parent_revision_id IS NULL OR parent_revision_id <> id)
+) STRICT;
+
+CREATE TABLE content_draft (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_key TEXT NOT NULL CHECK(
+        length(package_key) BETWEEN 1 AND 96
+        AND package_key = trim(package_key)
+        AND package_key GLOB '[a-z0-9][a-z0-9._-]*'
+        AND package_key NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    package_revision INTEGER NOT NULL CHECK(package_revision > 0),
+    source_format TEXT NOT NULL CHECK(source_format IN ('json', 'toml')),
+    content_hash TEXT NOT NULL CHECK(
+        length(content_hash) = 64
+        AND content_hash = lower(content_hash)
+        AND content_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    package_json TEXT NOT NULL CHECK(
+        json_valid(package_json) = 1 AND json_type(package_json) = 'object'
+    ),
+    status TEXT NOT NULL CHECK(status IN ('draft', 'validated', 'rejected', 'published')),
+    validation_json TEXT NOT NULL CHECK(
+        json_valid(validation_json) = 1 AND json_type(validation_json) = 'array'
+    ),
+    published_revision_id INTEGER REFERENCES content_revision(id) ON DELETE RESTRICT,
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+    UNIQUE(package_key, package_revision),
+    CHECK(
+        (status = 'published' AND published_revision_id IS NOT NULL)
+        OR (status <> 'published' AND published_revision_id IS NULL)
+    )
+) STRICT;
+
+CREATE TABLE content_revision_member (
+    revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
+    member_kind TEXT NOT NULL CHECK(
+        member_kind IN ('wuhun', 'skill', 'starter-skill', 'effect', 'beast', 'ring')
+    ),
+    member_key TEXT NOT NULL CHECK(
+        length(member_key) BETWEEN 1 AND 200
+        AND member_key = trim(member_key)
+        AND instr(member_key, char(0)) = 0
+    ),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    PRIMARY KEY(revision_id, member_kind, member_key)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE content_revision_activation (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
+    reason TEXT NOT NULL CHECK(reason IN ('initial', 'publish', 'rollback', 'replay')),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0)
+) STRICT;
+
+CREATE INDEX content_revision_parent_page
+    ON content_revision(parent_revision_id, id);
+CREATE INDEX content_draft_status_page
+    ON content_draft(status, id);
+CREATE INDEX content_revision_member_lookup
+    ON content_revision_member(member_kind, member_key, revision_id);
+CREATE INDEX content_revision_activation_page
+    ON content_revision_activation(revision_id, id);
+
+CREATE TRIGGER content_revision_no_update
+BEFORE UPDATE ON content_revision
+BEGIN
+    SELECT RAISE(ABORT, 'content revision is immutable');
+END;
+CREATE TRIGGER content_revision_no_delete
+BEFORE DELETE ON content_revision
+BEGIN
+    SELECT RAISE(ABORT, 'content revision is immutable');
+END;
+CREATE TRIGGER content_revision_no_reinsert
+BEFORE INSERT ON content_revision
+WHEN EXISTS(
+    SELECT 1 FROM content_revision
+     WHERE id = NEW.id
+        OR (package_key = NEW.package_key AND package_revision = NEW.package_revision)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'content revision is append-only');
+END;
+
+CREATE TRIGGER content_draft_no_delete
+BEFORE DELETE ON content_draft
+BEGIN
+    SELECT RAISE(ABORT, 'content draft history cannot be deleted');
+END;
+CREATE TRIGGER content_draft_no_reinsert
+BEFORE INSERT ON content_draft
+WHEN EXISTS(
+    SELECT 1 FROM content_draft
+     WHERE id = NEW.id
+        OR (package_key = NEW.package_key AND package_revision = NEW.package_revision)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'content draft identity already exists');
+END;
+CREATE TRIGGER content_draft_transition_guard
+BEFORE UPDATE ON content_draft
+WHEN NEW.id <> OLD.id
+  OR NEW.package_key <> OLD.package_key
+  OR NEW.package_revision <> OLD.package_revision
+  OR OLD.status = 'published'
+  OR (NEW.status = 'published' AND OLD.status <> 'validated')
+  OR (NEW.status = 'published' AND NEW.published_revision_id IS NULL)
+  OR (NEW.status <> 'published' AND NEW.published_revision_id IS NOT NULL)
+  OR (NEW.package_json <> OLD.package_json AND NEW.status <> 'draft')
+  OR (NEW.content_hash <> OLD.content_hash AND NEW.status <> 'draft')
+  OR NEW.updated_at < OLD.updated_at
+BEGIN
+    SELECT RAISE(ABORT, 'invalid content draft transition');
+END;
+
+CREATE TRIGGER content_revision_member_no_update
+BEFORE UPDATE ON content_revision_member
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is immutable');
+END;
+CREATE TRIGGER content_revision_member_no_delete
+BEFORE DELETE ON content_revision_member
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is immutable');
+END;
+CREATE TRIGGER content_revision_member_no_reinsert
+BEFORE INSERT ON content_revision_member
+WHEN EXISTS(
+    SELECT 1 FROM content_revision_member
+     WHERE revision_id = NEW.revision_id
+       AND member_kind = NEW.member_kind
+       AND member_key = NEW.member_key
+)
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is append-only');
+END;
+
+CREATE TRIGGER content_revision_activation_no_update
+BEFORE UPDATE ON content_revision_activation
+BEGIN
+    SELECT RAISE(ABORT, 'content revision activation is immutable');
+END;
+CREATE TRIGGER content_revision_activation_no_delete
+BEFORE DELETE ON content_revision_activation
+BEGIN
+    SELECT RAISE(ABORT, 'content revision activation is immutable');
+END;
+CREATE TRIGGER content_revision_activation_no_reinsert
+BEFORE INSERT ON content_revision_activation
+WHEN EXISTS(SELECT 1 FROM content_revision_activation WHERE id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'content revision activation is append-only');
+END;
+
+INSERT INTO content_revision(
+    package_key, package_revision, parent_revision_id, source_format,
+    content_hash, author, minimum_runtime, manifest_json, created_at, published_at
+) VALUES(
+    'douluo-core', 1, NULL, 'builtin',
+    'be6169e733ac1588ca2de13c9a31ba94921f024b4e93978fa0069e1cc6f7f8c1',
+    'builtin', '0.1.20', '{"source":"migration-v23","mode":"baseline"}', 0, 0
+);
+
+INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+SELECT revision.id, 'wuhun', wuhun.name, 0
+  FROM content_revision revision CROSS JOIN wuhun
+ WHERE revision.package_key = 'douluo-core' AND revision.package_revision = 1;
+INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+SELECT revision.id, 'skill', skill.skill_key, 0
+  FROM content_revision revision CROSS JOIN skill
+ WHERE revision.package_key = 'douluo-core' AND revision.package_revision = 1
+   AND skill.enabled = 1;
+INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+SELECT revision.id, 'starter-skill', skill.skill_key, 0
+  FROM content_revision revision
+  JOIN skill ON skill.skill_key = 'entangle'
+ WHERE revision.package_key = 'douluo-core' AND revision.package_revision = 1
+   AND skill.enabled = 1;
+INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+SELECT revision.id, 'effect', effect.effect_key, 0
+  FROM content_revision revision CROSS JOIN effect_definition effect
+ WHERE revision.package_key = 'douluo-core' AND revision.package_revision = 1
+   AND effect.enabled = 1;
+INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+SELECT revision.id, 'beast', beast.beast_key, 0
+  FROM content_revision revision CROSS JOIN soul_beast beast
+ WHERE revision.package_key = 'douluo-core' AND revision.package_revision = 1
+   AND beast.enabled = 1;
+INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+SELECT revision.id, 'ring', ring.ring_key, 0
+  FROM content_revision revision CROSS JOIN soul_ring ring
+ WHERE revision.package_key = 'douluo-core' AND revision.package_revision = 1
+   AND ring.enabled = 1;
+
+INSERT INTO content_revision_activation(revision_id, reason, created_at)
+SELECT id, 'initial', 0 FROM content_revision
+ WHERE package_key = 'douluo-core' AND package_revision = 1;
+
+DROP TRIGGER player_skill_scope_guard;
+CREATE TRIGGER player_skill_scope_guard
+BEFORE INSERT ON player_skill
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM player_wuhun_state state
+      JOIN wuhun w ON w.id = state.wuhun_id
+      JOIN skill ON skill.skill_key = NEW.skill_key
+     WHERE state.player_id = NEW.player_id
+       AND state.wuhun_id = NEW.wuhun_id
+       AND state.slot = NEW.wuhun_slot
+       AND skill.enabled = 1
+       AND (skill.wuhun_category = 'all' OR skill.wuhun_category = w.category)
+       AND (
+           EXISTS(
+               SELECT 1
+                 FROM content_revision_member member
+                WHERE member.revision_id = (
+                          SELECT revision_id
+                            FROM content_revision_activation
+                           ORDER BY id DESC
+                           LIMIT 1
+                      )
+                  AND member.member_kind = 'starter-skill'
+                  AND member.member_key = NEW.skill_key
+           )
+           OR EXISTS(
+               SELECT 1
+                 FROM soul_ring_drop pending
+                 JOIN soul_ring ring ON ring.ring_key = pending.ring_key
+                WHERE pending.player_id = NEW.player_id
+                  AND pending.status = 'pending'
+                  AND ring.skill_key = NEW.skill_key
+           )
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'player skill scope mismatch');
+END;
+
+DROP TRIGGER battle_skill_event_effect_v2_snapshot;
+CREATE TRIGGER battle_skill_event_effect_v2_snapshot
+AFTER INSERT ON battle_skill_event
+BEGIN
+    INSERT INTO battle_effect_snapshot(
+        battle_id, player_id, battle_skill_event_id, effect_key, skill_key,
+        trigger_kind, target_kind, operation, attribute_key, value_mode, value,
+        duration_rounds, chance_percent, stack_policy, parameters_json,
+        started_sequence, expires_after_sequence, rule_version,
+        source_message_id, description, created_at
+    )
+    SELECT NEW.battle_id, NEW.player_id, NEW.id, definition.effect_key, NEW.skill_key,
+           definition.trigger_kind, definition.target_kind, definition.operation,
+           definition.attribute_key, definition.value_mode, definition.value,
+           definition.duration_rounds, definition.chance_percent, definition.stack_policy,
+           definition.parameters_json, NEW.sequence,
+           NEW.sequence + definition.duration_rounds - 1, 'effect-v2',
+           NEW.source_message_id, definition.description, NEW.created_at
+      FROM effect_definition definition
+      JOIN content_revision_member member
+        ON member.member_kind = 'effect' AND member.member_key = definition.effect_key
+     WHERE member.revision_id = (
+               SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1
+           )
+       AND definition.skill_key = NEW.skill_key
+       AND definition.enabled = 1
+       AND definition.trigger_kind = 'on_release'
+       AND definition.created_at <= NEW.created_at;
+    SELECT CASE WHEN changes() <> (
+        SELECT COUNT(*)
+          FROM effect_definition definition
+          JOIN content_revision_member member
+            ON member.member_kind = 'effect' AND member.member_key = definition.effect_key
+         WHERE member.revision_id = (
+                   SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1
+               )
+           AND definition.skill_key = NEW.skill_key
+           AND definition.enabled = 1
+           AND definition.trigger_kind = 'on_release'
+           AND definition.created_at <= NEW.created_at
+    ) THEN RAISE(ABORT, 'battle effect snapshot is incomplete') END;
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -3554,6 +3867,55 @@ const LEGACY_CLAIM_REQUIRED: &str =
 pub struct Store {
     path: PathBuf,
     busy_timeout: Duration,
+    write_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentDraftRecord {
+    pub id: i64,
+    pub package_key: String,
+    pub package_revision: i64,
+    pub source_format: String,
+    pub content_hash: String,
+    pub status: String,
+    pub validation_json: String,
+    pub published_revision_id: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentValidationReport {
+    pub package_key: String,
+    pub package_revision: i64,
+    pub content_hash: String,
+    pub errors: Vec<String>,
+    pub wuhun_count: usize,
+    pub skill_count: usize,
+    pub effect_count: usize,
+    pub soul_beast_count: usize,
+    pub soul_ring_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentRevisionRecord {
+    pub id: i64,
+    pub package_key: String,
+    pub package_revision: i64,
+    pub parent_revision_id: Option<i64>,
+    pub source_format: String,
+    pub content_hash: String,
+    pub author: String,
+    pub minimum_runtime: String,
+    pub published_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentPublishReceipt {
+    pub revision: ContentRevisionRecord,
+    pub active_revision_id: i64,
+    pub member_count: i64,
+    pub replayed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4576,6 +4938,647 @@ fn apply_experience_in_transaction(
     })
 }
 
+fn content_draft_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContentDraftRecord> {
+    Ok(ContentDraftRecord {
+        id: row.get(0)?,
+        package_key: row.get(1)?,
+        package_revision: row.get(2)?,
+        source_format: row.get(3)?,
+        content_hash: row.get(4)?,
+        status: row.get(5)?,
+        validation_json: row.get(6)?,
+        published_revision_id: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+fn content_revision_record_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ContentRevisionRecord> {
+    Ok(ContentRevisionRecord {
+        id: row.get(0)?,
+        package_key: row.get(1)?,
+        package_revision: row.get(2)?,
+        parent_revision_id: row.get(3)?,
+        source_format: row.get(4)?,
+        content_hash: row.get(5)?,
+        author: row.get(6)?,
+        minimum_runtime: row.get(7)?,
+        published_at: row.get(8)?,
+    })
+}
+
+fn load_content_draft_by_identity(
+    connection: &Connection,
+    package_key: &str,
+    package_revision: i64,
+) -> Result<Option<ContentDraftRecord>, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT id, package_key, package_revision, source_format, content_hash,
+                   status, validation_json, published_revision_id, created_at, updated_at
+              FROM content_draft
+             WHERE package_key = ?1 AND package_revision = ?2
+            "#,
+            params![package_key, package_revision],
+            content_draft_record_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取内容草稿失败：{error}"))
+}
+
+fn draft_package_json(
+    draft: &ContentDraftRecord,
+    connection: &Connection,
+) -> Result<String, String> {
+    connection
+        .query_row(
+            "SELECT package_json FROM content_draft WHERE id = ?1",
+            [draft.id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| format!("读取内容草稿正文失败：{error}"))
+}
+
+fn load_content_revision_by_id(
+    connection: &Connection,
+    revision_id: i64,
+) -> Result<Option<ContentRevisionRecord>, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT id, package_key, package_revision, parent_revision_id, source_format,
+                   content_hash, author, minimum_runtime, published_at
+              FROM content_revision
+             WHERE id = ?1
+            "#,
+            [revision_id],
+            content_revision_record_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取内容 revision 失败：{error}"))
+}
+
+fn current_content_revision_id(connection: &Connection) -> Result<i64, String> {
+    connection
+        .query_row(
+            "SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("读取当前内容 revision 失败：{error}"))
+}
+
+fn content_revision_member_count(connection: &Connection, revision_id: i64) -> Result<i64, String> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM content_revision_member WHERE revision_id = ?1",
+            [revision_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("统计内容 revision 成员失败：{error}"))
+}
+
+fn active_content_member_exists(
+    connection: &Connection,
+    member_kind: &str,
+    member_key: &str,
+) -> Result<bool, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM content_revision_member member
+                 WHERE member.revision_id = (
+                           SELECT revision_id
+                             FROM content_revision_activation
+                            ORDER BY id DESC
+                            LIMIT 1
+                       )
+                   AND member.member_kind = ?1
+                   AND member.member_key = ?2
+            )
+            "#,
+            params![member_kind, member_key],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("读取当前内容 revision 成员失败：{error}"))
+}
+
+fn content_validation_report(
+    package: &ContentPackage,
+    content_hash: String,
+    errors: Vec<String>,
+) -> ContentValidationReport {
+    ContentValidationReport {
+        package_key: package.package_key.clone(),
+        package_revision: package.revision,
+        content_hash,
+        errors,
+        wuhun_count: package.wuhun.len(),
+        skill_count: package.skills.len(),
+        effect_count: package.effects.len(),
+        soul_beast_count: package.soul_beasts.len(),
+        soul_ring_count: package.soul_rings.len(),
+    }
+}
+
+fn validate_content_package_against_database(
+    connection: &Connection,
+    package: &ContentPackage,
+) -> Result<Vec<String>, String> {
+    let mut errors = validate_shape(package);
+    let highest_revision = connection
+        .query_row(
+            "SELECT MAX(package_revision) FROM content_revision WHERE package_key = ?1",
+            [&package.package_key],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(|error| format!("读取内容包版本失败：{error}"))?;
+    if highest_revision.is_some_and(|highest| package.revision <= highest) {
+        errors.push(format!(
+            "内容包 {} 的 revision 必须大于已发布版本",
+            package.package_key
+        ));
+    }
+
+    let package_skill_keys = package
+        .skills
+        .iter()
+        .map(|entry| entry.skill_key.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let package_beast_keys = package
+        .soul_beasts
+        .iter()
+        .map(|entry| entry.beast_key.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let mut names = std::collections::BTreeSet::new();
+    for entry in &package.wuhun {
+        if !names.insert(entry.name.as_str()) {
+            errors.push(format!("内容包内武魂名称重复：{}", entry.name));
+        }
+        if catalog_value_exists(connection, "wuhun", "name", &entry.name)? {
+            errors.push(format!("武魂名称已存在：{}", entry.name));
+        }
+    }
+    names.clear();
+    for entry in &package.skills {
+        if !entry.enabled {
+            errors.push(format!("当前发布切片不允许禁用新魂技：{}", entry.skill_key));
+        }
+        if !names.insert(entry.name.as_str()) {
+            errors.push(format!("内容包内魂技名称重复：{}", entry.name));
+        }
+        if catalog_value_exists(connection, "skill", "skill_key", &entry.skill_key)?
+            || catalog_value_exists(connection, "skill", "name", &entry.name)?
+        {
+            errors.push(format!(
+                "魂技键或名称已存在：{} / {}",
+                entry.skill_key, entry.name
+            ));
+        }
+    }
+    names.clear();
+    for entry in &package.effects {
+        if !entry.enabled {
+            errors.push(format!(
+                "当前发布切片不允许禁用新效果：{}",
+                entry.effect_key
+            ));
+        }
+        if catalog_value_exists(
+            connection,
+            "effect_definition",
+            "effect_key",
+            &entry.effect_key,
+        )? {
+            errors.push(format!("效果键已存在：{}", entry.effect_key));
+        }
+        if !package_skill_keys.contains(entry.skill_key.as_str())
+            && !catalog_enabled_exists(connection, "skill", "skill_key", &entry.skill_key)?
+        {
+            errors.push(format!(
+                "效果 {} 引用了不存在或未启用的魂技 {}",
+                entry.effect_key, entry.skill_key
+            ));
+        }
+    }
+    for entry in &package.soul_beasts {
+        if !entry.enabled {
+            errors.push(format!("当前发布切片不允许禁用新魂兽：{}", entry.beast_key));
+        }
+        if !names.insert(entry.name.as_str()) {
+            errors.push(format!("内容包内魂兽名称重复：{}", entry.name));
+        }
+        if catalog_value_exists(connection, "soul_beast", "beast_key", &entry.beast_key)?
+            || catalog_value_exists(connection, "soul_beast", "name", &entry.name)?
+        {
+            errors.push(format!(
+                "魂兽键或名称已存在：{} / {}",
+                entry.beast_key, entry.name
+            ));
+        }
+        if !catalog_value_exists(connection, "map", "map_key", &entry.map_key)? {
+            errors.push(format!(
+                "魂兽 {} 引用了不存在的地图 {}",
+                entry.beast_key, entry.map_key
+            ));
+        }
+        if !catalog_value_exists(connection, "item", "item_key", &entry.drop_item_key)? {
+            errors.push(format!(
+                "魂兽 {} 引用了不存在的掉落物品 {}",
+                entry.beast_key, entry.drop_item_key
+            ));
+        }
+    }
+    names.clear();
+    let mut ring_beasts = std::collections::BTreeSet::new();
+    for entry in &package.soul_rings {
+        if !entry.enabled {
+            errors.push(format!("当前发布切片不允许禁用新魂环：{}", entry.ring_key));
+        }
+        if !names.insert(entry.name.as_str()) {
+            errors.push(format!("内容包内魂环名称重复：{}", entry.name));
+        }
+        if !ring_beasts.insert(entry.soul_beast_key.as_str()) {
+            errors.push(format!(
+                "内容包内魂兽重复绑定魂环：{}",
+                entry.soul_beast_key
+            ));
+        }
+        if catalog_value_exists(connection, "soul_ring", "ring_key", &entry.ring_key)?
+            || catalog_value_exists(connection, "soul_ring", "name", &entry.name)?
+        {
+            errors.push(format!(
+                "魂环键或名称已存在：{} / {}",
+                entry.ring_key, entry.name
+            ));
+        }
+        if !package_beast_keys.contains(entry.soul_beast_key.as_str())
+            && !catalog_enabled_exists(
+                connection,
+                "soul_beast",
+                "beast_key",
+                &entry.soul_beast_key,
+            )?
+        {
+            errors.push(format!(
+                "魂环 {} 引用了不存在或未启用的魂兽 {}",
+                entry.ring_key, entry.soul_beast_key
+            ));
+        }
+        if !package_skill_keys.contains(entry.skill_key.as_str())
+            && !catalog_enabled_exists(connection, "skill", "skill_key", &entry.skill_key)?
+        {
+            errors.push(format!(
+                "魂环 {} 引用了不存在或未启用的魂技 {}",
+                entry.ring_key, entry.skill_key
+            ));
+        }
+        if !package_beast_keys.contains(entry.soul_beast_key.as_str())
+            && soul_ring_exists_for_beast(connection, &entry.soul_beast_key)?
+        {
+            errors.push(format!("魂兽 {} 已经绑定魂环", entry.soul_beast_key));
+        }
+    }
+    Ok(errors)
+}
+
+fn catalog_value_exists(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    value: &str,
+) -> Result<bool, String> {
+    let sql = match (table, column) {
+        ("wuhun", "name") => "SELECT EXISTS(SELECT 1 FROM wuhun WHERE name = ?1)",
+        ("skill", "skill_key") => "SELECT EXISTS(SELECT 1 FROM skill WHERE skill_key = ?1)",
+        ("skill", "name") => "SELECT EXISTS(SELECT 1 FROM skill WHERE name = ?1)",
+        ("effect_definition", "effect_key") => {
+            "SELECT EXISTS(SELECT 1 FROM effect_definition WHERE effect_key = ?1)"
+        }
+        ("soul_beast", "beast_key") => {
+            "SELECT EXISTS(SELECT 1 FROM soul_beast WHERE beast_key = ?1)"
+        }
+        ("soul_beast", "name") => "SELECT EXISTS(SELECT 1 FROM soul_beast WHERE name = ?1)",
+        ("soul_ring", "ring_key") => "SELECT EXISTS(SELECT 1 FROM soul_ring WHERE ring_key = ?1)",
+        ("soul_ring", "name") => "SELECT EXISTS(SELECT 1 FROM soul_ring WHERE name = ?1)",
+        ("map", "map_key") => "SELECT EXISTS(SELECT 1 FROM map WHERE map_key = ?1)",
+        ("item", "item_key") => "SELECT EXISTS(SELECT 1 FROM item WHERE item_key = ?1)",
+        _ => return Err(format!("未知内容目录查询：{table}.{column}")),
+    };
+    connection
+        .query_row(sql, [value], |row| row.get::<_, bool>(0))
+        .map_err(|error| format!("查询内容目录 {table}.{column} 失败：{error}"))
+}
+
+fn catalog_enabled_exists(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    value: &str,
+) -> Result<bool, String> {
+    let sql = match (table, column) {
+        ("skill", "skill_key") => {
+            "SELECT EXISTS(SELECT 1 FROM skill WHERE skill_key = ?1 AND enabled = 1)"
+        }
+        ("soul_beast", "beast_key") => {
+            "SELECT EXISTS(SELECT 1 FROM soul_beast WHERE beast_key = ?1 AND enabled = 1)"
+        }
+        _ => return Err(format!("未知启用内容目录查询：{table}.{column}")),
+    };
+    connection
+        .query_row(sql, [value], |row| row.get::<_, bool>(0))
+        .map_err(|error| format!("查询启用内容目录 {table}.{column} 失败：{error}"))
+}
+
+fn soul_ring_exists_for_beast(connection: &Connection, beast_key: &str) -> Result<bool, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM soul_ring ring
+                JOIN soul_beast beast ON beast.id = ring.soul_beast_id
+                WHERE beast.beast_key = ?1
+            )
+            "#,
+            [beast_key],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("查询魂兽已绑定魂环失败：{error}"))
+}
+
+fn ensure_content_revision_member(
+    connection: &Connection,
+    revision_id: i64,
+    member_kind: &str,
+    member_key: &str,
+    created_at: i64,
+) -> Result<(), String> {
+    let exists = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM content_revision_member
+                 WHERE revision_id = ?1 AND member_kind = ?2 AND member_key = ?3
+            )
+            "#,
+            params![revision_id, member_kind, member_key],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("查询内容 revision 成员失败：{error}"))?;
+    if !exists {
+        connection
+            .execute(
+                r#"
+                INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+                VALUES(?1, ?2, ?3, ?4)
+                "#,
+                params![revision_id, member_kind, member_key, created_at],
+            )
+            .map_err(|error| format!("写入内容 revision 成员失败：{error}"))?;
+    }
+    Ok(())
+}
+
+fn publish_content_package_rows(
+    connection: &Connection,
+    revision_id: i64,
+    package: &ContentPackage,
+    created_at: i64,
+) -> Result<(), String> {
+    for entry in &package.wuhun {
+        connection
+            .execute(
+                "INSERT INTO wuhun(name, category, form, description, weight) VALUES(?1, ?2, ?3, ?4, ?5)",
+                params![
+                    entry.name,
+                    entry.category,
+                    entry.form,
+                    entry.description,
+                    entry.weight
+                ],
+            )
+            .map_err(|error| format!("发布武魂 {} 失败：{error}", entry.name))?;
+        let wuhun_id = connection.last_insert_rowid();
+        let parameters_json = serde_json::json!({
+            "source": "content-v23",
+            "package": package.package_key,
+            "revision": package.revision,
+        })
+        .to_string();
+        connection
+            .execute(
+                r#"
+                INSERT INTO wuhun_stat_template(
+                    wuhun_id, attack_percent, defense_percent,
+                    strength_percent, agility_percent, spirit_percent, endurance_percent,
+                    perception_percent, luck_percent, parameters_json, created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+                "#,
+                params![
+                    wuhun_id,
+                    entry.stats.attack_percent,
+                    entry.stats.defense_percent,
+                    entry.stats.strength_percent,
+                    entry.stats.agility_percent,
+                    entry.stats.spirit_percent,
+                    entry.stats.endurance_percent,
+                    entry.stats.perception_percent,
+                    entry.stats.luck_percent,
+                    parameters_json,
+                    created_at
+                ],
+            )
+            .map_err(|error| format!("发布武魂 {} 属性模板失败：{error}", entry.name))?;
+        ensure_content_revision_member(connection, revision_id, "wuhun", &entry.name, created_at)?;
+    }
+    for entry in &package.skills {
+        connection
+            .execute(
+                r#"
+                INSERT INTO skill(
+                    skill_key, name, skill_type, wuhun_category, ring_index,
+                    soul_power_cost, cooldown_rounds, base_damage,
+                    spirit_ratio_percent, strength_ratio_percent, description,
+                    enabled, created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+                "#,
+                params![
+                    entry.skill_key,
+                    entry.name,
+                    entry.skill_type,
+                    entry.wuhun_category,
+                    entry.ring_index,
+                    entry.soul_power_cost,
+                    entry.cooldown_rounds,
+                    entry.base_damage,
+                    entry.spirit_ratio_percent,
+                    entry.strength_ratio_percent,
+                    entry.description,
+                    entry.enabled,
+                    created_at
+                ],
+            )
+            .map_err(|error| format!("发布魂技 {} 失败：{error}", entry.skill_key))?;
+        ensure_content_revision_member(
+            connection,
+            revision_id,
+            "skill",
+            &entry.skill_key,
+            created_at,
+        )?;
+        if entry.starter {
+            ensure_content_revision_member(
+                connection,
+                revision_id,
+                "starter-skill",
+                &entry.skill_key,
+                created_at,
+            )?;
+        }
+    }
+    for entry in &package.effects {
+        let parameters_json = serde_json::to_string(&entry.parameters)
+            .map_err(|error| format!("序列化效果 {} 参数失败：{error}", entry.effect_key))?;
+        connection
+            .execute(
+                r#"
+                INSERT INTO effect_definition(
+                    effect_key, skill_key, trigger_kind, target_kind, operation,
+                    attribute_key, value_mode, value, duration_rounds, chance_percent,
+                    stack_policy, parameters_json, description, enabled, created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
+                "#,
+                params![
+                    entry.effect_key,
+                    entry.skill_key,
+                    entry.trigger_kind,
+                    entry.target_kind,
+                    entry.operation,
+                    entry.attribute_key,
+                    entry.value_mode,
+                    entry.value,
+                    entry.duration_rounds,
+                    entry.chance_percent,
+                    entry.stack_policy,
+                    parameters_json,
+                    entry.description,
+                    entry.enabled,
+                    created_at
+                ],
+            )
+            .map_err(|error| format!("发布效果 {} 失败：{error}", entry.effect_key))?;
+        ensure_content_revision_member(
+            connection,
+            revision_id,
+            "skill",
+            &entry.skill_key,
+            created_at,
+        )?;
+        ensure_content_revision_member(
+            connection,
+            revision_id,
+            "effect",
+            &entry.effect_key,
+            created_at,
+        )?;
+    }
+    for entry in &package.soul_beasts {
+        connection
+            .execute(
+                r#"
+                INSERT INTO soul_beast(
+                    beast_key, name, description, map_key, age, level_required, max_hp,
+                    attack, defense, speed, exp_reward, drop_item_key, drop_quantity,
+                    enabled, created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
+                "#,
+                params![
+                    entry.beast_key,
+                    entry.name,
+                    entry.description,
+                    entry.map_key,
+                    entry.age,
+                    entry.level_required,
+                    entry.max_hp,
+                    entry.attack,
+                    entry.defense,
+                    entry.speed,
+                    entry.exp_reward,
+                    entry.drop_item_key,
+                    entry.drop_quantity,
+                    entry.enabled,
+                    created_at
+                ],
+            )
+            .map_err(|error| format!("发布魂兽 {} 失败：{error}", entry.beast_key))?;
+        ensure_content_revision_member(
+            connection,
+            revision_id,
+            "beast",
+            &entry.beast_key,
+            created_at,
+        )?;
+    }
+    for entry in &package.soul_rings {
+        let inserted = connection
+            .execute(
+                r#"
+                INSERT INTO soul_ring(
+                    ring_key, name, soul_beast_id, skill_key, ring_index, age, color,
+                    description, enabled, created_at, updated_at
+                )
+                SELECT ?1, ?2, beast.id, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9
+                  FROM soul_beast beast
+                 WHERE beast.beast_key = ?10
+                "#,
+                params![
+                    entry.ring_key,
+                    entry.name,
+                    entry.skill_key,
+                    entry.ring_index,
+                    entry.age,
+                    entry.color,
+                    entry.description,
+                    entry.enabled,
+                    created_at,
+                    entry.soul_beast_key
+                ],
+            )
+            .map_err(|error| format!("发布魂环 {} 失败：{error}", entry.ring_key))?;
+        if inserted != 1 {
+            return Err(format!("发布魂环 {} 时找不到魂兽", entry.ring_key));
+        }
+        ensure_content_revision_member(
+            connection,
+            revision_id,
+            "beast",
+            &entry.soul_beast_key,
+            created_at,
+        )?;
+        ensure_content_revision_member(
+            connection,
+            revision_id,
+            "skill",
+            &entry.skill_key,
+            created_at,
+        )?;
+        ensure_content_revision_member(
+            connection,
+            revision_id,
+            "ring",
+            &entry.ring_key,
+            created_at,
+        )?;
+    }
+    Ok(())
+}
+
 impl Store {
     pub fn initialize(data_dir: &Path, config: &DatabaseConfig) -> Result<Self, String> {
         let path = data_dir.join(&config.relative_path);
@@ -4586,6 +5589,7 @@ impl Store {
         let store = Self {
             path,
             busy_timeout: Duration::from_millis(config.busy_timeout_ms),
+            write_lock: Arc::new(Mutex::new(())),
         };
         let mut connection = store.open()?;
         store.ensure_wal_mode(&connection)?;
@@ -4603,6 +5607,321 @@ impl Store {
             }
         }
         Ok(store)
+    }
+
+    /// 写入或重置同身份的未发布内容草稿，不直接改动运行时目录。
+    pub fn stage_content_package(
+        &self,
+        loaded: &LoadedContentPackage,
+    ) -> Result<ContentDraftRecord, String> {
+        let shape_errors = validate_shape(&loaded.package);
+        if !shape_errors.is_empty() {
+            return Err(format!("内容包字段校验失败：{}", shape_errors.join("；")));
+        }
+        let package_json = canonical_json(&loaded.package)?;
+        let expected_hash = content_hash(&loaded.package)?;
+        if loaded.content_hash != expected_hash {
+            return Err("内容包哈希与规范化内容不一致".to_string());
+        }
+        if !matches!(loaded.source_format.as_str(), "json" | "toml") {
+            return Err("内容包来源格式必须是 json 或 toml".to_string());
+        }
+        let mut connection = self.open()?;
+        let transaction = self.begin_immediate(&mut connection, "开始内容草稿事务失败")?;
+        let timestamp = now_timestamp()?;
+        let existing = load_content_draft_by_identity(
+            &transaction,
+            &loaded.package.package_key,
+            loaded.package.revision,
+        )?;
+        if let Some(existing) = existing {
+            if existing.status == "published" {
+                if existing.content_hash == expected_hash {
+                    transaction
+                        .commit()
+                        .map_err(|error| format!("提交已发布内容草稿查询失败：{error}"))?;
+                    return Ok(existing);
+                }
+                return Err(format!(
+                    "内容包 {} rev.{} 已发布且内容不同；必须使用更大的 revision",
+                    loaded.package.package_key, loaded.package.revision
+                ));
+            }
+            transaction
+                .execute(
+                    r#"
+                    UPDATE content_draft
+                       SET source_format = ?1,
+                           content_hash = ?2,
+                           package_json = ?3,
+                           status = 'draft',
+                           validation_json = '[]',
+                           updated_at = ?4
+                     WHERE id = ?5
+                    "#,
+                    params![
+                        loaded.source_format,
+                        expected_hash,
+                        package_json,
+                        timestamp,
+                        existing.id
+                    ],
+                )
+                .map_err(|error| format!("更新内容草稿失败：{error}"))?;
+        } else {
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO content_draft(
+                        package_key, package_revision, source_format, content_hash,
+                        package_json, status, validation_json, published_revision_id,
+                        created_at, updated_at
+                    ) VALUES(?1, ?2, ?3, ?4, ?5, 'draft', '[]', NULL, ?6, ?6)
+                    "#,
+                    params![
+                        loaded.package.package_key,
+                        loaded.package.revision,
+                        loaded.source_format,
+                        expected_hash,
+                        package_json,
+                        timestamp
+                    ],
+                )
+                .map_err(|error| format!("创建内容草稿失败：{error}"))?;
+        }
+        let record = load_content_draft_by_identity(
+            &transaction,
+            &loaded.package.package_key,
+            loaded.package.revision,
+        )?
+        .ok_or_else(|| "保存内容草稿后无法读取记录".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交内容草稿事务失败：{error}"))?;
+        Ok(record)
+    }
+
+    /// 校验草稿与当前目录引用，并持久化可供运营端展示的错误结果。
+    pub fn validate_content_draft(
+        &self,
+        package_key: &str,
+        package_revision: i64,
+    ) -> Result<ContentValidationReport, String> {
+        let mut connection = self.open()?;
+        let transaction = self.begin_immediate(&mut connection, "开始内容草稿校验事务失败")?;
+        let draft = load_content_draft_by_identity(&transaction, package_key, package_revision)?
+            .ok_or_else(|| "内容草稿不存在".to_string())?;
+        let package =
+            serde_json::from_str::<ContentPackage>(&draft_package_json(&draft, &transaction)?)
+                .map_err(|error| format!("已保存内容草稿不是有效 JSON：{error}"))?;
+        let expected_hash = content_hash(&package)?;
+        if expected_hash != draft.content_hash {
+            return Err("内容草稿哈希与保存内容不一致".to_string());
+        }
+        let errors = if draft.status == "published" {
+            let mut errors = validate_shape(&package);
+            let published_revision_id = draft
+                .published_revision_id
+                .ok_or_else(|| "已发布内容草稿缺少对应 revision".to_string())?;
+            let published_revision =
+                load_content_revision_by_id(&transaction, published_revision_id)?
+                    .ok_or_else(|| "已发布内容 revision 不存在".to_string())?;
+            if published_revision.package_key != package.package_key
+                || published_revision.package_revision != package.revision
+                || published_revision.content_hash != expected_hash
+            {
+                errors.push("已发布内容 revision 与草稿不一致".to_string());
+            }
+            errors
+        } else {
+            validate_content_package_against_database(&transaction, &package)?
+        };
+        let report = content_validation_report(&package, expected_hash, errors);
+        if draft.status != "published" {
+            let validation_json = serde_json::to_string(&report.errors)
+                .map_err(|error| format!("序列化内容校验结果失败：{error}"))?;
+            let status = if report.errors.is_empty() {
+                "validated"
+            } else {
+                "rejected"
+            };
+            transaction
+                .execute(
+                    "UPDATE content_draft SET status = ?1, validation_json = ?2, updated_at = ?3 WHERE id = ?4",
+                    params![status, validation_json, now_timestamp()?, draft.id],
+                )
+                .map_err(|error| format!("保存内容草稿校验结果失败：{error}"))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("提交内容草稿校验事务失败：{error}"))?;
+        Ok(report)
+    }
+
+    /// 在短写事务内发布已校验草稿，并将新 revision 激活为当前目录。
+    pub fn publish_content_draft(
+        &self,
+        package_key: &str,
+        package_revision: i64,
+    ) -> Result<ContentPublishReceipt, String> {
+        let mut connection = self.open()?;
+        let transaction = self.begin_immediate(&mut connection, "开始内容发布事务失败")?;
+        let draft = load_content_draft_by_identity(&transaction, package_key, package_revision)?
+            .ok_or_else(|| "内容草稿不存在".to_string())?;
+        if draft.status == "published" {
+            let revision_id = draft
+                .published_revision_id
+                .ok_or_else(|| "已发布内容草稿缺少 revision 关联".to_string())?;
+            let revision = load_content_revision_by_id(&transaction, revision_id)?
+                .ok_or_else(|| "已发布内容 revision 不存在".to_string())?;
+            let mut active_revision_id = current_content_revision_id(&transaction)?;
+            if active_revision_id != revision_id {
+                transaction
+                    .execute(
+                        "INSERT INTO content_revision_activation(revision_id, reason, created_at) VALUES(?1, 'replay', ?2)",
+                        params![revision_id, now_timestamp()?],
+                    )
+                    .map_err(|error| format!("重新激活已发布内容 revision 失败：{error}"))?;
+                active_revision_id = revision_id;
+            }
+            let member_count = content_revision_member_count(&transaction, revision_id)?;
+            transaction
+                .commit()
+                .map_err(|error| format!("提交内容发布重放查询失败：{error}"))?;
+            return Ok(ContentPublishReceipt {
+                revision,
+                active_revision_id,
+                member_count,
+                replayed: true,
+            });
+        }
+        if draft.status != "validated" {
+            return Err("内容草稿必须先通过验证才能发布".to_string());
+        }
+        let package =
+            serde_json::from_str::<ContentPackage>(&draft_package_json(&draft, &transaction)?)
+                .map_err(|error| format!("已保存内容草稿不是有效 JSON：{error}"))?;
+        let expected_hash = content_hash(&package)?;
+        if expected_hash != draft.content_hash {
+            return Err("内容草稿哈希与保存内容不一致".to_string());
+        }
+        let errors = validate_content_package_against_database(&transaction, &package)?;
+        if !errors.is_empty() {
+            let validation_json = serde_json::to_string(&errors)
+                .map_err(|error| format!("序列化内容校验失败失败：{error}"))?;
+            transaction
+                .execute(
+                    "UPDATE content_draft SET status = 'rejected', validation_json = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![validation_json, now_timestamp()?, draft.id],
+                )
+                .map_err(|error| format!("更新被拒绝内容草稿失败：{error}"))?;
+            transaction
+                .commit()
+                .map_err(|error| format!("提交被拒绝内容草稿失败：{error}"))?;
+            return Err(format!("内容草稿校验失败：{}", errors.join("；")));
+        }
+        let parent_revision_id = current_content_revision_id(&transaction)?;
+        let timestamp = now_timestamp()?;
+        let manifest_json = canonical_json(&package)?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO content_revision(
+                    package_key, package_revision, parent_revision_id, source_format,
+                    content_hash, author, minimum_runtime, manifest_json, created_at, published_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+                "#,
+                params![
+                    package.package_key,
+                    package.revision,
+                    parent_revision_id,
+                    draft.source_format,
+                    expected_hash,
+                    package.author,
+                    package.minimum_runtime,
+                    manifest_json,
+                    timestamp
+                ],
+            )
+            .map_err(|error| format!("创建内容 revision 失败：{error}"))?;
+        let revision_id = transaction.last_insert_rowid();
+        transaction
+            .execute(
+                r#"
+                INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+                SELECT ?1, member_kind, member_key, ?2
+                  FROM content_revision_member
+                 WHERE revision_id = ?3
+                "#,
+                params![revision_id, timestamp, parent_revision_id],
+            )
+            .map_err(|error| format!("继承父内容 revision 成员失败：{error}"))?;
+        publish_content_package_rows(&transaction, revision_id, &package, timestamp)?;
+        let updated = transaction
+            .execute(
+                r#"
+                UPDATE content_draft
+                   SET status = 'published',
+                       validation_json = '[]',
+                       published_revision_id = ?1,
+                       updated_at = ?2
+                 WHERE id = ?3 AND status = 'validated'
+                "#,
+                params![revision_id, timestamp, draft.id],
+            )
+            .map_err(|error| format!("标记内容草稿已发布失败：{error}"))?;
+        if updated != 1 {
+            return Err("内容草稿发布状态发生并发变化".to_string());
+        }
+        transaction
+            .execute(
+                "INSERT INTO content_revision_activation(revision_id, reason, created_at) VALUES(?1, 'publish', ?2)",
+                params![revision_id, timestamp],
+            )
+            .map_err(|error| format!("激活内容 revision 失败：{error}"))?;
+        let revision = load_content_revision_by_id(&transaction, revision_id)?
+            .ok_or_else(|| "保存内容 revision 后无法读取记录".to_string())?;
+        let member_count = content_revision_member_count(&transaction, revision_id)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交内容发布事务失败：{error}"))?;
+        Ok(ContentPublishReceipt {
+            revision,
+            active_revision_id: revision_id,
+            member_count,
+            replayed: false,
+        })
+    }
+
+    /// 读取最后一条 activation 所指向的当前内容 revision。
+    #[allow(dead_code)]
+    pub fn active_content_revision(&self) -> Result<ContentRevisionRecord, String> {
+        let connection = self.open()?;
+        let revision_id = current_content_revision_id(&connection)?;
+        load_content_revision_by_id(&connection, revision_id)?
+            .ok_or_else(|| "当前内容 revision 不存在".to_string())
+    }
+
+    /// 仅追加一条 rollback activation，不删除目录、草稿或历史快照。
+    #[allow(dead_code)]
+    pub fn rollback_content_revision(
+        &self,
+        revision_id: i64,
+    ) -> Result<ContentRevisionRecord, String> {
+        let mut connection = self.open()?;
+        let transaction = self.begin_immediate(&mut connection, "开始内容回滚事务失败")?;
+        let revision = load_content_revision_by_id(&transaction, revision_id)?
+            .ok_or_else(|| "目标内容 revision 不存在".to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO content_revision_activation(revision_id, reason, created_at) VALUES(?1, 'rollback', ?2)",
+                params![revision_id, now_timestamp()?],
+            )
+            .map_err(|error| format!("回滚激活内容 revision 失败：{error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交内容回滚事务失败：{error}"))?;
+        Ok(revision)
     }
 
     fn open(&self) -> Result<Connection, String> {
@@ -5020,10 +6339,25 @@ impl Store {
                 validate_v22_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 23)? {
+                transaction
+                    .execute_batch(MIGRATION_V23)
+                    .map_err(|error| format!("执行数据库迁移 v23 失败：{error}"))?;
+                validate_v23_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(23, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v23 失败：{error}"))?;
+            } else {
+                validate_v23_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23 失败：{error}"
                 )
             })?;
             Ok(())
@@ -5053,6 +6387,7 @@ impl Store {
                 validate_v20_schema(connection)?;
                 validate_v21_schema(connection)?;
                 validate_v22_schema(connection)?;
+                validate_v23_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -6768,7 +8103,21 @@ impl Store {
         let player = load_battle_player(&connection, key)?;
         let total = connection
             .query_row(
-                "SELECT COUNT(*) FROM soul_beast WHERE map_key = ?1 AND enabled = 1 AND level_required <= ?2",
+                r#"
+                SELECT COUNT(*)
+                  FROM soul_beast beast
+                  JOIN content_revision_member member
+                    ON member.member_kind = 'beast' AND member.member_key = beast.beast_key
+                 WHERE member.revision_id = (
+                           SELECT revision_id
+                             FROM content_revision_activation
+                            ORDER BY id DESC
+                            LIMIT 1
+                       )
+                   AND beast.map_key = ?1
+                   AND beast.enabled = 1
+                   AND beast.level_required <= ?2
+                "#,
                 params![player.map_key, player.level],
                 |row| row.get::<_, i64>(0),
             )
@@ -7520,6 +8869,14 @@ impl Store {
                 soul_ring_drop,
                 replayed: true,
             });
+        }
+        if let Some(learned_skill) = learned_skill.as_ref()
+            && !active_content_member_exists(&transaction, "skill", &learned_skill.skill.skill_key)?
+        {
+            return Err(format!(
+                "魂技“{}”不在当前内容 revision 中，无法继续释放",
+                learned_skill.skill.name
+            ));
         }
         let state = load_active_battle_state(&transaction, player.player_id)?
             .ok_or_else(|| "你当前不在战斗中，请先使用“挑战 <魂兽>”".to_string())?;
@@ -9269,6 +10626,10 @@ impl Store {
         validate_daily_checkin_input(input)?;
         validate_operation_input(operation)?;
 
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| "签到写锁已损坏".to_string())?;
         let mut connection = self.open()?;
         let transaction = self.begin_immediate(&mut connection, "开始签到事务失败")?;
         ensure_no_legacy_identity(&transaction, key)?;
@@ -10592,9 +11953,22 @@ fn load_wuhun_state_by_player(
 
 fn draw_weighted_wuhun(connection: &Connection) -> Result<(i64, AwakenedWuhun), String> {
     let total_weight = connection
-        .query_row("SELECT SUM(weight) FROM wuhun", [], |row| {
-            row.get::<_, Option<i64>>(0)
-        })
+        .query_row(
+            r#"
+            SELECT SUM(wuhun.weight)
+              FROM wuhun
+              JOIN content_revision_member member
+                ON member.member_kind = 'wuhun' AND member.member_key = wuhun.name
+             WHERE member.revision_id = (
+                       SELECT revision_id
+                         FROM content_revision_activation
+                        ORDER BY id DESC
+                        LIMIT 1
+                   )
+            "#,
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
         .map_err(|error| format!("读取武魂权重总和失败：{error}"))?
         .ok_or_else(|| "武魂目录为空，无法觉醒".to_string())?;
     if total_weight <= 0 {
@@ -10623,9 +11997,18 @@ fn load_wuhun_at_weight_ticket(
         .query_row(
             r#"
             WITH weighted AS (
-                SELECT id, name, category, form, description,
-                       SUM(weight) OVER (ORDER BY id) AS cumulative_weight
+                SELECT wuhun.id, wuhun.name, wuhun.category, wuhun.form,
+                       wuhun.description,
+                       SUM(wuhun.weight) OVER (ORDER BY wuhun.id) AS cumulative_weight
                   FROM wuhun
+                  JOIN content_revision_member member
+                    ON member.member_kind = 'wuhun' AND member.member_key = wuhun.name
+                 WHERE member.revision_id = (
+                           SELECT revision_id
+                             FROM content_revision_activation
+                            ORDER BY id DESC
+                            LIMIT 1
+                       )
             )
             SELECT id, name, category, form, description
               FROM weighted
@@ -10664,9 +12047,23 @@ fn seed_player_skills(
                 level, proficiency, equipped, learned_at
             )
             SELECT ?1, ?2, skill.skill_key, 1, 1, 0, 1, ?3
-             FROM skill
-             WHERE skill.enabled = 1
-               AND skill.skill_key = 'entangle'
+              FROM skill
+              JOIN wuhun ON wuhun.id = ?2
+              JOIN content_revision_member skill_member
+                ON skill_member.member_kind = 'skill'
+               AND skill_member.member_key = skill.skill_key
+              JOIN content_revision_member starter_member
+                ON starter_member.member_kind = 'starter-skill'
+               AND starter_member.member_key = skill.skill_key
+             WHERE skill_member.revision_id = (
+                       SELECT revision_id
+                         FROM content_revision_activation
+                        ORDER BY id DESC
+                        LIMIT 1
+                   )
+               AND starter_member.revision_id = skill_member.revision_id
+               AND skill.enabled = 1
+               AND (skill.wuhun_category = 'all' OR skill.wuhun_category = wuhun.category)
             "#,
             params![player_id, wuhun_id, learned_at],
         )
@@ -10777,9 +12174,18 @@ fn load_skill_effects(
             SELECT effect_key, target_kind, operation, attribute_key, value_mode, value,
                    duration_rounds, description, trigger_kind, chance_percent,
                    stack_policy, parameters_json
-              FROM effect_definition
-             WHERE skill_key = ?1 AND enabled = 1
-             ORDER BY effect_key
+              FROM effect_definition definition
+              JOIN content_revision_member member
+                ON member.member_kind = 'effect' AND member.member_key = definition.effect_key
+             WHERE member.revision_id = (
+                       SELECT revision_id
+                         FROM content_revision_activation
+                        ORDER BY id DESC
+                        LIMIT 1
+                   )
+               AND definition.skill_key = ?1
+               AND definition.enabled = 1
+             ORDER BY definition.effect_key
             "#,
         )
         .map_err(|error| format!("准备魂技效果查询失败：{error}"))?
@@ -11049,7 +12455,16 @@ fn insert_soul_ring_drop(
             )
             SELECT ?1, ?2, ?3, ring.ring_key, ?4, ?5, 'pending', ?6
               FROM soul_ring ring
-             WHERE ring.soul_beast_id = ?7 AND ring.enabled = 1
+              JOIN content_revision_member member
+                ON member.member_kind = 'ring' AND member.member_key = ring.ring_key
+             WHERE member.revision_id = (
+                       SELECT revision_id
+                         FROM content_revision_activation
+                        ORDER BY id DESC
+                        LIMIT 1
+                   )
+               AND ring.soul_beast_id = ?7
+               AND ring.enabled = 1
             "#,
             params![
                 battle_id,
@@ -11169,7 +12584,20 @@ fn load_wuhun_combat_modifier(
 ) -> Result<WuhunCombatModifier, String> {
     let template = connection
         .query_row(
-            "SELECT attack_percent, defense_percent, parameters_json FROM wuhun_stat_template WHERE wuhun_id = ?1",
+            r#"
+            SELECT template.attack_percent, template.defense_percent, template.parameters_json
+              FROM wuhun_stat_template template
+              JOIN wuhun ON wuhun.id = template.wuhun_id
+              JOIN content_revision_member member
+                ON member.member_kind = 'wuhun' AND member.member_key = wuhun.name
+             WHERE template.wuhun_id = ?1
+               AND member.revision_id = (
+                       SELECT revision_id
+                         FROM content_revision_activation
+                        ORDER BY id DESC
+                        LIMIT 1
+                   )
+            "#,
             [wuhun_id],
             |row| {
                 Ok((
@@ -11643,7 +13071,7 @@ fn load_soul_beast_by_name_or_key(
     connection
         .query_row(
             &format!(
-                "{} WHERE sb.map_key = ?1 AND sb.enabled = 1 AND sb.level_required <= ?2 AND (sb.name = ?3 OR sb.beast_key = ?3) LIMIT 1",
+                "{} JOIN content_revision_member member ON member.member_kind = 'beast' AND member.member_key = sb.beast_key WHERE member.revision_id = (SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1) AND sb.map_key = ?1 AND sb.enabled = 1 AND sb.level_required <= ?2 AND (sb.name = ?3 OR sb.beast_key = ?3) LIMIT 1",
                 soul_beast_select_sql()
             ),
             params![map_key, level, requested_name_or_key],
@@ -11663,7 +13091,7 @@ fn query_soul_beasts(
 ) -> Result<Vec<SoulBeastRecord>, String> {
     connection
         .prepare(&format!(
-            "{} WHERE sb.enabled = 1 AND (?1 IS NULL OR sb.map_key = ?1) AND (?2 IS NULL OR sb.level_required <= ?2) ORDER BY sb.level_required, sb.age, sb.id LIMIT ?3 OFFSET ?4",
+            "{} JOIN content_revision_member member ON member.member_kind = 'beast' AND member.member_key = sb.beast_key WHERE member.revision_id = (SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1) AND sb.enabled = 1 AND (?1 IS NULL OR sb.map_key = ?1) AND (?2 IS NULL OR sb.level_required <= ?2) ORDER BY sb.level_required, sb.age, sb.id LIMIT ?3 OFFSET ?4",
             soul_beast_select_sql()
         ))
         .map_err(|error| format!("准备魂兽分页查询失败：{error}"))?
@@ -19577,6 +21005,460 @@ fn validate_v22_index(
         .map_err(|error| error.replace("v7", "v22"))
 }
 
+fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
+    let expected_tables = [
+        (
+            "content_revision",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("package_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("package_revision", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("parent_revision_id", "INTEGER", false, false, None, 0),
+                TableColumnInfo::new("source_format", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("content_hash", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("author", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("minimum_runtime", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("manifest_json", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("published_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+        (
+            "content_draft",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("package_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("package_revision", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("source_format", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("content_hash", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("package_json", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("status", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("validation_json", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("published_revision_id", "INTEGER", false, false, None, 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("updated_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+        (
+            "content_revision_member",
+            vec![
+                TableColumnInfo::new("revision_id", "INTEGER", true, true, None, 0),
+                TableColumnInfo::new("member_kind", "TEXT", true, true, None, 0),
+                TableColumnInfo::new("member_key", "TEXT", true, true, None, 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+        (
+            "content_revision_activation",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("revision_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("reason", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+    ];
+    for (table, expected) in expected_tables {
+        let actual = table_columns_with_type(connection, table)?;
+        if actual != expected {
+            return Err(format!(
+                "数据库已标记迁移 v23，但表 {table} 字段不匹配：{actual:?}"
+            ));
+        }
+    }
+
+    for (table, markers) in [
+        (
+            "content_revision",
+            &[
+                ") STRICT",
+                "UNIQUE(PACKAGE_KEY, PACKAGE_REVISION)",
+                "JSON_VALID(MANIFEST_JSON) = 1",
+            ][..],
+        ),
+        (
+            "content_draft",
+            &[
+                ") STRICT",
+                "UNIQUE(PACKAGE_KEY, PACKAGE_REVISION)",
+                "JSON_VALID(PACKAGE_JSON) = 1",
+                "STATUS IN ('DRAFT', 'VALIDATED', 'REJECTED', 'PUBLISHED')",
+            ][..],
+        ),
+        (
+            "content_revision_member",
+            &[
+                ") STRICT, WITHOUT ROWID",
+                "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING')",
+                "PRIMARY KEY(REVISION_ID, MEMBER_KIND, MEMBER_KEY)",
+            ][..],
+        ),
+        (
+            "content_revision_activation",
+            &[
+                ") STRICT",
+                "REASON IN ('INITIAL', 'PUBLISH', 'ROLLBACK', 'REPLAY')",
+            ][..],
+        ),
+    ] {
+        validate_v23_table_sql(connection, table, markers)?;
+    }
+
+    validate_v23_foreign_keys(
+        connection,
+        "content_revision",
+        &[(
+            "content_revision",
+            "parent_revision_id",
+            "id",
+            "NO ACTION",
+            "RESTRICT",
+        )],
+    )?;
+    validate_v23_foreign_keys(
+        connection,
+        "content_draft",
+        &[(
+            "content_revision",
+            "published_revision_id",
+            "id",
+            "NO ACTION",
+            "RESTRICT",
+        )],
+    )?;
+    validate_v23_foreign_keys(
+        connection,
+        "content_revision_member",
+        &[(
+            "content_revision",
+            "revision_id",
+            "id",
+            "NO ACTION",
+            "RESTRICT",
+        )],
+    )?;
+    validate_v23_foreign_keys(
+        connection,
+        "content_revision_activation",
+        &[(
+            "content_revision",
+            "revision_id",
+            "id",
+            "NO ACTION",
+            "RESTRICT",
+        )],
+    )?;
+
+    for (table, expected) in [
+        ("content_revision", &["content_revision_parent_page"][..]),
+        ("content_draft", &["content_draft_status_page"][..]),
+        (
+            "content_revision_member",
+            &["content_revision_member_lookup"][..],
+        ),
+        (
+            "content_revision_activation",
+            &["content_revision_activation_page"][..],
+        ),
+    ] {
+        validate_v23_custom_index_set(connection, table, expected)?;
+    }
+    for (name, columns) in [
+        (
+            "content_revision_parent_page",
+            &["parent_revision_id", "id"][..],
+        ),
+        ("content_draft_status_page", &["status", "id"][..]),
+        (
+            "content_revision_member_lookup",
+            &["member_kind", "member_key", "revision_id"][..],
+        ),
+        (
+            "content_revision_activation_page",
+            &["revision_id", "id"][..],
+        ),
+    ] {
+        validate_v23_index(connection, name, false, columns, false)?;
+    }
+
+    let active_revision = current_content_revision_id(connection)?;
+    let active_exists = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM content_revision WHERE id = ?1)",
+            [active_revision],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("校验 v23 当前内容 revision 失败：{error}"))?;
+    if !active_exists {
+        return Err("v23 当前内容 revision 不存在".to_string());
+    }
+
+    let invalid_members = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM content_revision_member member
+                  LEFT JOIN content_revision revision ON revision.id = member.revision_id
+                 WHERE revision.id IS NULL
+                    OR (member.member_kind = 'wuhun' AND NOT EXISTS(
+                        SELECT 1 FROM wuhun WHERE name = member.member_key
+                    ))
+                    OR (member.member_kind IN ('skill', 'starter-skill') AND NOT EXISTS(
+                        SELECT 1 FROM skill WHERE skill_key = member.member_key AND enabled = 1
+                    ))
+                    OR (member.member_kind = 'effect' AND NOT EXISTS(
+                        SELECT 1 FROM effect_definition WHERE effect_key = member.member_key AND enabled = 1
+                    ))
+                    OR (member.member_kind = 'beast' AND NOT EXISTS(
+                        SELECT 1 FROM soul_beast WHERE beast_key = member.member_key AND enabled = 1
+                    ))
+                    OR (member.member_kind = 'ring' AND NOT EXISTS(
+                        SELECT 1 FROM soul_ring WHERE ring_key = member.member_key AND enabled = 1
+                    ))
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("校验 v23 内容成员引用失败：{error}"))?;
+    if invalid_members {
+        return Err("v23 内容 revision 包含缺失、禁用或孤立目录成员".to_string());
+    }
+
+    let untracked_catalog = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM wuhun w
+                 WHERE NOT EXISTS(
+                    SELECT 1 FROM content_revision_member member
+                     WHERE member.member_kind = 'wuhun' AND member.member_key = w.name
+                 )
+            ) OR EXISTS(
+                SELECT 1 FROM skill skill
+                 WHERE skill.enabled = 1 AND NOT EXISTS(
+                    SELECT 1 FROM content_revision_member member
+                     WHERE member.member_kind = 'skill' AND member.member_key = skill.skill_key
+                 )
+            ) OR EXISTS(
+                SELECT 1 FROM effect_definition effect
+                 WHERE effect.enabled = 1 AND NOT EXISTS(
+                    SELECT 1 FROM content_revision_member member
+                     WHERE member.member_kind = 'effect' AND member.member_key = effect.effect_key
+                 )
+            ) OR EXISTS(
+                SELECT 1 FROM soul_beast beast
+                 WHERE beast.enabled = 1 AND NOT EXISTS(
+                    SELECT 1 FROM content_revision_member member
+                     WHERE member.member_kind = 'beast' AND member.member_key = beast.beast_key
+                 )
+            ) OR EXISTS(
+                SELECT 1 FROM soul_ring ring
+                 WHERE ring.enabled = 1 AND NOT EXISTS(
+                    SELECT 1 FROM content_revision_member member
+                     WHERE member.member_kind = 'ring' AND member.member_key = ring.ring_key
+                 )
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("校验 v23 未发布目录失败：{error}"))?;
+    if untracked_catalog {
+        return Err("v23 存在未纳入任何发布 revision 的启用目录数据".to_string());
+    }
+
+    let invalid_active_dependencies = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM effect_definition effect
+                  JOIN content_revision_member member
+                    ON member.member_kind = 'effect' AND member.member_key = effect.effect_key
+                 WHERE member.revision_id = ?1
+                   AND NOT EXISTS(
+                        SELECT 1 FROM content_revision_member skill_member
+                         WHERE skill_member.revision_id = member.revision_id
+                           AND skill_member.member_kind = 'skill'
+                           AND skill_member.member_key = effect.skill_key
+                   )
+            ) OR EXISTS(
+                SELECT 1
+                  FROM soul_ring ring
+                  JOIN soul_beast beast ON beast.id = ring.soul_beast_id
+                  JOIN content_revision_member member
+                    ON member.member_kind = 'ring' AND member.member_key = ring.ring_key
+                 WHERE member.revision_id = ?1
+                   AND (
+                        NOT EXISTS(
+                            SELECT 1 FROM content_revision_member skill_member
+                             WHERE skill_member.revision_id = member.revision_id
+                               AND skill_member.member_kind = 'skill'
+                               AND skill_member.member_key = ring.skill_key
+                        )
+                        OR NOT EXISTS(
+                            SELECT 1 FROM content_revision_member beast_member
+                             WHERE beast_member.revision_id = member.revision_id
+                               AND beast_member.member_kind = 'beast'
+                               AND beast_member.member_key = beast.beast_key
+                        )
+                   )
+            ) OR EXISTS(
+                SELECT 1
+                  FROM content_revision_member starter_member
+                 WHERE starter_member.revision_id = ?1
+                   AND starter_member.member_kind = 'starter-skill'
+                   AND NOT EXISTS(
+                        SELECT 1 FROM content_revision_member skill_member
+                         WHERE skill_member.revision_id = starter_member.revision_id
+                           AND skill_member.member_kind = 'skill'
+                           AND skill_member.member_key = starter_member.member_key
+                   )
+            ) OR EXISTS(
+                SELECT 1
+                  FROM content_revision_member member
+                  LEFT JOIN wuhun w ON w.name = member.member_key
+                  LEFT JOIN wuhun_stat_template template ON template.wuhun_id = w.id
+                 WHERE member.revision_id = ?1
+                   AND member.member_kind = 'wuhun'
+                   AND template.wuhun_id IS NULL
+            )
+            "#,
+            [active_revision],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("校验 v23 当前内容依赖失败：{error}"))?;
+    if invalid_active_dependencies {
+        return Err("v23 当前内容 revision 的目录依赖或武魂模板不完整".to_string());
+    }
+
+    let expected_triggers = [
+        ("content_revision_no_update", "content_revision"),
+        ("content_revision_no_delete", "content_revision"),
+        ("content_revision_no_reinsert", "content_revision"),
+        ("content_draft_no_delete", "content_draft"),
+        ("content_draft_no_reinsert", "content_draft"),
+        ("content_draft_transition_guard", "content_draft"),
+        (
+            "content_revision_member_no_update",
+            "content_revision_member",
+        ),
+        (
+            "content_revision_member_no_delete",
+            "content_revision_member",
+        ),
+        (
+            "content_revision_member_no_reinsert",
+            "content_revision_member",
+        ),
+        (
+            "content_revision_activation_no_update",
+            "content_revision_activation",
+        ),
+        (
+            "content_revision_activation_no_delete",
+            "content_revision_activation",
+        ),
+        (
+            "content_revision_activation_no_reinsert",
+            "content_revision_activation",
+        ),
+    ];
+    for (name, table) in expected_triggers {
+        let (actual_table, sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v23 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v23，但缺少触发器 {name}"))?;
+        if actual_table != table || !sql.to_ascii_uppercase().contains("RAISE(ABORT") {
+            return Err(format!("v23 触发器 {name} 契约不匹配"));
+        }
+    }
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v23 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v23 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v23 全库触发器失败：{error}"))?;
+    for (name, table, sql) in triggers {
+        let declared = expected_triggers
+            .iter()
+            .any(|(expected_name, expected_table)| {
+                name == *expected_name && table == *expected_table
+            })
+            || name == "battle_skill_event_effect_v2_snapshot"
+            || name == "player_skill_scope_guard";
+        let touches_v23 = matches!(
+            table.as_str(),
+            "content_revision"
+                | "content_draft"
+                | "content_revision_member"
+                | "content_revision_activation"
+        ) || [
+            "content_revision",
+            "content_draft",
+            "content_revision_member",
+            "content_revision_activation",
+        ]
+        .iter()
+        .any(|identifier| sql_mentions_identifier(&sql, identifier));
+        if touches_v23 && !declared {
+            return Err(format!("v23 触发器 {name} 未声明却引用内容发布表 {table}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v23_table_sql(
+    connection: &Connection,
+    table: &str,
+    markers: &[&str],
+) -> Result<(), String> {
+    validate_v10_table_sql(connection, table, markers).map_err(|error| error.replace("v10", "v23"))
+}
+
+fn validate_v23_foreign_keys(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, &str, &str, &str)],
+) -> Result<(), String> {
+    validate_v9_foreign_keys(connection, table, expected)
+        .map_err(|error| error.replace("v9", "v23"))
+}
+
+fn validate_v23_custom_index_set(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), String> {
+    validate_v10_custom_index_set(connection, table, expected)
+        .map_err(|error| error.replace("v10", "v23"))
+}
+
+fn validate_v23_index(
+    connection: &Connection,
+    index_name: &str,
+    unique: bool,
+    columns: &[&str],
+    partial: bool,
+) -> Result<(), String> {
+    validate_v7_index(connection, index_name, unique, columns, partial)
+        .map_err(|error| error.replace("v7", "v23"))
+}
+
 fn validate_v17_foreign_keys(
     connection: &Connection,
     table: &str,
@@ -21208,6 +23090,10 @@ fn now_timestamp() -> Result<i64, String> {
 mod tests {
     use std::sync::{Arc, Barrier};
 
+    use crate::content::{
+        EffectPackageEntry, SkillPackageEntry, SoulBeastPackageEntry, SoulRingPackageEntry,
+        WuhunPackageEntry, WuhunStatsPackageEntry,
+    };
     use tempfile::tempdir;
 
     use super::*;
@@ -22145,6 +24031,7 @@ mod tests {
         let store = Store {
             path,
             busy_timeout: Duration::from_millis(3_000),
+            write_lock: Arc::new(Mutex::new(())),
         };
         let mut connection = store.open().expect("应打开数据库");
         connection
@@ -23054,11 +24941,10 @@ mod tests {
         store
             .register_player(&identity(), "并发签到", "男")
             .expect("应创建并发签到角色");
-        let store = Arc::new(store);
         let barrier = Arc::new(Barrier::new(12));
         let handles = (0..12)
             .map(|index| {
-                let store = Arc::clone(&store);
+                let store = store.clone();
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
@@ -26783,27 +28669,53 @@ mod tests {
     }
 
     #[test]
-    fn v22_custom_effect_definition_drives_the_same_interpreter() {
+    fn v23_published_effect_definition_drives_the_same_interpreter() {
         let (directory, store) = test_store();
         register_awakened_pair(&store);
         let player_id = player_id_for(&store, &identity());
-        let connection = store.open().expect("应打开 v22 自定义效果数据库");
-        connection
-            .execute(
-                r#"
-                INSERT INTO effect_definition(
-                    effect_key, skill_key, trigger_kind, target_kind, operation,
-                    attribute_key, value_mode, value, duration_rounds, chance_percent,
-                    stack_policy, parameters_json, description, enabled, created_at, updated_at
-                ) VALUES(
-                    'entangle-heavy', 'entangle', 'on_release', 'enemy', 'modify_stat',
-                    'beast_attack', 'percent_delta', -50, 2, 100, 'strongest', '{}',
-                    '测试自定义减攻', 1, 0, 0
-                )
-                "#,
-                [],
-            )
-            .expect("应插入自定义通用效果定义");
+        let package = ContentPackage {
+            package_key: "test-effects".to_string(),
+            revision: 1,
+            author: "test".to_string(),
+            minimum_runtime: String::new(),
+            wuhun: Vec::new(),
+            skills: Vec::new(),
+            effects: vec![EffectPackageEntry {
+                effect_key: "entangle-heavy".to_string(),
+                skill_key: "entangle".to_string(),
+                trigger_kind: "on_release".to_string(),
+                target_kind: "enemy".to_string(),
+                operation: "modify_stat".to_string(),
+                attribute_key: "beast_attack".to_string(),
+                value_mode: "percent_delta".to_string(),
+                value: -50,
+                duration_rounds: 2,
+                chance_percent: 100,
+                stack_policy: "strongest".to_string(),
+                parameters: Default::default(),
+                description: "test content effect".to_string(),
+                enabled: true,
+            }],
+            soul_beasts: Vec::new(),
+            soul_rings: Vec::new(),
+        };
+        let loaded = LoadedContentPackage {
+            content_hash: content_hash(&package).expect("content hash"),
+            package,
+            source_format: "json".to_string(),
+        };
+        store
+            .stage_content_package(&loaded)
+            .expect("content package should stage");
+        let validation = store
+            .validate_content_draft("test-effects", 1)
+            .expect("content package should validate");
+        assert!(validation.errors.is_empty(), "{validation:?}");
+        let published = store
+            .publish_content_draft("test-effects", 1)
+            .expect("content package should publish");
+        assert!(!published.replayed);
+        let connection = store.open().expect("应打开 v23 自定义效果数据库");
         connection
             .execute(
                 "UPDATE player SET level = 3, hp = 1000, max_hp = 1000, soul_power = 1000, max_soul_power = 1000, strength = 1, endurance = 0, perception = 0, luck = 0, updated_at = 1 WHERE id = ?1",
@@ -26815,21 +28727,21 @@ mod tests {
             .teleport_with_operation(
                 &identity(),
                 Some("落日森林"),
-                &map_operation("传送", "v22-custom-map"),
+                &map_operation("传送", "v23-custom-map"),
             )
             .expect("应进入自定义效果测试地图");
         store
             .challenge_soul_beast_with_operation(
                 &identity(),
                 "哥布林",
-                &transfer_operation("挑战", "v22-custom-start"),
+                &transfer_operation("挑战", "v23-custom-start"),
             )
             .expect("应创建自定义效果测试战斗");
         let release = store
             .use_skill_battle_with_operation(
                 &identity(),
                 "缠绕",
-                &transfer_operation("释放技能", "v22-custom-use"),
+                &transfer_operation("释放技能", "v23-custom-use"),
             )
             .expect("自定义效果应复用通用解释器");
         assert_eq!(
@@ -26846,7 +28758,7 @@ mod tests {
                 .any(|effect| effect.effect_key == "entangle-heavy" && effect.value == -50)
         );
         assert_eq!(release.battle.active_effects.len(), 2);
-        let connection = store.open().expect("应读取 v22 自定义快照");
+        let connection = store.open().expect("应读取 v23 自定义快照");
         let snapshot = connection
             .query_row(
                 "SELECT operation, attribute_key, value_mode, value, rule_version FROM battle_effect_snapshot WHERE effect_key = 'entangle-heavy'",
@@ -26885,6 +28797,304 @@ mod tests {
                 .active_effects
                 .iter()
                 .any(|effect| effect.effect_key == "entangle-heavy")
+        );
+    }
+
+    #[test]
+    fn v23_starter_skill_is_published_idempotently_and_rolls_back() {
+        let (_directory, store) = test_store();
+        let baseline = store
+            .active_content_revision()
+            .expect("baseline content revision should exist");
+        let package = ContentPackage {
+            package_key: "test-starters".to_string(),
+            revision: 1,
+            author: "test".to_string(),
+            minimum_runtime: String::new(),
+            wuhun: Vec::new(),
+            skills: vec![SkillPackageEntry {
+                skill_key: "test-starter".to_string(),
+                name: "test starter".to_string(),
+                skill_type: "active".to_string(),
+                wuhun_category: "all".to_string(),
+                ring_index: 1,
+                soul_power_cost: 10,
+                cooldown_rounds: 1,
+                base_damage: 20,
+                spirit_ratio_percent: 100,
+                strength_ratio_percent: 0,
+                description: "test starter skill".to_string(),
+                enabled: true,
+                starter: true,
+            }],
+            effects: Vec::new(),
+            soul_beasts: Vec::new(),
+            soul_rings: Vec::new(),
+        };
+        let loaded = LoadedContentPackage {
+            content_hash: content_hash(&package).expect("content hash"),
+            package,
+            source_format: "toml".to_string(),
+        };
+        store
+            .stage_content_package(&loaded)
+            .expect("starter package should stage");
+        let validation = store
+            .validate_content_draft("test-starters", 1)
+            .expect("starter package should validate");
+        assert!(validation.errors.is_empty(), "{validation:?}");
+        let published = store
+            .publish_content_draft("test-starters", 1)
+            .expect("starter package should publish");
+        assert!(!published.replayed);
+        assert_ne!(published.revision.id, baseline.id);
+        assert!(
+            active_content_member_exists(&store.open().unwrap(), "starter-skill", "test-starter")
+                .unwrap()
+        );
+
+        let replayed_draft = store
+            .stage_content_package(&loaded)
+            .expect("published package should stage idempotently");
+        assert_eq!(replayed_draft.status, "published");
+        let replayed_validation = store
+            .validate_content_draft("test-starters", 1)
+            .expect("published draft should validate idempotently");
+        assert!(
+            replayed_validation.errors.is_empty(),
+            "{replayed_validation:?}"
+        );
+        assert!(
+            store
+                .publish_content_draft("test-starters", 1)
+                .expect("published package should replay")
+                .replayed
+        );
+
+        store
+            .rollback_content_revision(baseline.id)
+            .expect("pre-replay rollback should succeed");
+        let reactivated = store
+            .publish_content_draft("test-starters", 1)
+            .expect("published package should reactivate after rollback");
+        assert!(reactivated.replayed);
+        assert_eq!(reactivated.active_revision_id, published.revision.id);
+
+        store
+            .register_player(&identity(), "starter test", "男")
+            .expect("starter test player should register");
+        store
+            .awaken_wuhun(&identity())
+            .expect("starter test player should awaken");
+        assert!(
+            store
+                .skills_page(&identity())
+                .expect("starter skills should be readable")
+                .entries
+                .iter()
+                .any(|entry| entry.skill.skill_key == "test-starter")
+        );
+
+        let rolled_back = store
+            .rollback_content_revision(baseline.id)
+            .expect("content rollback should succeed");
+        assert_eq!(rolled_back.id, baseline.id);
+        assert!(
+            !active_content_member_exists(&store.open().unwrap(), "starter-skill", "test-starter")
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .active_content_revision()
+                .expect("active revision should reload")
+                .id,
+            baseline.id
+        );
+    }
+
+    #[test]
+    fn v23_full_catalog_package_is_visible_only_in_its_active_revision() {
+        let (_directory, store) = test_store();
+        let baseline = store
+            .active_content_revision()
+            .expect("baseline content revision should exist");
+        let package = ContentPackage {
+            package_key: "test-full-catalog".to_string(),
+            revision: 1,
+            author: "test".to_string(),
+            minimum_runtime: String::new(),
+            wuhun: vec![WuhunPackageEntry {
+                name: "test catalog wuhun".to_string(),
+                category: "控制系".to_string(),
+                form: "test form".to_string(),
+                description: "test catalog wuhun".to_string(),
+                weight: 100_000,
+                stats: WuhunStatsPackageEntry {
+                    attack_percent: 125,
+                    defense_percent: 110,
+                    strength_percent: 100,
+                    agility_percent: 100,
+                    spirit_percent: 100,
+                    endurance_percent: 100,
+                    perception_percent: 100,
+                    luck_percent: 100,
+                },
+            }],
+            skills: vec![SkillPackageEntry {
+                skill_key: "test-catalog-skill".to_string(),
+                name: "test catalog skill".to_string(),
+                skill_type: "active".to_string(),
+                wuhun_category: "控制系".to_string(),
+                ring_index: 1,
+                soul_power_cost: 10,
+                cooldown_rounds: 1,
+                base_damage: 20,
+                spirit_ratio_percent: 100,
+                strength_ratio_percent: 0,
+                description: "test catalog skill".to_string(),
+                enabled: true,
+                starter: true,
+            }],
+            effects: vec![EffectPackageEntry {
+                effect_key: "test-catalog-effect".to_string(),
+                skill_key: "test-catalog-skill".to_string(),
+                trigger_kind: "on_release".to_string(),
+                target_kind: "beast".to_string(),
+                operation: "modify_stat".to_string(),
+                attribute_key: "beast_attack".to_string(),
+                value_mode: "percent_delta".to_string(),
+                value: -25,
+                duration_rounds: 2,
+                chance_percent: 100,
+                stack_policy: "strongest".to_string(),
+                parameters: Default::default(),
+                description: "test catalog effect".to_string(),
+                enabled: true,
+            }],
+            soul_beasts: vec![SoulBeastPackageEntry {
+                beast_key: "test-catalog-beast".to_string(),
+                name: "test catalog beast".to_string(),
+                description: "test catalog beast".to_string(),
+                map_key: "sunset-forest".to_string(),
+                age: 20,
+                level_required: 1,
+                max_hp: 100,
+                attack: 20,
+                defense: 5,
+                speed: 5,
+                exp_reward: 10,
+                drop_item_key: "small-healing-potion".to_string(),
+                drop_quantity: 1,
+                enabled: true,
+            }],
+            soul_rings: vec![SoulRingPackageEntry {
+                ring_key: "test-catalog-ring".to_string(),
+                name: "test catalog ring".to_string(),
+                soul_beast_key: "test-catalog-beast".to_string(),
+                skill_key: "test-catalog-skill".to_string(),
+                ring_index: 1,
+                age: 20,
+                color: "white".to_string(),
+                description: "test catalog ring".to_string(),
+                enabled: true,
+            }],
+        };
+        let loaded = LoadedContentPackage {
+            content_hash: content_hash(&package).expect("content hash"),
+            package,
+            source_format: "json".to_string(),
+        };
+        store
+            .stage_content_package(&loaded)
+            .expect("full catalog package should stage");
+        let validation = store
+            .validate_content_draft("test-full-catalog", 1)
+            .expect("full catalog package should validate");
+        assert!(validation.errors.is_empty(), "{validation:?}");
+        store
+            .publish_content_draft("test-full-catalog", 1)
+            .expect("full catalog package should publish");
+
+        let connection = store.open().expect("active catalog should open");
+        for (kind, key) in [
+            ("wuhun", "test catalog wuhun"),
+            ("skill", "test-catalog-skill"),
+            ("starter-skill", "test-catalog-skill"),
+            ("effect", "test-catalog-effect"),
+            ("beast", "test-catalog-beast"),
+            ("ring", "test-catalog-ring"),
+        ] {
+            assert!(active_content_member_exists(&connection, kind, key).unwrap());
+        }
+        let total_weight = connection
+            .query_row(
+                r#"
+                SELECT SUM(wuhun.weight)
+                  FROM wuhun
+                  JOIN content_revision_member member
+                    ON member.member_kind = 'wuhun' AND member.member_key = wuhun.name
+                 WHERE member.revision_id = (
+                           SELECT revision_id
+                             FROM content_revision_activation
+                            ORDER BY id DESC
+                            LIMIT 1
+                       )
+                "#,
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("active wuhun weight should exist");
+        assert_eq!(
+            load_wuhun_at_weight_ticket(&connection, total_weight - 1, total_weight)
+                .unwrap()
+                .expect("weighted catalog should contain the custom wuhun")
+                .1
+                .name,
+            "test catalog wuhun"
+        );
+        let wuhun_id = connection
+            .query_row(
+                "SELECT id FROM wuhun WHERE name = 'test catalog wuhun'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("custom wuhun should exist");
+        assert_eq!(
+            load_wuhun_combat_modifier(&connection, wuhun_id, "控制系")
+                .expect("active custom wuhun should have a template")
+                .attack_percent,
+            125
+        );
+        assert_eq!(
+            load_skill_effects(&connection, "test-catalog-skill")
+                .expect("active custom effects should load")
+                .len(),
+            1
+        );
+        assert!(
+            query_soul_beasts(&connection, Some("sunset-forest"), Some(1), 20, 0)
+                .expect("active custom beasts should load")
+                .iter()
+                .any(|beast| beast.beast_key == "test-catalog-beast")
+        );
+        drop(connection);
+
+        store
+            .rollback_content_revision(baseline.id)
+            .expect("catalog rollback should succeed");
+        let connection = store.open().expect("rolled-back catalog should open");
+        assert!(!active_content_member_exists(&connection, "wuhun", "test catalog wuhun").unwrap());
+        assert!(load_wuhun_combat_modifier(&connection, wuhun_id, "控制系").is_err());
+        assert!(
+            load_skill_effects(&connection, "test-catalog-skill")
+                .expect("inactive custom effects should resolve as empty")
+                .is_empty()
+        );
+        assert!(
+            !query_soul_beasts(&connection, Some("sunset-forest"), Some(1), 20, 0)
+                .expect("rolled-back custom beasts should load as absent")
+                .iter()
+                .any(|beast| beast.beast_key == "test-catalog-beast")
         );
     }
 
@@ -27659,6 +29869,58 @@ mod tests {
             CREATE TRIGGER player_skill_reads_skill
             AFTER INSERT ON player_skill
             BEGIN SELECT EXISTS(SELECT 1 FROM skill); END;
+            "#,
+        );
+    }
+
+    fn assert_v23_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v23 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v23 迁移应成功");
+        let connection = store.open().expect("应打开 v23 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v23 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v23 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v23")
+                || error.contains("content_revision")
+                || error.contains("content_draft"),
+            "v23 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    #[test]
+    fn recorded_v23_with_damaged_schema_or_cross_table_trigger_fails_closed() {
+        for mutation in [
+            "DROP TABLE content_draft;",
+            "DROP INDEX content_revision_member_lookup;",
+            "DROP TRIGGER content_draft_transition_guard;",
+        ] {
+            assert_v23_damage_fails_closed(mutation);
+        }
+        assert_v23_damage_fails_closed(
+            r#"
+            CREATE TRIGGER player_wuhun_reads_content_revision
+            AFTER INSERT ON player_wuhun
+            BEGIN
+                SELECT EXISTS(SELECT 1 FROM content_revision);
+            END;
+            "#,
+        );
+    }
+
+    #[test]
+    fn recorded_v23_with_orphan_member_fails_closed() {
+        assert_v23_damage_fails_closed(
+            r#"
+            PRAGMA foreign_keys = OFF;
+            INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+            VALUES(999999, 'skill', 'entangle', 0);
+            PRAGMA foreign_keys = ON;
             "#,
         );
     }
