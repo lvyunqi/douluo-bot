@@ -9,6 +9,7 @@ QimenBot 动态插件版斗罗大陆文字游戏，插件 ID 为 `douluo-game`�
 - 跨协议消息：兼容 OneBot 11 与 QQ 官方机器人，回复优先使用通用消息段。
 - 插图支持：支持本地 Base64 图片和公网 HTTPS 图片地址；未配置图片时仍返回完整文本。
 - 可选媒体服务：仓库包含一个独立的静态图片服务示例，可用于向 QQ 官方 Markdown 暴露公网图片。
+- 可选管理服务：默认仅回环监听，提供健康检查、短期管理会话与当前内容 revision 查询。
 
 ## Requirements
 
@@ -41,7 +42,7 @@ cargo build --manifest-path services/douluo-media/Cargo.toml --release --locked
 1. 将当前平台的动态库复制到 QimenBot `plugin_bin_dir`。
 2. 在 QimenBot Web 插件页重新扫描动态插件。
 3. 启用 `douluo-game`。
-4. 按需在 `config/plugins/douluo-game.toml` 中配置数据库、授权上下文、内容包和插图。
+4. 按需在 `config/plugins/douluo-game.toml` 中配置数据库、授权上下文、内容包、管理服务和插图。
 
 ## Minimal Config
 
@@ -54,6 +55,14 @@ busy_timeout_ms = 3000
 package_file = ""
 auto_publish = false
 
+[web]
+enabled = false
+bind = "127.0.0.1"
+port = 18181
+allow_remote = false
+public_base_url = ""
+# 启用管理服务时必须配置 16-256 字符的 admin_secret。
+
 [illustrations]
 enabled = false
 mode = "direct"
@@ -64,9 +73,22 @@ remote_base_url = ""
 说明：
 
 - `content.package_file` 必须是插件 `data_dir` 内的安全相对路径，支持 `.json` 和 `.toml`。
+- `web.enabled` 默认关闭；启用时 `web.bind` 只能是 IP 地址，默认仅允许 `127.0.0.1`/`::1` 等回环监听。
+- 非回环监听必须同时设置 `web.allow_remote = true` 和公网 HTTPS `web.public_base_url`，并由反向代理终止 TLS。
+- `web.admin_secret` 只用于建立短期 HttpOnly 会话，不会由插件显示或写入日志。
 - `illustrations.mode = "direct"` 会读取本地图片并交给宿主按协议发送。
 - `illustrations.mode = "remote"` 会拼接 `remote_base_url` 生成公网图片地址，适合 QQ 官方 Markdown。
 - QQ 官方机器人使用远程图片时，地址必须是平台可访问的 HTTPS URL。
+
+## Management API
+
+启用管理服务后，`/healthz` 与 `/readyz` 可用于本机进程检查。管理 API 默认同源且不开放 CORS：
+
+- `POST /api/v1/session`：以管理密钥建立短期会话并返回 CSRF token。
+- `GET /api/v1/session`、`DELETE /api/v1/session`：读取或结束当前会话；退出请求需要 CSRF token。
+- `GET /api/v1/content/active`：读取当前激活内容 revision，要求 `content_admin` 会话。
+
+当前版本尚未提供草稿列表、内容上传、差异预览或发布/回滚写接口；这些操作只会在后续版本通过 Store API 实现。
 
 ## Common Commands
 

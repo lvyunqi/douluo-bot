@@ -3897,7 +3897,7 @@ pub struct ContentValidationReport {
     pub soul_ring_count: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ContentRevisionRecord {
     pub id: i64,
     pub package_key: String,

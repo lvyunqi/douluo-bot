@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "斗罗大陆文字游戏",
-  "description": "插件启动、内容包、身份命名空间、插图和跨协议消息配置。",
+  "description": "插件启动、内容包、管理服务、身份命名空间、插图和跨协议消息配置。",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -61,6 +61,79 @@
           "then": {
             "properties": { "package_file": { "minLength": 1 } },
             "required": ["package_file"]
+          }
+        }
+      ]
+    },
+    "web": {
+      "title": "管理服务",
+      "description": "默认关闭并仅允许回环监听；启用后提供独立的游戏管理 API。",
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "enabled": {
+          "title": "启用管理服务",
+          "type": "boolean",
+          "default": false
+        },
+        "bind": {
+          "title": "监听 IP",
+          "description": "默认仅监听回环地址；不接受域名，避免 DNS 重绑定边界不清。",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 45,
+          "default": "127.0.0.1"
+        },
+        "port": {
+          "title": "监听端口",
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 65535,
+          "default": 18181
+        },
+        "allow_remote": {
+          "title": "允许非回环监听",
+          "description": "仅在反向代理已提供 HTTPS 时开启；开启后必须配置公开 HTTPS 基址。",
+          "type": "boolean",
+          "default": false
+        },
+        "public_base_url": {
+          "title": "公开 HTTPS 基址",
+          "description": "非回环部署所用的反向代理 HTTPS 地址，不含查询参数。",
+          "type": "string",
+          "maxLength": 300,
+          "default": ""
+        },
+        "admin_secret": {
+          "title": "管理密钥",
+          "description": "仅用于建立短期管理会话，不会显示或写入插件日志。",
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 256,
+          "format": "password",
+          "writeOnly": true,
+          "x-qimen-secret": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "enabled": { "const": true } },
+            "required": ["enabled"]
+          },
+          "then": {
+            "required": ["admin_secret"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "allow_remote": { "const": true } },
+            "required": ["allow_remote"]
+          },
+          "then": {
+            "properties": { "public_base_url": { "minLength": 9 } },
+            "required": ["public_base_url"]
           }
         }
       ]

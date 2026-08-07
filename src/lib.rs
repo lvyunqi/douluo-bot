@@ -9,9 +9,10 @@ mod game;
 mod identity;
 pub mod message;
 mod store;
+mod web;
 
 use std::path::Path;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use abi_stable_host_api::{
     CommandRequest, CommandResponse, PluginConfigRequest, PluginConfigResult, PluginInitConfig,
@@ -24,14 +25,28 @@ use crate::config::parse_config;
 use crate::game::GameService;
 use crate::message::{GameDocument, response_for};
 use crate::store::Store;
+use crate::web::ManagementServer;
 
 static RUNTIME: OnceLock<RwLock<Option<Arc<GameService>>>> = OnceLock::new();
+static MANAGEMENT_SERVER: OnceLock<Mutex<Option<ManagementServer>>> = OnceLock::new();
+static RUNTIME_TRANSITION: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn runtime_slot() -> &'static RwLock<Option<Arc<GameService>>> {
     RUNTIME.get_or_init(|| RwLock::new(None))
 }
 
+fn management_server_slot() -> &'static Mutex<Option<ManagementServer>> {
+    MANAGEMENT_SERVER.get_or_init(|| Mutex::new(None))
+}
+
+fn runtime_transition_slot() -> &'static Mutex<()> {
+    RUNTIME_TRANSITION.get_or_init(|| Mutex::new(()))
+}
+
 fn initialize(config: PluginInitConfig) -> Result<(), String> {
+    let _transition = runtime_transition_slot()
+        .lock()
+        .map_err(|_| "插件运行时切换锁已损坏".to_string())?;
     let parsed = parse_config(config.config_json.as_str())?;
     catalog::validate_embedded_manifest()?;
     let data_dir = config.data_dir.as_str().trim();
@@ -52,8 +67,14 @@ fn initialize(config: PluginInitConfig) -> Result<(), String> {
             store.publish_content_draft(&loaded.package.package_key, loaded.package.revision)?;
         }
     }
+    let web_config = parsed.web.clone();
     let illustration_assets = IllustrationAssets::load(data_dir, &parsed.illustrations)?;
-    let service = Arc::new(GameService::with_assets(store, parsed, illustration_assets));
+    let service = Arc::new(GameService::with_assets(
+        store.clone(),
+        parsed,
+        illustration_assets,
+    ));
+    replace_management_server(&web_config, store)?;
     let mut slot = runtime_slot()
         .write()
         .map_err(|_| "插件运行时锁已损坏".to_string())?;
@@ -61,7 +82,46 @@ fn initialize(config: PluginInitConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// 先释放旧监听再启动新配置；新配置失败时尽力恢复旧服务，避免 reload 留下空窗。
+fn replace_management_server(
+    web_config: &crate::config::WebConfig,
+    store: Store,
+) -> Result<(), String> {
+    let mut slot = management_server_slot()
+        .lock()
+        .map_err(|_| "管理服务锁已损坏".to_string())?;
+    let mut previous = slot.take();
+    if let Some(server) = previous.as_mut() {
+        server.stop()?;
+    }
+    match ManagementServer::start_if_enabled(web_config, store) {
+        Ok(replacement) => {
+            *slot = replacement;
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(server) = previous.as_mut()
+                && let Err(restart_error) = server.restart()
+            {
+                return Err(format!(
+                    "管理服务新配置启动失败：{error}；恢复旧服务失败：{restart_error}"
+                ));
+            }
+            *slot = previous;
+            Err(error)
+        }
+    }
+}
+
 fn shutdown_runtime() {
+    let Ok(_transition) = runtime_transition_slot().lock() else {
+        return;
+    };
+    if let Ok(mut slot) = management_server_slot().lock()
+        && let Some(mut server) = slot.take()
+    {
+        let _ = server.stop();
+    }
     if let Ok(mut slot) = runtime_slot().write() {
         *slot = None;
     }
@@ -127,7 +187,7 @@ fn execute_service_operation(
     api = "0.6",
     config_schema = "../config.schema.json",
     config_ui = "../config.ui.json",
-    config_version = 5,
+    config_version = 6,
     config_apply = "reload"
 )]
 mod plugin {
@@ -665,12 +725,23 @@ mod plugin {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::net::TcpListener;
+    use std::sync::{Mutex, OnceLock};
 
     use abi_stable::std_types::RString;
 
     use super::*;
-    use crate::config::{AuthorizationMode, PluginConfig};
+    use crate::config::{AuthorizationMode, PluginConfig, WebConfig};
     use crate::store::IdentityKey;
+
+    static MANAGEMENT_RUNTIME_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn management_runtime_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        MANAGEMENT_RUNTIME_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("管理运行时测试锁应可用")
+    }
 
     #[test]
     fn denied_allowlist_request_never_executes_economic_operation() {
@@ -726,6 +797,97 @@ mod tests {
                 .entries
                 .iter()
                 .all(|entry| entry.command != "签到")
+        );
+    }
+
+    #[test]
+    fn management_server_reload_failure_restores_the_previous_listener() {
+        let _guard = management_runtime_test_lock();
+        let directory = tempfile::tempdir().expect("应创建管理服务临时目录");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("应初始化管理服务数据库");
+        let enabled = WebConfig {
+            enabled: true,
+            port: 0,
+            admin_secret: "0123456789abcdef".to_string(),
+            ..WebConfig::default()
+        };
+        replace_management_server(&enabled, store.clone()).expect("应启动初始管理服务");
+        assert!(
+            management_server_slot()
+                .lock()
+                .expect("管理服务锁应可用")
+                .is_some()
+        );
+
+        let invalid = WebConfig {
+            bind: "invalid-bind".to_string(),
+            ..enabled
+        };
+        assert!(replace_management_server(&invalid, store.clone()).is_err());
+        assert!(
+            management_server_slot()
+                .lock()
+                .expect("恢复后的管理服务锁应可用")
+                .is_some()
+        );
+
+        let disabled = WebConfig::default();
+        replace_management_server(&disabled, store).expect("禁用配置应停止管理服务");
+        assert!(
+            management_server_slot()
+                .lock()
+                .expect("停止后的管理服务锁应可用")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn plugin_initialize_and_shutdown_own_the_management_server_lifecycle() {
+        let _guard = management_runtime_test_lock();
+        shutdown_runtime();
+        let directory = tempfile::tempdir().expect("应创建插件临时数据目录");
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("应预留回环端口")
+            .local_addr()
+            .expect("应读取预留端口")
+            .port();
+        let config_json = serde_json::json!({
+            "web": {
+                "enabled": true,
+                "bind": "127.0.0.1",
+                "port": port,
+                "admin_secret": "0123456789abcdef"
+            }
+        })
+        .to_string();
+        initialize(PluginInitConfig {
+            plugin_id: RString::from("douluo-game"),
+            config_json: RString::from(config_json),
+            plugin_dir: RString::new(),
+            data_dir: RString::from(directory.path().to_string_lossy().to_string()),
+        })
+        .expect("插件初始化应启动管理服务");
+        assert!(runtime_slot().read().expect("插件运行时锁应可用").is_some());
+        assert!(
+            management_server_slot()
+                .lock()
+                .expect("管理服务锁应可用")
+                .is_some()
+        );
+
+        shutdown_runtime();
+        assert!(
+            runtime_slot()
+                .read()
+                .expect("关闭后的插件运行时锁应可用")
+                .is_none()
+        );
+        assert!(
+            management_server_slot()
+                .lock()
+                .expect("关闭后的管理服务锁应可用")
+                .is_none()
         );
     }
 }

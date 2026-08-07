@@ -13,14 +13,18 @@ crate-type = ["cdylib"]
 [dependencies]
 abi-stable-host-api = "=0.1.13"
 abi_stable = "0.11"
+axum = "0.8.8"
 base64 = "=0.22.1"
+getrandom = "0.3.4"
 qimen-dynamic-plugin-derive = "=0.1.13"
 rusqlite = { version = "0.34", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "=0.10.9"
+tokio = { version = "1.50", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 toml = "=0.8.23"
 url = { version = "=2.5.8", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5.3", features = ["util"] }

@@ -1,3 +1,5 @@
+use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path};
 
 use serde::Deserialize;
@@ -9,6 +11,7 @@ use url::{Host, Url};
 pub struct PluginConfig {
     pub database: DatabaseConfig,
     pub content: ContentConfig,
+    pub web: WebConfig,
     pub identity: IdentityConfig,
     pub authorization: AuthorizationConfig,
     pub illustrations: IllustrationConfig,
@@ -21,6 +24,61 @@ pub struct PluginConfig {
 pub struct ContentConfig {
     pub package_file: String,
     pub auto_publish: bool,
+}
+
+/// 管理服务的监听、远程暴露与认证启动配置。
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebConfig {
+    pub enabled: bool,
+    pub bind: String,
+    pub port: u16,
+    pub allow_remote: bool,
+    pub public_base_url: String,
+    pub admin_secret: String,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1".to_string(),
+            port: 18_181,
+            allow_remote: false,
+            public_base_url: String::new(),
+            admin_secret: String::new(),
+        }
+    }
+}
+
+impl fmt::Debug for WebConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let secret = if self.admin_secret.is_empty() {
+            "<empty>"
+        } else {
+            "<redacted>"
+        };
+        formatter
+            .debug_struct("WebConfig")
+            .field("enabled", &self.enabled)
+            .field("bind", &self.bind)
+            .field("port", &self.port)
+            .field("allow_remote", &self.allow_remote)
+            .field("public_base_url", &self.public_base_url)
+            .field("admin_secret", &secret)
+            .finish()
+    }
+}
+
+impl WebConfig {
+    /// 将受校验的绑定配置转换为实际监听地址。
+    pub(crate) fn socket_addr(&self) -> Result<SocketAddr, String> {
+        let ip = self
+            .bind
+            .parse::<IpAddr>()
+            .map_err(|_| "web.bind 必须是合法 IP 地址".to_string())?;
+        Ok(SocketAddr::new(ip, self.port))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -169,6 +227,33 @@ pub fn validate_config(config: &PluginConfig) -> Result<(), String> {
     } else if config.content.auto_publish {
         return Err("content.auto_publish=true 时必须配置 package_file".to_string());
     }
+    let web_bind = config
+        .web
+        .bind
+        .parse::<IpAddr>()
+        .map_err(|_| "web.bind 必须是合法 IP 地址".to_string())?;
+    if config.web.port < 1024 {
+        return Err("web.port 必须在 1024 到 65535 之间".to_string());
+    }
+    if !config.web.public_base_url.is_empty() {
+        validate_public_https_url(&config.web.public_base_url, false)
+            .map_err(|_| "web.public_base_url 必须是公网 HTTPS 地址".to_string())?;
+    }
+    if config.web.enabled {
+        if !web_bind.is_loopback() && !config.web.allow_remote {
+            return Err(
+                "web.bind 仅允许回环地址；远程监听必须显式设置 web.allow_remote=true".to_string(),
+            );
+        }
+        if !valid_web_admin_secret(&config.web.admin_secret) {
+            return Err(
+                "web.admin_secret 必须是无首尾空白和控制字符的 16-256 字符密钥".to_string(),
+            );
+        }
+        if config.web.allow_remote && config.web.public_base_url.is_empty() {
+            return Err("web.allow_remote=true 时必须配置 web.public_base_url".to_string());
+        }
+    }
     if !valid_namespace(&config.identity.namespace) {
         return Err(
             "identity.namespace 只能包含字母、数字、点、下划线和横线，长度 1-64".to_string(),
@@ -207,6 +292,12 @@ fn valid_namespace(value: &str) -> bool {
 fn valid_identity_id(value: &str) -> bool {
     !value.is_empty()
         && value.chars().count() <= 128
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_web_admin_secret(value: &str) -> bool {
+    (16..=256).contains(&value.chars().count())
         && value.trim() == value
         && !value.chars().any(char::is_control)
 }
@@ -507,6 +598,43 @@ mod tests {
             );
         }
         assert!(parse_config(r#"{"content":{"auto_publish":true}}"#).is_err());
+    }
+
+    #[test]
+    fn web_defaults_are_disabled_and_enabled_config_is_strict() {
+        let config = parse_config("{}").expect("默认配置应有效");
+        assert!(!config.web.enabled);
+        assert_eq!(config.web.bind, "127.0.0.1");
+        assert_eq!(config.web.port, 18_181);
+        assert!(format!("{config:?}").contains("<empty>"));
+
+        let enabled = parse_config(r#"{"web":{"enabled":true,"admin_secret":"0123456789abcdef"}}"#)
+            .expect("回环管理服务配置应有效");
+        assert_eq!(
+            enabled.web.socket_addr().expect("地址应有效").port(),
+            18_181
+        );
+        let debug = format!("{enabled:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("0123456789abcdef"));
+
+        for config_json in [
+            r#"{"web":{"enabled":true,"admin_secret":"short"}}"#,
+            r#"{"web":{"enabled":true,"bind":"example.com","admin_secret":"0123456789abcdef"}}"#,
+            r#"{"web":{"enabled":true,"bind":"0.0.0.0","admin_secret":"0123456789abcdef"}}"#,
+            r#"{"web":{"enabled":true,"bind":"0.0.0.0","allow_remote":true,"admin_secret":"0123456789abcdef"}}"#,
+        ] {
+            assert!(
+                parse_config(config_json).is_err(),
+                "不安全 Web 配置不应通过"
+            );
+        }
+
+        let remote = parse_config(
+            r#"{"web":{"enabled":true,"bind":"0.0.0.0","allow_remote":true,"public_base_url":"https://admin.example.com","admin_secret":"0123456789abcdef"}}"#,
+        )
+        .expect("带公开 HTTPS 基址的远程配置应有效");
+        assert!(remote.web.allow_remote);
     }
 
     #[test]

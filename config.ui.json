@@ -1,6 +1,6 @@
 {
   "": {
-    "ui:order": ["database", "content", "identity", "authorization", "illustrations", "messages"]
+    "ui:order": ["database", "content", "web", "identity", "authorization", "illustrations", "messages"]
   },
   "/database/busy_timeout_ms": {
     "ui:widget": "slider",
@@ -9,6 +9,18 @@
   },
   "/content/package_file": {
     "placeholder": "douluo-game/content/package.toml",
+    "width": "full"
+  },
+  "/web/bind": {
+    "placeholder": "127.0.0.1",
+    "width": "half"
+  },
+  "/web/public_base_url": {
+    "placeholder": "https://game-admin.example.com",
+    "width": "full"
+  },
+  "/web/admin_secret": {
+    "ui:widget": "password",
     "width": "full"
   },
   "/identity/max_character_name_chars": {
