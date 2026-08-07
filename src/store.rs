@@ -3861,6 +3861,100 @@ BEGIN
 END;
 "#;
 
+// v24.3.1 先落地 revision transition 的不可变快照边界，声明解析留待后续切片。
+const MIGRATION_V24: &str = r#"
+CREATE TABLE content_revision_transition (
+    revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
+    entity_kind TEXT NOT NULL CHECK(
+        entity_kind IN ('wuhun', 'skill', 'effect', 'beast', 'ring')
+    ),
+    source_key TEXT NOT NULL CHECK(
+        length(source_key) BETWEEN 1 AND 200
+        AND source_key = trim(source_key)
+        AND instr(source_key, char(0)) = 0
+    ),
+    target_key TEXT CHECK(
+        target_key IS NULL OR (
+            length(target_key) BETWEEN 1 AND 200
+            AND target_key = trim(target_key)
+            AND instr(target_key, char(0)) = 0
+        )
+    ),
+    transition_kind TEXT NOT NULL CHECK(
+        transition_kind IN ('deprecated', 'replaced')
+    ),
+    reason TEXT NOT NULL CHECK(
+        length(reason) BETWEEN 1 AND 512
+        AND reason = trim(reason)
+        AND instr(reason, char(0)) = 0
+        AND reason NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    PRIMARY KEY(revision_id, entity_kind, source_key),
+    CHECK(
+        (transition_kind = 'deprecated' AND target_key IS NULL)
+        OR (
+            transition_kind = 'replaced'
+            AND target_key IS NOT NULL
+            AND target_key <> source_key
+        )
+    )
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX content_revision_transition_target
+    ON content_revision_transition(revision_id, entity_kind, target_key);
+CREATE INDEX content_revision_transition_source
+    ON content_revision_transition(entity_kind, source_key, revision_id);
+
+CREATE TRIGGER content_revision_transition_no_update
+BEFORE UPDATE ON content_revision_transition
+BEGIN
+    SELECT RAISE(ABORT, 'content revision transition is immutable');
+END;
+CREATE TRIGGER content_revision_transition_no_delete
+BEFORE DELETE ON content_revision_transition
+BEGIN
+    SELECT RAISE(ABORT, 'content revision transition is immutable');
+END;
+CREATE TRIGGER content_revision_transition_no_reinsert
+BEFORE INSERT ON content_revision_transition
+WHEN EXISTS(
+    SELECT 1 FROM content_revision_transition
+     WHERE revision_id = NEW.revision_id
+       AND entity_kind = NEW.entity_kind
+       AND source_key = NEW.source_key
+)
+BEGIN
+    SELECT RAISE(ABORT, 'content revision transition is append-only');
+END;
+
+-- 只有父 revision 的已有成员可以成为 source，target 必须已写入当前 revision。
+CREATE TRIGGER content_revision_transition_scope_guard
+BEFORE INSERT ON content_revision_transition
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM content_revision child
+      JOIN content_revision parent ON parent.id = child.parent_revision_id
+      JOIN content_revision_member member ON member.revision_id = parent.id
+     WHERE child.id = NEW.revision_id
+       AND member.member_kind = NEW.entity_kind
+       AND member.member_key = NEW.source_key
+)
+OR (
+    NEW.target_key IS NOT NULL
+    AND NOT EXISTS(
+        SELECT 1
+          FROM content_revision_member member
+         WHERE member.revision_id = NEW.revision_id
+           AND member.member_kind = NEW.entity_kind
+           AND member.member_key = NEW.target_key
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'content revision transition scope mismatch');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -5176,6 +5270,13 @@ fn active_content_member_exists(
                        )
                    AND member.member_kind = ?1
                    AND member.member_key = ?2
+                   AND NOT EXISTS(
+                       SELECT 1
+                         FROM content_revision_transition transition
+                        WHERE transition.revision_id = member.revision_id
+                          AND transition.entity_kind = ?1
+                          AND transition.source_key = ?2
+                   )
             )
             "#,
             params![member_kind, member_key],
@@ -5972,6 +6073,21 @@ impl Store {
                 params![revision_id, timestamp, parent_revision_id],
             )
             .map_err(|error| format!("继承父内容 revision 成员失败：{error}"))?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO content_revision_transition(
+                    revision_id, entity_kind, source_key, target_key,
+                    transition_kind, reason, created_at
+                )
+                SELECT ?1, entity_kind, source_key, target_key,
+                       transition_kind, reason, created_at
+                  FROM content_revision_transition
+                 WHERE revision_id = ?3
+                "#,
+                params![revision_id, timestamp, parent_revision_id],
+            )
+            .map_err(|error| format!("继承父内容 revision transition 失败：{error}"))?;
         publish_content_package_rows(&transaction, revision_id, &package, timestamp)?;
         let updated = transaction
             .execute(
@@ -6307,7 +6423,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
                     format!(
-                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22 失败：{error}"
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24 失败：{error}"
                     )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
@@ -6664,10 +6780,25 @@ impl Store {
                 validate_v23_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 24)? {
+                transaction
+                    .execute_batch(MIGRATION_V24)
+                    .map_err(|error| format!("执行数据库迁移 v24 失败：{error}"))?;
+                validate_v24_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(24, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v24 失败：{error}"))?;
+            } else {
+                validate_v24_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24 失败：{error}"
                 )
             })?;
             Ok(())
@@ -6698,6 +6829,7 @@ impl Store {
                 validate_v21_schema(connection)?;
                 validate_v22_schema(connection)?;
                 validate_v23_schema(connection)?;
+                validate_v24_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -21710,7 +21842,8 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
                 name == *expected_name && table == *expected_table
             })
             || name == "battle_skill_event_effect_v2_snapshot"
-            || name == "player_skill_scope_guard";
+            || name == "player_skill_scope_guard"
+            || name == "content_revision_transition_scope_guard";
         let touches_v23 = matches!(
             table.as_str(),
             "content_revision"
@@ -21730,6 +21863,320 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// 校验 v24.3.1 transition 快照的结构、继承关系和 active 边界。
+fn validate_v24_schema(connection: &Connection) -> Result<(), String> {
+    let expected_tables = [(
+        "content_revision_transition",
+        vec![
+            TableColumnInfo::new("revision_id", "INTEGER", true, true, None, 0),
+            TableColumnInfo::new("entity_kind", "TEXT", true, true, None, 0),
+            TableColumnInfo::new("source_key", "TEXT", true, true, None, 0),
+            TableColumnInfo::new("target_key", "TEXT", false, false, None, 0),
+            TableColumnInfo::new("transition_kind", "TEXT", true, false, None, 0),
+            TableColumnInfo::new("reason", "TEXT", true, false, None, 0),
+            TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+        ],
+    )];
+    for (table, expected) in expected_tables {
+        let actual = table_columns_with_type(connection, table)?;
+        if actual != expected {
+            return Err(format!(
+                "数据库已标记迁移 v24，但表 {table} 字段不匹配：{actual:?}"
+            ));
+        }
+    }
+
+    validate_v24_table_sql(
+        connection,
+        "content_revision_transition",
+        &[
+            ") STRICT, WITHOUT ROWID",
+            "ENTITY_KIND IN ('WUHUN', 'SKILL', 'EFFECT', 'BEAST', 'RING')",
+            "TRANSITION_KIND IN ('DEPRECATED', 'REPLACED')",
+            "PRIMARY KEY(REVISION_ID, ENTITY_KIND, SOURCE_KEY)",
+            "TARGET_KEY <> SOURCE_KEY",
+        ],
+    )?;
+    validate_v24_foreign_keys(
+        connection,
+        "content_revision_transition",
+        &[(
+            "content_revision",
+            "revision_id",
+            "id",
+            "NO ACTION",
+            "RESTRICT",
+        )],
+    )?;
+    validate_v24_custom_index_set(
+        connection,
+        "content_revision_transition",
+        &[
+            "content_revision_transition_source",
+            "content_revision_transition_target",
+        ],
+    )?;
+    for (name, columns) in [
+        (
+            "content_revision_transition_source",
+            &["entity_kind", "source_key", "revision_id"][..],
+        ),
+        (
+            "content_revision_transition_target",
+            &["revision_id", "entity_kind", "target_key"][..],
+        ),
+    ] {
+        validate_v24_index(connection, name, false, columns, false)?;
+    }
+
+    let invalid_transitions = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM content_revision_transition transition
+                  LEFT JOIN content_revision revision
+                    ON revision.id = transition.revision_id
+                  LEFT JOIN content_revision parent
+                    ON parent.id = revision.parent_revision_id
+                 WHERE revision.id IS NULL
+                    OR parent.id IS NULL
+                    OR transition.transition_kind NOT IN ('deprecated', 'replaced')
+                    OR transition.source_key = transition.target_key
+                    OR (transition.transition_kind = 'deprecated'
+                        AND transition.target_key IS NOT NULL)
+                    OR (transition.transition_kind = 'replaced'
+                        AND transition.target_key IS NULL)
+                    OR NOT EXISTS(
+                        SELECT 1
+                          FROM content_revision_member member
+                         WHERE member.revision_id = parent.id
+                           AND member.member_kind = transition.entity_kind
+                           AND member.member_key = transition.source_key
+                    )
+                    OR (transition.target_key IS NOT NULL AND NOT EXISTS(
+                        SELECT 1
+                          FROM content_revision_member member
+                         WHERE member.revision_id = transition.revision_id
+                           AND member.member_kind = transition.entity_kind
+                           AND member.member_key = transition.target_key
+                    ))
+                    OR (
+                        transition.target_key IS NOT NULL
+                        AND EXISTS(
+                            SELECT 1
+                              FROM content_revision_member member
+                             WHERE member.revision_id = parent.id
+                               AND member.member_kind = transition.entity_kind
+                               AND member.member_key = transition.target_key
+                        )
+                        AND NOT EXISTS(
+                            SELECT 1
+                              FROM content_revision_transition parent_transition
+                             WHERE parent_transition.revision_id = parent.id
+                               AND parent_transition.entity_kind = transition.entity_kind
+                               AND parent_transition.source_key = transition.source_key
+                               AND parent_transition.transition_kind = transition.transition_kind
+                               AND parent_transition.reason = transition.reason
+                               AND parent_transition.created_at = transition.created_at
+                               AND (
+                                    parent_transition.target_key = transition.target_key
+                                    OR (parent_transition.target_key IS NULL
+                                        AND transition.target_key IS NULL)
+                               )
+                        )
+                    )
+            ) OR EXISTS(
+                SELECT 1
+                  FROM content_revision_transition transition
+                 WHERE transition.target_key IS NOT NULL
+                 GROUP BY transition.revision_id, transition.entity_kind, transition.target_key
+                HAVING COUNT(*) > 1
+            ) OR EXISTS(
+                SELECT 1
+                  FROM content_revision child
+                  JOIN content_revision_transition parent_transition
+                    ON parent_transition.revision_id = child.parent_revision_id
+                 WHERE NOT EXISTS(
+                    SELECT 1
+                      FROM content_revision_transition child_transition
+                     WHERE child_transition.revision_id = child.id
+                       AND child_transition.entity_kind = parent_transition.entity_kind
+                       AND child_transition.source_key = parent_transition.source_key
+                       AND child_transition.transition_kind = parent_transition.transition_kind
+                       AND child_transition.reason = parent_transition.reason
+                       AND child_transition.created_at = parent_transition.created_at
+                       AND (
+                            child_transition.target_key = parent_transition.target_key
+                            OR (child_transition.target_key IS NULL
+                                AND parent_transition.target_key IS NULL)
+                       )
+                 )
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("校验 v24 内容 transition 关系失败：{error}"))?;
+    if invalid_transitions {
+        return Err("v24 内容 transition 包含孤立、未继承、重复或越界关系".to_string());
+    }
+
+    let transition_cycle = connection
+        .query_row(
+            r#"
+            WITH RECURSIVE edges AS (
+                SELECT revision_id, entity_kind, source_key, target_key
+                  FROM content_revision_transition
+                 WHERE target_key IS NOT NULL
+            ),
+            walk(revision_id, entity_kind, start_key, current_key, visited, cycle) AS (
+                SELECT revision_id, entity_kind, source_key, target_key,
+                       json_array(source_key), 0
+                  FROM edges
+                UNION ALL
+                SELECT walk.revision_id, walk.entity_kind, walk.start_key,
+                       edge.target_key,
+                       json_insert(walk.visited, '$[#]', edge.target_key),
+                       CASE WHEN EXISTS(
+                           SELECT 1
+                             FROM json_each(walk.visited) visited
+                            WHERE visited.value = edge.target_key
+                       ) THEN 1 ELSE 0 END
+                  FROM walk
+                  JOIN edges edge
+                    ON edge.revision_id = walk.revision_id
+                   AND edge.entity_kind = walk.entity_kind
+                   AND edge.source_key = walk.current_key
+                 WHERE walk.cycle = 0
+            )
+            SELECT EXISTS(SELECT 1 FROM walk WHERE cycle = 1)
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("校验 v24 内容 transition 环路失败：{error}"))?;
+    if transition_cycle {
+        return Err("v24 内容 transition 存在环路".to_string());
+    }
+
+    let expected_triggers = [
+        (
+            "content_revision_transition_no_update",
+            "content_revision_transition",
+        ),
+        (
+            "content_revision_transition_no_delete",
+            "content_revision_transition",
+        ),
+        (
+            "content_revision_transition_no_reinsert",
+            "content_revision_transition",
+        ),
+        (
+            "content_revision_transition_scope_guard",
+            "content_revision_transition",
+        ),
+    ];
+    for (name, table) in expected_triggers {
+        let (actual_table, sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v24 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v24，但缺少触发器 {name}"))?;
+        if actual_table != table || !sql.to_ascii_uppercase().contains("RAISE(ABORT") {
+            return Err(format!("v24 触发器 {name} 契约不匹配"));
+        }
+    }
+    let scope_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'content_revision_transition_scope_guard'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| format!("读取 v24 transition 作用域触发器失败：{error}"))?
+        .to_ascii_uppercase();
+    for marker in [
+        "CONTENT_REVISION_MEMBER",
+        "PARENT_REVISION_ID",
+        "RAISE(ABORT",
+    ] {
+        if !scope_sql.contains(marker) {
+            return Err(format!("v24 transition 作用域触发器缺少约束：{marker}"));
+        }
+    }
+
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v24 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v24 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v24 全库触发器失败：{error}"))?;
+    for (name, table, sql) in triggers {
+        let declared = expected_triggers
+            .iter()
+            .any(|(expected_name, expected_table)| {
+                name == *expected_name && table == *expected_table
+            });
+        let touches_v24 = table == "content_revision_transition"
+            || sql_mentions_identifier(&sql, "content_revision_transition");
+        if touches_v24 && !declared {
+            return Err(format!(
+                "v24 触发器 {name} 未声明却引用 transition 表 {table}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v24_table_sql(
+    connection: &Connection,
+    table: &str,
+    markers: &[&str],
+) -> Result<(), String> {
+    validate_v10_table_sql(connection, table, markers).map_err(|error| error.replace("v10", "v24"))
+}
+
+fn validate_v24_foreign_keys(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, &str, &str, &str)],
+) -> Result<(), String> {
+    validate_v9_foreign_keys(connection, table, expected)
+        .map_err(|error| error.replace("v9", "v24"))
+}
+
+fn validate_v24_custom_index_set(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), String> {
+    validate_v10_custom_index_set(connection, table, expected)
+        .map_err(|error| error.replace("v10", "v24"))
+}
+
+fn validate_v24_index(
+    connection: &Connection,
+    index_name: &str,
+    unique: bool,
+    columns: &[&str],
+    partial: bool,
+) -> Result<(), String> {
+    validate_v7_index(connection, index_name, unique, columns, partial)
+        .map_err(|error| error.replace("v7", "v24"))
 }
 
 fn validate_v23_table_sql(
@@ -29401,6 +29848,117 @@ mod tests {
                 .is_none()
         );
         assert!(store.preview_content_draft("preview-draft", 0).is_err());
+    }
+
+    #[test]
+    fn v24_content_transition_snapshot_is_immutable_and_filters_replaced_members() {
+        let (directory, store) = test_store();
+        let package = content_preview_package("transition-target");
+        store
+            .stage_content_package(&package)
+            .expect("应写入 transition 测试草稿");
+        assert!(
+            store
+                .validate_content_draft("transition-target", 1)
+                .expect("应校验 transition 测试草稿")
+                .errors
+                .is_empty()
+        );
+        let revision = store
+            .publish_content_draft("transition-target", 1)
+            .expect("应发布 transition 测试 revision")
+            .revision;
+
+        let connection = store.open().expect("应打开 transition 测试数据库");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migration WHERE version = 24",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("应读取 v24 迁移记录"),
+            1
+        );
+        connection
+            .execute(
+                r#"
+                INSERT INTO content_revision_transition(
+                    revision_id, entity_kind, source_key, target_key,
+                    transition_kind, reason, created_at
+                ) VALUES(?1, 'skill', 'entangle', 'preview-skill', 'replaced', '测试替换', 1)
+                "#,
+                [revision.id],
+            )
+            .expect("应写入合法 transition");
+        assert!(
+            !active_content_member_exists(&connection, "skill", "entangle")
+                .expect("应过滤被替代的 active 成员")
+        );
+        assert!(
+            active_content_member_exists(&connection, "skill", "preview-skill")
+                .expect("target 应保持 active")
+        );
+        assert!(connection
+            .execute(
+                "UPDATE content_revision_transition SET reason = '修改' WHERE revision_id = ?1 AND entity_kind = 'skill' AND source_key = 'entangle'",
+                [revision.id],
+            )
+            .is_err());
+        assert!(connection
+            .execute(
+                "DELETE FROM content_revision_transition WHERE revision_id = ?1 AND entity_kind = 'skill' AND source_key = 'entangle'",
+                [revision.id],
+            )
+            .is_err());
+        drop(connection);
+
+        let inherited_package = content_effect_package(
+            "transition-inherited",
+            "transition-inherited-effect",
+            "entangle",
+        );
+        store
+            .stage_content_package(&inherited_package)
+            .expect("应写入 transition 继承测试草稿");
+        assert!(
+            store
+                .validate_content_draft("transition-inherited", 1)
+                .expect("应校验 transition 继承测试草稿")
+                .errors
+                .is_empty()
+        );
+        let inherited_revision = store
+            .publish_content_draft("transition-inherited", 1)
+            .expect("应发布并继承 transition")
+            .revision;
+        let inherited = store.open().expect("应打开继承后的 transition 数据库");
+        assert_eq!(
+            inherited
+                .query_row(
+                    "SELECT COUNT(*) FROM content_revision_transition WHERE revision_id = ?1",
+                    [inherited_revision.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("应读取继承的 transition"),
+            1
+        );
+        assert!(
+            !active_content_member_exists(&inherited, "skill", "entangle")
+                .expect("继承后的 source 仍应过滤")
+        );
+        drop(inherited);
+
+        Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("重启后 transition schema 应保持有效");
+        let broken = store.open().expect("应打开 transition 损坏测试数据库");
+        broken
+            .execute("DROP TRIGGER content_revision_transition_scope_guard", [])
+            .expect("应移除 transition 作用域触发器以验证 fail-closed");
+        drop(broken);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("缺少 transition 作用域触发器时应拒绝启动");
+        assert!(error.contains("v24") && error.contains("scope_guard"));
     }
 
     #[test]
