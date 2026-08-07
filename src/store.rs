@@ -3088,6 +3088,465 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_V22: &str = r#"
+-- v22 keeps the v21 tables as a compatibility adapter. New content and new
+-- battle releases use the typed, append-only definition/snapshot tables below.
+CREATE TABLE wuhun_stat_template (
+    wuhun_id INTEGER PRIMARY KEY REFERENCES wuhun(id) ON DELETE RESTRICT,
+    attack_percent INTEGER NOT NULL CHECK(attack_percent BETWEEN 1 AND 500),
+    defense_percent INTEGER NOT NULL CHECK(defense_percent BETWEEN 1 AND 500),
+    strength_percent INTEGER NOT NULL CHECK(strength_percent BETWEEN 1 AND 500),
+    agility_percent INTEGER NOT NULL CHECK(agility_percent BETWEEN 1 AND 500),
+    spirit_percent INTEGER NOT NULL CHECK(spirit_percent BETWEEN 1 AND 500),
+    endurance_percent INTEGER NOT NULL CHECK(endurance_percent BETWEEN 1 AND 500),
+    perception_percent INTEGER NOT NULL CHECK(perception_percent BETWEEN 1 AND 500),
+    luck_percent INTEGER NOT NULL CHECK(luck_percent BETWEEN 1 AND 500),
+    parameters_json TEXT NOT NULL CHECK(
+        json_valid(parameters_json) = 1 AND json_type(parameters_json) = 'object'
+    ),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= created_at)
+) STRICT;
+
+INSERT INTO wuhun_stat_template(
+    wuhun_id, attack_percent, defense_percent,
+    strength_percent, agility_percent, spirit_percent, endurance_percent,
+    perception_percent, luck_percent, parameters_json, created_at, updated_at
+)
+SELECT id,
+       CASE category
+           WHEN '强攻系' THEN 120
+           WHEN '控制系' THEN 90
+           WHEN '敏攻系' THEN 100
+           WHEN '辅助系' THEN 70
+           WHEN '防御系' THEN 80
+           WHEN '食物系' THEN 60
+           ELSE 100
+       END,
+       CASE category
+           WHEN '强攻系' THEN 80
+           WHEN '控制系' THEN 100
+           WHEN '敏攻系' THEN 90
+           WHEN '辅助系' THEN 110
+           WHEN '防御系' THEN 130
+           WHEN '食物系' THEN 100
+           ELSE 100
+       END,
+       100, 100, 100, 100, 100, 100, '{"source":"category-v1"}', 0, 0
+  FROM wuhun
+ WHERE NOT EXISTS(
+       SELECT 1 FROM wuhun_stat_template template
+        WHERE template.wuhun_id = wuhun.id
+ );
+
+CREATE INDEX wuhun_stat_template_page
+    ON wuhun_stat_template(attack_percent, defense_percent, wuhun_id);
+
+CREATE TRIGGER wuhun_stat_template_no_update
+BEFORE UPDATE ON wuhun_stat_template
+BEGIN
+    SELECT RAISE(ABORT, 'wuhun stat template is immutable');
+END;
+CREATE TRIGGER wuhun_stat_template_no_delete
+BEFORE DELETE ON wuhun_stat_template
+BEGIN
+    SELECT RAISE(ABORT, 'wuhun stat template is immutable');
+END;
+CREATE TRIGGER wuhun_stat_template_no_reinsert
+BEFORE INSERT ON wuhun_stat_template
+WHEN EXISTS(SELECT 1 FROM wuhun_stat_template WHERE wuhun_id = NEW.wuhun_id)
+BEGIN
+    SELECT RAISE(ABORT, 'wuhun stat template is append-only');
+END;
+
+CREATE TRIGGER wuhun_stat_template_scope_guard
+BEFORE INSERT ON wuhun_stat_template
+WHEN NOT EXISTS(SELECT 1 FROM wuhun WHERE id = NEW.wuhun_id)
+BEGIN
+    SELECT RAISE(ABORT, 'wuhun stat template scope mismatch');
+END;
+
+-- The v15 trigger remains the compatibility seam, but its values now come
+-- from the immutable template instead of a Rust/category match.
+DROP TRIGGER battle_wuhun_modifier_scope_guard;
+CREATE TRIGGER battle_wuhun_modifier_scope_guard
+BEFORE INSERT ON battle_wuhun_modifier
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM battle b
+      JOIN player_wuhun_state s ON s.player_id = b.player_id AND s.slot = 1
+      JOIN wuhun w ON w.id = s.wuhun_id
+      JOIN wuhun_stat_template template ON template.wuhun_id = w.id
+     WHERE b.id = NEW.battle_id
+       AND b.player_id = NEW.player_id
+       AND b.status = 'active'
+       AND b.action_count = 0
+       AND s.enabled = 1
+       AND s.stability > 0
+       AND NEW.wuhun_id = s.wuhun_id
+       AND NEW.enabled_at_start = 1
+       AND NEW.attack_percent = CASE
+           WHEN json_extract(template.parameters_json, '$.source') = 'category-v1' THEN CASE w.category
+               WHEN '强攻系' THEN 120
+               WHEN '控制系' THEN 90
+               WHEN '敏攻系' THEN 100
+               WHEN '辅助系' THEN 70
+               WHEN '防御系' THEN 80
+               WHEN '食物系' THEN 60
+               ELSE 100
+           END
+           ELSE template.attack_percent
+       END
+       AND NEW.defense_percent = CASE
+           WHEN json_extract(template.parameters_json, '$.source') = 'category-v1' THEN CASE w.category
+               WHEN '强攻系' THEN 80
+               WHEN '控制系' THEN 100
+               WHEN '敏攻系' THEN 90
+               WHEN '辅助系' THEN 110
+               WHEN '防御系' THEN 130
+               WHEN '食物系' THEN 100
+               ELSE 100
+           END
+           ELSE template.defense_percent
+       END
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle wuhun modifier scope mismatch');
+END;
+
+CREATE TABLE effect_definition (
+    effect_key TEXT PRIMARY KEY CHECK(
+        length(effect_key) BETWEEN 1 AND 96
+        AND effect_key = trim(effect_key)
+        AND effect_key GLOB '[a-z0-9][a-z0-9._-]*'
+        AND effect_key NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    skill_key TEXT NOT NULL REFERENCES skill(skill_key) ON DELETE RESTRICT,
+    trigger_kind TEXT NOT NULL CHECK(
+        trigger_kind IN ('on_release', 'on_turn_start', 'on_turn_end', 'on_hit', 'on_being_hit')
+    ),
+    target_kind TEXT NOT NULL CHECK(
+        target_kind IN ('self', 'enemy', 'player', 'beast', 'all')
+    ),
+    operation TEXT NOT NULL CHECK(
+        length(operation) BETWEEN 1 AND 64
+        AND operation = trim(operation)
+        AND operation GLOB '[a-z][a-z0-9_]*'
+        AND operation NOT GLOB '*[^a-z0-9_]*'
+    ),
+    attribute_key TEXT NOT NULL CHECK(
+        length(attribute_key) BETWEEN 1 AND 96
+        AND attribute_key = trim(attribute_key)
+        AND attribute_key GLOB '[a-z][a-z0-9_]*'
+        AND attribute_key NOT GLOB '*[^a-z0-9_]*'
+    ),
+    value_mode TEXT NOT NULL CHECK(
+        value_mode IN ('absolute', 'percent_delta', 'percent_remaining')
+    ),
+    value INTEGER NOT NULL CHECK(value BETWEEN -1000000 AND 1000000),
+    duration_rounds INTEGER NOT NULL CHECK(duration_rounds BETWEEN 1 AND 100),
+    chance_percent INTEGER NOT NULL CHECK(chance_percent BETWEEN 0 AND 100),
+    stack_policy TEXT NOT NULL CHECK(
+        stack_policy IN ('strongest', 'add', 'refresh', 'replace')
+    ),
+    parameters_json TEXT NOT NULL CHECK(
+        json_valid(parameters_json) = 1 AND json_type(parameters_json) = 'object'
+    ),
+    description TEXT NOT NULL CHECK(length(description) BETWEEN 1 AND 2000),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+    UNIQUE(skill_key, effect_key)
+) STRICT;
+
+INSERT INTO effect_definition(
+    effect_key, skill_key, trigger_kind, target_kind, operation,
+    attribute_key, value_mode, value, duration_rounds, chance_percent,
+    stack_policy, parameters_json, description, enabled, created_at, updated_at
+)
+SELECT old.effect_key, old.skill_key, 'on_release', old.target_kind,
+       'modify_stat', 'beast_attack', 'percent_delta', -old.magnitude_percent,
+       old.duration_rounds, 100, 'strongest', '{}', old.description,
+       old.enabled, old.created_at, old.updated_at
+  FROM skill_effect old
+ WHERE NOT EXISTS(
+       SELECT 1 FROM effect_definition current
+        WHERE current.effect_key = old.effect_key
+ );
+
+CREATE INDEX effect_definition_skill_page
+    ON effect_definition(skill_key, enabled, effect_key);
+
+CREATE TRIGGER effect_definition_no_update
+BEFORE UPDATE ON effect_definition
+BEGIN
+    SELECT RAISE(ABORT, 'effect definition catalog is immutable');
+END;
+CREATE TRIGGER effect_definition_no_delete
+BEFORE DELETE ON effect_definition
+BEGIN
+    SELECT RAISE(ABORT, 'effect definition catalog is immutable');
+END;
+CREATE TRIGGER effect_definition_no_reinsert
+BEFORE INSERT ON effect_definition
+WHEN EXISTS(
+    SELECT 1 FROM effect_definition
+     WHERE effect_key = NEW.effect_key
+        OR (skill_key = NEW.skill_key AND effect_key = NEW.effect_key)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'effect definition is append-only');
+END;
+CREATE TRIGGER effect_definition_scope_guard
+BEFORE INSERT ON effect_definition
+WHEN NOT EXISTS(SELECT 1 FROM skill WHERE skill_key = NEW.skill_key)
+BEGIN
+    SELECT RAISE(ABORT, 'effect definition scope mismatch');
+END;
+
+CREATE TABLE battle_effect_snapshot (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    battle_id INTEGER NOT NULL REFERENCES battle(id) ON DELETE RESTRICT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    battle_skill_event_id INTEGER NOT NULL REFERENCES battle_skill_event(id) ON DELETE RESTRICT,
+    effect_key TEXT NOT NULL REFERENCES effect_definition(effect_key) ON DELETE RESTRICT,
+    skill_key TEXT NOT NULL REFERENCES skill(skill_key) ON DELETE RESTRICT,
+    trigger_kind TEXT NOT NULL,
+    target_kind TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    attribute_key TEXT NOT NULL,
+    value_mode TEXT NOT NULL,
+    value INTEGER NOT NULL,
+    duration_rounds INTEGER NOT NULL CHECK(duration_rounds BETWEEN 1 AND 100),
+    chance_percent INTEGER NOT NULL CHECK(chance_percent BETWEEN 0 AND 100),
+    stack_policy TEXT NOT NULL,
+    parameters_json TEXT NOT NULL CHECK(
+        json_valid(parameters_json) = 1 AND json_type(parameters_json) = 'object'
+    ),
+    started_sequence INTEGER NOT NULL CHECK(started_sequence > 0),
+    expires_after_sequence INTEGER NOT NULL CHECK(expires_after_sequence >= started_sequence),
+    rule_version TEXT NOT NULL CHECK(rule_version IN ('legacy', 'effect-v2')),
+    source_message_id TEXT NOT NULL CHECK(
+        length(source_message_id) <= 256
+        AND instr(source_message_id, char(0)) = 0
+        AND source_message_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    description TEXT NOT NULL CHECK(length(description) BETWEEN 1 AND 2000),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    UNIQUE(battle_skill_event_id, effect_key),
+    CHECK(expires_after_sequence = started_sequence + duration_rounds - 1)
+) STRICT;
+
+CREATE INDEX battle_effect_snapshot_battle_page
+    ON battle_effect_snapshot(battle_id, expires_after_sequence, id);
+CREATE INDEX battle_effect_snapshot_player_page
+    ON battle_effect_snapshot(player_id, id);
+
+CREATE TRIGGER battle_effect_snapshot_no_update
+BEFORE UPDATE ON battle_effect_snapshot
+BEGIN
+    SELECT RAISE(ABORT, 'battle effect snapshot is immutable');
+END;
+CREATE TRIGGER battle_effect_snapshot_no_delete
+BEFORE DELETE ON battle_effect_snapshot
+BEGIN
+    SELECT RAISE(ABORT, 'battle effect snapshot is immutable');
+END;
+CREATE TRIGGER battle_effect_snapshot_no_reinsert
+BEFORE INSERT ON battle_effect_snapshot
+WHEN EXISTS(
+    SELECT 1 FROM battle_effect_snapshot
+     WHERE id = NEW.id
+        OR (battle_skill_event_id = NEW.battle_skill_event_id AND effect_key = NEW.effect_key)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle effect snapshot is append-only');
+END;
+CREATE TRIGGER battle_effect_snapshot_scope_guard
+BEFORE INSERT ON battle_effect_snapshot
+WHEN (
+    NEW.rule_version = 'legacy'
+    AND NOT EXISTS(
+        SELECT 1
+          FROM battle_skill_effect old
+         WHERE old.battle_skill_event_id = NEW.battle_skill_event_id
+           AND old.skill_effect_key = NEW.effect_key
+           AND old.rule_version IN ('legacy', 'effect-v1')
+    )
+ ) OR (
+    NEW.rule_version NOT IN ('legacy', 'effect-v2')
+ ) OR (
+    NEW.rule_version = 'effect-v2'
+    AND NOT EXISTS(
+    SELECT 1
+      FROM battle_skill_event event
+      JOIN effect_definition definition
+        ON definition.effect_key = NEW.effect_key
+       AND definition.skill_key = event.skill_key
+     WHERE event.id = NEW.battle_skill_event_id
+       AND event.battle_id = NEW.battle_id
+       AND event.player_id = NEW.player_id
+       AND event.skill_key = NEW.skill_key
+       AND event.sequence = NEW.started_sequence
+       AND event.source_message_id = NEW.source_message_id
+       AND event.created_at = NEW.created_at
+       AND definition.enabled = 1
+       AND definition.created_at <= event.created_at
+       AND definition.trigger_kind = NEW.trigger_kind
+       AND definition.target_kind = NEW.target_kind
+       AND definition.operation = NEW.operation
+       AND definition.attribute_key = NEW.attribute_key
+       AND definition.value_mode = NEW.value_mode
+       AND definition.value = NEW.value
+       AND definition.duration_rounds = NEW.duration_rounds
+       AND definition.chance_percent = NEW.chance_percent
+       AND definition.stack_policy = NEW.stack_policy
+       AND definition.parameters_json = NEW.parameters_json
+       AND definition.description = NEW.description
+       AND NEW.expires_after_sequence = NEW.started_sequence + NEW.duration_rounds - 1
+    )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'battle effect snapshot scope or formula mismatch');
+END;
+
+CREATE TRIGGER battle_skill_event_effect_v2_snapshot
+AFTER INSERT ON battle_skill_event
+BEGIN
+    INSERT INTO battle_effect_snapshot(
+        battle_id, player_id, battle_skill_event_id, effect_key, skill_key,
+        trigger_kind, target_kind, operation, attribute_key, value_mode, value,
+        duration_rounds, chance_percent, stack_policy, parameters_json,
+        started_sequence, expires_after_sequence, rule_version,
+        source_message_id, description, created_at
+    )
+    SELECT NEW.battle_id, NEW.player_id, NEW.id, definition.effect_key, NEW.skill_key,
+           definition.trigger_kind, definition.target_kind, definition.operation,
+           definition.attribute_key, definition.value_mode, definition.value,
+           definition.duration_rounds, definition.chance_percent, definition.stack_policy,
+           definition.parameters_json, NEW.sequence,
+           NEW.sequence + definition.duration_rounds - 1, 'effect-v2',
+           NEW.source_message_id, definition.description, NEW.created_at
+      FROM effect_definition definition
+     WHERE definition.skill_key = NEW.skill_key
+       AND definition.enabled = 1
+       AND definition.trigger_kind = 'on_release'
+       AND definition.created_at <= NEW.created_at;
+    SELECT CASE WHEN changes() <> (
+        SELECT COUNT(*) FROM effect_definition
+         WHERE skill_key = NEW.skill_key
+           AND enabled = 1
+           AND trigger_kind = 'on_release'
+           AND created_at <= NEW.created_at
+    ) THEN RAISE(ABORT, 'battle effect snapshot is incomplete') END;
+END;
+
+INSERT INTO battle_effect_snapshot(
+    battle_id, player_id, battle_skill_event_id, effect_key, skill_key,
+    trigger_kind, target_kind, operation, attribute_key, value_mode, value,
+    duration_rounds, chance_percent, stack_policy, parameters_json,
+    started_sequence, expires_after_sequence, rule_version,
+    source_message_id, description, created_at
+)
+SELECT old.battle_id, old.player_id, old.battle_skill_event_id, old.skill_effect_key,
+       use_event.skill_key, definition.trigger_kind, definition.target_kind,
+       definition.operation, definition.attribute_key, definition.value_mode,
+       definition.value, definition.duration_rounds, definition.chance_percent,
+       definition.stack_policy, definition.parameters_json, old.started_sequence,
+       old.started_sequence + definition.duration_rounds - 1,
+       CASE WHEN old.rule_version = 'effect-v1'
+                  AND NOT EXISTS(
+                      SELECT 1 FROM battle_skill_effect_expiration old_expiration
+                       WHERE old_expiration.battle_skill_effect_id = old.id
+                  )
+            THEN 'effect-v2' ELSE 'legacy' END,
+       old.source_message_id, definition.description, old.created_at
+  FROM battle_skill_effect old
+  JOIN battle_skill_event use_event ON use_event.id = old.battle_skill_event_id
+  JOIN effect_definition definition ON definition.effect_key = old.skill_effect_key
+ WHERE NOT EXISTS(
+       SELECT 1 FROM battle_effect_snapshot current
+        WHERE current.battle_skill_event_id = old.battle_skill_event_id
+          AND current.effect_key = old.skill_effect_key
+ );
+
+CREATE TABLE battle_effect_expiration (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    battle_effect_snapshot_id INTEGER NOT NULL UNIQUE REFERENCES battle_effect_snapshot(id) ON DELETE RESTRICT,
+    battle_id INTEGER NOT NULL REFERENCES battle(id) ON DELETE RESTRICT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    battle_event_id INTEGER NOT NULL REFERENCES battle_event(id) ON DELETE RESTRICT,
+    expired_sequence INTEGER NOT NULL CHECK(expired_sequence > 0),
+    reason TEXT NOT NULL CHECK(reason IN ('legacy', 'scheduled', 'battle_end')),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0)
+) STRICT;
+
+INSERT INTO battle_effect_expiration(
+    battle_effect_snapshot_id, battle_id, player_id, battle_event_id,
+    expired_sequence, reason, created_at
+)
+SELECT snapshot.id, snapshot.battle_id, snapshot.player_id, old_expiration.battle_event_id,
+       old_expiration.expired_sequence, old_expiration.reason, old_expiration.created_at
+  FROM battle_effect_snapshot snapshot
+  JOIN battle_skill_effect old
+    ON old.battle_skill_event_id = snapshot.battle_skill_event_id
+   AND old.skill_effect_key = snapshot.effect_key
+  JOIN battle_skill_effect_expiration old_expiration
+    ON old_expiration.battle_skill_effect_id = old.id
+ WHERE snapshot.rule_version = 'legacy';
+
+CREATE INDEX battle_effect_expiration_battle_page
+    ON battle_effect_expiration(battle_id, id);
+CREATE INDEX battle_effect_expiration_event_page
+    ON battle_effect_expiration(battle_event_id, id);
+
+CREATE TRIGGER battle_effect_expiration_no_update
+BEFORE UPDATE ON battle_effect_expiration
+BEGIN
+    SELECT RAISE(ABORT, 'battle effect expiration is immutable');
+END;
+CREATE TRIGGER battle_effect_expiration_no_delete
+BEFORE DELETE ON battle_effect_expiration
+BEGIN
+    SELECT RAISE(ABORT, 'battle effect expiration is immutable');
+END;
+CREATE TRIGGER battle_effect_expiration_no_reinsert
+BEFORE INSERT ON battle_effect_expiration
+WHEN EXISTS(
+    SELECT 1 FROM battle_effect_expiration
+     WHERE id = NEW.id OR battle_effect_snapshot_id = NEW.battle_effect_snapshot_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle effect expiration is append-only');
+END;
+CREATE TRIGGER battle_effect_expiration_scope_guard
+BEFORE INSERT ON battle_effect_expiration
+WHEN NEW.reason = 'legacy'
+ OR NOT EXISTS(
+    SELECT 1
+      FROM battle_effect_snapshot snapshot
+      JOIN battle_event event ON event.id = NEW.battle_event_id
+     WHERE snapshot.id = NEW.battle_effect_snapshot_id
+       AND snapshot.rule_version = 'effect-v2'
+       AND snapshot.battle_id = NEW.battle_id
+       AND snapshot.player_id = NEW.player_id
+       AND event.battle_id = NEW.battle_id
+       AND event.player_id = NEW.player_id
+       AND event.sequence = NEW.expired_sequence
+       AND event.created_at = NEW.created_at
+       AND NEW.expired_sequence BETWEEN snapshot.started_sequence AND snapshot.expires_after_sequence
+       AND (
+           (NEW.reason = 'scheduled'
+            AND event.status_after = 'active'
+            AND NEW.expired_sequence = snapshot.expires_after_sequence)
+           OR (NEW.reason = 'battle_end' AND event.status_after <> 'active')
+       )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'battle effect expiration scope mismatch');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -3510,6 +3969,14 @@ pub struct SkillEffectRecord {
     pub magnitude_percent: i64,
     pub duration_rounds: i64,
     pub description: String,
+    pub trigger_kind: String,
+    pub operation: String,
+    pub attribute_key: String,
+    pub value_mode: String,
+    pub value: i64,
+    pub chance_percent: i64,
+    pub stack_policy: String,
+    pub parameters_json: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3527,6 +3994,14 @@ pub struct BattleSkillEffectRecord {
     pub expires_after_sequence: i64,
     pub rule_version: String,
     pub description: String,
+    pub trigger_kind: String,
+    pub operation: String,
+    pub attribute_key: String,
+    pub value_mode: String,
+    pub value: i64,
+    pub chance_percent: i64,
+    pub stack_policy: String,
+    pub parameters_json: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4203,7 +4678,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
                     format!(
-                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21 失败：{error}"
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22 失败：{error}"
                     )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
@@ -4530,10 +5005,25 @@ impl Store {
                 validate_v21_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 22)? {
+                transaction
+                    .execute_batch(MIGRATION_V22)
+                    .map_err(|error| format!("执行数据库迁移 v22 失败：{error}"))?;
+                validate_v22_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(22, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v22 失败：{error}"))?;
+            } else {
+                validate_v22_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22 失败：{error}"
                 )
             })?;
             Ok(())
@@ -4562,6 +5052,7 @@ impl Store {
                 validate_v19_schema(connection)?;
                 validate_v20_schema(connection)?;
                 validate_v21_schema(connection)?;
+                validate_v22_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -6888,7 +7379,8 @@ impl Store {
             )
             .map_err(|error| format!("创建战斗快照失败：{error}"))?;
         let battle_id = transaction.last_insert_rowid();
-        let wuhun_modifier = wuhun_combat_modifier(&wuhun_state.category);
+        let wuhun_modifier =
+            load_wuhun_combat_modifier(&transaction, wuhun_id, &wuhun_state.category)?;
         insert_battle_wuhun_modifier(
             &transaction,
             battle_id,
@@ -8152,23 +8644,7 @@ impl Store {
         if already_awakened {
             return Err("你的第一武魂已经觉醒".to_string());
         }
-        let wuhun = transaction
-            .query_row(
-                "SELECT id, name, category, form, description FROM wuhun ORDER BY RANDOM() LIMIT 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        AwakenedWuhun {
-                            name: row.get(1)?,
-                            category: row.get(2)?,
-                            form: row.get(3)?,
-                            description: row.get(4)?,
-                        },
-                    ))
-                },
-            )
-            .map_err(|error| format!("选择武魂失败：{error}"))?;
+        let wuhun = draw_weighted_wuhun(&transaction)?;
         let timestamp = now_timestamp()?;
         transaction
             .execute(
@@ -10114,6 +10590,66 @@ fn load_wuhun_state_by_player(
     Ok(load_wuhun_state_with_id_by_player(connection, player_id)?.map(|(_, state)| state))
 }
 
+fn draw_weighted_wuhun(connection: &Connection) -> Result<(i64, AwakenedWuhun), String> {
+    let total_weight = connection
+        .query_row("SELECT SUM(weight) FROM wuhun", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })
+        .map_err(|error| format!("读取武魂权重总和失败：{error}"))?
+        .ok_or_else(|| "武魂目录为空，无法觉醒".to_string())?;
+    if total_weight <= 0 {
+        return Err("武魂权重总和必须大于 0".to_string());
+    }
+    let ticket = connection
+        .query_row(
+            "SELECT (random() & 9223372036854775807) % ?1",
+            [total_weight],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("生成武魂权重签失败：{error}"))?;
+    load_wuhun_at_weight_ticket(connection, ticket, total_weight)?
+        .ok_or_else(|| "武魂权重目录不连续，无法完成觉醒".to_string())
+}
+
+fn load_wuhun_at_weight_ticket(
+    connection: &Connection,
+    ticket: i64,
+    total_weight: i64,
+) -> Result<Option<(i64, AwakenedWuhun)>, String> {
+    if ticket < 0 || ticket >= total_weight {
+        return Err("武魂权重签超出范围".to_string());
+    }
+    connection
+        .query_row(
+            r#"
+            WITH weighted AS (
+                SELECT id, name, category, form, description,
+                       SUM(weight) OVER (ORDER BY id) AS cumulative_weight
+                  FROM wuhun
+            )
+            SELECT id, name, category, form, description
+              FROM weighted
+             WHERE ?1 < cumulative_weight
+             ORDER BY id
+             LIMIT 1
+            "#,
+            [ticket],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    AwakenedWuhun {
+                        name: row.get(1)?,
+                        category: row.get(2)?,
+                        form: row.get(3)?,
+                        description: row.get(4)?,
+                    },
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("按权重选择武魂失败：{error}"))
+}
+
 fn seed_player_skills(
     connection: &Connection,
     player_id: i64,
@@ -10208,13 +10744,26 @@ fn player_skill_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pla
 }
 
 fn skill_effect_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SkillEffectRecord> {
+    let target_kind: String = row.get(1)?;
+    let operation: String = row.get(2)?;
+    let attribute_key: String = row.get(3)?;
+    let value_mode: String = row.get(4)?;
+    let value: i64 = row.get(5)?;
     Ok(SkillEffectRecord {
         effect_key: row.get(0)?,
-        effect_kind: row.get(1)?,
-        target_kind: row.get(2)?,
-        magnitude_percent: row.get(3)?,
-        duration_rounds: row.get(4)?,
-        description: row.get(5)?,
+        effect_kind: compatibility_effect_kind(&operation, &attribute_key, &value_mode, value),
+        target_kind,
+        magnitude_percent: compatibility_magnitude(&operation, &attribute_key, &value_mode, value),
+        duration_rounds: row.get(6)?,
+        description: row.get(7)?,
+        trigger_kind: row.get(8)?,
+        operation,
+        attribute_key,
+        value_mode,
+        value,
+        chance_percent: row.get(9)?,
+        stack_policy: row.get(10)?,
+        parameters_json: row.get(11)?,
     })
 }
 
@@ -10225,9 +10774,10 @@ fn load_skill_effects(
     connection
         .prepare(
             r#"
-            SELECT effect_key, effect_kind, target_kind, magnitude_percent,
-                   duration_rounds, description
-              FROM skill_effect
+            SELECT effect_key, target_kind, operation, attribute_key, value_mode, value,
+                   duration_rounds, description, trigger_kind, chance_percent,
+                   stack_policy, parameters_json
+              FROM effect_definition
              WHERE skill_key = ?1 AND enabled = 1
              ORDER BY effect_key
             "#,
@@ -10237,6 +10787,39 @@ fn load_skill_effects(
         .map_err(|error| format!("查询魂技效果失败：{error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("解析魂技效果失败：{error}"))
+}
+
+fn compatibility_effect_kind(
+    operation: &str,
+    attribute_key: &str,
+    value_mode: &str,
+    value: i64,
+) -> String {
+    if operation == "modify_stat"
+        && attribute_key == "beast_attack"
+        && value_mode == "percent_delta"
+        && value < 0
+    {
+        "beast_attack_reduction".to_string()
+    } else {
+        operation.to_string()
+    }
+}
+
+fn compatibility_magnitude(
+    operation: &str,
+    attribute_key: &str,
+    value_mode: &str,
+    value: i64,
+) -> i64 {
+    if operation == "modify_stat"
+        && attribute_key == "beast_attack"
+        && value_mode == "percent_delta"
+    {
+        value.unsigned_abs() as i64
+    } else {
+        value
+    }
 }
 
 fn player_skill_select_sql() -> &'static str {
@@ -10545,6 +11128,7 @@ fn load_wuhun_state_event_by_battle_event(
         .map_err(|error| format!("读取战斗武魂状态事件失败：{error}"))
 }
 
+#[allow(dead_code)]
 fn wuhun_combat_modifier(category: &str) -> WuhunCombatModifier {
     match category {
         "强攻系" => WuhunCombatModifier {
@@ -10578,6 +11162,44 @@ fn wuhun_combat_modifier(category: &str) -> WuhunCombatModifier {
     }
 }
 
+fn load_wuhun_combat_modifier(
+    connection: &Connection,
+    wuhun_id: i64,
+    category: &str,
+) -> Result<WuhunCombatModifier, String> {
+    let template = connection
+        .query_row(
+            "SELECT attack_percent, defense_percent, parameters_json FROM wuhun_stat_template WHERE wuhun_id = ?1",
+            [wuhun_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取武魂属性模板失败：{error}"))?
+        .ok_or_else(|| format!("武魂 {category} 缺少版本化属性模板"))?;
+    let source = serde_json::from_str::<serde_json::Value>(&template.2)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("source")
+                .and_then(|source| source.as_str())
+                .map(str::to_string)
+        });
+    if source.as_deref() == Some("category-v1") {
+        Ok(wuhun_combat_modifier(category))
+    } else {
+        Ok(WuhunCombatModifier {
+            attack_percent: template.0,
+            defense_percent: template.1,
+        })
+    }
+}
+
 fn active_wuhun_modifier(enabled: bool, modifier: WuhunCombatModifier) -> WuhunCombatModifier {
     if enabled {
         modifier
@@ -10607,30 +11229,104 @@ fn beast_attack_after_skill_effects(
     active_effects: &[BattleSkillEffectRecord],
     pending_effects: &[SkillEffectRecord],
 ) -> Result<i64, String> {
-    let active_reduction = active_effects
-        .iter()
-        .filter(|effect| {
-            effect.effect_kind == "beast_attack_reduction" && effect.target_kind == "enemy"
-        })
-        .map(|effect| effect.magnitude_percent)
-        .max()
-        .unwrap_or(0);
-    let pending_reduction = pending_effects
-        .iter()
-        .filter(|effect| {
-            effect.effect_kind == "beast_attack_reduction" && effect.target_kind == "enemy"
-        })
-        .map(|effect| effect.magnitude_percent)
-        .max()
-        .unwrap_or(0);
-    let strongest_reduction = active_reduction.max(pending_reduction);
-    if strongest_reduction == 0 {
+    let mut strongest = 0_i64;
+    let mut additive = 0_i64;
+    let mut replacement = None;
+    for effect in active_effects {
+        apply_beast_attack_effect(
+            &effect.trigger_kind,
+            &effect.target_kind,
+            &effect.operation,
+            &effect.attribute_key,
+            &effect.value_mode,
+            effect.value,
+            effect.chance_percent,
+            &effect.stack_policy,
+            &effect.parameters_json,
+            &mut strongest,
+            &mut additive,
+            &mut replacement,
+        )?;
+    }
+    for effect in pending_effects {
+        apply_beast_attack_effect(
+            &effect.trigger_kind,
+            &effect.target_kind,
+            &effect.operation,
+            &effect.attribute_key,
+            &effect.value_mode,
+            effect.value,
+            effect.chance_percent,
+            &effect.stack_policy,
+            &effect.parameters_json,
+            &mut strongest,
+            &mut additive,
+            &mut replacement,
+        )?;
+    }
+    let base_reduction = strongest.max(replacement.unwrap_or(0));
+    let reduction = base_reduction
+        .checked_add(additive)
+        .ok_or_else(|| "魂技减攻效果叠加溢出".to_string())?
+        .min(90);
+    if reduction == 0 {
         return Ok(beast_attack);
     }
     let remaining_percent = 100_i64
-        .checked_sub(strongest_reduction)
+        .checked_sub(reduction)
         .ok_or_else(|| "魂技减攻效果超出范围".to_string())?;
     scale_combat_value(beast_attack, remaining_percent, "魂技减攻效果").map(|scaled| scaled.max(1))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_beast_attack_effect(
+    trigger_kind: &str,
+    target_kind: &str,
+    operation: &str,
+    attribute_key: &str,
+    value_mode: &str,
+    value: i64,
+    chance_percent: i64,
+    stack_policy: &str,
+    parameters_json: &str,
+    strongest: &mut i64,
+    additive: &mut i64,
+    replacement: &mut Option<i64>,
+) -> Result<(), String> {
+    let parameters = serde_json::from_str::<serde_json::Value>(parameters_json)
+        .map_err(|error| format!("魂技效果参数不是有效 JSON：{error}"))?;
+    if parameters
+        .as_object()
+        .is_none_or(|object| !object.is_empty())
+    {
+        return Err("当前魂技效果解释器不支持非空 parameters".to_string());
+    }
+    if trigger_kind != "on_release"
+        || !matches!(target_kind, "enemy" | "beast")
+        || operation != "modify_stat"
+        || attribute_key != "beast_attack"
+        || value_mode != "percent_delta"
+        || !(-90..=-1).contains(&value)
+        || chance_percent != 100
+    {
+        return Err(format!(
+            "当前魂技效果解释器不支持 {trigger_kind}/{target_kind}/{operation}/{attribute_key}/{value_mode}/{value}/{chance_percent}"
+        ));
+    }
+    let reduction = value
+        .checked_neg()
+        .ok_or_else(|| "魂技效果数值超出范围".to_string())?;
+    match stack_policy {
+        "strongest" | "refresh" => *strongest = (*strongest).max(reduction),
+        "add" => {
+            *additive = additive
+                .checked_add(reduction)
+                .ok_or_else(|| "魂技效果叠加数值溢出".to_string())?;
+        }
+        "replace" => *replacement = Some(reduction),
+        _ => return Err(format!("当前魂技效果解释器不支持叠加策略 {stack_policy}")),
+    }
+    Ok(())
 }
 
 pub fn skill_damage_percent(level: i64) -> Result<i64, String> {
@@ -11191,32 +11887,56 @@ fn load_battle_events(
 fn battle_skill_effect_record_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<BattleSkillEffectRecord> {
+    let operation: String = row.get(5)?;
+    let target_kind: String = row.get(6)?;
+    let attribute_key: String = row.get(7)?;
+    let value_mode: String = row.get(8)?;
+    let value: i64 = row.get(9)?;
     Ok(BattleSkillEffectRecord {
         id: row.get(0)?,
         battle_skill_event_id: row.get(1)?,
         effect_key: row.get(2)?,
         skill_key: row.get(3)?,
         skill_name: row.get(4)?,
-        effect_kind: row.get(5)?,
-        target_kind: row.get(6)?,
-        magnitude_percent: row.get(7)?,
-        duration_rounds: row.get(8)?,
-        started_sequence: row.get(9)?,
-        expires_after_sequence: row.get(10)?,
-        rule_version: row.get(11)?,
-        description: row.get(12)?,
+        effect_kind: compatibility_effect_kind(&operation, &attribute_key, &value_mode, value),
+        target_kind,
+        magnitude_percent: compatibility_magnitude(&operation, &attribute_key, &value_mode, value),
+        duration_rounds: row.get(10)?,
+        started_sequence: row.get(11)?,
+        expires_after_sequence: row.get(12)?,
+        rule_version: row.get(13)?,
+        description: row.get(14)?,
+        trigger_kind: row.get(15)?,
+        operation,
+        attribute_key,
+        value_mode,
+        value,
+        chance_percent: row.get(16)?,
+        stack_policy: row.get(17)?,
+        parameters_json: row.get(18)?,
     })
 }
 
 const BATTLE_SKILL_EFFECT_SELECT: &str = r#"
-    SELECT effect.id, effect.battle_skill_event_id, effect.skill_effect_key,
-           use_event.skill_key, skill.name, effect.effect_kind, effect.target_kind,
-           effect.magnitude_percent, effect.duration_rounds, effect.started_sequence,
-           effect.expires_after_sequence, effect.rule_version, definition.description
-      FROM battle_skill_effect effect
+    SELECT effect.id, effect.battle_skill_event_id, effect.effect_key,
+           effect.skill_key, skill.name, effect.operation, effect.target_kind,
+           effect.attribute_key, effect.value_mode, effect.value,
+           effect.duration_rounds, effect.started_sequence,
+           effect.expires_after_sequence,
+           CASE WHEN effect.rule_version = 'effect-v2'
+                     AND EXISTS(
+                         SELECT 1 FROM battle_skill_effect compat
+                          WHERE compat.battle_skill_event_id = effect.battle_skill_event_id
+                            AND compat.skill_effect_key = effect.effect_key
+                            AND compat.rule_version = 'effect-v1'
+                     )
+                THEN 'effect-v1' ELSE effect.rule_version END,
+           effect.description,
+           effect.trigger_kind, effect.chance_percent, effect.stack_policy,
+           effect.parameters_json
+      FROM battle_effect_snapshot effect
       JOIN battle_skill_event use_event ON use_event.id = effect.battle_skill_event_id
-      JOIN skill ON skill.skill_key = use_event.skill_key
-      JOIN skill_effect definition ON definition.effect_key = effect.skill_effect_key
+      JOIN skill ON skill.skill_key = effect.skill_key
 "#;
 
 fn load_battle_skill_effects_by_skill_event(
@@ -11225,7 +11945,7 @@ fn load_battle_skill_effects_by_skill_event(
 ) -> Result<Vec<BattleSkillEffectRecord>, String> {
     connection
         .prepare(&format!(
-            "{BATTLE_SKILL_EFFECT_SELECT} WHERE effect.battle_skill_event_id = ?1 AND effect.rule_version = 'effect-v1' ORDER BY effect.id"
+            "{BATTLE_SKILL_EFFECT_SELECT} WHERE effect.battle_skill_event_id = ?1 AND effect.rule_version = 'effect-v2' AND NOT EXISTS (SELECT 1 FROM battle_skill_effect compat WHERE compat.battle_skill_event_id = effect.battle_skill_event_id AND compat.skill_effect_key = effect.effect_key AND compat.rule_version = 'legacy') ORDER BY effect.id"
         ))
         .map_err(|error| format!("准备战斗魂技效果快照查询失败：{error}"))?
         .query_map([battle_skill_event_id], battle_skill_effect_record_from_row)
@@ -11244,12 +11964,18 @@ fn load_active_battle_skill_effects(
             r#"
             {BATTLE_SKILL_EFFECT_SELECT}
              WHERE effect.battle_id = ?1
-               AND effect.rule_version = 'effect-v1'
+               AND effect.rule_version = 'effect-v2'
                AND effect.started_sequence <= ?2
                AND effect.expires_after_sequence >= ?2
                AND NOT EXISTS(
-                   SELECT 1 FROM battle_skill_effect_expiration expiration
-                    WHERE expiration.battle_skill_effect_id = effect.id
+                   SELECT 1 FROM battle_skill_effect compat
+                    WHERE compat.battle_skill_event_id = effect.battle_skill_event_id
+                      AND compat.skill_effect_key = effect.effect_key
+                      AND compat.rule_version = 'legacy'
+               )
+               AND NOT EXISTS(
+                   SELECT 1 FROM battle_effect_expiration expiration
+                    WHERE expiration.battle_effect_snapshot_id = effect.id
                )
              ORDER BY effect.id
             "#
@@ -11272,10 +11998,16 @@ fn load_expired_battle_skill_effects_by_event(
         .prepare(&format!(
             r#"
             {BATTLE_SKILL_EFFECT_SELECT}
-              JOIN battle_skill_effect_expiration expiration
-                ON expiration.battle_skill_effect_id = effect.id
+              JOIN battle_effect_expiration expiration
+                ON expiration.battle_effect_snapshot_id = effect.id
              WHERE expiration.battle_event_id = ?1
                AND expiration.reason <> 'legacy'
+               AND NOT EXISTS(
+                   SELECT 1 FROM battle_skill_effect compat
+                    WHERE compat.battle_skill_event_id = effect.battle_skill_event_id
+                      AND compat.skill_effect_key = effect.effect_key
+                      AND compat.rule_version = 'legacy'
+               )
              ORDER BY expiration.id
             "#
         ))
@@ -11500,6 +12232,40 @@ fn expire_battle_skill_effects(
             ],
         )
         .map_err(|error| format!("保存魂技效果结束事件失败：{error}"))?;
+    connection
+        .execute(
+            r#"
+            INSERT INTO battle_effect_expiration(
+                battle_effect_snapshot_id, battle_id, player_id, battle_event_id,
+                expired_sequence, reason, created_at
+            )
+            SELECT effect.id, effect.battle_id, effect.player_id, ?3, ?4, ?5, ?6
+              FROM battle_effect_snapshot effect
+             WHERE effect.battle_id = ?1
+               AND effect.player_id = ?2
+               AND effect.rule_version = 'effect-v2'
+               AND effect.started_sequence <= ?4
+               AND effect.expires_after_sequence >= ?4
+               AND (
+                   (?5 = 'scheduled' AND effect.expires_after_sequence = ?4)
+                   OR ?5 = 'battle_end'
+               )
+               AND NOT EXISTS(
+                   SELECT 1 FROM battle_effect_expiration previous
+                    WHERE previous.battle_effect_snapshot_id = effect.id
+               )
+             ORDER BY effect.id
+            "#,
+            params![
+                battle_id,
+                player_id,
+                battle_event_id,
+                sequence,
+                reason,
+                created_at
+            ],
+        )
+        .map_err(|error| format!("保存通用魂技效果结束事件失败：{error}"))?;
     Ok(())
 }
 
@@ -16719,6 +17485,13 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
                 table.as_str(),
                 "skill_effect" | "battle_skill_effect" | "battle_skill_effect_expiration"
             )
+            || matches!(
+                table.as_str(),
+                "wuhun_stat_template"
+                    | "effect_definition"
+                    | "battle_effect_snapshot"
+                    | "battle_effect_expiration"
+            )
             || sql_mentions_identifier(&trigger_sql, "skill_loadout_event")
             || sql_mentions_identifier(&trigger_sql, "skill_progress_event")
             || sql_mentions_identifier(&trigger_sql, "battle_skill_modifier")
@@ -16726,6 +17499,14 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
                 "skill_effect",
                 "battle_skill_effect",
                 "battle_skill_effect_expiration",
+            ]
+            .iter()
+            .any(|identifier| sql_mentions_identifier(&trigger_sql, identifier))
+            || [
+                "wuhun_stat_template",
+                "effect_definition",
+                "battle_effect_snapshot",
+                "battle_effect_expiration",
             ]
             .iter()
             .any(|identifier| sql_mentions_identifier(&trigger_sql, identifier))
@@ -18158,7 +18939,8 @@ fn validate_v21_schema(connection: &Connection) -> Result<(), String> {
             .iter()
             .any(|(expected_name, expected_table)| {
                 name == *expected_name && table == *expected_table
-            });
+            })
+            || name == "battle_effect_snapshot_scope_guard";
         let touches_v21 = matches!(
             table.as_str(),
             "skill_effect" | "battle_skill_effect" | "battle_skill_effect_expiration"
@@ -18211,6 +18993,588 @@ fn validate_v21_index(
 ) -> Result<(), String> {
     validate_v7_index(connection, index_name, unique, columns, partial)
         .map_err(|error| error.replace("v7", "v21"))
+}
+
+fn validate_v22_schema(connection: &Connection) -> Result<(), String> {
+    let expected_tables = [
+        (
+            "wuhun_stat_template",
+            vec![
+                TableColumnInfo::new("wuhun_id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("attack_percent", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("defense_percent", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("strength_percent", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("agility_percent", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("spirit_percent", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("endurance_percent", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("perception_percent", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("luck_percent", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("parameters_json", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("updated_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+        (
+            "effect_definition",
+            vec![
+                TableColumnInfo::new("effect_key", "TEXT", true, true, None, 0),
+                TableColumnInfo::new("skill_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("trigger_kind", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("target_kind", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("operation", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("attribute_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("value_mode", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("value", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("duration_rounds", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("chance_percent", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("stack_policy", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("parameters_json", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("description", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("enabled", "INTEGER", true, false, Some("1"), 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("updated_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+        (
+            "battle_effect_snapshot",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("battle_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("battle_skill_event_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("effect_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("skill_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("trigger_kind", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("target_kind", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("operation", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("attribute_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("value_mode", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("value", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("duration_rounds", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("chance_percent", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("stack_policy", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("parameters_json", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("started_sequence", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("expires_after_sequence", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("rule_version", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("source_message_id", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("description", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+        (
+            "battle_effect_expiration",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("battle_effect_snapshot_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("battle_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("battle_event_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("expired_sequence", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("reason", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+    ];
+    for (table, expected) in expected_tables {
+        let actual = table_columns_with_type(connection, table)?;
+        if actual != expected {
+            return Err(format!(
+                "数据库已标记迁移 v22，但表 {table} 字段不匹配：{actual:?}"
+            ));
+        }
+    }
+
+    validate_v22_table_sql(
+        connection,
+        "wuhun_stat_template",
+        &[
+            ") STRICT",
+            "ATTACK_PERCENT BETWEEN 1 AND 500",
+            "JSON_VALID(PARAMETERS_JSON) = 1",
+        ],
+    )?;
+    validate_v22_table_sql(
+        connection,
+        "effect_definition",
+        &[
+            ") STRICT",
+            "TRIGGER_KIND IN ('ON_RELEASE', 'ON_TURN_START', 'ON_TURN_END', 'ON_HIT', 'ON_BEING_HIT')",
+            "VALUE_MODE IN ('ABSOLUTE', 'PERCENT_DELTA', 'PERCENT_REMAINING')",
+            "STACK_POLICY IN ('STRONGEST', 'ADD', 'REFRESH', 'REPLACE')",
+            "JSON_VALID(PARAMETERS_JSON) = 1",
+            "UNIQUE(SKILL_KEY, EFFECT_KEY)",
+        ],
+    )?;
+    validate_v22_table_sql(
+        connection,
+        "battle_effect_snapshot",
+        &[
+            ") STRICT",
+            "RULE_VERSION IN ('LEGACY', 'EFFECT-V2')",
+            "UNIQUE(BATTLE_SKILL_EVENT_ID, EFFECT_KEY)",
+            "EXPIRES_AFTER_SEQUENCE = STARTED_SEQUENCE + DURATION_ROUNDS - 1",
+        ],
+    )?;
+    validate_v22_table_sql(
+        connection,
+        "battle_effect_expiration",
+        &[
+            ") STRICT",
+            "BATTLE_EFFECT_SNAPSHOT_ID INTEGER NOT NULL UNIQUE",
+            "REASON IN ('LEGACY', 'SCHEDULED', 'BATTLE_END')",
+        ],
+    )?;
+
+    validate_v22_foreign_keys(
+        connection,
+        "wuhun_stat_template",
+        &[("wuhun", "wuhun_id", "id", "NO ACTION", "RESTRICT")],
+    )?;
+    validate_v22_foreign_keys(
+        connection,
+        "effect_definition",
+        &[("skill", "skill_key", "skill_key", "NO ACTION", "RESTRICT")],
+    )?;
+    validate_v22_foreign_keys(
+        connection,
+        "battle_effect_snapshot",
+        &[
+            ("battle", "battle_id", "id", "NO ACTION", "RESTRICT"),
+            (
+                "battle_skill_event",
+                "battle_skill_event_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            (
+                "effect_definition",
+                "effect_key",
+                "effect_key",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+            ("skill", "skill_key", "skill_key", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+    validate_v22_foreign_keys(
+        connection,
+        "battle_effect_expiration",
+        &[
+            ("battle", "battle_id", "id", "NO ACTION", "RESTRICT"),
+            (
+                "battle_effect_snapshot",
+                "battle_effect_snapshot_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            (
+                "battle_event",
+                "battle_event_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+        ],
+    )?;
+
+    for (table, expected) in [
+        ("wuhun_stat_template", &["wuhun_stat_template_page"][..]),
+        ("effect_definition", &["effect_definition_skill_page"][..]),
+        (
+            "battle_effect_snapshot",
+            &[
+                "battle_effect_snapshot_battle_page",
+                "battle_effect_snapshot_player_page",
+            ][..],
+        ),
+        (
+            "battle_effect_expiration",
+            &[
+                "battle_effect_expiration_battle_page",
+                "battle_effect_expiration_event_page",
+            ][..],
+        ),
+    ] {
+        validate_v22_custom_index_set(connection, table, expected)?;
+    }
+    for (name, columns) in [
+        (
+            "wuhun_stat_template_page",
+            &["attack_percent", "defense_percent", "wuhun_id"][..],
+        ),
+        (
+            "effect_definition_skill_page",
+            &["skill_key", "enabled", "effect_key"][..],
+        ),
+        (
+            "battle_effect_snapshot_battle_page",
+            &["battle_id", "expires_after_sequence", "id"][..],
+        ),
+        (
+            "battle_effect_snapshot_player_page",
+            &["player_id", "id"][..],
+        ),
+        (
+            "battle_effect_expiration_battle_page",
+            &["battle_id", "id"][..],
+        ),
+        (
+            "battle_effect_expiration_event_page",
+            &["battle_event_id", "id"][..],
+        ),
+    ] {
+        validate_v22_index(connection, name, false, columns, false)?;
+    }
+
+    let invalid_wuhun_templates = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM wuhun w
+                  LEFT JOIN wuhun_stat_template template ON template.wuhun_id = w.id
+                 WHERE template.wuhun_id IS NULL
+            ) OR EXISTS(
+                SELECT 1
+                  FROM wuhun_stat_template template
+                  LEFT JOIN wuhun w ON w.id = template.wuhun_id
+                 WHERE w.id IS NULL
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("校验 v22 武魂属性模板失败：{error}"))?;
+    if invalid_wuhun_templates {
+        return Err("v22 武魂属性模板与武魂目录不完整或不一致".to_string());
+    }
+
+    let invalid_definitions = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM effect_definition
+                 WHERE enabled = 1
+                   AND NOT (
+                       trigger_kind = 'on_release'
+                       AND target_kind IN ('enemy', 'beast')
+                       AND operation = 'modify_stat'
+                       AND attribute_key = 'beast_attack'
+                       AND value_mode = 'percent_delta'
+                       AND value BETWEEN -90 AND -1
+                       AND chance_percent = 100
+                       AND stack_policy IN ('strongest', 'add', 'refresh', 'replace')
+                       AND json(parameters_json) = json('{}')
+                   )
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("校验 v22 效果定义失败：{error}"))?;
+    if invalid_definitions {
+        return Err("v22 启用的效果定义包含当前解释器不支持的操作，已拒绝加载".to_string());
+    }
+
+    let seed_matches = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM effect_definition
+                 WHERE effect_key = 'entangle-slow'
+                   AND skill_key = 'entangle'
+                   AND trigger_kind = 'on_release'
+                   AND target_kind = 'enemy'
+                   AND operation = 'modify_stat'
+                   AND attribute_key = 'beast_attack'
+                   AND value_mode = 'percent_delta'
+                   AND value = -30
+                   AND duration_rounds = 3
+                   AND chance_percent = 100
+                   AND stack_policy = 'strongest'
+                   AND enabled = 1
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("校验 v22 缠绕效果定义失败：{error}"))?;
+    if !seed_matches {
+        return Err("v22 缠绕通用效果定义缺失或被篡改".to_string());
+    }
+
+    let invalid_snapshots = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM battle_effect_snapshot snapshot
+                  LEFT JOIN battle_skill_event event
+                    ON event.id = snapshot.battle_skill_event_id
+                  LEFT JOIN effect_definition definition
+                    ON definition.effect_key = snapshot.effect_key
+                 WHERE event.id IS NULL
+                    OR definition.effect_key IS NULL
+                    OR snapshot.battle_id <> event.battle_id
+                    OR snapshot.player_id <> event.player_id
+                    OR snapshot.skill_key <> event.skill_key
+                    OR snapshot.started_sequence <> event.sequence
+                    OR snapshot.source_message_id <> event.source_message_id
+                    OR snapshot.created_at <> event.created_at
+                    OR snapshot.expires_after_sequence < snapshot.started_sequence
+                    OR snapshot.rule_version NOT IN ('legacy', 'effect-v2')
+                    OR (
+                        snapshot.rule_version = 'effect-v2'
+                        AND (
+                            snapshot.trigger_kind <> definition.trigger_kind
+                            OR snapshot.target_kind <> definition.target_kind
+                            OR snapshot.operation <> definition.operation
+                            OR snapshot.attribute_key <> definition.attribute_key
+                            OR snapshot.value_mode <> definition.value_mode
+                            OR snapshot.value <> definition.value
+                            OR snapshot.duration_rounds <> definition.duration_rounds
+                            OR snapshot.chance_percent <> definition.chance_percent
+                            OR snapshot.stack_policy <> definition.stack_policy
+                            OR snapshot.parameters_json <> definition.parameters_json
+                            OR snapshot.description <> definition.description
+                        )
+                    )
+            ) OR EXISTS(
+                SELECT 1
+                  FROM battle_skill_effect old
+                  LEFT JOIN battle_effect_snapshot snapshot
+                    ON snapshot.battle_skill_event_id = old.battle_skill_event_id
+                   AND snapshot.effect_key = old.skill_effect_key
+                 WHERE old.rule_version = 'effect-v1'
+                   AND NOT EXISTS(
+                       SELECT 1 FROM battle_skill_effect_expiration old_expiration
+                        WHERE old_expiration.battle_skill_effect_id = old.id
+                   )
+                   AND (snapshot.id IS NULL OR snapshot.rule_version <> 'effect-v2')
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("校验 v22 战斗效果快照失败：{error}"))?;
+    if invalid_snapshots {
+        return Err("v22 战斗效果快照缺失、孤立或与冻结定义不一致".to_string());
+    }
+
+    let invalid_expirations = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM battle_effect_expiration expiration
+                  LEFT JOIN battle_effect_snapshot snapshot
+                    ON snapshot.id = expiration.battle_effect_snapshot_id
+                  LEFT JOIN battle_event event ON event.id = expiration.battle_event_id
+                 WHERE snapshot.id IS NULL
+                    OR event.id IS NULL
+                    OR expiration.battle_id <> snapshot.battle_id
+                    OR expiration.player_id <> snapshot.player_id
+                    OR event.battle_id <> snapshot.battle_id
+                    OR event.player_id <> snapshot.player_id
+                    OR event.sequence <> expiration.expired_sequence
+                    OR event.created_at <> expiration.created_at
+                    OR (
+                        snapshot.rule_version = 'effect-v2'
+                        AND NOT (
+                            (expiration.reason = 'scheduled'
+                             AND expiration.expired_sequence = snapshot.expires_after_sequence
+                             AND event.status_after = 'active')
+                            OR (expiration.reason = 'battle_end'
+                                AND expiration.expired_sequence BETWEEN snapshot.started_sequence
+                                    AND snapshot.expires_after_sequence
+                                AND event.status_after <> 'active')
+                        )
+                    )
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("校验 v22 战斗效果过期事件失败：{error}"))?;
+    if invalid_expirations {
+        return Err("v22 战斗效果过期事件缺失、孤立或范围不一致".to_string());
+    }
+
+    let expected_triggers = [
+        ("wuhun_stat_template_no_update", "wuhun_stat_template"),
+        ("wuhun_stat_template_no_delete", "wuhun_stat_template"),
+        ("wuhun_stat_template_no_reinsert", "wuhun_stat_template"),
+        ("wuhun_stat_template_scope_guard", "wuhun_stat_template"),
+        ("effect_definition_no_update", "effect_definition"),
+        ("effect_definition_no_delete", "effect_definition"),
+        ("effect_definition_no_reinsert", "effect_definition"),
+        ("effect_definition_scope_guard", "effect_definition"),
+        ("battle_effect_snapshot_no_update", "battle_effect_snapshot"),
+        ("battle_effect_snapshot_no_delete", "battle_effect_snapshot"),
+        (
+            "battle_effect_snapshot_no_reinsert",
+            "battle_effect_snapshot",
+        ),
+        (
+            "battle_effect_snapshot_scope_guard",
+            "battle_effect_snapshot",
+        ),
+        (
+            "battle_skill_event_effect_v2_snapshot",
+            "battle_skill_event",
+        ),
+        (
+            "battle_effect_expiration_no_update",
+            "battle_effect_expiration",
+        ),
+        (
+            "battle_effect_expiration_no_delete",
+            "battle_effect_expiration",
+        ),
+        (
+            "battle_effect_expiration_no_reinsert",
+            "battle_effect_expiration",
+        ),
+        (
+            "battle_effect_expiration_scope_guard",
+            "battle_effect_expiration",
+        ),
+    ];
+    for (name, table) in expected_triggers {
+        let (actual_table, sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v22 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v22，但缺少触发器 {name}"))?;
+        let normalized = sql.to_ascii_uppercase();
+        if actual_table != table || !normalized.contains("RAISE(ABORT") {
+            return Err(format!("v22 触发器 {name} 契约不匹配"));
+        }
+        if name == "battle_skill_event_effect_v2_snapshot"
+            && (!normalized.contains("INSERT INTO BATTLE_EFFECT_SNAPSHOT")
+                || !normalized.contains("FROM EFFECT_DEFINITION")
+                || !normalized.contains("'EFFECT-V2'")
+                || !normalized.contains("CHANGES()"))
+        {
+            return Err("v22 战斗效果释放快照触发器不完整".to_string());
+        }
+    }
+
+    for table in [
+        "wuhun_stat_template",
+        "effect_definition",
+        "battle_effect_snapshot",
+        "battle_effect_expiration",
+    ] {
+        let mut actual = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?1")
+            .map_err(|error| format!("读取 v22 表 {table} 触发器集合失败：{error}"))?
+            .query_map([table], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("查询 v22 表 {table} 触发器集合失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析 v22 表 {table} 触发器集合失败：{error}"))?;
+        let mut expected = expected_triggers
+            .iter()
+            .filter_map(|(name, expected_table)| {
+                (*expected_table == table).then_some((*name).to_string())
+            })
+            .collect::<Vec<_>>();
+        actual.sort();
+        expected.sort();
+        if actual != expected {
+            return Err(format!(
+                "数据库已标记迁移 v22，但表 {table} 触发器集合不匹配：实际 {actual:?}，期望 {expected:?}"
+            ));
+        }
+    }
+
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v22 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v22 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v22 全库触发器失败：{error}"))?;
+    for (name, table, sql) in triggers {
+        let declared = expected_triggers
+            .iter()
+            .any(|(expected_name, expected_table)| {
+                name == *expected_name && table == *expected_table
+            })
+            || name == "battle_wuhun_modifier_scope_guard";
+        let touches_v22 = matches!(
+            table.as_str(),
+            "wuhun_stat_template"
+                | "effect_definition"
+                | "battle_effect_snapshot"
+                | "battle_effect_expiration"
+        ) || [
+            "wuhun_stat_template",
+            "effect_definition",
+            "battle_effect_snapshot",
+            "battle_effect_expiration",
+        ]
+        .iter()
+        .any(|identifier| sql_mentions_identifier(&sql, identifier));
+        if touches_v22 && !declared {
+            return Err(format!(
+                "v22 触发器 {name} 未声明却引用通用内容或效果表 {table}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v22_table_sql(
+    connection: &Connection,
+    table: &str,
+    markers: &[&str],
+) -> Result<(), String> {
+    validate_v10_table_sql(connection, table, markers).map_err(|error| error.replace("v10", "v22"))
+}
+
+fn validate_v22_foreign_keys(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, &str, &str, &str)],
+) -> Result<(), String> {
+    validate_v9_foreign_keys(connection, table, expected)
+        .map_err(|error| error.replace("v9", "v22"))
+}
+
+fn validate_v22_custom_index_set(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), String> {
+    validate_v10_custom_index_set(connection, table, expected)
+        .map_err(|error| error.replace("v10", "v22"))
+}
+
+fn validate_v22_index(
+    connection: &Connection,
+    index_name: &str,
+    unique: bool,
+    columns: &[&str],
+    partial: bool,
+) -> Result<(), String> {
+    validate_v7_index(connection, index_name, unique, columns, partial)
+        .map_err(|error| error.replace("v7", "v22"))
 }
 
 fn validate_v17_foreign_keys(
@@ -18517,6 +19881,14 @@ fn validate_v12_triggers(connection: &Connection) -> Result<(), String> {
                 "skill_effect",
                 "battle_skill_effect",
                 "battle_skill_effect_expiration",
+            ]
+            .iter()
+            .any(|identifier| sql_mentions_identifier(&sql, identifier))
+            || [
+                "wuhun_stat_template",
+                "effect_definition",
+                "battle_effect_snapshot",
+                "battle_effect_expiration",
             ]
             .iter()
             .any(|identifier| sql_mentions_identifier(&sql, identifier))
@@ -20233,6 +21605,24 @@ mod tests {
         );
     }
 
+    fn assert_v22_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v22 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v22 迁移应成功");
+        let connection = store.open().expect("应打开 v22 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v22 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v22 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v22"),
+            "v22 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
     fn start_v21_battle(
         store: &Store,
         message_prefix: &str,
@@ -20431,6 +21821,42 @@ mod tests {
             .expect("查询不应失败")
             .expect("角色应存在");
         assert_eq!(player.wuhun_name.as_deref(), Some(awakened.name.as_str()));
+    }
+
+    #[test]
+    fn wuhun_awaken_draw_honors_catalog_weights() {
+        let (_directory, store) = test_store();
+        let connection = store.open().expect("应打开武魂权重测试数据库");
+        connection
+            .execute("UPDATE wuhun SET weight = id", [])
+            .expect("应设置可区分的武魂权重");
+        let rows = connection
+            .prepare("SELECT id, name, weight FROM wuhun ORDER BY id")
+            .expect("应准备武魂权重查询")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .expect("应查询武魂权重")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("应解析武魂权重");
+        let total_weight = rows.iter().map(|row| row.2).sum::<i64>();
+        let mut start = 0;
+        for (_, expected_name, weight) in rows {
+            let first = load_wuhun_at_weight_ticket(&connection, start, total_weight)
+                .expect("权重区间起点应可选择")
+                .expect("权重区间起点应命中武魂");
+            let last = load_wuhun_at_weight_ticket(&connection, start + weight - 1, total_weight)
+                .expect("权重区间终点应可选择")
+                .expect("权重区间终点应命中武魂");
+            assert_eq!(first.1.name, expected_name);
+            assert_eq!(last.1.name, expected_name);
+            start += weight;
+        }
+        assert!(load_wuhun_at_weight_ticket(&connection, total_weight, total_weight).is_err());
     }
 
     #[test]
@@ -25340,11 +26766,146 @@ mod tests {
                 magnitude_percent: 30,
                 duration_rounds: 3,
                 description: "束缚使魂兽攻击降低 30%，持续本次及后续共 3 个行动回合。".to_string(),
+                trigger_kind: "on_release".to_string(),
+                operation: "modify_stat".to_string(),
+                attribute_key: "beast_attack".to_string(),
+                value_mode: "percent_delta".to_string(),
+                value: -30,
+                chance_percent: 100,
+                stack_policy: "strongest".to_string(),
+                parameters_json: "{}".to_string(),
             }
         );
         assert_eq!(
             store.skills_page(&identity()).unwrap().entries[0].effects,
             detail.effects
+        );
+    }
+
+    #[test]
+    fn v22_custom_effect_definition_drives_the_same_interpreter() {
+        let (directory, store) = test_store();
+        register_awakened_pair(&store);
+        let player_id = player_id_for(&store, &identity());
+        let connection = store.open().expect("应打开 v22 自定义效果数据库");
+        connection
+            .execute(
+                r#"
+                INSERT INTO effect_definition(
+                    effect_key, skill_key, trigger_kind, target_kind, operation,
+                    attribute_key, value_mode, value, duration_rounds, chance_percent,
+                    stack_policy, parameters_json, description, enabled, created_at, updated_at
+                ) VALUES(
+                    'entangle-heavy', 'entangle', 'on_release', 'enemy', 'modify_stat',
+                    'beast_attack', 'percent_delta', -50, 2, 100, 'strongest', '{}',
+                    '测试自定义减攻', 1, 0, 0
+                )
+                "#,
+                [],
+            )
+            .expect("应插入自定义通用效果定义");
+        connection
+            .execute(
+                "UPDATE player SET level = 3, hp = 1000, max_hp = 1000, soul_power = 1000, max_soul_power = 1000, strength = 1, endurance = 0, perception = 0, luck = 0, updated_at = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置自定义效果测试属性");
+        drop(connection);
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "v22-custom-map"),
+            )
+            .expect("应进入自定义效果测试地图");
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "哥布林",
+                &transfer_operation("挑战", "v22-custom-start"),
+            )
+            .expect("应创建自定义效果测试战斗");
+        let release = store
+            .use_skill_battle_with_operation(
+                &identity(),
+                "缠绕",
+                &transfer_operation("释放技能", "v22-custom-use"),
+            )
+            .expect("自定义效果应复用通用解释器");
+        assert_eq!(
+            release.skill.as_ref().expect("应有魂技回执").effects.len(),
+            2
+        );
+        assert!(
+            release
+                .skill
+                .as_ref()
+                .unwrap()
+                .effects
+                .iter()
+                .any(|effect| effect.effect_key == "entangle-heavy" && effect.value == -50)
+        );
+        assert_eq!(release.battle.active_effects.len(), 2);
+        let connection = store.open().expect("应读取 v22 自定义快照");
+        let snapshot = connection
+            .query_row(
+                "SELECT operation, attribute_key, value_mode, value, rule_version FROM battle_effect_snapshot WHERE effect_key = 'entangle-heavy'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .expect("应读取自定义效果释放快照");
+        assert_eq!(
+            snapshot,
+            (
+                "modify_stat".to_string(),
+                "beast_attack".to_string(),
+                "percent_delta".to_string(),
+                -50,
+                "effect-v2".to_string()
+            )
+        );
+        drop(connection);
+        drop(store);
+        let restored = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("自定义效果数据库应可热重载");
+        let active = restored
+            .active_battle(&identity())
+            .expect("应读取重载后的自定义战斗")
+            .expect("自定义效果战斗应仍进行中");
+        assert!(
+            active
+                .active_effects
+                .iter()
+                .any(|effect| effect.effect_key == "entangle-heavy")
+        );
+    }
+
+    #[test]
+    fn recorded_v22_with_damaged_schema_or_cross_table_trigger_fails_closed() {
+        for mutation in [
+            "DROP TABLE battle_effect_expiration;",
+            "DROP INDEX effect_definition_skill_page;",
+            "DROP TRIGGER battle_skill_event_effect_v2_snapshot;",
+            "DROP TRIGGER wuhun_stat_template_scope_guard;",
+        ] {
+            assert_v22_damage_fails_closed(mutation);
+        }
+        assert_v22_damage_fails_closed(
+            r#"
+            CREATE TRIGGER player_wuhun_reads_effect_definition
+            AFTER INSERT ON player_wuhun
+            BEGIN
+                SELECT EXISTS(SELECT 1 FROM effect_definition);
+            END;
+            "#,
         );
     }
 
@@ -25358,6 +26919,14 @@ mod tests {
                 magnitude_percent: 30,
                 duration_rounds: 3,
                 description: "弱效果".to_string(),
+                trigger_kind: "on_release".to_string(),
+                operation: "modify_stat".to_string(),
+                attribute_key: "beast_attack".to_string(),
+                value_mode: "percent_delta".to_string(),
+                value: -30,
+                chance_percent: 100,
+                stack_policy: "strongest".to_string(),
+                parameters_json: "{}".to_string(),
             },
             SkillEffectRecord {
                 effect_key: "strong".to_string(),
@@ -25366,6 +26935,14 @@ mod tests {
                 magnitude_percent: 50,
                 duration_rounds: 1,
                 description: "强效果".to_string(),
+                trigger_kind: "on_release".to_string(),
+                operation: "modify_stat".to_string(),
+                attribute_key: "beast_attack".to_string(),
+                value_mode: "percent_delta".to_string(),
+                value: -50,
+                chance_percent: 100,
+                stack_policy: "strongest".to_string(),
+                parameters_json: "{}".to_string(),
             },
         ];
         assert_eq!(beast_attack_after_skill_effects(100, &[], &effects), Ok(50));

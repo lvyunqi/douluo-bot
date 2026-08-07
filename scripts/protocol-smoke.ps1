@@ -567,7 +567,7 @@ try {
     Assert-Condition ($afterReload.Text.Contains("金魂币")) "command failed after dynamic reload"
     $skillsAfterReload = Invoke-OneBotCommand $endpoint "技能"
     Assert-Condition ($skillsAfterReload.Text.Contains("熟练度：10/100")) "skill proficiency did not survive dynamic reload"
-    Write-Output "protocol smoke passed: OneBot tasks/PVE/wuhun stability/modifier/skill level damage/effect/proficiency/economy, private/group, synthetic QQ payload, descriptor, and reload"
+    Write-Output "protocol smoke passed: OneBot tasks/PVE/wuhun stability/template modifier/skill level damage/effect-v2 receipt/proficiency/economy, private/group, synthetic QQ payload, descriptor, and reload"
 } finally {
     if ($null -ne $process -and -not $process.HasExited) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
