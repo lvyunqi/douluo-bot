@@ -3910,6 +3910,43 @@ pub struct ContentRevisionRecord {
     pub published_at: i64,
 }
 
+/// 内容 revision 列表中的摘要，正文和 manifest 不通过管理查询返回。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentRevisionSummary {
+    pub revision: ContentRevisionRecord,
+    pub member_count: i64,
+}
+
+/// 内容 revision 的追加式激活历史记录。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentRevisionActivationRecord {
+    pub id: i64,
+    pub revision_id: i64,
+    pub reason: String,
+    pub created_at: i64,
+}
+
+/// 内容 revision 的受限游标分页结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentRevisionPage {
+    pub entries: Vec<ContentRevisionSummary>,
+    pub next_after_id: Option<i64>,
+}
+
+/// 内容草稿的受限游标分页结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentDraftPage {
+    pub entries: Vec<ContentDraftRecord>,
+    pub next_after_id: Option<i64>,
+}
+
+/// 内容激活历史的受限游标分页结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentRevisionActivationPage {
+    pub entries: Vec<ContentRevisionActivationRecord>,
+    pub next_after_id: Option<i64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContentPublishReceipt {
     pub revision: ContentRevisionRecord,
@@ -5031,6 +5068,19 @@ fn current_content_revision_id(connection: &Connection) -> Result<i64, String> {
         .map_err(|error| format!("读取当前内容 revision 失败：{error}"))
 }
 
+fn content_cursor_page_args(after_id: Option<i64>, limit: usize) -> Result<(i64, i64), String> {
+    if !(1..=100).contains(&limit) {
+        return Err("内容分页数量必须在 1 到 100 之间".to_string());
+    }
+    let after_id = after_id.unwrap_or(0);
+    if after_id < 0 {
+        return Err("内容分页游标不能为负数".to_string());
+    }
+    let fetch_limit =
+        i64::try_from(limit + 1).map_err(|_| "内容分页数量无法转换为 SQLite 整数".to_string())?;
+    Ok((after_id, fetch_limit))
+}
+
 fn content_revision_member_count(connection: &Connection, revision_id: i64) -> Result<i64, String> {
     connection
         .query_row(
@@ -5890,6 +5940,132 @@ impl Store {
             active_revision_id: revision_id,
             member_count,
             replayed: false,
+        })
+    }
+
+    /// 按稳定的自增 ID 游标读取 revision 元数据，不返回 manifest 正文。
+    pub fn list_content_revisions(
+        &self,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> Result<ContentRevisionPage, String> {
+        let (after_id, fetch_limit) = content_cursor_page_args(after_id, limit)?;
+        let connection = self.open()?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT revision.id, revision.package_key, revision.package_revision,
+                       revision.parent_revision_id, revision.source_format,
+                       revision.content_hash, revision.author, revision.minimum_runtime,
+                       revision.published_at,
+                       (SELECT COUNT(*) FROM content_revision_member member
+                         WHERE member.revision_id = revision.id)
+                  FROM content_revision revision
+                 WHERE revision.id > ?1
+                 ORDER BY revision.id ASC
+                 LIMIT ?2
+                "#,
+            )
+            .map_err(|error| format!("准备内容 revision 分页查询失败：{error}"))?;
+        let mut entries = statement
+            .query_map(params![after_id, fetch_limit], |row| {
+                Ok(ContentRevisionSummary {
+                    revision: content_revision_record_from_row(row)?,
+                    member_count: row.get(9)?,
+                })
+            })
+            .map_err(|error| format!("查询内容 revision 分页失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析内容 revision 分页失败：{error}"))?;
+        let has_more = entries.len() > limit;
+        entries.truncate(limit);
+        let next_after_id = has_more
+            .then(|| entries.last().map(|entry| entry.revision.id))
+            .flatten();
+        Ok(ContentRevisionPage {
+            entries,
+            next_after_id,
+        })
+    }
+
+    /// 按稳定的自增 ID 游标读取草稿元数据，不读取草稿正文。
+    pub fn list_content_drafts(
+        &self,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> Result<ContentDraftPage, String> {
+        let (after_id, fetch_limit) = content_cursor_page_args(after_id, limit)?;
+        let connection = self.open()?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT id, package_key, package_revision, source_format, content_hash,
+                       status, validation_json, published_revision_id, created_at, updated_at
+                  FROM content_draft
+                 WHERE id > ?1
+                 ORDER BY id ASC
+                 LIMIT ?2
+                "#,
+            )
+            .map_err(|error| format!("准备内容草稿分页查询失败：{error}"))?;
+        let mut entries = statement
+            .query_map(
+                params![after_id, fetch_limit],
+                content_draft_record_from_row,
+            )
+            .map_err(|error| format!("查询内容草稿分页失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析内容草稿分页失败：{error}"))?;
+        let has_more = entries.len() > limit;
+        entries.truncate(limit);
+        let next_after_id = has_more
+            .then(|| entries.last().map(|entry| entry.id))
+            .flatten();
+        Ok(ContentDraftPage {
+            entries,
+            next_after_id,
+        })
+    }
+
+    /// 按稳定的自增 ID 游标读取追加式 activation 历史。
+    pub fn list_content_activations(
+        &self,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> Result<ContentRevisionActivationPage, String> {
+        let (after_id, fetch_limit) = content_cursor_page_args(after_id, limit)?;
+        let connection = self.open()?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT id, revision_id, reason, created_at
+                  FROM content_revision_activation
+                 WHERE id > ?1
+                 ORDER BY id ASC
+                 LIMIT ?2
+                "#,
+            )
+            .map_err(|error| format!("准备内容 activation 分页查询失败：{error}"))?;
+        let mut entries = statement
+            .query_map(params![after_id, fetch_limit], |row| {
+                Ok(ContentRevisionActivationRecord {
+                    id: row.get(0)?,
+                    revision_id: row.get(1)?,
+                    reason: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })
+            .map_err(|error| format!("查询内容 activation 分页失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析内容 activation 分页失败：{error}"))?;
+        let has_more = entries.len() > limit;
+        entries.truncate(limit);
+        let next_after_id = has_more
+            .then(|| entries.last().map(|entry| entry.id))
+            .flatten();
+        Ok(ContentRevisionActivationPage {
+            entries,
+            next_after_id,
         })
     }
 
@@ -23105,6 +23281,44 @@ mod tests {
         (directory, store)
     }
 
+    fn content_effect_package(
+        package_key: &str,
+        effect_key: &str,
+        skill_key: &str,
+    ) -> LoadedContentPackage {
+        let package = ContentPackage {
+            package_key: package_key.to_string(),
+            revision: 1,
+            author: "test".to_string(),
+            minimum_runtime: String::new(),
+            wuhun: Vec::new(),
+            skills: Vec::new(),
+            effects: vec![EffectPackageEntry {
+                effect_key: effect_key.to_string(),
+                skill_key: skill_key.to_string(),
+                trigger_kind: "on_release".to_string(),
+                target_kind: "enemy".to_string(),
+                operation: "modify_stat".to_string(),
+                attribute_key: "beast_attack".to_string(),
+                value_mode: "percent_delta".to_string(),
+                value: -10,
+                duration_rounds: 1,
+                chance_percent: 100,
+                stack_policy: "strongest".to_string(),
+                parameters: Default::default(),
+                description: "content pagination test effect".to_string(),
+                enabled: true,
+            }],
+            soul_beasts: Vec::new(),
+            soul_rings: Vec::new(),
+        };
+        LoadedContentPackage {
+            content_hash: content_hash(&package).expect("应计算测试内容包哈希"),
+            package,
+            source_format: "json".to_string(),
+        }
+    }
+
     fn identity<'a>() -> IdentityKey<'a> {
         IdentityKey {
             protocol: Protocol::OneBot11,
@@ -28909,6 +29123,160 @@ mod tests {
                 .expect("active revision should reload")
                 .id,
             baseline.id
+        );
+    }
+
+    #[test]
+    fn v24_content_metadata_pages_are_stable_and_bounded() {
+        let (_directory, store) = test_store();
+
+        let draft = content_effect_package("page-draft", "page-draft-effect", "entangle");
+        store
+            .stage_content_package(&draft)
+            .expect("应写入待校验草稿");
+
+        let rejected = content_effect_package(
+            "page-rejected",
+            "page-rejected-effect",
+            "missing-page-skill",
+        );
+        store
+            .stage_content_package(&rejected)
+            .expect("应写入将被拒绝的草稿");
+        assert!(
+            !store
+                .validate_content_draft("page-rejected", 1)
+                .expect("应校验将被拒绝的草稿")
+                .errors
+                .is_empty()
+        );
+
+        let validated =
+            content_effect_package("page-validated", "page-validated-effect", "entangle");
+        store
+            .stage_content_package(&validated)
+            .expect("应写入待发布草稿");
+        assert!(
+            store
+                .validate_content_draft("page-validated", 1)
+                .expect("应校验待发布草稿")
+                .errors
+                .is_empty()
+        );
+
+        for (package_key, effect_key) in [
+            ("page-published-one", "page-published-effect-one"),
+            ("page-published-two", "page-published-effect-two"),
+            ("page-published-three", "page-published-effect-three"),
+        ] {
+            let package = content_effect_package(package_key, effect_key, "entangle");
+            store
+                .stage_content_package(&package)
+                .expect("应写入待发布内容包");
+            assert!(
+                store
+                    .validate_content_draft(package_key, 1)
+                    .expect("应校验待发布内容包")
+                    .errors
+                    .is_empty()
+            );
+            store
+                .publish_content_draft(package_key, 1)
+                .expect("应发布内容包");
+        }
+
+        let first_drafts = store
+            .list_content_drafts(None, 2)
+            .expect("应读取首个草稿分页");
+        assert_eq!(first_drafts.entries.len(), 2);
+        assert_eq!(first_drafts.entries[0].status, "draft");
+        assert_eq!(first_drafts.entries[1].status, "rejected");
+        assert!(
+            first_drafts.entries[1]
+                .validation_json
+                .contains("missing-page-skill")
+        );
+        assert_eq!(first_drafts.next_after_id, Some(first_drafts.entries[1].id));
+        let remaining_drafts = store
+            .list_content_drafts(first_drafts.next_after_id, 100)
+            .expect("应读取剩余草稿分页");
+        assert_eq!(remaining_drafts.entries.len(), 4);
+        assert_eq!(remaining_drafts.entries[0].status, "validated");
+        assert_eq!(
+            remaining_drafts
+                .entries
+                .iter()
+                .filter(|entry| entry.status == "published")
+                .count(),
+            3
+        );
+        assert!(remaining_drafts.next_after_id.is_none());
+        assert!(
+            remaining_drafts
+                .entries
+                .windows(2)
+                .all(|entries| entries[0].id < entries[1].id)
+        );
+
+        let first_revisions = store
+            .list_content_revisions(None, 2)
+            .expect("应读取首个 revision 分页");
+        assert_eq!(first_revisions.entries.len(), 2);
+        assert!(
+            first_revisions
+                .entries
+                .iter()
+                .all(|entry| entry.member_count > 0)
+        );
+        assert_eq!(
+            first_revisions.next_after_id,
+            Some(first_revisions.entries[1].revision.id)
+        );
+        let remaining_revisions = store
+            .list_content_revisions(first_revisions.next_after_id, 100)
+            .expect("应读取剩余 revision 分页");
+        assert_eq!(remaining_revisions.entries.len(), 2);
+        assert!(remaining_revisions.next_after_id.is_none());
+        assert!(
+            remaining_revisions
+                .entries
+                .windows(2)
+                .all(|entries| entries[0].revision.id < entries[1].revision.id)
+        );
+
+        let first_activations = store
+            .list_content_activations(None, 2)
+            .expect("应读取首个 activation 分页");
+        assert_eq!(first_activations.entries.len(), 2);
+        assert_eq!(first_activations.entries[0].reason, "initial");
+        assert_eq!(first_activations.entries[1].reason, "publish");
+        assert_eq!(
+            first_activations.next_after_id,
+            Some(first_activations.entries[1].id)
+        );
+        let remaining_activations = store
+            .list_content_activations(first_activations.next_after_id, 100)
+            .expect("应读取剩余 activation 分页");
+        assert_eq!(remaining_activations.entries.len(), 2);
+        assert!(remaining_activations.next_after_id.is_none());
+        assert!(
+            remaining_activations
+                .entries
+                .windows(2)
+                .all(|entries| entries[0].id < entries[1].id)
+        );
+
+        assert!(
+            store.list_content_drafts(Some(-1), 1).is_err(),
+            "负数游标必须被拒绝"
+        );
+        assert!(
+            store.list_content_revisions(None, 0).is_err(),
+            "零分页大小必须被拒绝"
+        );
+        assert!(
+            store.list_content_activations(None, 101).is_err(),
+            "超过上限的分页大小必须被拒绝"
         );
     }
 

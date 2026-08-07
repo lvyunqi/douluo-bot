@@ -9,7 +9,7 @@ QimenBot 动态插件版斗罗大陆文字游戏，插件 ID 为 `douluo-game`�
 - 跨协议消息：兼容 OneBot 11 与 QQ 官方机器人，回复优先使用通用消息段。
 - 插图支持：支持本地 Base64 图片和公网 HTTPS 图片地址；未配置图片时仍返回完整文本。
 - 可选媒体服务：仓库包含一个独立的静态图片服务示例，可用于向 QQ 官方 Markdown 暴露公网图片。
-- 可选管理服务：默认仅回环监听，提供健康检查、短期管理会话与当前内容 revision 查询。
+- 可选管理服务：默认仅回环监听，提供健康检查、短期管理会话、当前内容 revision 与内容元数据游标列表。
 
 ## Requirements
 
@@ -87,8 +87,11 @@ remote_base_url = ""
 - `POST /api/v1/session`：以管理密钥建立短期会话并返回 CSRF token。
 - `GET /api/v1/session`、`DELETE /api/v1/session`：读取或结束当前会话；退出请求需要 CSRF token。
 - `GET /api/v1/content/active`：读取当前激活内容 revision，要求 `content_admin` 会话。
+- `GET /api/v1/content/revisions`：读取 revision 元数据和成员数量，使用 `after_id` 游标与 `limit=1..100`。
+- `GET /api/v1/content/drafts`：读取草稿状态、哈希和校验错误，使用相同游标；不返回草稿正文。
+- `GET /api/v1/content/activations`：读取追加式 activation 历史，使用相同游标。
 
-当前版本尚未提供草稿列表、内容上传、差异预览或发布/回滚写接口；这些操作只会在后续版本通过 Store API 实现。
+当前版本尚未提供草稿正文、内容上传、差异预览或发布/回滚写接口；这些操作只会在后续版本通过 Store API 实现。
 
 ## Common Commands
 

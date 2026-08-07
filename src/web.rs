@@ -10,7 +10,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
@@ -21,7 +21,10 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::{net::TcpListener, runtime::Builder as RuntimeBuilder, sync::oneshot};
 
-use crate::{config::WebConfig, store::Store};
+use crate::{
+    config::WebConfig,
+    store::{ContentDraftRecord, ContentRevisionActivationRecord, ContentRevisionRecord, Store},
+};
 
 const SESSION_COOKIE: &str = "douluo_admin_session";
 const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
@@ -247,6 +250,9 @@ fn build_router(state: Arc<ManagementState>) -> Router {
             get(current_session).post(login).delete(logout),
         )
         .route("/api/v1/content/active", get(active_content_revision))
+        .route("/api/v1/content/revisions", get(content_revisions))
+        .route("/api/v1/content/drafts", get(content_drafts))
+        .route("/api/v1/content/activations", get(content_activations))
         .layer(DefaultBodyLimit::max(MAX_API_BODY_BYTES))
         .with_state(state)
 }
@@ -274,6 +280,54 @@ struct SessionResponse {
     role: &'static str,
     csrf_token: String,
     expires_in_seconds: u64,
+}
+
+/// 管理列表统一使用受限的自增 ID 游标，避免无界 offset 查询。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContentPageQuery {
+    #[serde(default)]
+    after_id: Option<i64>,
+    #[serde(default = "default_content_page_limit")]
+    limit: usize,
+}
+
+fn default_content_page_limit() -> usize {
+    25
+}
+
+#[derive(Serialize)]
+struct CursorPage<T> {
+    entries: Vec<T>,
+    next_after_id: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct ContentRevisionListEntry {
+    revision: ContentRevisionRecord,
+    member_count: i64,
+}
+
+#[derive(Serialize)]
+struct ContentDraftListEntry {
+    id: i64,
+    package_key: String,
+    package_revision: i64,
+    source_format: String,
+    content_hash: String,
+    status: String,
+    validation_errors: Vec<String>,
+    published_revision_id: Option<i64>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Serialize)]
+struct ContentActivationListEntry {
+    id: i64,
+    revision_id: i64,
+    reason: String,
+    created_at: i64,
 }
 
 async fn login(
@@ -383,6 +437,134 @@ async fn active_content_revision(
     match state.store.active_content_revision() {
         Ok(revision) => json_response(StatusCode::OK, json!({ "revision": revision })),
         Err(_) => api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    }
+}
+
+async fn content_revisions(
+    State(state): State<Arc<ManagementState>>,
+    headers: HeaderMap,
+    Query(query): Query<ContentPageQuery>,
+) -> Response {
+    if let Err(error) = require_permission(&state, &headers, AdminPermission::ContentRead) {
+        return error.into_response();
+    }
+    let (after_id, limit) = match content_page_params(query) {
+        Ok(params) => params,
+        Err(code) => return api_error(StatusCode::BAD_REQUEST, code),
+    };
+    match state.store.list_content_revisions(after_id, limit) {
+        Ok(page) => json_response(
+            StatusCode::OK,
+            CursorPage {
+                entries: page
+                    .entries
+                    .into_iter()
+                    .map(|entry| ContentRevisionListEntry {
+                        revision: entry.revision,
+                        member_count: entry.member_count,
+                    })
+                    .collect(),
+                next_after_id: page.next_after_id,
+            },
+        ),
+        Err(_) => api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    }
+}
+
+async fn content_drafts(
+    State(state): State<Arc<ManagementState>>,
+    headers: HeaderMap,
+    Query(query): Query<ContentPageQuery>,
+) -> Response {
+    if let Err(error) = require_permission(&state, &headers, AdminPermission::ContentRead) {
+        return error.into_response();
+    }
+    let (after_id, limit) = match content_page_params(query) {
+        Ok(params) => params,
+        Err(code) => return api_error(StatusCode::BAD_REQUEST, code),
+    };
+    let page = match state.store.list_content_drafts(after_id, limit) {
+        Ok(page) => page,
+        Err(_) => return api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    };
+    let entries = match page
+        .entries
+        .into_iter()
+        .map(content_draft_list_entry)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(entries) => entries,
+        Err(_) => return api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    };
+    json_response(
+        StatusCode::OK,
+        CursorPage {
+            entries,
+            next_after_id: page.next_after_id,
+        },
+    )
+}
+
+async fn content_activations(
+    State(state): State<Arc<ManagementState>>,
+    headers: HeaderMap,
+    Query(query): Query<ContentPageQuery>,
+) -> Response {
+    if let Err(error) = require_permission(&state, &headers, AdminPermission::ContentRead) {
+        return error.into_response();
+    }
+    let (after_id, limit) = match content_page_params(query) {
+        Ok(params) => params,
+        Err(code) => return api_error(StatusCode::BAD_REQUEST, code),
+    };
+    match state.store.list_content_activations(after_id, limit) {
+        Ok(page) => json_response(
+            StatusCode::OK,
+            CursorPage {
+                entries: page
+                    .entries
+                    .into_iter()
+                    .map(content_activation_list_entry)
+                    .collect(),
+                next_after_id: page.next_after_id,
+            },
+        ),
+        Err(_) => api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    }
+}
+
+fn content_page_params(query: ContentPageQuery) -> Result<(Option<i64>, usize), &'static str> {
+    if query.after_id.is_some_and(|after_id| after_id < 0) || !(1..=100).contains(&query.limit) {
+        return Err("invalid_pagination");
+    }
+    Ok((query.after_id, query.limit))
+}
+
+fn content_draft_list_entry(
+    draft: ContentDraftRecord,
+) -> Result<ContentDraftListEntry, serde_json::Error> {
+    Ok(ContentDraftListEntry {
+        id: draft.id,
+        package_key: draft.package_key,
+        package_revision: draft.package_revision,
+        source_format: draft.source_format,
+        content_hash: draft.content_hash,
+        status: draft.status,
+        validation_errors: serde_json::from_str(&draft.validation_json)?,
+        published_revision_id: draft.published_revision_id,
+        created_at: draft.created_at,
+        updated_at: draft.updated_at,
+    })
+}
+
+fn content_activation_list_entry(
+    activation: ContentRevisionActivationRecord,
+) -> ContentActivationListEntry {
+    ContentActivationListEntry {
+        id: activation.id,
+        revision_id: activation.revision_id,
+        reason: activation.reason,
+        created_at: activation.created_at,
     }
 }
 
@@ -526,6 +708,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
+    use crate::content::{ContentPackage, EffectPackageEntry, LoadedContentPackage, content_hash};
     use axum::{
         body::{Body, to_bytes},
         http::{Method, Request},
@@ -570,6 +753,34 @@ mod tests {
             .await
             .expect("应读取响应正文");
         serde_json::from_slice(&bytes).expect("响应应为 JSON")
+    }
+
+    async fn login_for_test(app: &Router) -> (String, String) {
+        let response = request(
+            app,
+            Method::POST,
+            "/api/v1/session",
+            &[("content-type", "application/json")],
+            br#"{"secret":"0123456789abcdef"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("登录应设置会话 cookie")
+            .to_str()
+            .expect("cookie 应为 ASCII")
+            .split(';')
+            .next()
+            .expect("cookie 应有值")
+            .to_string();
+        let payload = response_json(response).await;
+        let csrf_token = payload["csrf_token"]
+            .as_str()
+            .expect("登录应返回 CSRF token")
+            .to_string();
+        (cookie, csrf_token)
     }
 
     #[tokio::test]
@@ -688,6 +899,130 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn content_metadata_lists_are_authenticated_and_cursor_bounded() {
+        let (_directory, state) = state();
+        let package = ContentPackage {
+            package_key: "web-list-draft".to_string(),
+            revision: 1,
+            author: "web-test".to_string(),
+            minimum_runtime: String::new(),
+            wuhun: Vec::new(),
+            skills: Vec::new(),
+            effects: vec![EffectPackageEntry {
+                effect_key: "web-list-effect".to_string(),
+                skill_key: "missing-web-skill".to_string(),
+                trigger_kind: "on_release".to_string(),
+                target_kind: "enemy".to_string(),
+                operation: "modify_stat".to_string(),
+                attribute_key: "beast_attack".to_string(),
+                value_mode: "percent_delta".to_string(),
+                value: -10,
+                duration_rounds: 1,
+                chance_percent: 100,
+                stack_policy: "strongest".to_string(),
+                parameters: Default::default(),
+                description: "web list test effect".to_string(),
+                enabled: true,
+            }],
+            soul_beasts: Vec::new(),
+            soul_rings: Vec::new(),
+        };
+        let loaded = LoadedContentPackage {
+            content_hash: content_hash(&package).expect("应计算 web 测试内容包哈希"),
+            package,
+            source_format: "json".to_string(),
+        };
+        state
+            .store
+            .stage_content_package(&loaded)
+            .expect("应写入 web 测试草稿");
+        state
+            .store
+            .validate_content_draft("web-list-draft", 1)
+            .expect("应校验 web 测试草稿");
+
+        let app = build_router(state);
+        for path in [
+            "/api/v1/content/revisions",
+            "/api/v1/content/drafts",
+            "/api/v1/content/activations",
+        ] {
+            let response = request(&app, Method::GET, path, &[], b"").await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+
+        let (cookie, _csrf_token) = login_for_test(&app).await;
+        let headers = [("cookie", cookie.as_str())];
+
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/content/revisions?limit=1",
+            &headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            payload["entries"][0]["revision"]["package_key"],
+            "douluo-core"
+        );
+        assert!(payload["entries"][0]["member_count"].as_i64().unwrap() > 0);
+
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/content/activations?limit=1",
+            &headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["entries"][0]["reason"], "initial");
+        assert_eq!(payload["entries"][0]["revision_id"], 1);
+
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/content/drafts?limit=1",
+            &headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["entries"][0]["package_key"], "web-list-draft");
+        assert_eq!(payload["entries"][0]["status"], "rejected");
+        assert_eq!(
+            payload["entries"][0]["validation_errors"][0],
+            "效果 web-list-effect 引用了不存在或未启用的魂技 missing-web-skill"
+        );
+        assert_eq!(
+            payload["entries"][0]["content_hash"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert!(payload["entries"][0].get("package_json").is_none());
+        assert!(payload["entries"][0].get("validation_json").is_none());
+
+        for path in [
+            "/api/v1/content/revisions?limit=0",
+            "/api/v1/content/drafts?after_id=-1",
+            "/api/v1/content/activations?limit=101",
+        ] {
+            let response = request(&app, Method::GET, path, &headers, b"").await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            let payload = response_json(response).await;
+            assert_eq!(payload["error"], "invalid_pagination");
+        }
     }
 
     #[test]
