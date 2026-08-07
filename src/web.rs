@@ -10,7 +10,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
@@ -23,7 +23,10 @@ use tokio::{net::TcpListener, runtime::Builder as RuntimeBuilder, sync::oneshot}
 
 use crate::{
     config::WebConfig,
-    store::{ContentDraftRecord, ContentRevisionActivationRecord, ContentRevisionRecord, Store},
+    store::{
+        ContentDraftDiffMember, ContentDraftRecord, ContentRevisionActivationRecord,
+        ContentRevisionRecord, Store,
+    },
 };
 
 const SESSION_COOKIE: &str = "douluo_admin_session";
@@ -252,6 +255,10 @@ fn build_router(state: Arc<ManagementState>) -> Router {
         .route("/api/v1/content/active", get(active_content_revision))
         .route("/api/v1/content/revisions", get(content_revisions))
         .route("/api/v1/content/drafts", get(content_drafts))
+        .route(
+            "/api/v1/content/drafts/{package_key}/{package_revision}/diff",
+            get(content_draft_diff),
+        )
         .route("/api/v1/content/activations", get(content_activations))
         .layer(DefaultBodyLimit::max(MAX_API_BODY_BYTES))
         .with_state(state)
@@ -328,6 +335,23 @@ struct ContentActivationListEntry {
     revision_id: i64,
     reason: String,
     created_at: i64,
+}
+
+#[derive(Serialize)]
+/// 草稿差异预览 API 中不含正文的新增目录成员。
+struct ContentDraftDiffMemberResponse {
+    member_kind: String,
+    member_key: String,
+}
+
+#[derive(Serialize)]
+/// 草稿差异预览 API 的只读响应，避免传出草稿正文。
+struct ContentDraftDiffResponse {
+    draft: ContentDraftListEntry,
+    active_revision: ContentRevisionRecord,
+    active_member_count: i64,
+    added_members: Vec<ContentDraftDiffMemberResponse>,
+    projected_member_count: i64,
 }
 
 async fn login(
@@ -505,6 +529,46 @@ async fn content_drafts(
     )
 }
 
+/// 在认证后的只读快照中返回草稿目录差异，不改变任何发布状态。
+async fn content_draft_diff(
+    State(state): State<Arc<ManagementState>>,
+    headers: HeaderMap,
+    Path((package_key, package_revision)): Path<(String, i64)>,
+) -> Response {
+    if let Err(error) = require_permission(&state, &headers, AdminPermission::ContentRead) {
+        return error.into_response();
+    }
+    if package_revision <= 0 {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_draft_identity");
+    }
+    let preview = match state
+        .store
+        .preview_content_draft(&package_key, package_revision)
+    {
+        Ok(Some(preview)) => preview,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "not_found"),
+        Err(_) => return api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    };
+    let draft = match content_draft_list_entry(preview.draft) {
+        Ok(draft) => draft,
+        Err(_) => return api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    };
+    json_response(
+        StatusCode::OK,
+        ContentDraftDiffResponse {
+            draft,
+            active_revision: preview.active_revision,
+            active_member_count: preview.active_member_count,
+            added_members: preview
+                .added_members
+                .into_iter()
+                .map(content_draft_diff_member_response)
+                .collect(),
+            projected_member_count: preview.projected_member_count,
+        },
+    )
+}
+
 async fn content_activations(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
@@ -565,6 +629,15 @@ fn content_activation_list_entry(
         revision_id: activation.revision_id,
         reason: activation.reason,
         created_at: activation.created_at,
+    }
+}
+
+fn content_draft_diff_member_response(
+    member: ContentDraftDiffMember,
+) -> ContentDraftDiffMemberResponse {
+    ContentDraftDiffMemberResponse {
+        member_kind: member.member_kind,
+        member_key: member.member_key,
     }
 }
 
@@ -948,6 +1021,7 @@ mod tests {
         for path in [
             "/api/v1/content/revisions",
             "/api/v1/content/drafts",
+            "/api/v1/content/drafts/web-list-draft/1/diff",
             "/api/v1/content/activations",
         ] {
             let response = request(&app, Method::GET, path, &[], b"").await;
@@ -1013,6 +1087,41 @@ mod tests {
         assert!(payload["entries"][0].get("package_json").is_none());
         assert!(payload["entries"][0].get("validation_json").is_none());
 
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/content/drafts/web-list-draft/1/diff",
+            &headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["draft"]["package_key"], "web-list-draft");
+        assert_eq!(payload["active_revision"]["package_key"], "douluo-core");
+        assert_eq!(payload["added_members"].as_array().unwrap().len(), 2);
+        assert!(
+            payload["added_members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|member| member["member_key"] == "web-list-effect")
+        );
+        assert!(payload.get("package_json").is_none());
+        assert!(payload["draft"].get("package_json").is_none());
+
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/content/drafts/missing-web-draft/1/diff",
+            &headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let payload = response_json(response).await;
+        assert_eq!(payload["error"], "not_found");
+
         for path in [
             "/api/v1/content/revisions?limit=0",
             "/api/v1/content/drafts?after_id=-1",
@@ -1023,6 +1132,18 @@ mod tests {
             let payload = response_json(response).await;
             assert_eq!(payload["error"], "invalid_pagination");
         }
+
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/content/drafts/web-list-draft/0/diff",
+            &headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response_json(response).await;
+        assert_eq!(payload["error"], "invalid_draft_identity");
     }
 
     #[test]

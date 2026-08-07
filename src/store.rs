@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -3947,6 +3948,23 @@ pub struct ContentRevisionActivationPage {
     pub next_after_id: Option<i64>,
 }
 
+/// 草稿预览中相对当前 active revision 新增的目录成员。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentDraftDiffMember {
+    pub member_kind: String,
+    pub member_key: String,
+}
+
+/// 草稿相对当前 active revision 的只读成员差异预览。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentDraftDiffPreview {
+    pub draft: ContentDraftRecord,
+    pub active_revision: ContentRevisionRecord,
+    pub active_member_count: i64,
+    pub added_members: Vec<ContentDraftDiffMember>,
+    pub projected_member_count: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContentPublishReceipt {
     pub revision: ContentRevisionRecord,
@@ -5091,6 +5109,54 @@ fn content_revision_member_count(connection: &Connection, revision_id: i64) -> R
         .map_err(|error| format!("统计内容 revision 成员失败：{error}"))
 }
 
+fn load_content_revision_member_set(
+    connection: &Connection,
+    revision_id: i64,
+) -> Result<BTreeSet<(String, String)>, String> {
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT member_kind, member_key
+              FROM content_revision_member
+             WHERE revision_id = ?1
+             ORDER BY member_kind ASC, member_key ASC
+            "#,
+        )
+        .map_err(|error| format!("准备内容 revision 成员读取失败：{error}"))?;
+    statement
+        .query_map([revision_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|error| format!("读取内容 revision 成员失败：{error}"))?
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|error| format!("解析内容 revision 成员失败：{error}"))
+}
+
+/// 复用发布时的成员归并规则，推导单个内容包可能新增的目录成员。
+fn content_package_member_set(package: &ContentPackage) -> BTreeSet<(String, String)> {
+    let mut members = BTreeSet::new();
+    for entry in &package.wuhun {
+        members.insert(("wuhun".to_string(), entry.name.clone()));
+    }
+    for entry in &package.skills {
+        members.insert(("skill".to_string(), entry.skill_key.clone()));
+        if entry.starter {
+            members.insert(("starter-skill".to_string(), entry.skill_key.clone()));
+        }
+    }
+    for entry in &package.effects {
+        members.insert(("skill".to_string(), entry.skill_key.clone()));
+        members.insert(("effect".to_string(), entry.effect_key.clone()));
+    }
+    for entry in &package.soul_beasts {
+        members.insert(("beast".to_string(), entry.beast_key.clone()));
+    }
+    for entry in &package.soul_rings {
+        members.insert(("beast".to_string(), entry.soul_beast_key.clone()));
+        members.insert(("skill".to_string(), entry.skill_key.clone()));
+        members.insert(("ring".to_string(), entry.ring_key.clone()));
+    }
+    members
+}
+
 fn active_content_member_exists(
     connection: &Connection,
     member_kind: &str,
@@ -5941,6 +6007,74 @@ impl Store {
             member_count,
             replayed: false,
         })
+    }
+
+    /// 在同一 SQLite 快照中预览草稿相对当前 active revision 的成员新增，不保留发布资格。
+    pub fn preview_content_draft(
+        &self,
+        package_key: &str,
+        package_revision: i64,
+    ) -> Result<Option<ContentDraftDiffPreview>, String> {
+        if package_revision <= 0 {
+            return Err("内容草稿 revision 必须大于 0".to_string());
+        }
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| format!("开始内容草稿差异预览读取事务失败：{error}"))?;
+        let Some(draft) =
+            load_content_draft_by_identity(&transaction, package_key, package_revision)?
+        else {
+            transaction
+                .commit()
+                .map_err(|error| format!("提交空内容草稿差异预览读取事务失败：{error}"))?;
+            return Ok(None);
+        };
+        let package =
+            serde_json::from_str::<ContentPackage>(&draft_package_json(&draft, &transaction)?)
+                .map_err(|error| format!("已保存内容草稿不是有效 JSON：{error}"))?;
+        if package.package_key != draft.package_key || package.revision != draft.package_revision {
+            return Err("已保存内容草稿正文与身份元数据不一致".to_string());
+        }
+        let expected_hash = content_hash(&package)?;
+        if expected_hash != draft.content_hash {
+            return Err("已保存内容草稿哈希与正文不一致".to_string());
+        }
+        let shape_errors = validate_shape(&package);
+        if !shape_errors.is_empty() {
+            return Err(format!(
+                "已保存内容草稿字段校验失败：{}",
+                shape_errors.join("；")
+            ));
+        }
+        let active_revision_id = current_content_revision_id(&transaction)?;
+        let active_revision = load_content_revision_by_id(&transaction, active_revision_id)?
+            .ok_or_else(|| "当前内容 revision 不存在".to_string())?;
+        let active_members = load_content_revision_member_set(&transaction, active_revision_id)?;
+        let active_member_count = i64::try_from(active_members.len())
+            .map_err(|_| "当前内容 revision 成员数量超出可预览范围".to_string())?;
+        let added_members = content_package_member_set(&package)
+            .difference(&active_members)
+            .map(|(member_kind, member_key)| ContentDraftDiffMember {
+                member_kind: member_kind.clone(),
+                member_key: member_key.clone(),
+            })
+            .collect::<Vec<_>>();
+        let added_member_count = i64::try_from(added_members.len())
+            .map_err(|_| "内容草稿新增成员数量超出可预览范围".to_string())?;
+        let projected_member_count = active_member_count
+            .checked_add(added_member_count)
+            .ok_or_else(|| "内容草稿投影成员数量溢出".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交内容草稿差异预览读取事务失败：{error}"))?;
+        Ok(Some(ContentDraftDiffPreview {
+            draft,
+            active_revision,
+            active_member_count,
+            added_members,
+            projected_member_count,
+        }))
     }
 
     /// 按稳定的自增 ID 游标读取 revision 元数据，不返回 manifest 正文。
@@ -23319,6 +23453,72 @@ mod tests {
         }
     }
 
+    fn content_preview_package(package_key: &str) -> LoadedContentPackage {
+        let package = ContentPackage {
+            package_key: package_key.to_string(),
+            revision: 1,
+            author: "test".to_string(),
+            minimum_runtime: String::new(),
+            wuhun: Vec::new(),
+            skills: vec![SkillPackageEntry {
+                skill_key: "preview-skill".to_string(),
+                name: "preview skill".to_string(),
+                skill_type: "active".to_string(),
+                wuhun_category: "all".to_string(),
+                ring_index: 1,
+                soul_power_cost: 10,
+                cooldown_rounds: 1,
+                base_damage: 20,
+                spirit_ratio_percent: 100,
+                strength_ratio_percent: 0,
+                description: "content diff preview skill".to_string(),
+                enabled: true,
+                starter: true,
+            }],
+            effects: vec![
+                EffectPackageEntry {
+                    effect_key: "preview-effect-new".to_string(),
+                    skill_key: "preview-skill".to_string(),
+                    trigger_kind: "on_release".to_string(),
+                    target_kind: "enemy".to_string(),
+                    operation: "modify_stat".to_string(),
+                    attribute_key: "beast_attack".to_string(),
+                    value_mode: "percent_delta".to_string(),
+                    value: -10,
+                    duration_rounds: 1,
+                    chance_percent: 100,
+                    stack_policy: "strongest".to_string(),
+                    parameters: Default::default(),
+                    description: "content diff preview new effect".to_string(),
+                    enabled: true,
+                },
+                EffectPackageEntry {
+                    effect_key: "preview-effect-existing".to_string(),
+                    skill_key: "entangle".to_string(),
+                    trigger_kind: "on_release".to_string(),
+                    target_kind: "enemy".to_string(),
+                    operation: "modify_stat".to_string(),
+                    attribute_key: "beast_attack".to_string(),
+                    value_mode: "percent_delta".to_string(),
+                    value: -10,
+                    duration_rounds: 1,
+                    chance_percent: 100,
+                    stack_policy: "strongest".to_string(),
+                    parameters: Default::default(),
+                    description: "content diff preview inherited effect".to_string(),
+                    enabled: true,
+                },
+            ],
+            soul_beasts: Vec::new(),
+            soul_rings: Vec::new(),
+        };
+        LoadedContentPackage {
+            content_hash: content_hash(&package).expect("应计算预览内容包哈希"),
+            package,
+            source_format: "json".to_string(),
+        }
+    }
+
     fn identity<'a>() -> IdentityKey<'a> {
         IdentityKey {
             protocol: Protocol::OneBot11,
@@ -29124,6 +29324,83 @@ mod tests {
                 .id,
             baseline.id
         );
+    }
+
+    #[test]
+    fn v24_content_draft_diff_preview_tracks_current_active_revision() {
+        let (_directory, store) = test_store();
+        let baseline = store
+            .active_content_revision()
+            .expect("应读取预览测试的 baseline revision");
+        let baseline_member_count = content_revision_member_count(
+            &store.open().expect("应打开预览测试数据库"),
+            baseline.id,
+        )
+        .expect("应统计 baseline 成员");
+
+        let draft = content_preview_package("preview-draft");
+        store.stage_content_package(&draft).expect("应写入预览草稿");
+        let preview = store
+            .preview_content_draft("preview-draft", 1)
+            .expect("应生成草稿差异预览")
+            .expect("草稿应存在");
+        assert_eq!(preview.draft.status, "draft");
+        assert_eq!(preview.active_revision.id, baseline.id);
+        assert_eq!(preview.active_member_count, baseline_member_count);
+        assert_eq!(
+            preview.added_members,
+            vec![
+                ContentDraftDiffMember {
+                    member_kind: "effect".to_string(),
+                    member_key: "preview-effect-existing".to_string(),
+                },
+                ContentDraftDiffMember {
+                    member_kind: "effect".to_string(),
+                    member_key: "preview-effect-new".to_string(),
+                },
+                ContentDraftDiffMember {
+                    member_kind: "skill".to_string(),
+                    member_key: "preview-skill".to_string(),
+                },
+                ContentDraftDiffMember {
+                    member_kind: "starter-skill".to_string(),
+                    member_key: "preview-skill".to_string(),
+                },
+            ]
+        );
+        assert_eq!(preview.projected_member_count, baseline_member_count + 4);
+
+        let parent = content_effect_package("preview-parent", "preview-parent-effect", "entangle");
+        store
+            .stage_content_package(&parent)
+            .expect("应写入预览父 revision");
+        assert!(
+            store
+                .validate_content_draft("preview-parent", 1)
+                .expect("应校验预览父 revision")
+                .errors
+                .is_empty()
+        );
+        let parent_revision = store
+            .publish_content_draft("preview-parent", 1)
+            .expect("应发布预览父 revision")
+            .revision;
+        let refreshed = store
+            .preview_content_draft("preview-draft", 1)
+            .expect("应按新 active revision 重新预览")
+            .expect("草稿应仍存在");
+        assert_eq!(refreshed.active_revision.id, parent_revision.id);
+        assert_eq!(refreshed.active_member_count, baseline_member_count + 1);
+        assert_eq!(refreshed.added_members, preview.added_members);
+        assert_eq!(refreshed.projected_member_count, baseline_member_count + 5);
+
+        assert!(
+            store
+                .preview_content_draft("missing-preview", 1)
+                .expect("不存在的草稿应返回空结果")
+                .is_none()
+        );
+        assert!(store.preview_content_draft("preview-draft", 0).is_err());
     }
 
     #[test]
