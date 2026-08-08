@@ -1002,6 +1002,7 @@ mod tests {
             }],
             soul_beasts: Vec::new(),
             soul_rings: Vec::new(),
+            transitions: Vec::new(),
         };
         let loaded = LoadedContentPackage {
             content_hash: content_hash(&package).expect("应计算 web 测试内容包哈希"),

@@ -11,7 +11,8 @@ use rusqlite::{
 
 use crate::config::DatabaseConfig;
 use crate::content::{
-    ContentPackage, LoadedContentPackage, canonical_json, content_hash, validate_shape,
+    ContentPackage, ContentTransitionPackageEntry, LoadedContentPackage, canonical_json,
+    content_hash, validate_shape,
 };
 use crate::message::Protocol;
 
@@ -5226,26 +5227,38 @@ fn load_content_revision_member_set(
 
 /// 复用发布时的成员归并规则，推导单个内容包可能新增的目录成员。
 fn content_package_member_set(package: &ContentPackage) -> BTreeSet<(String, String)> {
-    let mut members = BTreeSet::new();
-    for entry in &package.wuhun {
-        members.insert(("wuhun".to_string(), entry.name.clone()));
-    }
+    let mut members = content_package_declared_member_set(package);
     for entry in &package.skills {
-        members.insert(("skill".to_string(), entry.skill_key.clone()));
         if entry.starter {
             members.insert(("starter-skill".to_string(), entry.skill_key.clone()));
         }
     }
     for entry in &package.effects {
         members.insert(("skill".to_string(), entry.skill_key.clone()));
+    }
+    for entry in &package.soul_rings {
+        members.insert(("beast".to_string(), entry.soul_beast_key.clone()));
+        members.insert(("skill".to_string(), entry.skill_key.clone()));
+    }
+    members
+}
+
+/// 仅收集内容包直接创建的目录成员，不能把依赖引用当作 replacement target。
+fn content_package_declared_member_set(package: &ContentPackage) -> BTreeSet<(String, String)> {
+    let mut members = BTreeSet::new();
+    for entry in &package.wuhun {
+        members.insert(("wuhun".to_string(), entry.name.clone()));
+    }
+    for entry in &package.skills {
+        members.insert(("skill".to_string(), entry.skill_key.clone()));
+    }
+    for entry in &package.effects {
         members.insert(("effect".to_string(), entry.effect_key.clone()));
     }
     for entry in &package.soul_beasts {
         members.insert(("beast".to_string(), entry.beast_key.clone()));
     }
     for entry in &package.soul_rings {
-        members.insert(("beast".to_string(), entry.soul_beast_key.clone()));
-        members.insert(("skill".to_string(), entry.skill_key.clone()));
         members.insert(("ring".to_string(), entry.ring_key.clone()));
     }
     members
@@ -5283,6 +5296,30 @@ fn active_content_member_exists(
             |row| row.get::<_, bool>(0),
         )
         .map_err(|error| format!("读取当前内容 revision 成员失败：{error}"))
+}
+
+/// 判断指定 revision 是否已为 source key 声明生命周期关系。
+fn active_content_transition_exists(
+    connection: &Connection,
+    revision_id: i64,
+    entity_kind: &str,
+    source_key: &str,
+) -> Result<bool, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM content_revision_transition
+                 WHERE revision_id = ?1
+                   AND entity_kind = ?2
+                   AND source_key = ?3
+            )
+            "#,
+            params![revision_id, entity_kind, source_key],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("读取当前内容 transition 失败：{error}"))
 }
 
 fn content_validation_report(
@@ -5460,6 +5497,50 @@ fn validate_content_package_against_database(
             && soul_ring_exists_for_beast(connection, &entry.soul_beast_key)?
         {
             errors.push(format!("魂兽 {} 已经绑定魂环", entry.soul_beast_key));
+        }
+    }
+
+    let active_revision_id = current_content_revision_id(connection)?;
+    let active_members = load_content_revision_member_set(connection, active_revision_id)?;
+    let package_members = content_package_declared_member_set(package);
+    for transition in &package.transitions {
+        let source_member = (
+            transition.entity_kind.clone(),
+            transition.source_key.clone(),
+        );
+        if !active_members.contains(&source_member) {
+            errors.push(format!(
+                "transition source 不在当前 active revision：{} / {}",
+                transition.entity_kind, transition.source_key
+            ));
+        } else if active_content_transition_exists(
+            connection,
+            active_revision_id,
+            &transition.entity_kind,
+            &transition.source_key,
+        )? {
+            errors.push(format!(
+                "transition source 已有生命周期关系：{} / {}",
+                transition.entity_kind, transition.source_key
+            ));
+        }
+        if transition.transition_kind == "replaced" {
+            let Some(target_key) = transition.target_key.as_ref() else {
+                continue;
+            };
+            let target_member = (transition.entity_kind.clone(), target_key.clone());
+            if !package_members.contains(&target_member) {
+                errors.push(format!(
+                    "transition target 必须由本包新增：{} / {}",
+                    transition.entity_kind, target_key
+                ));
+            }
+            if active_members.contains(&target_member) {
+                errors.push(format!(
+                    "transition target 已在当前 active revision：{} / {}",
+                    transition.entity_kind, target_key
+                ));
+            }
         }
     }
     Ok(errors)
@@ -5796,6 +5877,42 @@ fn publish_content_package_rows(
     Ok(())
 }
 
+/// 将已通过数据库 lint 的 transition 声明写入新 revision。
+fn publish_content_transitions(
+    connection: &Connection,
+    revision_id: i64,
+    transitions: &[ContentTransitionPackageEntry],
+    created_at: i64,
+) -> Result<(), String> {
+    for transition in transitions {
+        connection
+            .execute(
+                r#"
+                INSERT INTO content_revision_transition(
+                    revision_id, entity_kind, source_key, target_key,
+                    transition_kind, reason, created_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+                params![
+                    revision_id,
+                    transition.entity_kind,
+                    transition.source_key,
+                    transition.target_key,
+                    transition.transition_kind,
+                    transition.reason,
+                    created_at
+                ],
+            )
+            .map_err(|error| {
+                format!(
+                    "写入内容 transition {} / {} 失败：{error}",
+                    transition.entity_kind, transition.source_key
+                )
+            })?;
+    }
+    Ok(())
+}
+
 impl Store {
     pub fn initialize(data_dir: &Path, config: &DatabaseConfig) -> Result<Self, String> {
         let path = data_dir.join(&config.relative_path);
@@ -6089,6 +6206,7 @@ impl Store {
             )
             .map_err(|error| format!("继承父内容 revision transition 失败：{error}"))?;
         publish_content_package_rows(&transaction, revision_id, &package, timestamp)?;
+        publish_content_transitions(&transaction, revision_id, &package.transitions, timestamp)?;
         let updated = transaction
             .execute(
                 r#"
@@ -23892,6 +24010,7 @@ mod tests {
             }],
             soul_beasts: Vec::new(),
             soul_rings: Vec::new(),
+            transitions: Vec::new(),
         };
         LoadedContentPackage {
             content_hash: content_hash(&package).expect("应计算测试内容包哈希"),
@@ -23958,6 +24077,7 @@ mod tests {
             ],
             soul_beasts: Vec::new(),
             soul_rings: Vec::new(),
+            transitions: Vec::new(),
         };
         LoadedContentPackage {
             content_hash: content_hash(&package).expect("应计算预览内容包哈希"),
@@ -29559,6 +29679,7 @@ mod tests {
             }],
             soul_beasts: Vec::new(),
             soul_rings: Vec::new(),
+            transitions: Vec::new(),
         };
         let loaded = LoadedContentPackage {
             content_hash: content_hash(&package).expect("content hash"),
@@ -29691,6 +29812,7 @@ mod tests {
             effects: Vec::new(),
             soul_beasts: Vec::new(),
             soul_rings: Vec::new(),
+            transitions: Vec::new(),
         };
         let loaded = LoadedContentPackage {
             content_hash: content_hash(&package).expect("content hash"),
@@ -29962,6 +30084,156 @@ mod tests {
     }
 
     #[test]
+    fn v24_content_package_transition_validates_and_publishes() {
+        let (_directory, store) = test_store();
+        let mut package = content_preview_package("transition-package");
+        package
+            .package
+            .transitions
+            .push(ContentTransitionPackageEntry {
+                entity_kind: "skill".to_string(),
+                source_key: "entangle".to_string(),
+                target_key: Some("preview-skill".to_string()),
+                transition_kind: "replaced".to_string(),
+                reason: "测试魂技替换".to_string(),
+            });
+        package.content_hash =
+            content_hash(&package.package).expect("应重算 transition 内容包哈希");
+        store
+            .stage_content_package(&package)
+            .expect("应写入带 transition 的草稿");
+        assert!(
+            store
+                .validate_content_draft("transition-package", 1)
+                .expect("应校验带 transition 的草稿")
+                .errors
+                .is_empty()
+        );
+        let published = store
+            .publish_content_draft("transition-package", 1)
+            .expect("应发布带 transition 的内容包");
+        let connection = store.open().expect("应读取已发布 transition");
+        let transition = connection
+            .query_row(
+                r#"
+                SELECT source_key, target_key, transition_kind, reason
+                  FROM content_revision_transition
+                 WHERE revision_id = ?1 AND entity_kind = 'skill'
+                "#,
+                [published.revision.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .expect("应保存 transition 声明");
+        assert_eq!(
+            transition,
+            (
+                "entangle".to_string(),
+                Some("preview-skill".to_string()),
+                "replaced".to_string(),
+                "测试魂技替换".to_string(),
+            )
+        );
+        assert!(
+            !active_content_member_exists(&connection, "skill", "entangle")
+                .expect("source 应被 transition 过滤")
+        );
+        assert!(
+            active_content_member_exists(&connection, "skill", "preview-skill")
+                .expect("target 应保持 active")
+        );
+
+        let mut invalid = content_effect_package(
+            "transition-invalid",
+            "transition-invalid-effect",
+            "entangle",
+        );
+        invalid
+            .package
+            .transitions
+            .push(ContentTransitionPackageEntry {
+                entity_kind: "skill".to_string(),
+                source_key: "sting".to_string(),
+                target_key: Some("missing-transition-target".to_string()),
+                transition_kind: "replaced".to_string(),
+                reason: "缺失 target".to_string(),
+            });
+        invalid.content_hash = content_hash(&invalid.package).expect("应重算无效 transition 哈希");
+        store
+            .stage_content_package(&invalid)
+            .expect("应写入无效 transition 草稿");
+        let validation = store
+            .validate_content_draft("transition-invalid", 1)
+            .expect("应返回无效 transition 校验报告");
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("target 必须由本包新增"))
+        );
+    }
+
+    #[test]
+    fn v24_content_package_transition_rejects_dependency_only_target() {
+        let (_directory, store) = test_store();
+        let baseline = store
+            .active_content_revision()
+            .expect("应读取 transition 依赖测试 baseline");
+        let historical = content_preview_package("transition-history");
+        store
+            .stage_content_package(&historical)
+            .expect("应写入历史 target 内容包");
+        assert!(
+            store
+                .validate_content_draft("transition-history", 1)
+                .expect("应校验历史 target 内容包")
+                .errors
+                .is_empty()
+        );
+        store
+            .publish_content_draft("transition-history", 1)
+            .expect("应发布历史 target 内容包");
+        store
+            .rollback_content_revision(baseline.id)
+            .expect("应回滚以使历史 target 变为非 active");
+
+        let mut package = content_effect_package(
+            "transition-dependency-only",
+            "transition-dependency-only-effect",
+            "preview-skill",
+        );
+        package
+            .package
+            .transitions
+            .push(ContentTransitionPackageEntry {
+                entity_kind: "skill".to_string(),
+                source_key: "entangle".to_string(),
+                target_key: Some("preview-skill".to_string()),
+                transition_kind: "replaced".to_string(),
+                reason: "依赖不是新 target".to_string(),
+            });
+        package.content_hash = content_hash(&package.package).expect("应重算依赖 target 哈希");
+        store
+            .stage_content_package(&package)
+            .expect("应写入依赖 target 草稿");
+        let validation = store
+            .validate_content_draft("transition-dependency-only", 1)
+            .expect("应返回依赖 target 校验报告");
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("target 必须由本包新增"))
+        );
+    }
+
+    #[test]
     fn v24_content_metadata_pages_are_stable_and_bounded() {
         let (_directory, store) = test_store();
 
@@ -30201,6 +30473,7 @@ mod tests {
                 description: "test catalog ring".to_string(),
                 enabled: true,
             }],
+            transitions: Vec::new(),
         };
         let loaded = LoadedContentPackage {
             content_hash: content_hash(&package).expect("content hash"),

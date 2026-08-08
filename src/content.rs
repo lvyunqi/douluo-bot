@@ -31,6 +31,20 @@ pub struct ContentPackage {
     pub soul_beasts: Vec<SoulBeastPackageEntry>,
     #[serde(default)]
     pub soul_rings: Vec<SoulRingPackageEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transitions: Vec<ContentTransitionPackageEntry>,
+}
+
+/// 内容包声明的旧 key 弃用或替换关系。
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContentTransitionPackageEntry {
+    pub entity_kind: String,
+    pub source_key: String,
+    #[serde(default)]
+    pub target_key: Option<String>,
+    pub transition_kind: String,
+    pub reason: String,
 }
 
 /// 内容包中的武魂及其属性模板。
@@ -264,7 +278,8 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
         + package.skills.len()
         + package.effects.len()
         + package.soul_beasts.len()
-        + package.soul_rings.len();
+        + package.soul_rings.len()
+        + package.transitions.len();
     if total == 0 {
         errors.push("内容包至少要包含一条目录数据".to_string());
     }
@@ -583,7 +598,81 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
             true,
         );
     }
+
+    let mut transition_sources = BTreeSet::new();
+    let mut transition_targets = BTreeSet::new();
+    for entry in &package.transitions {
+        if !matches!(
+            entry.entity_kind.as_str(),
+            "wuhun" | "skill" | "effect" | "beast" | "ring"
+        ) {
+            errors.push(format!(
+                "transition {} 的 entity_kind 不受支持",
+                entry.source_key
+            ));
+        }
+        if !matches!(entry.transition_kind.as_str(), "deprecated" | "replaced") {
+            errors.push(format!(
+                "transition {} 的 transition_kind 不受支持",
+                entry.source_key
+            ));
+        }
+        validate_transition_key(
+            &mut errors,
+            "transition.source_key",
+            &entry.entity_kind,
+            &entry.source_key,
+        );
+        if let Some(target_key) = &entry.target_key {
+            validate_transition_key(
+                &mut errors,
+                "transition.target_key",
+                &entry.entity_kind,
+                target_key,
+            );
+        }
+        text_field(&mut errors, "transition.reason", &entry.reason, 512, true);
+        if !transition_sources.insert(format!("{}:{}", entry.entity_kind, entry.source_key)) {
+            errors.push(format!(
+                "transition source 重复：{} / {}",
+                entry.entity_kind, entry.source_key
+            ));
+        }
+        if let Some(target_key) = &entry.target_key {
+            if entry.source_key == *target_key {
+                errors.push(format!(
+                    "transition source 与 target 不能相同：{}",
+                    entry.source_key
+                ));
+            }
+            if !transition_targets.insert(format!("{}:{}", entry.entity_kind, target_key)) {
+                errors.push(format!(
+                    "transition target 重复：{} / {}",
+                    entry.entity_kind, target_key
+                ));
+            }
+        }
+        match (entry.transition_kind.as_str(), entry.target_key.as_ref()) {
+            ("deprecated", Some(_)) => errors.push(format!(
+                "deprecated transition 不允许 target：{}",
+                entry.source_key
+            )),
+            ("replaced", None) => errors.push(format!(
+                "replaced transition 必须提供 target：{}",
+                entry.source_key
+            )),
+            _ => {}
+        }
+    }
     errors
+}
+
+fn validate_transition_key(errors: &mut Vec<String>, field: &str, entity_kind: &str, value: &str) {
+    if entity_kind == "wuhun" {
+        text_field(errors, field, value, 200, true);
+    } else {
+        validate_key(errors, field, value);
+    }
 }
 
 fn validate_percent_fields(errors: &mut Vec<String>, prefix: &str, stats: &WuhunStatsPackageEntry) {
@@ -685,6 +774,7 @@ mod tests {
             }],
             soul_beasts: Vec::new(),
             soul_rings: Vec::new(),
+            transitions: Vec::new(),
         }
     }
 
@@ -716,6 +806,42 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("效果键重复"))
         );
+    }
+
+    #[test]
+    fn transition_declarations_preserve_legacy_hash_and_enforce_shape() {
+        let package = minimal_package();
+        let canonical = canonical_json(&package).expect("空 transition 包应可规范化");
+        assert!(!canonical.contains("\"transitions\""));
+        let legacy = parse_package_text(&canonical, "json").expect("旧格式内容包应继续可解析");
+        assert_eq!(legacy.content_hash, content_hash(&package).unwrap());
+
+        let mut invalid = package;
+        invalid.transitions = vec![
+            ContentTransitionPackageEntry {
+                entity_kind: "skill".to_string(),
+                source_key: "test-skill".to_string(),
+                target_key: None,
+                transition_kind: "replaced".to_string(),
+                reason: "缺少 target".to_string(),
+            },
+            ContentTransitionPackageEntry {
+                entity_kind: "skill".to_string(),
+                source_key: "test-skill".to_string(),
+                target_key: Some("test-skill".to_string()),
+                transition_kind: "deprecated".to_string(),
+                reason: "错误的弃用目标".to_string(),
+            },
+        ];
+        let errors = validate_shape(&invalid);
+        assert!(errors.iter().any(|error| error.contains("必须提供 target")));
+        assert!(errors.iter().any(|error| error.contains("不允许 target")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("source 与 target 不能相同"))
+        );
+        assert!(errors.iter().any(|error| error.contains("source 重复")));
     }
 
     #[test]
