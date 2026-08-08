@@ -95,6 +95,7 @@ function Invoke-OneBotCommand {
         [string]$GroupId = "",
         [long]$MessageId = 0,
         [switch]$AllowNoAction,
+        [switch]$CollectAll,
         [hashtable]$ExtraEvent = @{}
     )
     $socket = [System.Net.WebSockets.ClientWebSocket]::new()
@@ -155,7 +156,8 @@ function Invoke-OneBotCommand {
         $actions = [System.Collections.Generic.List[object]]::new()
         $deadline = [DateTime]::UtcNow.AddSeconds(10)
         while ([DateTime]::UtcNow -lt $deadline) {
-            $payload = Receive-WebSocketText $socket 10000
+            $receiveTimeout = if ($CollectAll -and $actions.Count -gt 0) { 400 } else { 10000 }
+            $payload = Receive-WebSocketText $socket $receiveTimeout
             if ([string]::IsNullOrWhiteSpace($payload)) {
                 break
             }
@@ -179,8 +181,8 @@ function Invoke-OneBotCommand {
                 echo = $action.echo
             }
             Send-WebSocketText $socket ($response | ConvertTo-Json -Compress -Depth 20)
-            # 一次命令的首个 Action 即可证明回调完成；避免等待第二个 Action。
-            if ($actions.Count -ge 1) {
+            # 普通命令拿到首个 Action 即可完成；指定 CollectAll 时额外留出短窗口检查重复回复。
+            if ($actions.Count -ge 1 -and -not $CollectAll) {
                 break
             }
         }
@@ -191,6 +193,7 @@ function Invoke-OneBotCommand {
                 ActionName = "none"
                 Text = ""
                 ActionJson = ""
+                ActionCount = 0
             }
         }
         Assert-Condition ($actions.Count -gt 0) "command '$Message' produced no OneBot Action"
@@ -201,6 +204,7 @@ function Invoke-OneBotCommand {
             ActionName = [string]$first.action
             Text = Get-ActionText $first
             ActionJson = ($first | ConvertTo-Json -Compress -Depth 30)
+            ActionCount = $actions.Count
         }
     } finally {
         if ($socket.State -eq [System.Net.WebSockets.WebSocketState]::Open) {
@@ -429,7 +433,8 @@ try {
         "购买", "出售", "使用", "转账", "发送物品", "任务", "接取任务", "任务进度",
         "提交任务", "放弃任务", "魂兽", "挑战", "攻击", "技能", "技能详情", "装备魂技", "卸下魂技",
         "魂环", "吸收魂环", "释放技能",
-        "逃跑", "战斗状态", "战斗日志"
+        "逃跑", "战斗状态", "战斗日志",
+        "设置快捷键", "快捷键列表", "查看快捷键", "删除快捷键"
     )) {
         $found = $commands | Where-Object { $_ -eq $command }
         Assert-Condition ($null -ne $found) "descriptor is missing command '$command' (commands=$($commands -join ', '))"
@@ -471,6 +476,23 @@ try {
             Assert-Condition ($result.Text.Contains("武魂稳定度")) "healing item response did not expose wuhun stability"
         }
     }
+
+    $shortcutSet = Invoke-OneBotCommand $endpoint "设置快捷键 状态-查状态"
+    Write-Output ("onebot 设置快捷键: {0} [{1}]" -f $shortcutSet.ActionName, $shortcutSet.Text)
+    Assert-Condition ($shortcutSet.Text.Contains("快捷键设置成功")) "player shortcut setup failed"
+    $shortcutList = Invoke-OneBotCommand $endpoint "快捷键列表"
+    Assert-Condition ($shortcutList.Text.Contains("【状态】查状态")) "shortcut list did not retain the player mapping"
+    $shortcutStatus = Invoke-OneBotCommand $endpoint "查状态" -MessageId 800003 -CollectAll
+    Write-Output ("onebot 查状态: {0} [{1}]" -f $shortcutStatus.ActionName, $shortcutStatus.Text)
+    Assert-Condition ($shortcutStatus.Text.Contains("角色状态")) "player shortcut did not dispatch the canonical status command"
+    Assert-Condition ($shortcutStatus.ActionCount -eq 1) "player shortcut produced duplicate replies"
+    $shortcutReplay = Invoke-OneBotCommand $endpoint "查状态" -MessageId 800003 -AllowNoAction
+    Assert-Condition ($shortcutReplay.ActionName -eq "none") "player shortcut replay was not suppressed by the host message deduplication"
+    $reservedShortcut = Invoke-OneBotCommand $endpoint "设置快捷键 状态-plugins"
+    Assert-Condition ($reservedShortcut.Text.Contains("不能覆盖 QimenBot")) "host management command was accepted as a player shortcut"
+    $hostPlugins = Invoke-OneBotCommand $endpoint "plugins"
+    Assert-Condition ($hostPlugins.Text.Contains("[plugins]")) "host plugins command was shadowed by a player shortcut"
+    Assert-Condition ($hostPlugins.Text.Contains("douluo-game")) "host plugins command did not report the dynamic game plugin"
 
     $closeWuhun = Invoke-OneBotCommand $endpoint "关武魂"
     Write-Output ("onebot 关武魂: {0} [{1}]" -f $closeWuhun.ActionName, $closeWuhun.Text)

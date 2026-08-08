@@ -2,7 +2,9 @@ use abi_stable_host_api::CommandRequest;
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::alias::{validate_player_alias_name, validate_player_alias_target};
+use crate::alias::{
+    is_player_alias_target, validate_player_alias_name, validate_player_alias_target,
+};
 use crate::assets::IllustrationAssets;
 use crate::catalog;
 use crate::config::{AuthorizationMode, IllustrationMode, PluginConfig};
@@ -430,6 +432,17 @@ impl GameService {
             .field("原指令", deleted.target_command)
             .field("快捷键", deleted.alias)
             .command("快捷键列表"))
+    }
+
+    /// 供宿主命令改写读取当前玩家快捷键；任何解析或存储异常都由调用方按未命中处理。
+    pub(crate) fn resolve_player_alias_command(&self, req: &CommandRequest) -> Option<String> {
+        let identity = resolve_identity(req, &self.config.identity).ok()?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let record = self
+            .store
+            .resolve_player_alias(&key, req.command_name.as_str())
+            .ok()??;
+        is_player_alias_target(&record.target_command).then_some(record.target_command)
     }
 
     pub fn menu(&self, args: &str) -> Result<GameDocument, String> {
@@ -3094,6 +3107,10 @@ mod tests {
         assert!(created.contains("快捷键设置成功"));
         assert!(created.contains("原指令：状态"));
         assert!(created.contains("快捷键：查状态"));
+        assert_eq!(
+            service.resolve_player_alias_command(&command_request("查状态", "", "alias-resolve",)),
+            Some("状态".to_string())
+        );
 
         let list = crate::message::render_text(
             &service

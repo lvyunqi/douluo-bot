@@ -15,6 +15,7 @@ mod web;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
+use abi_stable::std_types::RString;
 use abi_stable_host_api::{
     CommandRequest, CommandResponse, PluginConfigRequest, PluginConfigResult, PluginInitConfig,
     PluginInitResult,
@@ -126,6 +127,32 @@ fn shutdown_runtime() {
     if let Ok(mut slot) = runtime_slot().write() {
         *slot = None;
     }
+}
+
+/// 为支持该可选符号的宿主返回当前玩家的 canonical 快捷键目标；空字符串表示未命中。
+///
+/// # Safety
+///
+/// 调用方必须传入与当前 ABI 兼容、在本次调用期间保持有效的 `CommandRequest` 引用。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qimen_plugin_command_rewrite(req: &CommandRequest) -> RString {
+    let service = match runtime_slot().read() {
+        Ok(slot) => slot.clone(),
+        Err(_) => None,
+    };
+    let Some(service) = service else {
+        return RString::new();
+    };
+    let Some(command) = service.resolve_player_alias_command(req) else {
+        return RString::new();
+    };
+    RString::from(
+        serde_json::json!({
+            "command": command,
+            "args": req.args.as_str(),
+        })
+        .to_string(),
+    )
 }
 
 fn with_service(
