@@ -555,11 +555,7 @@ impl GameService {
                         soul_ring_color_label(&ring.ring.color),
                         ring.ring.age
                     ))
-                    .line(if ring.skill_bound {
-                        format!("魂技：{}", ring.ring.skill.name)
-                    } else {
-                        "魂技：历史绑定不可验证".to_string()
-                    });
+                    .line(format!("魂技：{}", ring.ring.skill.name));
             }
             document = document.command("剥离魂环");
         }
@@ -601,15 +597,12 @@ impl GameService {
     }
 
     fn detach_soul_ring_document(&self, receipt: SoulRingDetachmentReceipt) -> GameDocument {
-        let skill_bound = receipt.ring.skill_bound;
         let skill_name = receipt.skill.name;
         let replayed = receipt.replayed;
         let notice = if replayed {
             "检测到相同消息的重复请求，已返回原剥离回执，未重复改变魂环状态"
-        } else if skill_bound {
-            "该魂环和它授予的魂技已永久退出当前状态；重新附加必须吸收新的待吸收魂环"
         } else {
-            "该历史魂环没有可验证的绑定魂技；已剥离魂环，未对任何历史魂技做补绑或改写"
+            "该魂环和它授予的魂技已永久退出当前状态；重新附加必须吸收新的待吸收魂环"
         };
         GameDocument::new(if replayed {
             "魂环剥离回执"
@@ -617,14 +610,7 @@ impl GameService {
             "魂环剥离成功"
         })
         .field("魂环", receipt.ring.ring.name)
-        .field(
-            "魂技",
-            if skill_bound {
-                skill_name
-            } else {
-                "无可验证的绑定魂技".to_string()
-            },
-        )
+        .field("魂技", skill_name)
         .field("环位", format!("第{}魂环", receipt.ring.ring_index))
         .notice(notice)
         .command("魂环")

@@ -4399,7 +4399,6 @@ WHEN NEW.player_soul_ring_id IS NULL
            AND ring.player_id = NEW.player_id
            AND ring.wuhun_id = NEW.wuhun_id
            AND ring.wuhun_slot = NEW.wuhun_slot
-           AND ring.binding_state = 'bound'
            AND ring.skill_key = NEW.skill_key
            AND catalog_ring.skill_key = NEW.skill_key
            AND drop_event.status = 'pending'
@@ -4579,7 +4578,7 @@ BEGIN
 END;
 "#;
 
-// v28 将魂环附加和魂技绑定拆为可追溯的历史；当前可用状态只来自尚未剥离的绑定。
+// v28 只建立前向的魂环绑定结构；旧玩家历史不得在这里被复制、转换或补绑。
 const MIGRATION_V28: &str = r#"
 DROP TRIGGER IF EXISTS player_skill_no_delete;
 DROP TRIGGER IF EXISTS player_skill_no_reinsert;
@@ -4607,18 +4606,9 @@ CREATE TABLE player_soul_ring_v28 (
     ring_index INTEGER NOT NULL CHECK(ring_index BETWEEN 1 AND 9),
     ring_key TEXT NOT NULL REFERENCES soul_ring(ring_key) ON DELETE RESTRICT,
     skill_key TEXT NOT NULL REFERENCES skill(skill_key) ON DELETE RESTRICT,
-    binding_state TEXT NOT NULL CHECK(binding_state IN ('legacy_unbound', 'bound')),
     soul_ring_drop_id INTEGER NOT NULL UNIQUE REFERENCES soul_ring_drop(id) ON DELETE RESTRICT,
     obtained_at INTEGER NOT NULL CHECK(obtained_at >= 0)
 ) STRICT;
-
-INSERT INTO player_soul_ring_v28(
-    id, player_id, wuhun_id, wuhun_slot, ring_index,
-    ring_key, skill_key, binding_state, soul_ring_drop_id, obtained_at
-)
-SELECT id, player_id, wuhun_id, wuhun_slot, ring_index,
-       ring_key, skill_key, 'legacy_unbound', soul_ring_drop_id, obtained_at
-  FROM player_soul_ring;
 
 DROP TABLE player_soul_ring;
 ALTER TABLE player_soul_ring_v28 RENAME TO player_soul_ring;
@@ -4638,6 +4628,7 @@ CREATE TABLE player_skill_v28 (
     learned_at INTEGER NOT NULL CHECK(learned_at >= 0)
 ) STRICT;
 
+-- 这里只保留旧魂技的原始历史，不为它建立任何魂环绑定。
 INSERT INTO player_skill_v28(
     id, player_id, wuhun_id, skill_key, wuhun_slot,
     player_soul_ring_id, level, proficiency, equipped, learned_at
@@ -4663,7 +4654,7 @@ CREATE UNIQUE INDEX player_skill_unbound_identity
 CREATE TABLE player_soul_ring_detachment (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     player_soul_ring_id INTEGER NOT NULL UNIQUE REFERENCES player_soul_ring(id) ON DELETE RESTRICT,
-    player_skill_id INTEGER UNIQUE REFERENCES player_skill(id) ON DELETE RESTRICT,
+    player_skill_id INTEGER NOT NULL UNIQUE REFERENCES player_skill(id) ON DELETE RESTRICT,
     player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
     wuhun_id INTEGER NOT NULL REFERENCES wuhun(id) ON DELETE RESTRICT,
     wuhun_slot INTEGER NOT NULL CHECK(wuhun_slot = 1),
@@ -4701,7 +4692,6 @@ SELECT learned.*
         SELECT 1
           FROM player_soul_ring_current_projection ring
          WHERE ring.id = learned.player_soul_ring_id
-           AND ring.binding_state = 'bound'
     );
 
 CREATE TRIGGER player_soul_ring_no_update
@@ -4739,7 +4729,6 @@ WHEN NOT EXISTS(
        AND ring.enabled = 1
        AND ring.ring_index = NEW.ring_index
        AND ring.skill_key = NEW.skill_key
-       AND NEW.binding_state = 'bound'
        AND NEW.ring_index = (
            SELECT COUNT(*) + 1
              FROM player_soul_ring_current_projection current_ring
@@ -4768,7 +4757,6 @@ WHEN NOT EXISTS(
        AND learned_ring.soul_ring_drop_id = NEW.soul_ring_drop_id
        AND learned_ring.ring_key = NEW.ring_key
        AND learned_ring.ring_index = NEW.ring_index
-       AND learned_ring.binding_state = 'bound'
        AND ring.enabled = 1
        AND audit.protocol = i.protocol
        AND audit.account_id = i.account_id
@@ -4793,12 +4781,16 @@ BEFORE INSERT ON player_skill
 WHEN EXISTS(
     SELECT 1 FROM player_skill
      WHERE id = NEW.id
-        OR (NEW.player_soul_ring_id IS NOT NULL
-            AND player_soul_ring_id = NEW.player_soul_ring_id)
-        OR (NEW.player_soul_ring_id IS NULL
+        OR (
+            NEW.player_soul_ring_id IS NOT NULL
+            AND player_soul_ring_id = NEW.player_soul_ring_id
+        )
+        OR (
+            NEW.player_soul_ring_id IS NULL
             AND player_id = NEW.player_id
             AND skill_key = NEW.skill_key
-            AND player_soul_ring_id IS NULL)
+            AND player_soul_ring_id IS NULL
+        )
 )
 BEGIN
     SELECT RAISE(ABORT, 'player skill is append-only');
@@ -4828,7 +4820,6 @@ WHEN NEW.player_soul_ring_id IS NULL
            AND ring.player_id = NEW.player_id
            AND ring.wuhun_id = NEW.wuhun_id
            AND ring.wuhun_slot = NEW.wuhun_slot
-           AND ring.binding_state = 'bound'
            AND ring.skill_key = NEW.skill_key
            AND catalog_ring.skill_key = NEW.skill_key
            AND drop_event.status = 'pending'
@@ -4878,10 +4869,7 @@ WHEN EXISTS(
     SELECT 1 FROM player_soul_ring_detachment
      WHERE id = NEW.id
         OR player_soul_ring_id = NEW.player_soul_ring_id
-        OR (
-            NEW.player_skill_id IS NOT NULL
-            AND player_skill_id = NEW.player_skill_id
-        )
+        OR player_skill_id = NEW.player_skill_id
         OR operation_log_id = NEW.operation_log_id
         OR (
             length(NEW.source_message_id) > 0
@@ -4908,26 +4896,15 @@ WHEN NOT EXISTS(
        AND ring.ring_index = NEW.ring_index
        AND ring.ring_key = NEW.ring_key
        AND ring.skill_key = NEW.skill_key
-       AND (
-           (
-               ring.binding_state = 'legacy_unbound'
-               AND NEW.player_skill_id IS NULL
-               AND NOT EXISTS(
-                   SELECT 1 FROM player_skill learned
-                    WHERE learned.player_soul_ring_id = ring.id
-               )
-           )
-           OR EXISTS(
-               SELECT 1
-                 FROM player_skill_bound_projection learned
-                WHERE ring.binding_state = 'bound'
-                  AND learned.id = NEW.player_skill_id
-                  AND learned.player_soul_ring_id = ring.id
-                  AND learned.player_id = NEW.player_id
-                  AND learned.wuhun_id = NEW.wuhun_id
-                  AND learned.wuhun_slot = NEW.wuhun_slot
-                  AND learned.skill_key = NEW.skill_key
-           )
+       AND EXISTS(
+           SELECT 1
+             FROM player_skill_bound_projection learned
+            WHERE learned.id = NEW.player_skill_id
+              AND learned.player_soul_ring_id = ring.id
+              AND learned.player_id = NEW.player_id
+              AND learned.wuhun_id = NEW.wuhun_id
+              AND learned.wuhun_slot = NEW.wuhun_slot
+              AND learned.skill_key = NEW.skill_key
        )
        AND NOT EXISTS(
            SELECT 1
@@ -5757,7 +5734,6 @@ pub struct PlayerSoulRingRecord {
     pub ring: SoulRingRecord,
     pub ring_index: i64,
     pub obtained_at: i64,
-    pub skill_bound: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8127,6 +8103,7 @@ impl Store {
             }
 
             if !migration_applied(&transaction, 28)? {
+                ensure_v28_can_initialize_without_player_history(&transaction)?;
                 transaction
                     .execute_batch(MIGRATION_V28)
                     .map_err(|error| format!("执行数据库迁移 v28 失败：{error}"))?;
@@ -10297,8 +10274,8 @@ impl Store {
                 r#"
                 INSERT INTO player_soul_ring(
                     player_id, wuhun_id, wuhun_slot, ring_index,
-                    ring_key, skill_key, binding_state, soul_ring_drop_id, obtained_at
-                ) VALUES(?1, ?2, 1, ?3, ?4, ?5, 'bound', ?6, ?7)
+                    ring_key, skill_key, soul_ring_drop_id, obtained_at
+                ) VALUES(?1, ?2, 1, ?3, ?4, ?5, ?6, ?7)
                 "#,
                 params![
                     player.player_id,
@@ -10400,7 +10377,6 @@ impl Store {
         }
         let ring = load_latest_current_player_soul_ring(&transaction, player.player_id)?
             .ok_or_else(|| "当前没有可剥离的魂环".to_string())?;
-        // 旧库无法证明魂环与魂技的原子绑定，只能保留为不可用历史并允许剥离。
         let player_skill_id = load_bound_player_skill_id(&transaction, ring.id)?;
         let operation_log_id = insert_operation_log(&transaction, key, operation)?;
         let created_at = now_timestamp()?;
@@ -13934,7 +13910,6 @@ fn player_soul_ring_record_from_row(
         ring: soul_ring_record_from_row(row, 1)?,
         ring_index: row.get(21)?,
         obtained_at: row.get(22)?,
-        skill_bound: row.get(23)?,
     })
 }
 
@@ -14083,7 +14058,7 @@ fn player_soul_ring_select_sql() -> &'static str {
            s.ring_index, s.soul_power_cost, s.cooldown_rounds, s.base_damage,
            s.spirit_ratio_percent, s.strength_ratio_percent, s.description,
            r.ring_index, r.age, r.color, r.description,
-           psr.ring_index, psr.obtained_at, psr.binding_state = 'bound'
+           psr.ring_index, psr.obtained_at
       FROM player_soul_ring_current_projection psr
       JOIN soul_ring r ON r.ring_key = psr.ring_key
       JOIN soul_beast sb ON sb.id = r.soul_beast_id
@@ -14100,7 +14075,7 @@ fn player_soul_ring_history_select_sql() -> &'static str {
            s.ring_index, s.soul_power_cost, s.cooldown_rounds, s.base_damage,
            s.spirit_ratio_percent, s.strength_ratio_percent, s.description,
            r.ring_index, r.age, r.color, r.description,
-           psr.ring_index, psr.obtained_at, psr.binding_state = 'bound'
+           psr.ring_index, psr.obtained_at
       FROM player_soul_ring psr
       JOIN soul_ring r ON r.ring_key = psr.ring_key
       JOIN soul_beast sb ON sb.id = r.soul_beast_id
@@ -14237,7 +14212,7 @@ fn load_latest_current_player_soul_ring(
 fn load_bound_player_skill_id(
     connection: &Connection,
     player_soul_ring_id: i64,
-) -> Result<Option<i64>, String> {
+) -> Result<i64, String> {
     connection
         .query_row(
             "SELECT id FROM player_skill_bound_projection WHERE player_soul_ring_id = ?1",
@@ -14245,7 +14220,8 @@ fn load_bound_player_skill_id(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|error| format!("读取魂环绑定魂技失败：{error}"))
+        .map_err(|error| format!("读取魂环绑定魂技失败：{error}"))?
+        .ok_or_else(|| "当前魂环缺少绑定魂技，拒绝剥离并保持数据不变".to_string())
 }
 
 fn load_soul_ring_drop_by_id(
@@ -23871,6 +23847,22 @@ fn ensure_v26_retirement_is_safe(connection: &Connection) -> Result<(), String> 
     Ok(())
 }
 
+/// v28 只对没有旧魂环历史的库建立新结构，不自动改写既有魂环绑定。
+fn ensure_v28_can_initialize_without_player_history(connection: &Connection) -> Result<(), String> {
+    let count = connection
+        .query_row("SELECT COUNT(*) FROM player_soul_ring", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|error| format!("检查 v28 旧玩家表 player_soul_ring 失败：{error}"))?;
+    if count != 0 {
+        return Err(
+            "检测到已有 player_soul_ring 玩家历史；v28 不迁移、不补绑、不改写旧存档，请继续使用旧版本或先取得明确的数据处理方案"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// 校验错误 v26 结构已被清除，且被其重写的魂技校验触发器已经恢复。
 fn validate_v27_schema(connection: &Connection) -> Result<(), String> {
     validate_v25_schema(connection)?;
@@ -23980,7 +23972,6 @@ fn validate_v28_schema(connection: &Connection) -> Result<(), String> {
                 TableColumnInfo::new("ring_index", "INTEGER", true, false, None, 0),
                 TableColumnInfo::new("ring_key", "TEXT", true, false, None, 0),
                 TableColumnInfo::new("skill_key", "TEXT", true, false, None, 0),
-                TableColumnInfo::new("binding_state", "TEXT", true, false, None, 0),
                 TableColumnInfo::new("soul_ring_drop_id", "INTEGER", true, false, None, 0),
                 TableColumnInfo::new("obtained_at", "INTEGER", true, false, None, 0),
             ],
@@ -23990,7 +23981,7 @@ fn validate_v28_schema(connection: &Connection) -> Result<(), String> {
             vec![
                 TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
                 TableColumnInfo::new("player_soul_ring_id", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("player_skill_id", "INTEGER", false, false, None, 0),
+                TableColumnInfo::new("player_skill_id", "INTEGER", true, false, None, 0),
                 TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
                 TableColumnInfo::new("wuhun_id", "INTEGER", true, false, None, 0),
                 TableColumnInfo::new("wuhun_slot", "INTEGER", true, false, None, 0),
@@ -24030,10 +24021,8 @@ fn validate_v28_schema(connection: &Connection) -> Result<(), String> {
         if table == "player_skill" && sql.contains("UNIQUE(PLAYER_ID, SKILL_KEY)") {
             return Err("v28 玩家魂技表仍保留阻止重新附加的历史唯一约束".to_string());
         }
-        if table == "player_soul_ring"
-            && !sql.contains("BINDING_STATE IN ('LEGACY_UNBOUND', 'BOUND')")
-        {
-            return Err("v28 魂环表缺少不可变绑定状态约束".to_string());
+        if table == "player_soul_ring" && sql.contains("BINDING_STATE") {
+            return Err("v28 魂环表不应包含可迁移的绑定状态字段".to_string());
         }
     }
 
@@ -24272,8 +24261,7 @@ fn validate_v28_schema(connection: &Connection) -> Result<(), String> {
         if name == "player_soul_ring_detachment_scope_guard"
             && (!sql.contains("PLAYER_SOUL_RING_CURRENT_PROJECTION")
                 || !sql.contains("剥离魂环")
-                || !sql.contains("LATER_RING.RING_INDEX > RING.RING_INDEX")
-                || !sql.contains("LEGACY_UNBOUND"))
+                || !sql.contains("LATER_RING.RING_INDEX > RING.RING_INDEX"))
         {
             return Err("v28 魂环剥离触发器未限制为后进先出操作".to_string());
         }
@@ -24295,8 +24283,11 @@ fn validate_v28_schema(connection: &Connection) -> Result<(), String> {
         {
             return Err("v28 玩家魂技范围触发器未强制魂环来源".to_string());
         }
-        if name == "player_soul_ring_scope_guard" && !sql.contains("NEW.BINDING_STATE = 'BOUND'") {
-            return Err("v28 魂环范围触发器允许创建无绑定状态的附加记录".to_string());
+        if name == "player_soul_ring_scope_guard"
+            && (!sql.contains("PLAYER_SOUL_RING_CURRENT_PROJECTION")
+                || !sql.contains("COUNT(*) + 1"))
+        {
+            return Err("v28 魂环范围触发器未强制按当前环位创建绑定".to_string());
         }
         if matches!(
             name,
@@ -24315,21 +24306,24 @@ fn validate_v28_schema(connection: &Connection) -> Result<(), String> {
                   FROM player_soul_ring ring
                   LEFT JOIN player_skill learned
                     ON learned.player_soul_ring_id = ring.id
-                 WHERE ring.binding_state NOT IN ('legacy_unbound', 'bound')
-                    OR (
-                        ring.binding_state = 'bound'
-                        AND (
-                            learned.id IS NULL
-                            OR learned.player_id <> ring.player_id
-                            OR learned.wuhun_id <> ring.wuhun_id
-                            OR learned.wuhun_slot <> ring.wuhun_slot
-                            OR learned.skill_key <> ring.skill_key
-                        )
-                    )
-                    OR (
-                        ring.binding_state = 'legacy_unbound'
-                        AND learned.id IS NOT NULL
-                    )
+                 WHERE learned.id IS NULL
+                    OR learned.player_id <> ring.player_id
+                    OR learned.wuhun_id <> ring.wuhun_id
+                    OR learned.wuhun_slot <> ring.wuhun_slot
+                    OR learned.skill_key <> ring.skill_key
+             ) OR EXISTS(
+                SELECT 1
+                  FROM player_skill learned
+                  LEFT JOIN player_soul_ring ring
+                    ON ring.id = learned.player_soul_ring_id
+                 WHERE learned.player_soul_ring_id IS NOT NULL
+                   AND (
+                       ring.id IS NULL
+                       OR learned.player_id <> ring.player_id
+                       OR learned.wuhun_id <> ring.wuhun_id
+                       OR learned.wuhun_slot <> ring.wuhun_slot
+                       OR learned.skill_key <> ring.skill_key
+                   )
              ) OR EXISTS(
                 SELECT 1
                   FROM player_soul_ring_current_projection ring
@@ -24337,35 +24331,18 @@ fn validate_v28_schema(connection: &Connection) -> Result<(), String> {
                 HAVING COUNT(*) <> 1
              ) OR EXISTS(
                 SELECT 1
-                  FROM player_skill_bound_projection learned
-                 WHERE learned.player_soul_ring_id IS NULL
-             ) OR EXISTS(
-                SELECT 1
                   FROM player_soul_ring_detachment detachment
                   LEFT JOIN player_soul_ring ring ON ring.id = detachment.player_soul_ring_id
                   LEFT JOIN player_skill learned ON learned.id = detachment.player_skill_id
                  WHERE ring.id IS NULL
+                    OR learned.id IS NULL
                     OR ring.player_id <> detachment.player_id
                     OR ring.wuhun_id <> detachment.wuhun_id
                     OR ring.wuhun_slot <> detachment.wuhun_slot
                     OR ring.ring_index <> detachment.ring_index
                     OR ring.ring_key <> detachment.ring_key
                     OR ring.skill_key <> detachment.skill_key
-                    OR (
-                        detachment.player_skill_id IS NULL
-                        AND (
-                            ring.binding_state <> 'legacy_unbound'
-                            OR learned.id IS NOT NULL
-                        )
-                    )
-                    OR (
-                        detachment.player_skill_id IS NOT NULL
-                        AND (
-                            ring.binding_state <> 'bound'
-                            OR learned.id IS NULL
-                            OR learned.player_soul_ring_id <> ring.id
-                        )
-                    )
+                    OR learned.player_soul_ring_id <> ring.id
             )
             "#,
             [],
@@ -31013,19 +30990,23 @@ mod tests {
     }
 
     #[test]
-    fn v28_never_post_binds_legacy_soul_skills() {
-        let start = MIGRATION_V28
-            .find("INSERT INTO player_skill_v28(")
-            .expect("v28 应复制旧魂技历史");
-        let copy_sql = &MIGRATION_V28[start..];
-        let end = copy_sql
-            .find("DROP TABLE player_skill;")
-            .expect("v28 应在复制后替换旧魂技表");
-        let copy_sql = &copy_sql[..end];
+    fn v28_never_converts_existing_soul_ring_history() {
+        assert!(MIGRATION_V28.contains("INSERT INTO player_skill_v28"));
+        assert!(!MIGRATION_V28.contains("INSERT INTO player_soul_ring_v28"));
+        assert!(!MIGRATION_V28.contains("legacy_unbound"));
 
-        assert!(copy_sql.contains("NULL,"));
-        assert!(!copy_sql.contains("FROM player_soul_ring"));
-        assert!(MIGRATION_V28.contains("'legacy_unbound'"));
+        let connection = Connection::open_in_memory().expect("应创建 v28 前向检查数据库");
+        connection
+            .execute_batch(
+                "CREATE TABLE player_skill (id INTEGER); CREATE TABLE player_soul_ring (id INTEGER);",
+            )
+            .expect("应创建旧玩家表");
+        connection
+            .execute("INSERT INTO player_soul_ring(id) VALUES(1)", [])
+            .expect("应写入旧魂环历史");
+        let error = ensure_v28_can_initialize_without_player_history(&connection)
+            .expect_err("v28 不得自动处理已有魂环历史");
+        assert!(error.contains("不迁移"));
     }
 
     #[test]
