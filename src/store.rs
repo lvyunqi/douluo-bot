@@ -3956,6 +3956,326 @@ BEGIN
 END;
 "#;
 
+// v24.3.3 统一从新玩法入口排除 transition source，历史玩家和战斗快照仍保留原始引用。
+const MIGRATION_V25: &str = r#"
+-- starter-skill 只是 skill 的可觉醒投影，必须服从同一生命周期关系。
+CREATE VIEW content_revision_visible_member AS
+SELECT member.revision_id, member.member_kind, member.member_key, member.created_at
+  FROM content_revision_member member
+ WHERE NOT EXISTS(
+    SELECT 1
+      FROM content_revision_transition transition
+     WHERE transition.revision_id = member.revision_id
+       AND transition.entity_kind = CASE member.member_kind
+           WHEN 'starter-skill' THEN 'skill'
+           ELSE member.member_kind
+       END
+       AND transition.source_key = member.member_key
+ );
+
+DROP TRIGGER battle_scope_guard;
+CREATE TRIGGER battle_scope_guard
+BEFORE INSERT ON battle
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM player p
+      JOIN player_map pm ON pm.player_id = p.id
+      JOIN map m ON m.map_key = pm.map_key
+      JOIN soul_beast sb ON sb.id = NEW.soul_beast_id
+      JOIN content_revision_visible_member member
+        ON member.member_kind = 'beast' AND member.member_key = sb.beast_key
+     WHERE p.id = NEW.player_id
+       AND member.revision_id = (
+           SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1
+       )
+       AND p.state = 'alive' AND p.hp > 0
+       AND EXISTS(SELECT 1 FROM player_wuhun pw WHERE pw.player_id = p.id)
+       AND p.level >= sb.level_required AND sb.enabled = 1
+       AND m.safe = 0 AND pm.map_key = sb.map_key AND pm.map_key = NEW.map_key
+       AND NEW.status = 'active' AND NEW.action_count = 0
+       AND NEW.player_level = p.level AND NEW.player_max_hp = p.max_hp AND NEW.player_hp = p.hp
+       AND NEW.player_strength = p.strength AND NEW.player_agility = p.agility
+       AND NEW.player_endurance = p.endurance AND NEW.player_perception = p.perception
+       AND NEW.player_luck = p.luck
+       AND NEW.beast_max_hp = sb.max_hp AND NEW.beast_hp = sb.max_hp
+       AND NEW.beast_attack = sb.attack AND NEW.beast_defense = sb.defense
+       AND NEW.beast_speed = sb.speed AND NEW.exp_reward = sb.exp_reward
+       AND NEW.drop_item_key = sb.drop_item_key AND NEW.drop_quantity = sb.drop_quantity
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle scope or active content mismatch');
+END;
+
+DROP TRIGGER player_skill_scope_guard;
+CREATE TRIGGER player_skill_scope_guard
+BEFORE INSERT ON player_skill
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM player_wuhun_state state
+      JOIN wuhun w ON w.id = state.wuhun_id
+      JOIN skill ON skill.skill_key = NEW.skill_key
+     WHERE state.player_id = NEW.player_id
+       AND state.wuhun_id = NEW.wuhun_id
+       AND state.slot = NEW.wuhun_slot
+       AND skill.enabled = 1
+       AND (skill.wuhun_category = 'all' OR skill.wuhun_category = w.category)
+       AND (
+           EXISTS(
+               SELECT 1
+                 FROM content_revision_visible_member member
+                WHERE member.revision_id = (
+                          SELECT revision_id
+                            FROM content_revision_activation
+                           ORDER BY id DESC
+                           LIMIT 1
+                      )
+                  AND member.member_kind = 'starter-skill'
+                  AND member.member_key = NEW.skill_key
+           )
+           OR EXISTS(
+               SELECT 1
+                 FROM soul_ring_drop pending
+                 JOIN soul_ring ring ON ring.ring_key = pending.ring_key
+                WHERE pending.player_id = NEW.player_id
+                  AND pending.status = 'pending'
+                  AND ring.skill_key = NEW.skill_key
+           )
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'player skill scope mismatch');
+END;
+
+DROP TRIGGER battle_wuhun_modifier_scope_guard;
+CREATE TRIGGER battle_wuhun_modifier_scope_guard
+BEFORE INSERT ON battle_wuhun_modifier
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM battle b
+      JOIN player_wuhun_state s ON s.player_id = b.player_id AND s.slot = 1
+      JOIN wuhun w ON w.id = s.wuhun_id
+      JOIN wuhun_stat_template template ON template.wuhun_id = w.id
+      JOIN content_revision_visible_member member
+        ON member.member_kind = 'wuhun' AND member.member_key = w.name
+     WHERE b.id = NEW.battle_id
+       AND b.player_id = NEW.player_id
+       AND member.revision_id = (
+           SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1
+       )
+       AND b.status = 'active'
+       AND b.action_count = 0
+       AND s.enabled = 1
+       AND s.stability > 0
+       AND NEW.wuhun_id = s.wuhun_id
+       AND NEW.enabled_at_start = 1
+       AND NEW.attack_percent = CASE
+           WHEN json_extract(template.parameters_json, '$.source') = 'category-v1' THEN CASE w.category
+               WHEN '强攻系' THEN 120
+               WHEN '控制系' THEN 90
+               WHEN '敏攻系' THEN 100
+               WHEN '辅助系' THEN 70
+               WHEN '防御系' THEN 80
+               WHEN '食物系' THEN 60
+               ELSE 100
+           END
+           ELSE template.attack_percent
+       END
+       AND NEW.defense_percent = CASE
+           WHEN json_extract(template.parameters_json, '$.source') = 'category-v1' THEN CASE w.category
+               WHEN '强攻系' THEN 80
+               WHEN '控制系' THEN 100
+               WHEN '敏攻系' THEN 90
+               WHEN '辅助系' THEN 110
+               WHEN '防御系' THEN 130
+               WHEN '食物系' THEN 100
+               ELSE 100
+           END
+           ELSE template.defense_percent
+       END
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle wuhun modifier scope or active content mismatch');
+END;
+
+DROP TRIGGER battle_skill_event_scope_guard;
+CREATE TRIGGER battle_skill_event_scope_guard
+BEFORE INSERT ON battle_skill_event
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM battle_event event
+      JOIN battle b ON b.id = event.battle_id
+      JOIN player p ON p.id = event.player_id
+      JOIN player_skill learned ON learned.id = NEW.player_skill_id
+      JOIN skill ON skill.skill_key = NEW.skill_key
+      JOIN content_revision_visible_member member
+        ON member.member_kind = 'skill' AND member.member_key = skill.skill_key
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE event.id = NEW.battle_event_id
+       AND event.battle_id = NEW.battle_id
+       AND event.player_id = NEW.player_id
+       AND event.sequence = NEW.sequence
+       AND event.event_kind = 'attack'
+       AND event.player_damage = NEW.damage
+       AND b.status = event.status_after
+       AND member.revision_id = (
+           SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1
+       )
+       AND learned.player_id = NEW.player_id
+       AND learned.skill_key = NEW.skill_key
+       AND learned.equipped = 1
+       AND skill.enabled = 1
+       AND skill.skill_type = 'active'
+       AND NEW.soul_power_cost = skill.soul_power_cost
+       AND NEW.cooldown_rounds = skill.cooldown_rounds
+       AND p.soul_power = NEW.soul_power_after
+       AND audit.protocol = (SELECT i.protocol FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.account_id = (SELECT i.account_id FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.namespace = (SELECT i.namespace FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.subject_kind = (SELECT i.subject_kind FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.subject_id = (SELECT i.subject_id FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.command = '释放技能'
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+       AND NOT EXISTS(
+           SELECT 1
+             FROM battle_skill_event previous
+            WHERE previous.battle_id = NEW.battle_id
+              AND previous.player_skill_id = NEW.player_skill_id
+              AND NEW.sequence - previous.sequence < NEW.cooldown_rounds
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle skill event scope, active content, cooldown, or audit mismatch');
+END;
+
+DROP TRIGGER battle_effect_snapshot_scope_guard;
+CREATE TRIGGER battle_effect_snapshot_scope_guard
+BEFORE INSERT ON battle_effect_snapshot
+WHEN (
+    NEW.rule_version = 'legacy'
+    AND NOT EXISTS(
+        SELECT 1
+          FROM battle_skill_effect old
+         WHERE old.battle_skill_event_id = NEW.battle_skill_event_id
+           AND old.skill_effect_key = NEW.effect_key
+           AND old.rule_version IN ('legacy', 'effect-v1')
+    )
+ ) OR (
+    NEW.rule_version NOT IN ('legacy', 'effect-v2')
+ ) OR (
+    NEW.rule_version = 'effect-v2'
+    AND NOT EXISTS(
+    SELECT 1
+      FROM battle_skill_event event
+      JOIN effect_definition definition
+        ON definition.effect_key = NEW.effect_key
+       AND definition.skill_key = event.skill_key
+      JOIN content_revision_visible_member member
+        ON member.member_kind = 'effect' AND member.member_key = definition.effect_key
+     WHERE event.id = NEW.battle_skill_event_id
+       AND member.revision_id = (
+           SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1
+       )
+       AND event.battle_id = NEW.battle_id
+       AND event.player_id = NEW.player_id
+       AND event.skill_key = NEW.skill_key
+       AND event.sequence = NEW.started_sequence
+       AND event.source_message_id = NEW.source_message_id
+       AND event.created_at = NEW.created_at
+       AND definition.enabled = 1
+       AND definition.created_at <= event.created_at
+       AND definition.trigger_kind = NEW.trigger_kind
+       AND definition.target_kind = NEW.target_kind
+       AND definition.operation = NEW.operation
+       AND definition.attribute_key = NEW.attribute_key
+       AND definition.value_mode = NEW.value_mode
+       AND definition.value = NEW.value
+       AND definition.duration_rounds = NEW.duration_rounds
+       AND definition.chance_percent = NEW.chance_percent
+       AND definition.stack_policy = NEW.stack_policy
+       AND definition.parameters_json = NEW.parameters_json
+       AND definition.description = NEW.description
+       AND NEW.expires_after_sequence = NEW.started_sequence + NEW.duration_rounds - 1
+    )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'battle effect snapshot scope, formula, or active content mismatch');
+END;
+
+DROP TRIGGER battle_skill_event_effect_v2_snapshot;
+CREATE TRIGGER battle_skill_event_effect_v2_snapshot
+AFTER INSERT ON battle_skill_event
+BEGIN
+    INSERT INTO battle_effect_snapshot(
+        battle_id, player_id, battle_skill_event_id, effect_key, skill_key,
+        trigger_kind, target_kind, operation, attribute_key, value_mode, value,
+        duration_rounds, chance_percent, stack_policy, parameters_json,
+        started_sequence, expires_after_sequence, rule_version,
+        source_message_id, description, created_at
+    )
+    SELECT NEW.battle_id, NEW.player_id, NEW.id, definition.effect_key, NEW.skill_key,
+           definition.trigger_kind, definition.target_kind, definition.operation,
+           definition.attribute_key, definition.value_mode, definition.value,
+           definition.duration_rounds, definition.chance_percent, definition.stack_policy,
+           definition.parameters_json, NEW.sequence,
+           NEW.sequence + definition.duration_rounds - 1, 'effect-v2',
+           NEW.source_message_id, definition.description, NEW.created_at
+      FROM effect_definition definition
+      JOIN content_revision_visible_member member
+        ON member.member_kind = 'effect' AND member.member_key = definition.effect_key
+     WHERE member.revision_id = (
+               SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1
+           )
+       AND definition.skill_key = NEW.skill_key
+       AND definition.enabled = 1
+       AND definition.trigger_kind = 'on_release'
+       AND definition.created_at <= NEW.created_at;
+    SELECT CASE WHEN changes() <> (
+        SELECT COUNT(*)
+          FROM effect_definition definition
+          JOIN content_revision_visible_member member
+            ON member.member_kind = 'effect' AND member.member_key = definition.effect_key
+         WHERE member.revision_id = (
+                   SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1
+               )
+           AND definition.skill_key = NEW.skill_key
+           AND definition.enabled = 1
+           AND definition.trigger_kind = 'on_release'
+           AND definition.created_at <= NEW.created_at
+    ) THEN RAISE(ABORT, 'battle effect snapshot is incomplete') END;
+END;
+
+DROP TRIGGER soul_ring_drop_scope_guard;
+CREATE TRIGGER soul_ring_drop_scope_guard
+BEFORE INSERT ON soul_ring_drop
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM battle_event event
+      JOIN battle b ON b.id = event.battle_id
+      JOIN soul_ring ring ON ring.soul_beast_id = b.soul_beast_id
+                           AND ring.ring_key = NEW.ring_key
+      JOIN content_revision_visible_member member
+        ON member.member_kind = 'ring' AND member.member_key = ring.ring_key
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE event.id = NEW.battle_event_id
+       AND member.revision_id = (
+           SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1
+       )
+       AND event.battle_id = NEW.battle_id
+       AND event.player_id = NEW.player_id
+       AND event.status_after = 'won'
+       AND event.event_kind = 'attack'
+       AND b.id = NEW.battle_id
+       AND b.player_id = NEW.player_id
+       AND audit.source_message_id = NEW.source_message_id
+       AND audit.outcome = 'ok'
+       AND audit.command IN ('攻击', '释放技能')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'soul ring drop scope, audit, or active content mismatch');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -5274,22 +5594,15 @@ fn active_content_member_exists(
             r#"
             SELECT EXISTS(
                 SELECT 1
-                  FROM content_revision_member member
+                  FROM content_revision_visible_member member
                  WHERE member.revision_id = (
                            SELECT revision_id
                              FROM content_revision_activation
                             ORDER BY id DESC
                             LIMIT 1
-                       )
+                   )
                    AND member.member_kind = ?1
                    AND member.member_key = ?2
-                   AND NOT EXISTS(
-                       SELECT 1
-                         FROM content_revision_transition transition
-                        WHERE transition.revision_id = member.revision_id
-                          AND transition.entity_kind = ?1
-                          AND transition.source_key = ?2
-                   )
             )
             "#,
             params![member_kind, member_key],
@@ -6913,10 +7226,25 @@ impl Store {
                 validate_v24_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 25)? {
+                transaction
+                    .execute_batch(MIGRATION_V25)
+                    .map_err(|error| format!("执行数据库迁移 v25 失败：{error}"))?;
+                validate_v25_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(25, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v25 失败：{error}"))?;
+            } else {
+                validate_v25_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25 失败：{error}"
                 )
             })?;
             Ok(())
@@ -6948,6 +7276,7 @@ impl Store {
                 validate_v22_schema(connection)?;
                 validate_v23_schema(connection)?;
                 validate_v24_schema(connection)?;
+                validate_v25_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -8666,7 +8995,7 @@ impl Store {
                 r#"
                 SELECT COUNT(*)
                   FROM soul_beast beast
-                  JOIN content_revision_member member
+                  JOIN content_revision_visible_member member
                     ON member.member_kind = 'beast' AND member.member_key = beast.beast_key
                  WHERE member.revision_id = (
                            SELECT revision_id
@@ -12517,7 +12846,7 @@ fn draw_weighted_wuhun(connection: &Connection) -> Result<(i64, AwakenedWuhun), 
             r#"
             SELECT SUM(wuhun.weight)
               FROM wuhun
-              JOIN content_revision_member member
+              JOIN content_revision_visible_member member
                 ON member.member_kind = 'wuhun' AND member.member_key = wuhun.name
              WHERE member.revision_id = (
                        SELECT revision_id
@@ -12561,7 +12890,7 @@ fn load_wuhun_at_weight_ticket(
                        wuhun.description,
                        SUM(wuhun.weight) OVER (ORDER BY wuhun.id) AS cumulative_weight
                   FROM wuhun
-                  JOIN content_revision_member member
+                  JOIN content_revision_visible_member member
                     ON member.member_kind = 'wuhun' AND member.member_key = wuhun.name
                  WHERE member.revision_id = (
                            SELECT revision_id
@@ -12609,10 +12938,10 @@ fn seed_player_skills(
             SELECT ?1, ?2, skill.skill_key, 1, 1, 0, 1, ?3
               FROM skill
               JOIN wuhun ON wuhun.id = ?2
-              JOIN content_revision_member skill_member
+              JOIN content_revision_visible_member skill_member
                 ON skill_member.member_kind = 'skill'
                AND skill_member.member_key = skill.skill_key
-              JOIN content_revision_member starter_member
+              JOIN content_revision_visible_member starter_member
                 ON starter_member.member_kind = 'starter-skill'
                AND starter_member.member_key = skill.skill_key
              WHERE skill_member.revision_id = (
@@ -12735,7 +13064,7 @@ fn load_skill_effects(
                    duration_rounds, description, trigger_kind, chance_percent,
                    stack_policy, parameters_json
               FROM effect_definition definition
-              JOIN content_revision_member member
+              JOIN content_revision_visible_member member
                 ON member.member_kind = 'effect' AND member.member_key = definition.effect_key
              WHERE member.revision_id = (
                        SELECT revision_id
@@ -13015,7 +13344,7 @@ fn insert_soul_ring_drop(
             )
             SELECT ?1, ?2, ?3, ring.ring_key, ?4, ?5, 'pending', ?6
               FROM soul_ring ring
-              JOIN content_revision_member member
+              JOIN content_revision_visible_member member
                 ON member.member_kind = 'ring' AND member.member_key = ring.ring_key
              WHERE member.revision_id = (
                        SELECT revision_id
@@ -13148,7 +13477,7 @@ fn load_wuhun_combat_modifier(
             SELECT template.attack_percent, template.defense_percent, template.parameters_json
               FROM wuhun_stat_template template
               JOIN wuhun ON wuhun.id = template.wuhun_id
-              JOIN content_revision_member member
+              JOIN content_revision_visible_member member
                 ON member.member_kind = 'wuhun' AND member.member_key = wuhun.name
              WHERE template.wuhun_id = ?1
                AND member.revision_id = (
@@ -13631,7 +13960,7 @@ fn load_soul_beast_by_name_or_key(
     connection
         .query_row(
             &format!(
-                "{} JOIN content_revision_member member ON member.member_kind = 'beast' AND member.member_key = sb.beast_key WHERE member.revision_id = (SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1) AND sb.map_key = ?1 AND sb.enabled = 1 AND sb.level_required <= ?2 AND (sb.name = ?3 OR sb.beast_key = ?3) LIMIT 1",
+                "{} JOIN content_revision_visible_member member ON member.member_kind = 'beast' AND member.member_key = sb.beast_key WHERE member.revision_id = (SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1) AND sb.map_key = ?1 AND sb.enabled = 1 AND sb.level_required <= ?2 AND (sb.name = ?3 OR sb.beast_key = ?3) LIMIT 1",
                 soul_beast_select_sql()
             ),
             params![map_key, level, requested_name_or_key],
@@ -13651,7 +13980,7 @@ fn query_soul_beasts(
 ) -> Result<Vec<SoulBeastRecord>, String> {
     connection
         .prepare(&format!(
-            "{} JOIN content_revision_member member ON member.member_kind = 'beast' AND member.member_key = sb.beast_key WHERE member.revision_id = (SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1) AND sb.enabled = 1 AND (?1 IS NULL OR sb.map_key = ?1) AND (?2 IS NULL OR sb.level_required <= ?2) ORDER BY sb.level_required, sb.age, sb.id LIMIT ?3 OFFSET ?4",
+            "{} JOIN content_revision_visible_member member ON member.member_kind = 'beast' AND member.member_key = sb.beast_key WHERE member.revision_id = (SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1) AND sb.enabled = 1 AND (?1 IS NULL OR sb.map_key = ?1) AND (?2 IS NULL OR sb.level_required <= ?2) ORDER BY sb.level_required, sb.age, sb.id LIMIT ?3 OFFSET ?4",
             soul_beast_select_sql()
         ))
         .map_err(|error| format!("准备魂兽分页查询失败：{error}"))?
@@ -21961,7 +22290,15 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
             })
             || name == "battle_skill_event_effect_v2_snapshot"
             || name == "player_skill_scope_guard"
-            || name == "content_revision_transition_scope_guard";
+            || name == "content_revision_transition_scope_guard"
+            || matches!(
+                name.as_str(),
+                "battle_scope_guard"
+                    | "battle_wuhun_modifier_scope_guard"
+                    | "battle_skill_event_scope_guard"
+                    | "battle_effect_snapshot_scope_guard"
+                    | "soul_ring_drop_scope_guard"
+            );
         let touches_v23 = matches!(
             table.as_str(),
             "content_revision"
@@ -22255,6 +22592,65 @@ fn validate_v24_schema(connection: &Connection) -> Result<(), String> {
             return Err(format!(
                 "v24 触发器 {name} 未声明却引用 transition 表 {table}"
             ));
+        }
+    }
+    Ok(())
+}
+
+/// 校验 v24.3.3 的可见成员视图和所有新玩法写入门控。
+fn validate_v25_schema(connection: &Connection) -> Result<(), String> {
+    let view_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'content_revision_visible_member'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v25 内容可见成员视图失败：{error}"))?
+        .ok_or_else(|| "数据库已标记迁移 v25，但缺少内容可见成员视图".to_string())?
+        .to_ascii_uppercase();
+    for marker in [
+        "CREATE VIEW CONTENT_REVISION_VISIBLE_MEMBER",
+        "FROM CONTENT_REVISION_MEMBER",
+        "FROM CONTENT_REVISION_TRANSITION",
+        "WHEN 'STARTER-SKILL' THEN 'SKILL'",
+        "SOURCE_KEY = MEMBER.MEMBER_KEY",
+    ] {
+        if !view_sql.contains(marker) {
+            return Err(format!("v25 内容可见成员视图缺少约束：{marker}"));
+        }
+    }
+
+    for (name, table) in [
+        ("battle_scope_guard", "battle"),
+        ("player_skill_scope_guard", "player_skill"),
+        ("battle_wuhun_modifier_scope_guard", "battle_wuhun_modifier"),
+        ("battle_skill_event_scope_guard", "battle_skill_event"),
+        (
+            "battle_effect_snapshot_scope_guard",
+            "battle_effect_snapshot",
+        ),
+        (
+            "battle_skill_event_effect_v2_snapshot",
+            "battle_skill_event",
+        ),
+        ("soul_ring_drop_scope_guard", "soul_ring_drop"),
+    ] {
+        let (actual_table, sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v25 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记迁移 v25，但缺少触发器 {name}"))?;
+        let sql = sql.to_ascii_uppercase();
+        if actual_table != table
+            || !sql.contains("CONTENT_REVISION_VISIBLE_MEMBER")
+            || !sql.contains("RAISE(ABORT")
+        {
+            return Err(format!("v25 触发器 {name} 未接入可见内容成员门控"));
         }
     }
     Ok(())
@@ -24081,6 +24477,132 @@ mod tests {
         };
         LoadedContentPackage {
             content_hash: content_hash(&package).expect("应计算预览内容包哈希"),
+            package,
+            source_format: "json".to_string(),
+        }
+    }
+
+    fn content_transition_resolver_package() -> LoadedContentPackage {
+        let package = ContentPackage {
+            package_key: "transition-active-resolver".to_string(),
+            revision: 1,
+            author: "test".to_string(),
+            minimum_runtime: String::new(),
+            wuhun: vec![WuhunPackageEntry {
+                name: "transition wuhun".to_string(),
+                category: "控制系".to_string(),
+                form: "test form".to_string(),
+                description: "transition resolver test wuhun".to_string(),
+                weight: 100_000,
+                stats: WuhunStatsPackageEntry {
+                    attack_percent: 120,
+                    defense_percent: 110,
+                    strength_percent: 100,
+                    agility_percent: 100,
+                    spirit_percent: 100,
+                    endurance_percent: 100,
+                    perception_percent: 100,
+                    luck_percent: 100,
+                },
+            }],
+            skills: vec![SkillPackageEntry {
+                skill_key: "transition-skill".to_string(),
+                name: "transition skill".to_string(),
+                skill_type: "active".to_string(),
+                wuhun_category: "all".to_string(),
+                ring_index: 1,
+                soul_power_cost: 10,
+                cooldown_rounds: 1,
+                base_damage: 20,
+                spirit_ratio_percent: 100,
+                strength_ratio_percent: 0,
+                description: "transition resolver test skill".to_string(),
+                enabled: true,
+                starter: true,
+            }],
+            effects: vec![EffectPackageEntry {
+                effect_key: "transition-effect".to_string(),
+                skill_key: "transition-skill".to_string(),
+                trigger_kind: "on_release".to_string(),
+                target_kind: "beast".to_string(),
+                operation: "modify_stat".to_string(),
+                attribute_key: "beast_attack".to_string(),
+                value_mode: "percent_delta".to_string(),
+                value: -25,
+                duration_rounds: 2,
+                chance_percent: 100,
+                stack_policy: "strongest".to_string(),
+                parameters: Default::default(),
+                description: "transition resolver test effect".to_string(),
+                enabled: true,
+            }],
+            soul_beasts: vec![SoulBeastPackageEntry {
+                beast_key: "transition-beast".to_string(),
+                name: "transition beast".to_string(),
+                description: "transition resolver test beast".to_string(),
+                map_key: "sunset-forest".to_string(),
+                age: 20,
+                level_required: 1,
+                max_hp: 20,
+                attack: 3,
+                defense: 1,
+                speed: 8,
+                exp_reward: 25,
+                drop_item_key: "small-healing-potion".to_string(),
+                drop_quantity: 1,
+                enabled: true,
+            }],
+            soul_rings: vec![SoulRingPackageEntry {
+                ring_key: "transition-ring".to_string(),
+                name: "transition ring".to_string(),
+                soul_beast_key: "transition-beast".to_string(),
+                skill_key: "transition-skill".to_string(),
+                ring_index: 1,
+                age: 20,
+                color: "white".to_string(),
+                description: "transition resolver test ring".to_string(),
+                enabled: true,
+            }],
+            transitions: vec![
+                ContentTransitionPackageEntry {
+                    entity_kind: "wuhun".to_string(),
+                    source_key: "独狼".to_string(),
+                    target_key: Some("transition wuhun".to_string()),
+                    transition_kind: "replaced".to_string(),
+                    reason: "测试武魂替换".to_string(),
+                },
+                ContentTransitionPackageEntry {
+                    entity_kind: "skill".to_string(),
+                    source_key: "entangle".to_string(),
+                    target_key: Some("transition-skill".to_string()),
+                    transition_kind: "replaced".to_string(),
+                    reason: "测试魂技替换".to_string(),
+                },
+                ContentTransitionPackageEntry {
+                    entity_kind: "effect".to_string(),
+                    source_key: "entangle-slow".to_string(),
+                    target_key: Some("transition-effect".to_string()),
+                    transition_kind: "replaced".to_string(),
+                    reason: "测试效果替换".to_string(),
+                },
+                ContentTransitionPackageEntry {
+                    entity_kind: "beast".to_string(),
+                    source_key: "slime".to_string(),
+                    target_key: Some("transition-beast".to_string()),
+                    transition_kind: "replaced".to_string(),
+                    reason: "测试魂兽替换".to_string(),
+                },
+                ContentTransitionPackageEntry {
+                    entity_kind: "ring".to_string(),
+                    source_key: "slime-ring".to_string(),
+                    target_key: Some("transition-ring".to_string()),
+                    transition_kind: "replaced".to_string(),
+                    reason: "测试魂环替换".to_string(),
+                },
+            ],
+        };
+        LoadedContentPackage {
+            content_hash: content_hash(&package).expect("应计算 transition resolver 内容包哈希"),
             package,
             source_format: "json".to_string(),
         }
@@ -28641,10 +29163,11 @@ mod tests {
                 DROP TRIGGER battle_wuhun_modifier_no_update;
                 DROP INDEX battle_wuhun_modifier_player_page;
                 DROP TABLE battle_wuhun_modifier;
-                DELETE FROM schema_migration WHERE version = 15;
+                DROP VIEW content_revision_visible_member;
+                DELETE FROM schema_migration WHERE version IN (15, 25);
                 "#,
             )
-            .expect("应移除 v15 结构并保留旧战斗");
+            .expect("应移除 v15 和 v25 结构并保留旧战斗");
         drop(connection);
         drop(store);
 
@@ -30231,6 +30754,302 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("target 必须由本包新增"))
         );
+    }
+
+    #[test]
+    fn v25_active_resolvers_filter_transition_sources() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "transition 历史角色", "男")
+            .expect("应创建 transition 历史角色");
+        store
+            .awaken_wuhun(&identity())
+            .expect("应在 transition 前完成武魂觉醒");
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "transition-history-map"),
+            )
+            .expect("应在 transition 前进入落日森林");
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "史莱姆",
+                &transfer_operation("挑战", "transition-history-start"),
+            )
+            .expect("应在 transition 前创建史莱姆战斗");
+
+        let package = content_transition_resolver_package();
+        store
+            .stage_content_package(&package)
+            .expect("应写入全量 resolver transition 草稿");
+        assert!(
+            store
+                .validate_content_draft("transition-active-resolver", 1)
+                .expect("应校验全量 resolver transition 草稿")
+                .errors
+                .is_empty()
+        );
+        store
+            .publish_content_draft("transition-active-resolver", 1)
+            .expect("应发布全量 resolver transition 草稿");
+
+        let connection = store.open().expect("应打开 transition resolver 数据库");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migration WHERE version = 25",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("应读取 v25 迁移记录"),
+            1
+        );
+        for (kind, key) in [
+            ("wuhun", "独狼"),
+            ("skill", "entangle"),
+            ("starter-skill", "entangle"),
+            ("effect", "entangle-slow"),
+            ("beast", "slime"),
+            ("ring", "slime-ring"),
+        ] {
+            assert!(
+                !active_content_member_exists(&connection, kind, key)
+                    .expect("transition source 应从 active resolver 隐藏"),
+                "{kind} / {key} 不应继续可见"
+            );
+        }
+        for (kind, key) in [
+            ("wuhun", "transition wuhun"),
+            ("skill", "transition-skill"),
+            ("starter-skill", "transition-skill"),
+            ("effect", "transition-effect"),
+            ("beast", "transition-beast"),
+            ("ring", "transition-ring"),
+        ] {
+            assert!(
+                active_content_member_exists(&connection, kind, key)
+                    .expect("transition target 应保持 active"),
+                "{kind} / {key} 应继续可见"
+            );
+        }
+
+        let total_weight = connection
+            .query_row(
+                r#"
+                SELECT SUM(wuhun.weight)
+                  FROM wuhun
+                  JOIN content_revision_visible_member member
+                    ON member.member_kind = 'wuhun' AND member.member_key = wuhun.name
+                 WHERE member.revision_id = (
+                           SELECT revision_id
+                             FROM content_revision_activation
+                            ORDER BY id DESC
+                            LIMIT 1
+                       )
+                "#,
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .expect("应读取可见武魂权重")
+            .expect("可见武魂权重不应为空");
+        assert_eq!(
+            load_wuhun_at_weight_ticket(&connection, total_weight - 1, total_weight)
+                .expect("应按可见权重选择武魂")
+                .expect("可见武魂权重应连续")
+                .1
+                .name,
+            "transition wuhun"
+        );
+        let source_wuhun_id = connection
+            .query_row("SELECT id FROM wuhun WHERE name = '独狼'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("应读取 source 武魂");
+        let target_wuhun_id = connection
+            .query_row(
+                "SELECT id FROM wuhun WHERE name = 'transition wuhun'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("应读取 target 武魂");
+        assert!(load_wuhun_combat_modifier(&connection, source_wuhun_id, "敏攻系").is_err());
+        assert_eq!(
+            load_wuhun_combat_modifier(&connection, target_wuhun_id, "控制系")
+                .expect("target 武魂属性模板应可读取")
+                .attack_percent,
+            120
+        );
+        assert!(
+            load_skill_effects(&connection, "entangle")
+                .expect("source 魂技效果查询应成功")
+                .is_empty()
+        );
+        assert_eq!(
+            load_skill_effects(&connection, "transition-skill")
+                .expect("target 魂技效果查询应成功")
+                .iter()
+                .map(|effect| effect.effect_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["transition-effect"]
+        );
+        let visible_beasts = query_soul_beasts(&connection, Some("sunset-forest"), Some(1), 20, 0)
+            .expect("应读取可见魂兽");
+        assert!(
+            !visible_beasts
+                .iter()
+                .any(|beast| beast.beast_key == "slime")
+                && visible_beasts
+                    .iter()
+                    .any(|beast| beast.beast_key == "transition-beast")
+        );
+        assert!(load_soul_beast_by_name_or_key(&connection, "slime", "sunset-forest", 1).is_err());
+        drop(connection);
+
+        let mut historical_win = None;
+        for turn in 1..=5 {
+            let message = format!("transition-history-attack-{turn}");
+            let receipt = store
+                .attack_battle_with_operation(&identity(), &transfer_operation("攻击", &message))
+                .expect("历史战斗应继续结算");
+            if receipt.battle.status == "won" {
+                historical_win = Some(receipt);
+                break;
+            }
+        }
+        assert!(
+            historical_win
+                .expect("历史史莱姆战斗应在五次内结束")
+                .soul_ring_drop
+                .is_none(),
+            "transition source 不得再产生新的魂环掉落"
+        );
+
+        let replacement_identity = IdentityKey {
+            protocol: Protocol::OneBot11,
+            account_id: "10001",
+            namespace: "test",
+            subject_kind: "user",
+            subject_id: "transition-replacement-player",
+        };
+        store
+            .register_player(&replacement_identity, "transition 新角色", "女")
+            .expect("应创建 transition 后角色");
+        store
+            .awaken_wuhun(&replacement_identity)
+            .expect("transition 后角色应完成武魂觉醒");
+        let skills = store
+            .skills_page(&replacement_identity)
+            .expect("应读取 transition 后初始魂技");
+        assert!(
+            skills
+                .entries
+                .iter()
+                .any(|entry| entry.skill.skill_key == "transition-skill")
+                && !skills
+                    .entries
+                    .iter()
+                    .any(|entry| entry.skill.skill_key == "entangle")
+        );
+        let awakened_wuhun = store
+            .open()
+            .expect("应读取 transition 后武魂")
+            .query_row(
+                r#"
+                SELECT w.name
+                  FROM player_wuhun player_wuhun
+                  JOIN wuhun w ON w.id = player_wuhun.wuhun_id
+                  JOIN player p ON p.id = player_wuhun.player_id
+                  JOIN identity i ON i.id = p.identity_id
+                 WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+                   AND i.subject_kind = ?4 AND i.subject_id = ?5
+                   AND player_wuhun.slot = 1
+                "#,
+                params![
+                    replacement_identity.protocol.as_str(),
+                    replacement_identity.account_id,
+                    replacement_identity.namespace,
+                    replacement_identity.subject_kind,
+                    replacement_identity.subject_id,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("应读取 transition 后角色的武魂");
+        assert_ne!(awakened_wuhun, "独狼");
+        store
+            .teleport_with_operation(
+                &replacement_identity,
+                Some("落日森林"),
+                &map_operation("传送", "transition-replacement-map"),
+            )
+            .expect("transition 后角色应进入落日森林");
+        let beasts = store
+            .soul_beasts_page(&replacement_identity, 1, 20)
+            .expect("应读取 transition 后魂兽列表");
+        assert!(
+            !beasts
+                .entries
+                .iter()
+                .any(|beast| beast.beast_key == "slime")
+                && beasts
+                    .entries
+                    .iter()
+                    .any(|beast| beast.beast_key == "transition-beast")
+        );
+        store
+            .challenge_soul_beast_with_operation(
+                &replacement_identity,
+                "transition-beast",
+                &transfer_operation("挑战", "transition-replacement-start"),
+            )
+            .expect("transition target 魂兽应可挑战");
+        let skill_receipt = store
+            .use_skill_battle_with_operation(
+                &replacement_identity,
+                "transition-skill",
+                &transfer_operation("释放技能", "transition-replacement-skill"),
+            )
+            .expect("transition target 魂技和效果快照应可释放");
+        assert!(skill_receipt.skill.is_some());
+        let mut target_win = (skill_receipt.battle.status == "won").then_some(skill_receipt);
+        for turn in 1..=5 {
+            if target_win.is_some() {
+                break;
+            }
+            let message = format!("transition-replacement-attack-{turn}");
+            let receipt = store
+                .attack_battle_with_operation(
+                    &replacement_identity,
+                    &transfer_operation("攻击", &message),
+                )
+                .expect("transition target 魂兽战斗应结算");
+            if receipt.battle.status == "won" {
+                target_win = Some(receipt);
+                break;
+            }
+        }
+        assert_eq!(
+            target_win
+                .expect("transition target 魂兽应在五次内结束")
+                .soul_ring_drop
+                .as_ref()
+                .map(|drop| drop.ring.ring_key.as_str()),
+            Some("transition-ring")
+        );
+    }
+
+    #[test]
+    fn v25_visible_member_schema_fails_closed() {
+        let (directory, store) = test_store();
+        let connection = store.open().expect("应打开 v25 schema 测试数据库");
+        connection
+            .execute_batch("DROP VIEW content_revision_visible_member;")
+            .expect("应移除 v25 可见成员视图以验证 fail-closed");
+        drop(connection);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("缺少 v25 可见成员视图时应拒绝启动");
+        assert!(error.contains("v25") && error.contains("可见成员视图"));
     }
 
     #[test]
