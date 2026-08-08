@@ -337,6 +337,17 @@ mod plugin {
     }
 
     #[command(
+        name = "剥离魂环",
+        description = "剥离当前最高环位的魂环及其绑定魂技",
+        aliases = "剥离",
+        category = "斗罗大陆·角色",
+        scope = "all"
+    )]
+    fn detach_soul_ring(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.detach_soul_ring(req))
+    }
+
+    #[command(
         name = "释放技能",
         description = "在魂兽战斗中释放魂技：释放技能 <魂技>",
         aliases = "使用技能,使用魂技,施放魂技",

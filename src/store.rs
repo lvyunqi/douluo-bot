@@ -3959,6 +3959,7 @@ END;
 // v24.3.3 统一从新玩法入口排除 transition source，历史玩家和战斗快照仍保留原始引用。
 const MIGRATION_V25: &str = r#"
 -- starter-skill 只是 skill 的可觉醒投影，必须服从同一生命周期关系。
+DROP VIEW IF EXISTS content_revision_visible_member;
 CREATE VIEW content_revision_visible_member AS
 SELECT member.revision_id, member.member_kind, member.member_key, member.created_at
   FROM content_revision_member member
@@ -4371,6 +4372,753 @@ WHEN NOT EXISTS(
 )
 BEGIN
     SELECT RAISE(ABORT, 'skill progress scope or formula mismatch');
+END;
+"#;
+
+// 旧版本回填会重写部分门禁；已升级到 v28 时必须恢复当前魂环绑定的完整约束。
+const V28_SOUL_SKILL_GUARD_REPAIR: &str = r#"
+DROP TRIGGER IF EXISTS player_skill_scope_guard;
+DROP TRIGGER IF EXISTS battle_skill_event_scope_guard;
+DROP TRIGGER IF EXISTS skill_loadout_event_scope_guard;
+DROP TRIGGER IF EXISTS skill_progress_event_scope_guard;
+DROP TRIGGER IF EXISTS battle_skill_modifier_scope_guard;
+DROP TRIGGER IF EXISTS battle_skill_event_modifier_snapshot;
+
+CREATE TRIGGER player_skill_scope_guard
+BEFORE INSERT ON player_skill
+WHEN NEW.player_soul_ring_id IS NULL
+  OR NOT EXISTS(
+      SELECT 1
+          FROM player_soul_ring_current_projection ring
+          JOIN soul_ring_drop drop_event ON drop_event.id = ring.soul_ring_drop_id
+          JOIN soul_ring catalog_ring ON catalog_ring.ring_key = ring.ring_key
+          JOIN skill ON skill.skill_key = NEW.skill_key
+          JOIN content_revision_visible_member member
+            ON member.member_kind = 'skill' AND member.member_key = NEW.skill_key
+         WHERE ring.id = NEW.player_soul_ring_id
+           AND ring.player_id = NEW.player_id
+           AND ring.wuhun_id = NEW.wuhun_id
+           AND ring.wuhun_slot = NEW.wuhun_slot
+           AND ring.binding_state = 'bound'
+           AND ring.skill_key = NEW.skill_key
+           AND catalog_ring.skill_key = NEW.skill_key
+           AND drop_event.status = 'pending'
+           AND skill.enabled = 1
+           AND member.revision_id = (
+               SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1
+           )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'player skill scope mismatch');
+END;
+
+CREATE TRIGGER battle_skill_event_scope_guard
+BEFORE INSERT ON battle_skill_event
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM battle_event event
+      JOIN battle b ON b.id = event.battle_id
+      JOIN player p ON p.id = event.player_id
+      JOIN player_skill_bound_projection learned ON learned.id = NEW.player_skill_id
+      JOIN skill ON skill.skill_key = NEW.skill_key
+      JOIN content_revision_visible_member member
+        ON member.member_kind = 'skill' AND member.member_key = skill.skill_key
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE event.id = NEW.battle_event_id
+       AND event.battle_id = NEW.battle_id
+       AND event.player_id = NEW.player_id
+       AND event.sequence = NEW.sequence
+       AND event.event_kind = 'attack'
+       AND event.player_damage = NEW.damage
+       AND b.status = event.status_after
+       AND member.revision_id = (
+           SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1
+       )
+       AND learned.player_id = NEW.player_id
+       AND learned.skill_key = NEW.skill_key
+       AND learned.equipped = 1
+       AND skill.enabled = 1
+       AND skill.skill_type = 'active'
+       AND NEW.soul_power_cost = skill.soul_power_cost
+       AND NEW.cooldown_rounds = skill.cooldown_rounds
+       AND p.soul_power = NEW.soul_power_after
+       AND audit.protocol = (SELECT i.protocol FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.account_id = (SELECT i.account_id FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.namespace = (SELECT i.namespace FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.subject_kind = (SELECT i.subject_kind FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.subject_id = (SELECT i.subject_id FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.command = '释放技能'
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+       AND NOT EXISTS(
+           SELECT 1
+             FROM battle_skill_event previous
+            WHERE previous.battle_id = NEW.battle_id
+              AND previous.player_skill_id = NEW.player_skill_id
+              AND NEW.sequence - previous.sequence < NEW.cooldown_rounds
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle skill event scope, current ring binding, cooldown, or audit mismatch');
+END;
+
+CREATE TRIGGER skill_loadout_event_scope_guard
+BEFORE INSERT ON skill_loadout_event
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM player_skill_bound_projection learned
+      JOIN skill ON skill.skill_key = learned.skill_key
+      JOIN player p ON p.id = learned.player_id
+      JOIN identity i ON i.id = p.identity_id
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE learned.id = NEW.player_skill_id
+       AND learned.player_id = NEW.player_id
+       AND learned.skill_key = NEW.skill_key
+       AND learned.equipped = NEW.equipped_before
+       AND skill.enabled = 1
+       AND audit.protocol = i.protocol
+       AND audit.account_id = i.account_id
+       AND audit.namespace = i.namespace
+       AND audit.subject_kind = i.subject_kind
+       AND audit.subject_id = i.subject_id
+       AND audit.command = CASE NEW.action
+           WHEN 'equip' THEN '装备魂技'
+           WHEN 'unequip' THEN '卸下魂技'
+       END
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+       AND (
+           (NEW.action = 'equip' AND (
+               SELECT COUNT(*) FROM player_skill_bound_projection
+                WHERE player_id = NEW.player_id AND equipped = 1
+           ) < 4)
+           OR
+           (NEW.action = 'unequip' AND (
+               SELECT COUNT(*) FROM player_skill_bound_projection
+                WHERE player_id = NEW.player_id AND equipped = 1
+           ) > 1)
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'skill loadout scope, current ring binding, audit, or capacity mismatch');
+END;
+
+CREATE TRIGGER skill_progress_event_scope_guard
+BEFORE INSERT ON skill_progress_event
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM battle_skill_event use_event
+      JOIN battle_event battle_event ON battle_event.id = use_event.battle_event_id
+      JOIN player_skill_bound_projection learned ON learned.id = NEW.player_skill_id
+      JOIN skill ON skill.skill_key = NEW.skill_key
+     WHERE use_event.id = NEW.battle_skill_event_id
+       AND use_event.player_id = NEW.player_id
+       AND use_event.player_skill_id = learned.id
+       AND use_event.skill_key = NEW.skill_key
+       AND use_event.source_message_id = NEW.source_message_id
+       AND battle_event.event_kind = 'attack'
+       AND learned.player_id = NEW.player_id
+       AND learned.level = NEW.level_before
+       AND learned.proficiency = NEW.proficiency_before
+       AND skill.enabled = 1
+       AND skill.skill_type = 'active'
+       AND NEW.proficiency_gain = MIN(5 + (skill.ring_index * 5), 4500 - NEW.proficiency_before)
+       AND NEW.level_after = CASE
+           WHEN NEW.proficiency_after >= 4500 THEN 10
+           WHEN NEW.proficiency_after >= 3600 THEN 9
+           WHEN NEW.proficiency_after >= 2800 THEN 8
+           WHEN NEW.proficiency_after >= 2100 THEN 7
+           WHEN NEW.proficiency_after >= 1500 THEN 6
+           WHEN NEW.proficiency_after >= 1000 THEN 5
+           WHEN NEW.proficiency_after >= 600 THEN 4
+           WHEN NEW.proficiency_after >= 300 THEN 3
+           WHEN NEW.proficiency_after >= 100 THEN 2
+           ELSE 1
+       END
+)
+BEGIN
+    SELECT RAISE(ABORT, 'skill progress scope, current ring binding, or formula mismatch');
+END;
+
+CREATE TRIGGER battle_skill_modifier_scope_guard
+BEFORE INSERT ON battle_skill_modifier
+WHEN NEW.rule_version <> 'level-v1'
+ OR NOT EXISTS(
+    SELECT 1
+      FROM battle_skill_event use_event
+      JOIN player_skill_bound_projection learned ON learned.id = use_event.player_skill_id
+     WHERE use_event.id = NEW.battle_skill_event_id
+       AND learned.player_id = use_event.player_id
+       AND learned.skill_key = use_event.skill_key
+       AND learned.level = NEW.skill_level
+       AND NEW.damage_percent = 100 + ((NEW.skill_level - 1) * 5)
+       AND NEW.created_at = use_event.created_at
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle skill modifier scope or formula mismatch');
+END;
+
+CREATE TRIGGER battle_skill_event_modifier_snapshot
+AFTER INSERT ON battle_skill_event
+BEGIN
+    INSERT INTO battle_skill_modifier(
+        battle_skill_event_id, skill_level, damage_percent, rule_version, created_at
+    )
+    SELECT NEW.id,
+           learned.level,
+           100 + ((learned.level - 1) * 5),
+           'level-v1',
+           NEW.created_at
+      FROM player_skill_bound_projection learned
+     WHERE learned.id = NEW.player_skill_id
+       AND learned.player_id = NEW.player_id
+       AND learned.skill_key = NEW.skill_key;
+    SELECT CASE WHEN changes() <> 1
+        THEN RAISE(ABORT, 'battle skill modifier snapshot is missing')
+    END;
+END;
+"#;
+
+// v28 将魂环附加和魂技绑定拆为可追溯的历史；当前可用状态只来自尚未剥离的绑定。
+const MIGRATION_V28: &str = r#"
+DROP TRIGGER IF EXISTS player_skill_no_delete;
+DROP TRIGGER IF EXISTS player_skill_no_reinsert;
+DROP TRIGGER IF EXISTS player_skill_identity_guard;
+DROP TRIGGER IF EXISTS player_skill_scope_guard;
+DROP TRIGGER IF EXISTS player_skill_progress_guard;
+DROP TRIGGER IF EXISTS player_soul_ring_no_update;
+DROP TRIGGER IF EXISTS player_soul_ring_no_delete;
+DROP TRIGGER IF EXISTS player_soul_ring_no_reinsert;
+DROP TRIGGER IF EXISTS player_soul_ring_scope_guard;
+DROP TRIGGER IF EXISTS soul_ring_event_scope_guard;
+DROP TRIGGER IF EXISTS battle_skill_event_scope_guard;
+DROP TRIGGER IF EXISTS skill_loadout_event_scope_guard;
+DROP TRIGGER IF EXISTS skill_progress_event_scope_guard;
+DROP TRIGGER IF EXISTS battle_skill_modifier_scope_guard;
+DROP TRIGGER IF EXISTS battle_skill_event_modifier_snapshot;
+DROP VIEW IF EXISTS player_skill_bound_projection;
+DROP VIEW IF EXISTS player_soul_ring_current_projection;
+
+CREATE TABLE player_soul_ring_v28 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    wuhun_id INTEGER NOT NULL REFERENCES wuhun(id) ON DELETE RESTRICT,
+    wuhun_slot INTEGER NOT NULL CHECK(wuhun_slot = 1),
+    ring_index INTEGER NOT NULL CHECK(ring_index BETWEEN 1 AND 9),
+    ring_key TEXT NOT NULL REFERENCES soul_ring(ring_key) ON DELETE RESTRICT,
+    skill_key TEXT NOT NULL REFERENCES skill(skill_key) ON DELETE RESTRICT,
+    binding_state TEXT NOT NULL CHECK(binding_state IN ('legacy_unbound', 'bound')),
+    soul_ring_drop_id INTEGER NOT NULL UNIQUE REFERENCES soul_ring_drop(id) ON DELETE RESTRICT,
+    obtained_at INTEGER NOT NULL CHECK(obtained_at >= 0)
+) STRICT;
+
+INSERT INTO player_soul_ring_v28(
+    id, player_id, wuhun_id, wuhun_slot, ring_index,
+    ring_key, skill_key, binding_state, soul_ring_drop_id, obtained_at
+)
+SELECT id, player_id, wuhun_id, wuhun_slot, ring_index,
+       ring_key, skill_key, 'legacy_unbound', soul_ring_drop_id, obtained_at
+  FROM player_soul_ring;
+
+DROP TABLE player_soul_ring;
+ALTER TABLE player_soul_ring_v28 RENAME TO player_soul_ring;
+CREATE INDEX player_soul_ring_player_page
+    ON player_soul_ring(player_id, wuhun_slot, ring_index, id);
+
+CREATE TABLE player_skill_v28 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE CASCADE,
+    wuhun_id INTEGER NOT NULL REFERENCES wuhun(id) ON DELETE RESTRICT,
+    skill_key TEXT NOT NULL REFERENCES skill(skill_key) ON DELETE RESTRICT,
+    wuhun_slot INTEGER NOT NULL CHECK(wuhun_slot = 1),
+    player_soul_ring_id INTEGER REFERENCES player_soul_ring(id) ON DELETE RESTRICT,
+    level INTEGER NOT NULL DEFAULT 1 CHECK(level BETWEEN 1 AND 10),
+    proficiency INTEGER NOT NULL DEFAULT 0 CHECK(proficiency >= 0),
+    equipped INTEGER NOT NULL DEFAULT 1 CHECK(equipped IN (0, 1)),
+    learned_at INTEGER NOT NULL CHECK(learned_at >= 0)
+) STRICT;
+
+INSERT INTO player_skill_v28(
+    id, player_id, wuhun_id, skill_key, wuhun_slot,
+    player_soul_ring_id, level, proficiency, equipped, learned_at
+)
+SELECT learned.id, learned.player_id, learned.wuhun_id, learned.skill_key, learned.wuhun_slot,
+       NULL,
+       learned.level, learned.proficiency, learned.equipped, learned.learned_at
+  FROM player_skill learned;
+
+DROP TABLE player_skill;
+ALTER TABLE player_skill_v28 RENAME TO player_skill;
+CREATE INDEX player_skill_player_page
+    ON player_skill(player_id, id);
+CREATE INDEX player_skill_equipped
+    ON player_skill(player_id, equipped, id);
+CREATE UNIQUE INDEX player_skill_ring_binding
+    ON player_skill(player_soul_ring_id)
+ WHERE player_soul_ring_id IS NOT NULL;
+CREATE UNIQUE INDEX player_skill_unbound_identity
+    ON player_skill(player_id, skill_key)
+ WHERE player_soul_ring_id IS NULL;
+
+CREATE TABLE player_soul_ring_detachment (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_soul_ring_id INTEGER NOT NULL UNIQUE REFERENCES player_soul_ring(id) ON DELETE RESTRICT,
+    player_skill_id INTEGER UNIQUE REFERENCES player_skill(id) ON DELETE RESTRICT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    wuhun_id INTEGER NOT NULL REFERENCES wuhun(id) ON DELETE RESTRICT,
+    wuhun_slot INTEGER NOT NULL CHECK(wuhun_slot = 1),
+    ring_index INTEGER NOT NULL CHECK(ring_index BETWEEN 1 AND 9),
+    ring_key TEXT NOT NULL REFERENCES soul_ring(ring_key) ON DELETE RESTRICT,
+    skill_key TEXT NOT NULL REFERENCES skill(skill_key) ON DELETE RESTRICT,
+    source_message_id TEXT NOT NULL CHECK(
+        length(source_message_id) <= 256
+        AND instr(source_message_id, char(0)) = 0
+        AND source_message_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    operation_log_id INTEGER NOT NULL UNIQUE REFERENCES operation_log(id) ON DELETE RESTRICT,
+    created_at INTEGER NOT NULL CHECK(created_at >= 0)
+) STRICT;
+
+CREATE INDEX player_soul_ring_detachment_player_page
+    ON player_soul_ring_detachment(player_id, id);
+CREATE UNIQUE INDEX player_soul_ring_detachment_player_message
+    ON player_soul_ring_detachment(player_id, source_message_id)
+ WHERE length(source_message_id) > 0;
+
+CREATE VIEW player_soul_ring_current_projection AS
+SELECT ring.*
+  FROM player_soul_ring ring
+ WHERE NOT EXISTS(
+    SELECT 1
+      FROM player_soul_ring_detachment detachment
+     WHERE detachment.player_soul_ring_id = ring.id
+ );
+
+CREATE VIEW player_skill_bound_projection AS
+SELECT learned.*
+  FROM player_skill learned
+ WHERE EXISTS(
+        SELECT 1
+          FROM player_soul_ring_current_projection ring
+         WHERE ring.id = learned.player_soul_ring_id
+           AND ring.binding_state = 'bound'
+    );
+
+CREATE TRIGGER player_soul_ring_no_update
+BEFORE UPDATE ON player_soul_ring
+BEGIN
+    SELECT RAISE(ABORT, 'player soul ring history is immutable');
+END;
+CREATE TRIGGER player_soul_ring_no_delete
+BEFORE DELETE ON player_soul_ring
+BEGIN
+    SELECT RAISE(ABORT, 'player soul ring history is immutable');
+END;
+CREATE TRIGGER player_soul_ring_no_reinsert
+BEFORE INSERT ON player_soul_ring
+WHEN EXISTS(
+    SELECT 1 FROM player_soul_ring
+     WHERE id = NEW.id OR soul_ring_drop_id = NEW.soul_ring_drop_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'player soul ring is append-only');
+END;
+CREATE TRIGGER player_soul_ring_scope_guard
+BEFORE INSERT ON player_soul_ring
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM player_wuhun_state state
+      JOIN soul_ring_drop drop_event ON drop_event.id = NEW.soul_ring_drop_id
+      JOIN soul_ring ring ON ring.ring_key = NEW.ring_key
+     WHERE state.player_id = NEW.player_id
+       AND state.wuhun_id = NEW.wuhun_id
+       AND state.slot = NEW.wuhun_slot
+       AND drop_event.player_id = NEW.player_id
+       AND drop_event.ring_key = NEW.ring_key
+       AND drop_event.status = 'pending'
+       AND ring.enabled = 1
+       AND ring.ring_index = NEW.ring_index
+       AND ring.skill_key = NEW.skill_key
+       AND NEW.binding_state = 'bound'
+       AND NEW.ring_index = (
+           SELECT COUNT(*) + 1
+             FROM player_soul_ring_current_projection current_ring
+            WHERE current_ring.player_id = NEW.player_id
+              AND current_ring.wuhun_slot = NEW.wuhun_slot
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'player soul ring scope mismatch');
+END;
+
+CREATE TRIGGER soul_ring_event_scope_guard
+BEFORE INSERT ON soul_ring_event
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM soul_ring_drop drop_event
+      JOIN player_soul_ring learned_ring ON learned_ring.id = NEW.player_soul_ring_id
+      JOIN soul_ring ring ON ring.ring_key = NEW.ring_key
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+      JOIN player p ON p.id = NEW.player_id
+      JOIN identity i ON i.id = p.identity_id
+     WHERE drop_event.id = NEW.soul_ring_drop_id
+       AND drop_event.status = 'absorbed'
+       AND drop_event.absorbed_operation_log_id = NEW.operation_log_id
+       AND learned_ring.player_id = NEW.player_id
+       AND learned_ring.soul_ring_drop_id = NEW.soul_ring_drop_id
+       AND learned_ring.ring_key = NEW.ring_key
+       AND learned_ring.ring_index = NEW.ring_index
+       AND learned_ring.binding_state = 'bound'
+       AND ring.enabled = 1
+       AND audit.protocol = i.protocol
+       AND audit.account_id = i.account_id
+       AND audit.namespace = i.namespace
+       AND audit.subject_kind = i.subject_kind
+       AND audit.subject_id = i.subject_id
+       AND audit.command = '吸收魂环'
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'soul ring event scope or audit mismatch');
+END;
+
+CREATE TRIGGER player_skill_no_delete
+BEFORE DELETE ON player_skill
+BEGIN
+    SELECT RAISE(ABORT, 'player skill history is immutable');
+END;
+CREATE TRIGGER player_skill_no_reinsert
+BEFORE INSERT ON player_skill
+WHEN EXISTS(
+    SELECT 1 FROM player_skill
+     WHERE id = NEW.id
+        OR (NEW.player_soul_ring_id IS NOT NULL
+            AND player_soul_ring_id = NEW.player_soul_ring_id)
+        OR (NEW.player_soul_ring_id IS NULL
+            AND player_id = NEW.player_id
+            AND skill_key = NEW.skill_key
+            AND player_soul_ring_id IS NULL)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'player skill is append-only');
+END;
+CREATE TRIGGER player_skill_identity_guard
+BEFORE UPDATE ON player_skill
+WHEN NEW.player_id <> OLD.player_id
+  OR NEW.wuhun_id <> OLD.wuhun_id
+  OR NEW.skill_key <> OLD.skill_key
+  OR NEW.wuhun_slot <> OLD.wuhun_slot
+  OR NEW.player_soul_ring_id IS NOT OLD.player_soul_ring_id
+BEGIN
+    SELECT RAISE(ABORT, 'player skill identity is immutable');
+END;
+CREATE TRIGGER player_skill_scope_guard
+BEFORE INSERT ON player_skill
+WHEN NEW.player_soul_ring_id IS NULL
+  OR NOT EXISTS(
+      SELECT 1
+          FROM player_soul_ring_current_projection ring
+          JOIN soul_ring_drop drop_event ON drop_event.id = ring.soul_ring_drop_id
+          JOIN soul_ring catalog_ring ON catalog_ring.ring_key = ring.ring_key
+          JOIN skill ON skill.skill_key = NEW.skill_key
+          JOIN content_revision_visible_member member
+            ON member.member_kind = 'skill' AND member.member_key = NEW.skill_key
+         WHERE ring.id = NEW.player_soul_ring_id
+           AND ring.player_id = NEW.player_id
+           AND ring.wuhun_id = NEW.wuhun_id
+           AND ring.wuhun_slot = NEW.wuhun_slot
+           AND ring.binding_state = 'bound'
+           AND ring.skill_key = NEW.skill_key
+           AND catalog_ring.skill_key = NEW.skill_key
+           AND drop_event.status = 'pending'
+           AND skill.enabled = 1
+           AND member.revision_id = (
+               SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1
+           )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'player skill scope mismatch');
+END;
+CREATE TRIGGER player_skill_progress_guard
+BEFORE UPDATE OF level, proficiency ON player_skill
+WHEN NEW.level <> OLD.level OR NEW.proficiency <> OLD.proficiency
+BEGIN
+    SELECT CASE WHEN NOT EXISTS(
+        SELECT 1
+          FROM skill_progress_event progress
+         WHERE progress.player_id = OLD.player_id
+           AND progress.player_skill_id = OLD.id
+           AND progress.skill_key = OLD.skill_key
+           AND progress.level_before = OLD.level
+           AND progress.level_after = NEW.level
+           AND progress.proficiency_before = OLD.proficiency
+           AND progress.proficiency_after = NEW.proficiency
+           AND progress.id = (
+               SELECT MAX(latest.id)
+                 FROM skill_progress_event latest
+                WHERE latest.player_skill_id = OLD.id
+           )
+    ) THEN RAISE(ABORT, 'player skill progress must follow an event') END;
+END;
+
+CREATE TRIGGER player_soul_ring_detachment_no_update
+BEFORE UPDATE ON player_soul_ring_detachment
+BEGIN
+    SELECT RAISE(ABORT, 'player soul ring detachment is immutable');
+END;
+CREATE TRIGGER player_soul_ring_detachment_no_delete
+BEFORE DELETE ON player_soul_ring_detachment
+BEGIN
+    SELECT RAISE(ABORT, 'player soul ring detachment is immutable');
+END;
+CREATE TRIGGER player_soul_ring_detachment_no_reinsert
+BEFORE INSERT ON player_soul_ring_detachment
+WHEN EXISTS(
+    SELECT 1 FROM player_soul_ring_detachment
+     WHERE id = NEW.id
+        OR player_soul_ring_id = NEW.player_soul_ring_id
+        OR (
+            NEW.player_skill_id IS NOT NULL
+            AND player_skill_id = NEW.player_skill_id
+        )
+        OR operation_log_id = NEW.operation_log_id
+        OR (
+            length(NEW.source_message_id) > 0
+            AND player_id = NEW.player_id
+            AND source_message_id = NEW.source_message_id
+        )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'player soul ring detachment is append-only');
+END;
+CREATE TRIGGER player_soul_ring_detachment_scope_guard
+BEFORE INSERT ON player_soul_ring_detachment
+WHEN NOT EXISTS(
+    SELECT 1
+     FROM player_soul_ring_current_projection ring
+      JOIN player p ON p.id = ring.player_id
+      JOIN identity i ON i.id = p.identity_id
+     JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE ring.id = NEW.player_soul_ring_id
+       AND length(NEW.source_message_id) > 0
+       AND ring.player_id = NEW.player_id
+       AND ring.wuhun_id = NEW.wuhun_id
+       AND ring.wuhun_slot = NEW.wuhun_slot
+       AND ring.ring_index = NEW.ring_index
+       AND ring.ring_key = NEW.ring_key
+       AND ring.skill_key = NEW.skill_key
+       AND (
+           (
+               ring.binding_state = 'legacy_unbound'
+               AND NEW.player_skill_id IS NULL
+               AND NOT EXISTS(
+                   SELECT 1 FROM player_skill learned
+                    WHERE learned.player_soul_ring_id = ring.id
+               )
+           )
+           OR EXISTS(
+               SELECT 1
+                 FROM player_skill_bound_projection learned
+                WHERE ring.binding_state = 'bound'
+                  AND learned.id = NEW.player_skill_id
+                  AND learned.player_soul_ring_id = ring.id
+                  AND learned.player_id = NEW.player_id
+                  AND learned.wuhun_id = NEW.wuhun_id
+                  AND learned.wuhun_slot = NEW.wuhun_slot
+                  AND learned.skill_key = NEW.skill_key
+           )
+       )
+       AND NOT EXISTS(
+           SELECT 1
+             FROM player_soul_ring_current_projection later_ring
+            WHERE later_ring.player_id = ring.player_id
+              AND later_ring.wuhun_slot = ring.wuhun_slot
+              AND later_ring.ring_index > ring.ring_index
+       )
+       AND NOT EXISTS(
+           SELECT 1 FROM battle active_battle
+            WHERE active_battle.player_id = ring.player_id
+              AND active_battle.status = 'active'
+       )
+       AND audit.protocol = i.protocol
+       AND audit.account_id = i.account_id
+       AND audit.namespace = i.namespace
+       AND audit.subject_kind = i.subject_kind
+       AND audit.subject_id = i.subject_id
+       AND audit.command = '剥离魂环'
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'player soul ring detachment scope or audit mismatch');
+END;
+
+DROP TRIGGER IF EXISTS battle_skill_event_scope_guard;
+CREATE TRIGGER battle_skill_event_scope_guard
+BEFORE INSERT ON battle_skill_event
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM battle_event event
+      JOIN battle b ON b.id = event.battle_id
+      JOIN player p ON p.id = event.player_id
+      JOIN player_skill_bound_projection learned ON learned.id = NEW.player_skill_id
+      JOIN skill ON skill.skill_key = NEW.skill_key
+      JOIN content_revision_visible_member member
+        ON member.member_kind = 'skill' AND member.member_key = skill.skill_key
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE event.id = NEW.battle_event_id
+       AND event.battle_id = NEW.battle_id
+       AND event.player_id = NEW.player_id
+       AND event.sequence = NEW.sequence
+       AND event.event_kind = 'attack'
+       AND event.player_damage = NEW.damage
+       AND b.status = event.status_after
+       AND member.revision_id = (
+           SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1
+       )
+       AND learned.player_id = NEW.player_id
+       AND learned.skill_key = NEW.skill_key
+       AND learned.equipped = 1
+       AND skill.enabled = 1
+       AND skill.skill_type = 'active'
+       AND NEW.soul_power_cost = skill.soul_power_cost
+       AND NEW.cooldown_rounds = skill.cooldown_rounds
+       AND p.soul_power = NEW.soul_power_after
+       AND audit.protocol = (SELECT i.protocol FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.account_id = (SELECT i.account_id FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.namespace = (SELECT i.namespace FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.subject_kind = (SELECT i.subject_kind FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.subject_id = (SELECT i.subject_id FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
+       AND audit.command = '释放技能'
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+       AND NOT EXISTS(
+           SELECT 1
+             FROM battle_skill_event previous
+            WHERE previous.battle_id = NEW.battle_id
+              AND previous.player_skill_id = NEW.player_skill_id
+              AND NEW.sequence - previous.sequence < NEW.cooldown_rounds
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle skill event scope, current ring binding, cooldown, or audit mismatch');
+END;
+
+CREATE TRIGGER skill_loadout_event_scope_guard
+BEFORE INSERT ON skill_loadout_event
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM player_skill_bound_projection learned
+      JOIN skill ON skill.skill_key = learned.skill_key
+      JOIN player p ON p.id = learned.player_id
+      JOIN identity i ON i.id = p.identity_id
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE learned.id = NEW.player_skill_id
+       AND learned.player_id = NEW.player_id
+       AND learned.skill_key = NEW.skill_key
+       AND learned.equipped = NEW.equipped_before
+       AND skill.enabled = 1
+       AND audit.protocol = i.protocol
+       AND audit.account_id = i.account_id
+       AND audit.namespace = i.namespace
+       AND audit.subject_kind = i.subject_kind
+       AND audit.subject_id = i.subject_id
+       AND audit.command = CASE NEW.action
+           WHEN 'equip' THEN '装备魂技'
+           WHEN 'unequip' THEN '卸下魂技'
+       END
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+       AND (
+           (NEW.action = 'equip' AND (
+               SELECT COUNT(*) FROM player_skill_bound_projection
+                WHERE player_id = NEW.player_id AND equipped = 1
+           ) < 4)
+           OR
+           (NEW.action = 'unequip' AND (
+               SELECT COUNT(*) FROM player_skill_bound_projection
+                WHERE player_id = NEW.player_id AND equipped = 1
+           ) > 1)
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'skill loadout scope, current ring binding, audit, or capacity mismatch');
+END;
+
+CREATE TRIGGER skill_progress_event_scope_guard
+BEFORE INSERT ON skill_progress_event
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM battle_skill_event use_event
+      JOIN battle_event battle_event ON battle_event.id = use_event.battle_event_id
+      JOIN player_skill_bound_projection learned ON learned.id = NEW.player_skill_id
+      JOIN skill ON skill.skill_key = NEW.skill_key
+     WHERE use_event.id = NEW.battle_skill_event_id
+       AND use_event.player_id = NEW.player_id
+       AND use_event.player_skill_id = learned.id
+       AND use_event.skill_key = NEW.skill_key
+       AND use_event.source_message_id = NEW.source_message_id
+       AND battle_event.event_kind = 'attack'
+       AND learned.player_id = NEW.player_id
+       AND learned.level = NEW.level_before
+       AND learned.proficiency = NEW.proficiency_before
+       AND skill.enabled = 1
+       AND skill.skill_type = 'active'
+       AND NEW.proficiency_gain = MIN(5 + (skill.ring_index * 5), 4500 - NEW.proficiency_before)
+       AND NEW.level_after = CASE
+           WHEN NEW.proficiency_after >= 4500 THEN 10
+           WHEN NEW.proficiency_after >= 3600 THEN 9
+           WHEN NEW.proficiency_after >= 2800 THEN 8
+           WHEN NEW.proficiency_after >= 2100 THEN 7
+           WHEN NEW.proficiency_after >= 1500 THEN 6
+           WHEN NEW.proficiency_after >= 1000 THEN 5
+           WHEN NEW.proficiency_after >= 600 THEN 4
+           WHEN NEW.proficiency_after >= 300 THEN 3
+           WHEN NEW.proficiency_after >= 100 THEN 2
+           ELSE 1
+       END
+)
+BEGIN
+    SELECT RAISE(ABORT, 'skill progress scope, current ring binding, or formula mismatch');
+END;
+
+CREATE TRIGGER battle_skill_modifier_scope_guard
+BEFORE INSERT ON battle_skill_modifier
+WHEN NEW.rule_version <> 'level-v1'
+ OR NOT EXISTS(
+    SELECT 1
+      FROM battle_skill_event use_event
+      JOIN player_skill_bound_projection learned ON learned.id = use_event.player_skill_id
+     WHERE use_event.id = NEW.battle_skill_event_id
+       AND learned.player_id = use_event.player_id
+       AND learned.skill_key = use_event.skill_key
+       AND learned.level = NEW.skill_level
+       AND NEW.damage_percent = 100 + ((NEW.skill_level - 1) * 5)
+       AND NEW.created_at = use_event.created_at
+)
+BEGIN
+    SELECT RAISE(ABORT, 'battle skill modifier scope or formula mismatch');
+END;
+
+CREATE TRIGGER battle_skill_event_modifier_snapshot
+AFTER INSERT ON battle_skill_event
+BEGIN
+    INSERT INTO battle_skill_modifier(
+        battle_skill_event_id, skill_level, damage_percent, rule_version, created_at
+    )
+    SELECT NEW.id,
+           learned.level,
+           100 + ((learned.level - 1) * 5),
+           'level-v1',
+           NEW.created_at
+      FROM player_skill_bound_projection learned
+     WHERE learned.id = NEW.player_skill_id
+       AND learned.player_id = NEW.player_id
+       AND learned.skill_key = NEW.skill_key;
+    SELECT CASE WHEN changes() <> 1
+        THEN RAISE(ABORT, 'battle skill modifier snapshot is missing')
+    END;
 END;
 "#;
 
@@ -5009,6 +5757,7 @@ pub struct PlayerSoulRingRecord {
     pub ring: SoulRingRecord,
     pub ring_index: i64,
     pub obtained_at: i64,
+    pub skill_bound: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5020,6 +5769,13 @@ pub struct SoulRingPage {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SoulRingAbsorbReceipt {
+    pub ring: PlayerSoulRingRecord,
+    pub skill: SkillRecord,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SoulRingDetachmentReceipt {
     pub ring: PlayerSoulRingRecord,
     pub skill: SkillRecord,
     pub replayed: bool,
@@ -7325,9 +8081,15 @@ impl Store {
             }
 
             if !migration_applied(&transaction, 25)? {
+                let v28_already_applied = migration_applied(&transaction, 28)?;
                 transaction
                     .execute_batch(MIGRATION_V25)
                     .map_err(|error| format!("执行数据库迁移 v25 失败：{error}"))?;
+                if v28_already_applied {
+                    transaction
+                        .execute_batch(V28_SOUL_SKILL_GUARD_REPAIR)
+                        .map_err(|error| format!("恢复 v28 魂环绑定门禁失败：{error}"))?;
+                }
                 validate_v25_schema(&transaction)?;
                 transaction
                     .execute(
@@ -7340,6 +8102,7 @@ impl Store {
             }
 
             if !migration_applied(&transaction, 27)? {
+                let v28_already_applied = migration_applied(&transaction, 28)?;
                 ensure_v26_retirement_is_safe(&transaction)?;
                 transaction
                     .execute_batch(MIGRATION_V27)
@@ -7347,6 +8110,11 @@ impl Store {
                 transaction
                     .execute_batch(MIGRATION_V25)
                     .map_err(|error| format!("重建 v25 魂技校验触发器失败：{error}"))?;
+                if v28_already_applied {
+                    transaction
+                        .execute_batch(V28_SOUL_SKILL_GUARD_REPAIR)
+                        .map_err(|error| format!("恢复 v28 魂环绑定门禁失败：{error}"))?;
+                }
                 validate_v27_schema(&transaction)?;
                 transaction
                     .execute(
@@ -7358,10 +8126,25 @@ impl Store {
                 validate_v27_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 28)? {
+                transaction
+                    .execute_batch(MIGRATION_V28)
+                    .map_err(|error| format!("执行数据库迁移 v28 失败：{error}"))?;
+                validate_v28_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(28, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v28 失败：{error}"))?;
+            } else {
+                validate_v28_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28 失败：{error}"
                 )
             })?;
             Ok(())
@@ -7395,6 +8178,7 @@ impl Store {
                 validate_v24_schema(connection)?;
                 validate_v25_schema(connection)?;
                 validate_v27_schema(connection)?;
+                validate_v28_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -9479,7 +10263,7 @@ impl Store {
         let capacity = soul_ring_capacity(load_player_level(&transaction, player.player_id)?);
         let ring_count = transaction
             .query_row(
-                "SELECT COUNT(*) FROM player_soul_ring WHERE player_id = ?1 AND wuhun_slot = 1",
+                "SELECT COUNT(*) FROM player_soul_ring_current_projection WHERE player_id = ?1 AND wuhun_slot = 1",
                 [player.player_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -9511,28 +10295,10 @@ impl Store {
         transaction
             .execute(
                 r#"
-                INSERT INTO player_skill(
-                    player_id, wuhun_id, skill_key, wuhun_slot,
-                    level, proficiency, equipped, learned_at
-                )
-                SELECT ?1, ?2, ring.skill_key, 1, 1, 0, 1, ?3
-                  FROM soul_ring ring
-                 WHERE ring.ring_key = ?4
-                   AND NOT EXISTS(
-                       SELECT 1 FROM player_skill learned
-                        WHERE learned.player_id = ?1 AND learned.skill_key = ring.skill_key
-                   )
-                "#,
-                params![player.player_id, wuhun_id, timestamp, ring.ring_key],
-            )
-            .map_err(|error| format!("学习魂环魂技失败：{error}"))?;
-        transaction
-            .execute(
-                r#"
                 INSERT INTO player_soul_ring(
                     player_id, wuhun_id, wuhun_slot, ring_index,
-                    ring_key, skill_key, soul_ring_drop_id, obtained_at
-                ) VALUES(?1, ?2, 1, ?3, ?4, ?5, ?6, ?7)
+                    ring_key, skill_key, binding_state, soul_ring_drop_id, obtained_at
+                ) VALUES(?1, ?2, 1, ?3, ?4, ?5, 'bound', ?6, ?7)
                 "#,
                 params![
                     player.player_id,
@@ -9546,6 +10312,24 @@ impl Store {
             )
             .map_err(|error| format!("保存玩家魂环失败：{error}"))?;
         let player_soul_ring_id = transaction.last_insert_rowid();
+        // 每次附加都创建新的魂技实体，永不复用已剥离或历史魂技的成长状态。
+        transaction
+            .execute(
+                r#"
+                INSERT INTO player_skill(
+                    player_id, wuhun_id, skill_key, wuhun_slot,
+                    player_soul_ring_id, level, proficiency, equipped, learned_at
+                ) VALUES(?1, ?2, ?3, 1, ?4, 1, 0, 1, ?5)
+                "#,
+                params![
+                    player.player_id,
+                    wuhun_id,
+                    ring.skill.skill_key,
+                    player_soul_ring_id,
+                    timestamp
+                ],
+            )
+            .map_err(|error| format!("创建魂环绑定魂技失败：{error}"))?;
         transaction
             .execute(
                 "UPDATE soul_ring_drop SET status = 'absorbed', absorbed_at = ?1, absorbed_operation_log_id = ?2 WHERE id = ?3",
@@ -9580,6 +10364,75 @@ impl Store {
         Ok(SoulRingAbsorbReceipt {
             skill: ring.skill,
             ring: player_ring,
+            replayed: false,
+        })
+    }
+
+    /// 只剥离当前最高环位，并以不可变账本使该魂环和其魂技立即退出当前投影。
+    pub fn detach_latest_soul_ring_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<SoulRingDetachmentReceipt, String> {
+        validate_identity_key(key)?;
+        validate_soul_ring_detachment_operation(operation)?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("开始剥离魂环事务失败：{error}"))?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let player = load_transfer_sender(&transaction, key)?;
+        ensure_transfer_participant_eligible(&player, "你的角色")?;
+
+        if let Some(existing) = load_soul_ring_detachment_by_message(
+            &transaction,
+            player.player_id,
+            operation.source_message_id,
+        )? {
+            transaction
+                .commit()
+                .map_err(|error| format!("提交剥离魂环重放事务失败：{error}"))?;
+            return Ok(existing);
+        }
+
+        if load_active_battle_state(&transaction, player.player_id)?.is_some() {
+            return Err("战斗中不能剥离魂环，请先结束当前战斗".to_string());
+        }
+        let ring = load_latest_current_player_soul_ring(&transaction, player.player_id)?
+            .ok_or_else(|| "当前没有可剥离的魂环".to_string())?;
+        // 旧库无法证明魂环与魂技的原子绑定，只能保留为不可用历史并允许剥离。
+        let player_skill_id = load_bound_player_skill_id(&transaction, ring.id)?;
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        let created_at = now_timestamp()?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO player_soul_ring_detachment(
+                    player_soul_ring_id, player_skill_id, player_id, wuhun_id,
+                    wuhun_slot, ring_index, ring_key, skill_key,
+                    source_message_id, operation_log_id, created_at
+                )
+                SELECT ?1, ?2, ring.player_id, ring.wuhun_id,
+                       ring.wuhun_slot, ring.ring_index, ring.ring_key, ring.skill_key,
+                       ?3, ?4, ?5
+                  FROM player_soul_ring_current_projection ring
+                 WHERE ring.id = ?1
+                "#,
+                params![
+                    ring.id,
+                    player_skill_id,
+                    operation.source_message_id,
+                    operation_log_id,
+                    created_at
+                ],
+            )
+            .map_err(|error| format!("写入魂环剥离记录失败：{error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交剥离魂环事务失败：{error}"))?;
+        Ok(SoulRingDetachmentReceipt {
+            skill: ring.ring.skill.clone(),
+            ring,
             replayed: false,
         })
     }
@@ -9832,9 +10685,6 @@ impl Store {
             .map_err(|error| format!("开始{action}事务失败：{error}"))?;
         ensure_no_legacy_identity(&transaction, key)?;
         let player = load_battle_player(&transaction, key)?;
-        let learned_skill = skill_name_or_key
-            .map(|name| load_player_skill_by_name_or_key(&transaction, player.player_id, name))
-            .transpose()?;
         if let Some(existing) = load_battle_event_by_message(
             &transaction,
             player.player_id,
@@ -9877,6 +10727,9 @@ impl Store {
                 replayed: true,
             });
         }
+        let learned_skill = skill_name_or_key
+            .map(|name| load_player_skill_by_name_or_key(&transaction, player.player_id, name))
+            .transpose()?;
         if let Some(learned_skill) = learned_skill.as_ref()
             && !active_content_member_exists(&transaction, "skill", &learned_skill.skill.skill_key)?
         {
@@ -11016,7 +11869,6 @@ impl Store {
                 params![player.0, wuhun.0, player.1, timestamp],
             )
             .map_err(|error| format!("保存觉醒武魂失败：{error}"))?;
-        seed_player_skills(&transaction, player.0, wuhun.0, timestamp)?;
         if let Some(operation) = operation {
             insert_operation_log(&transaction, key, operation)?;
         }
@@ -13040,44 +13892,6 @@ fn load_wuhun_at_weight_ticket(
         .map_err(|error| format!("按权重选择武魂失败：{error}"))
 }
 
-fn seed_player_skills(
-    connection: &Connection,
-    player_id: i64,
-    wuhun_id: i64,
-    learned_at: i64,
-) -> Result<(), String> {
-    connection
-        .execute(
-            r#"
-            INSERT INTO player_skill(
-                player_id, wuhun_id, skill_key, wuhun_slot,
-                level, proficiency, equipped, learned_at
-            )
-            SELECT ?1, ?2, skill.skill_key, 1, 1, 0, 1, ?3
-              FROM skill
-              JOIN wuhun ON wuhun.id = ?2
-              JOIN content_revision_visible_member skill_member
-                ON skill_member.member_kind = 'skill'
-               AND skill_member.member_key = skill.skill_key
-              JOIN content_revision_visible_member starter_member
-                ON starter_member.member_kind = 'starter-skill'
-               AND starter_member.member_key = skill.skill_key
-             WHERE skill_member.revision_id = (
-                       SELECT revision_id
-                         FROM content_revision_activation
-                        ORDER BY id DESC
-                        LIMIT 1
-                   )
-               AND starter_member.revision_id = skill_member.revision_id
-               AND skill.enabled = 1
-               AND (skill.wuhun_category = 'all' OR skill.wuhun_category = wuhun.category)
-            "#,
-            params![player_id, wuhun_id, learned_at],
-        )
-        .map_err(|error| format!("保存初始魂技失败：{error}"))?;
-    Ok(())
-}
-
 fn skill_record_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<SkillRecord> {
     Ok(SkillRecord {
         skill_key: row.get(offset)?,
@@ -13120,6 +13934,7 @@ fn player_soul_ring_record_from_row(
         ring: soul_ring_record_from_row(row, 1)?,
         ring_index: row.get(21)?,
         obtained_at: row.get(22)?,
+        skill_bound: row.get(23)?,
     })
 }
 
@@ -13242,7 +14057,7 @@ fn player_skill_select_sql() -> &'static str {
            s.ring_index, s.soul_power_cost, s.cooldown_rounds, s.base_damage,
            s.spirit_ratio_percent, s.strength_ratio_percent, s.description,
            ps.level, ps.proficiency, ps.equipped, ps.learned_at
-      FROM player_skill ps
+      FROM player_skill_bound_projection ps
       JOIN skill s ON s.skill_key = ps.skill_key
     "#
 }
@@ -13268,7 +14083,24 @@ fn player_soul_ring_select_sql() -> &'static str {
            s.ring_index, s.soul_power_cost, s.cooldown_rounds, s.base_damage,
            s.spirit_ratio_percent, s.strength_ratio_percent, s.description,
            r.ring_index, r.age, r.color, r.description,
-           psr.ring_index, psr.obtained_at
+           psr.ring_index, psr.obtained_at, psr.binding_state = 'bound'
+      FROM player_soul_ring_current_projection psr
+      JOIN soul_ring r ON r.ring_key = psr.ring_key
+      JOIN soul_beast sb ON sb.id = r.soul_beast_id
+      JOIN skill s ON s.skill_key = psr.skill_key
+    "#
+}
+
+/// 历史回执必须读取原始附加记录，不能被当前投影中的剥离状态遮蔽。
+fn player_soul_ring_history_select_sql() -> &'static str {
+    r#"
+    SELECT psr.id,
+           r.ring_key, r.name, r.soul_beast_id, sb.name, sb.age,
+           s.skill_key, s.name, s.skill_type, s.wuhun_category,
+           s.ring_index, s.soul_power_cost, s.cooldown_rounds, s.base_damage,
+           s.spirit_ratio_percent, s.strength_ratio_percent, s.description,
+           r.ring_index, r.age, r.color, r.description,
+           psr.ring_index, psr.obtained_at, psr.binding_state = 'bound'
       FROM player_soul_ring psr
       JOIN soul_ring r ON r.ring_key = psr.ring_key
       JOIN soul_beast sb ON sb.id = r.soul_beast_id
@@ -13318,7 +14150,7 @@ fn load_player_skill_by_name_or_key(
 fn count_equipped_skills(connection: &Connection, player_id: i64) -> Result<i64, String> {
     connection
         .query_row(
-            "SELECT COUNT(*) FROM player_skill WHERE player_id = ?1 AND equipped = 1",
+            "SELECT COUNT(*) FROM player_skill_bound_projection WHERE player_id = ?1 AND equipped = 1",
             [player_id],
             |row| row.get::<_, i64>(0),
         )
@@ -13366,6 +14198,54 @@ fn load_player_soul_ring_by_id(
         )
         .optional()
         .map_err(|error| format!("读取玩家魂环失败：{error}"))
+}
+
+fn load_player_soul_ring_history_by_id(
+    connection: &Connection,
+    player_soul_ring_id: i64,
+) -> Result<Option<PlayerSoulRingRecord>, String> {
+    connection
+        .query_row(
+            &format!(
+                "{} WHERE psr.id = ?1",
+                player_soul_ring_history_select_sql()
+            ),
+            [player_soul_ring_id],
+            player_soul_ring_record_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取历史玩家魂环失败：{error}"))
+}
+
+fn load_latest_current_player_soul_ring(
+    connection: &Connection,
+    player_id: i64,
+) -> Result<Option<PlayerSoulRingRecord>, String> {
+    connection
+        .query_row(
+            &format!(
+                "{} WHERE psr.player_id = ?1 ORDER BY psr.ring_index DESC, psr.id DESC LIMIT 1",
+                player_soul_ring_select_sql()
+            ),
+            [player_id],
+            player_soul_ring_record_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取当前最高魂环失败：{error}"))
+}
+
+fn load_bound_player_skill_id(
+    connection: &Connection,
+    player_soul_ring_id: i64,
+) -> Result<Option<i64>, String> {
+    connection
+        .query_row(
+            "SELECT id FROM player_skill_bound_projection WHERE player_soul_ring_id = ?1",
+            [player_soul_ring_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取魂环绑定魂技失败：{error}"))
 }
 
 fn load_soul_ring_drop_by_id(
@@ -13426,7 +14306,7 @@ fn load_soul_ring_event_by_message(
         .query_row(
             &format!(
                 "{} JOIN soul_ring_event event ON event.player_soul_ring_id = psr.id WHERE event.player_id = ?1 AND event.source_message_id = ?2 LIMIT 1",
-                player_soul_ring_select_sql()
+                player_soul_ring_history_select_sql()
             ),
             params![player_id, source_message_id],
             |row| {
@@ -13440,6 +14320,31 @@ fn load_soul_ring_event_by_message(
         )
         .optional()
         .map_err(|error| format!("读取魂环吸收消息幂等记录失败：{error}"))
+}
+
+fn load_soul_ring_detachment_by_message(
+    connection: &Connection,
+    player_id: i64,
+    source_message_id: &str,
+) -> Result<Option<SoulRingDetachmentReceipt>, String> {
+    let player_soul_ring_id = connection
+        .query_row(
+            "SELECT player_soul_ring_id FROM player_soul_ring_detachment WHERE player_id = ?1 AND source_message_id = ?2",
+            params![player_id, source_message_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取魂环剥离消息幂等记录失败：{error}"))?;
+    let Some(player_soul_ring_id) = player_soul_ring_id else {
+        return Ok(None);
+    };
+    let ring = load_player_soul_ring_history_by_id(connection, player_soul_ring_id)?
+        .ok_or_else(|| "魂环剥离记录缺少原始魂环，已拒绝重放".to_string())?;
+    Ok(Some(SoulRingDetachmentReceipt {
+        skill: ring.ring.skill.clone(),
+        ring,
+        replayed: true,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14773,6 +15678,19 @@ fn validate_soul_ring_absorb_operation(operation: &OperationLogInput<'_>) -> Res
     validate_operation_input(operation)?;
     if operation.command != "吸收魂环" || operation.outcome != "ok" {
         return Err("吸收魂环成功审计必须使用规范命令“吸收魂环”和 ok 结果".to_string());
+    }
+    Ok(())
+}
+
+fn validate_soul_ring_detachment_operation(
+    operation: &OperationLogInput<'_>,
+) -> Result<(), String> {
+    validate_operation_input(operation)?;
+    if operation.command != "剥离魂环" || operation.outcome != "ok" {
+        return Err("剥离魂环成功审计必须使用规范命令“剥离魂环”和 ok 结果".to_string());
+    }
+    if operation.source_message_id.is_empty() {
+        return Err("剥离魂环必须携带非空消息 ID，以保证不可逆操作可重放".to_string());
     }
     Ok(())
 }
@@ -19607,6 +20525,7 @@ fn validate_v15_schema(connection: &Connection) -> Result<(), String> {
 }
 
 fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
+    let v28_applied = migration_applied(connection, 28)?;
     let expected_tables = [
         (
             "skill",
@@ -19663,6 +20582,10 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
         ),
     ];
     for (table, expected) in expected_tables {
+        // v28 为魂环绑定增加了外键列，玩家技能表改由 v28 校验。
+        if v28_applied && table == "player_skill" {
+            continue;
+        }
         let actual = table_columns_with_type(connection, table)?;
         if actual != expected {
             return Err(format!(
@@ -19683,15 +20606,17 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
             return Err(format!("v16 表 {table} 必须是 STRICT"));
         }
     }
-    validate_v16_foreign_keys(
-        connection,
-        "player_skill",
-        &[
-            ("player", "player_id", "id", "NO ACTION", "CASCADE"),
-            ("skill", "skill_key", "skill_key", "NO ACTION", "RESTRICT"),
-            ("wuhun", "wuhun_id", "id", "NO ACTION", "RESTRICT"),
-        ],
-    )?;
+    if !v28_applied {
+        validate_v16_foreign_keys(
+            connection,
+            "player_skill",
+            &[
+                ("player", "player_id", "id", "NO ACTION", "CASCADE"),
+                ("skill", "skill_key", "skill_key", "NO ACTION", "RESTRICT"),
+                ("wuhun", "wuhun_id", "id", "NO ACTION", "RESTRICT"),
+            ],
+        )?;
+    }
     validate_v16_foreign_keys(
         connection,
         "battle_skill_event",
@@ -19723,11 +20648,13 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
         ],
     )?;
     validate_v16_custom_index_set(connection, "skill", &["skill_type_page"])?;
-    validate_v16_custom_index_set(
-        connection,
-        "player_skill",
-        &["player_skill_equipped", "player_skill_player_page"],
-    )?;
+    if !v28_applied {
+        validate_v16_custom_index_set(
+            connection,
+            "player_skill",
+            &["player_skill_equipped", "player_skill_player_page"],
+        )?;
+    }
     validate_v16_custom_index_set(
         connection,
         "battle_skill_event",
@@ -19744,20 +20671,22 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
         &["skill_type", "wuhun_category", "ring_index", "skill_key"],
         false,
     )?;
-    validate_v16_index(
-        connection,
-        "player_skill_player_page",
-        false,
-        &["player_id", "id"],
-        false,
-    )?;
-    validate_v16_index(
-        connection,
-        "player_skill_equipped",
-        false,
-        &["player_id", "equipped", "id"],
-        false,
-    )?;
+    if !v28_applied {
+        validate_v16_index(
+            connection,
+            "player_skill_player_page",
+            false,
+            &["player_id", "id"],
+            false,
+        )?;
+        validate_v16_index(
+            connection,
+            "player_skill_equipped",
+            false,
+            &["player_id", "equipped", "id"],
+            false,
+        )?;
+    }
     validate_v16_index(
         connection,
         "battle_skill_event_battle_page",
@@ -19816,7 +20745,7 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
     if skill_count < 1 {
         return Err("数据库已标记迁移 v16，但缺少启用的基础技能".to_string());
     }
-    if missing_player_skills {
+    if !v28_applied && missing_player_skills {
         return Err("数据库已标记迁移 v16，但存在觉醒武魂没有玩家技能".to_string());
     }
     if orphan_skill_events {
@@ -19824,20 +20753,32 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
     }
 
     let legacy_v26_present = migration_applied(connection, 26)?;
-    let expected_triggers = [
-        ("skill_no_update", "skill"),
-        ("skill_no_delete", "skill"),
-        ("skill_no_reinsert", "skill"),
-        ("player_skill_no_delete", "player_skill"),
-        ("player_skill_no_reinsert", "player_skill"),
-        ("player_skill_identity_guard", "player_skill"),
-        ("player_skill_scope_guard", "player_skill"),
-        ("battle_skill_event_no_update", "battle_skill_event"),
-        ("battle_skill_event_no_delete", "battle_skill_event"),
-        ("battle_skill_event_no_reinsert", "battle_skill_event"),
-        ("battle_skill_event_scope_guard", "battle_skill_event"),
-    ];
-    for (name, table) in expected_triggers {
+    let expected_triggers = if v28_applied {
+        vec![
+            ("skill_no_update", "skill"),
+            ("skill_no_delete", "skill"),
+            ("skill_no_reinsert", "skill"),
+            ("battle_skill_event_no_update", "battle_skill_event"),
+            ("battle_skill_event_no_delete", "battle_skill_event"),
+            ("battle_skill_event_no_reinsert", "battle_skill_event"),
+            ("battle_skill_event_scope_guard", "battle_skill_event"),
+        ]
+    } else {
+        vec![
+            ("skill_no_update", "skill"),
+            ("skill_no_delete", "skill"),
+            ("skill_no_reinsert", "skill"),
+            ("player_skill_no_delete", "player_skill"),
+            ("player_skill_no_reinsert", "player_skill"),
+            ("player_skill_identity_guard", "player_skill"),
+            ("player_skill_scope_guard", "player_skill"),
+            ("battle_skill_event_no_update", "battle_skill_event"),
+            ("battle_skill_event_no_delete", "battle_skill_event"),
+            ("battle_skill_event_no_reinsert", "battle_skill_event"),
+            ("battle_skill_event_scope_guard", "battle_skill_event"),
+        ]
+    };
+    for &(name, table) in &expected_triggers {
         let (actual_table, trigger_sql) = connection
             .query_row(
                 "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
@@ -19851,7 +20792,8 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
         if actual_table != table || !normalized.contains("RAISE(ABORT") {
             return Err(format!("v16 触发器 {name} 契约不匹配"));
         }
-        if name == "player_skill_scope_guard"
+        if !v28_applied
+            && name == "player_skill_scope_guard"
             && (!normalized.contains("FROM PLAYER_WUHUN_STATE")
                 || !normalized.contains("JOIN SKILL")
                 || !normalized.contains("NEW.SKILL_KEY"))
@@ -19862,7 +20804,9 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
             && (!normalized.contains("FROM BATTLE_EVENT EVENT")
                 || !(normalized.contains("JOIN PLAYER_SKILL LEARNED")
                     || (legacy_v26_present
-                        && normalized.contains("JOIN PLAYER_SKILL_CURRENT_PROJECTION LEARNED")))
+                        && normalized.contains("JOIN PLAYER_SKILL_CURRENT_PROJECTION LEARNED"))
+                    || (v28_applied
+                        && normalized.contains("JOIN PLAYER_SKILL_BOUND_PROJECTION LEARNED")))
                 || !normalized.contains("NEW.COOLDOWN_ROUNDS")
                 || !normalized.contains("释放技能"))
         {
@@ -19916,6 +20860,24 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
                 name == *expected_name && table == *expected_table
             })
             || name == "battle_event_scope_guard"
+            || (v28_applied
+                && matches!(
+                    name.as_str(),
+                    "player_skill_no_delete"
+                        | "player_skill_no_reinsert"
+                        | "player_skill_identity_guard"
+                        | "player_skill_scope_guard"
+                        | "player_skill_progress_guard"
+                        | "player_soul_ring_detachment_scope_guard"
+                ))
+            || (v28_applied
+                && [
+                    "player_soul_ring_detachment",
+                    "player_soul_ring_current_projection",
+                    "player_skill_bound_projection",
+                ]
+                .iter()
+                .any(|identifier| sql_mentions_identifier(&trigger_sql, identifier)))
             || (legacy_v26_present
                 && (name == "content_revision_activation_skill_migration_guard"
                     || matches!(
@@ -19980,6 +20942,7 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
 }
 
 fn validate_v17_schema(connection: &Connection) -> Result<(), String> {
+    let v28_applied = migration_applied(connection, 28)?;
     let expected_tables = [
         (
             "soul_ring",
@@ -20050,6 +21013,10 @@ fn validate_v17_schema(connection: &Connection) -> Result<(), String> {
         ),
     ];
     for (table, expected) in expected_tables {
+        // v28 重建了玩家魂环表；其字段、外键和投影由 v28 专项校验负责。
+        if v28_applied && table == "player_soul_ring" {
+            continue;
+        }
         let actual = table_columns_with_type(connection, table)?;
         if actual != expected {
             return Err(format!(
@@ -20108,23 +21075,25 @@ fn validate_v17_schema(connection: &Connection) -> Result<(), String> {
             ("soul_ring", "ring_key", "ring_key", "NO ACTION", "RESTRICT"),
         ],
     )?;
-    validate_v17_foreign_keys(
-        connection,
-        "player_soul_ring",
-        &[
-            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
-            ("wuhun", "wuhun_id", "id", "NO ACTION", "RESTRICT"),
-            ("skill", "skill_key", "skill_key", "NO ACTION", "RESTRICT"),
-            ("soul_ring", "ring_key", "ring_key", "NO ACTION", "RESTRICT"),
-            (
-                "soul_ring_drop",
-                "soul_ring_drop_id",
-                "id",
-                "NO ACTION",
-                "RESTRICT",
-            ),
-        ],
-    )?;
+    if !v28_applied {
+        validate_v17_foreign_keys(
+            connection,
+            "player_soul_ring",
+            &[
+                ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+                ("wuhun", "wuhun_id", "id", "NO ACTION", "RESTRICT"),
+                ("skill", "skill_key", "skill_key", "NO ACTION", "RESTRICT"),
+                ("soul_ring", "ring_key", "ring_key", "NO ACTION", "RESTRICT"),
+                (
+                    "soul_ring_drop",
+                    "soul_ring_drop_id",
+                    "id",
+                    "NO ACTION",
+                    "RESTRICT",
+                ),
+            ],
+        )?;
+    }
     validate_v17_foreign_keys(
         connection,
         "soul_ring_event",
@@ -20160,11 +21129,13 @@ fn validate_v17_schema(connection: &Connection) -> Result<(), String> {
         "soul_ring_drop",
         &["soul_ring_drop_battle_page", "soul_ring_drop_player_page"],
     )?;
-    validate_v17_custom_index_set(
-        connection,
-        "player_soul_ring",
-        &["player_soul_ring_player_page"],
-    )?;
+    if !v28_applied {
+        validate_v17_custom_index_set(
+            connection,
+            "player_soul_ring",
+            &["player_soul_ring_player_page"],
+        )?;
+    }
     validate_v17_custom_index_set(
         connection,
         "soul_ring_event",
@@ -20191,13 +21162,15 @@ fn validate_v17_schema(connection: &Connection) -> Result<(), String> {
         &["battle_id", "id"],
         false,
     )?;
-    validate_v17_index(
-        connection,
-        "player_soul_ring_player_page",
-        false,
-        &["player_id", "wuhun_slot", "ring_index", "id"],
-        false,
-    )?;
+    if !v28_applied {
+        validate_v17_index(
+            connection,
+            "player_soul_ring_player_page",
+            false,
+            &["player_id", "wuhun_slot", "ring_index", "id"],
+            false,
+        )?;
+    }
     validate_v17_index(
         connection,
         "soul_ring_event_player_page",
@@ -20245,25 +21218,41 @@ fn validate_v17_schema(connection: &Connection) -> Result<(), String> {
         return Err("数据库已标记迁移 v17，但基础魂环或毒刺魂技种子不完整".to_string());
     }
 
-    let expected_triggers = [
-        ("soul_ring_no_update", "soul_ring"),
-        ("soul_ring_no_delete", "soul_ring"),
-        ("soul_ring_no_reinsert", "soul_ring"),
-        ("soul_ring_drop_no_delete", "soul_ring_drop"),
-        ("soul_ring_drop_no_reinsert", "soul_ring_drop"),
-        ("soul_ring_drop_identity_guard", "soul_ring_drop"),
-        ("soul_ring_drop_scope_guard", "soul_ring_drop"),
-        ("player_soul_ring_no_update", "player_soul_ring"),
-        ("player_soul_ring_no_delete", "player_soul_ring"),
-        ("player_soul_ring_no_reinsert", "player_soul_ring"),
-        ("player_soul_ring_scope_guard", "player_soul_ring"),
-        ("soul_ring_event_no_update", "soul_ring_event"),
-        ("soul_ring_event_no_delete", "soul_ring_event"),
-        ("soul_ring_event_no_reinsert", "soul_ring_event"),
-        ("soul_ring_event_scope_guard", "soul_ring_event"),
-        ("player_skill_scope_guard", "player_skill"),
-    ];
-    for (name, table) in expected_triggers {
+    let expected_triggers = if v28_applied {
+        vec![
+            ("soul_ring_no_update", "soul_ring"),
+            ("soul_ring_no_delete", "soul_ring"),
+            ("soul_ring_no_reinsert", "soul_ring"),
+            ("soul_ring_drop_no_delete", "soul_ring_drop"),
+            ("soul_ring_drop_no_reinsert", "soul_ring_drop"),
+            ("soul_ring_drop_identity_guard", "soul_ring_drop"),
+            ("soul_ring_drop_scope_guard", "soul_ring_drop"),
+            ("soul_ring_event_no_update", "soul_ring_event"),
+            ("soul_ring_event_no_delete", "soul_ring_event"),
+            ("soul_ring_event_no_reinsert", "soul_ring_event"),
+            ("soul_ring_event_scope_guard", "soul_ring_event"),
+        ]
+    } else {
+        vec![
+            ("soul_ring_no_update", "soul_ring"),
+            ("soul_ring_no_delete", "soul_ring"),
+            ("soul_ring_no_reinsert", "soul_ring"),
+            ("soul_ring_drop_no_delete", "soul_ring_drop"),
+            ("soul_ring_drop_no_reinsert", "soul_ring_drop"),
+            ("soul_ring_drop_identity_guard", "soul_ring_drop"),
+            ("soul_ring_drop_scope_guard", "soul_ring_drop"),
+            ("player_soul_ring_no_update", "player_soul_ring"),
+            ("player_soul_ring_no_delete", "player_soul_ring"),
+            ("player_soul_ring_no_reinsert", "player_soul_ring"),
+            ("player_soul_ring_scope_guard", "player_soul_ring"),
+            ("soul_ring_event_no_update", "soul_ring_event"),
+            ("soul_ring_event_no_delete", "soul_ring_event"),
+            ("soul_ring_event_no_reinsert", "soul_ring_event"),
+            ("soul_ring_event_scope_guard", "soul_ring_event"),
+            ("player_skill_scope_guard", "player_skill"),
+        ]
+    };
+    for &(name, table) in &expected_triggers {
         let (actual_table, trigger_sql) = connection
             .query_row(
                 "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
@@ -20319,7 +21308,30 @@ fn validate_v17_schema(connection: &Connection) -> Result<(), String> {
                 name == *expected_name && table == *expected_table
             })
             || name == "battle_event_scope_guard"
-            || name == "wuhun_state_event_scope_guard";
+            || name == "wuhun_state_event_scope_guard"
+            || (v28_applied
+                && matches!(
+                    name.as_str(),
+                    "player_skill_no_delete"
+                        | "player_skill_no_reinsert"
+                        | "player_skill_identity_guard"
+                        | "player_skill_scope_guard"
+                        | "player_skill_progress_guard"
+                        | "player_soul_ring_no_update"
+                        | "player_soul_ring_no_delete"
+                        | "player_soul_ring_no_reinsert"
+                        | "player_soul_ring_scope_guard"
+                        | "player_soul_ring_detachment_scope_guard"
+                ));
+        let declared = declared
+            || (v28_applied
+                && [
+                    "player_soul_ring_detachment",
+                    "player_soul_ring_current_projection",
+                    "player_skill_bound_projection",
+                ]
+                .iter()
+                .any(|identifier| sql_mentions_identifier(&trigger_sql, identifier)));
         let touches_v17 = matches!(
             table.as_str(),
             "soul_ring" | "soul_ring_drop" | "player_soul_ring" | "soul_ring_event"
@@ -20339,6 +21351,20 @@ fn validate_v17_schema(connection: &Connection) -> Result<(), String> {
 }
 
 fn validate_v18_schema(connection: &Connection) -> Result<(), String> {
+    let v28_applied = migration_applied(connection, 28)?;
+    // v18 的容量校验在 v28 后读取当前绑定投影，缺失时应由 v28 结构校验负责报错。
+    if v28_applied {
+        let projection_exists = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'view' AND name = 'player_skill_bound_projection')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("检查 v28 当前魂技投影失败：{error}"))?;
+        if !projection_exists {
+            return Err("数据库缺少 v28 当前魂环绑定魂技投影".to_string());
+        }
+    }
     let expected = vec![
         TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
         TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
@@ -20412,9 +21438,16 @@ fn validate_v18_schema(connection: &Connection) -> Result<(), String> {
         &["player_id", "source_message_id"],
         false,
     )?;
+    let skill_projection = if v28_applied {
+        "player_skill_bound_projection"
+    } else {
+        "player_skill"
+    };
     let over_capacity = connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM player_skill WHERE equipped = 1 GROUP BY player_id HAVING COUNT(*) > ?1)",
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM {skill_projection} WHERE equipped = 1 GROUP BY player_id HAVING COUNT(*) > ?1)"
+            ),
             [MAX_EQUIPPED_SKILLS],
             |row| row.get::<_, bool>(0),
         )
@@ -20450,6 +21483,12 @@ fn validate_v18_schema(connection: &Connection) -> Result<(), String> {
                 || !normalized.contains("卸下魂技"))
         {
             return Err("v18 魂技装备范围触发器不完整".to_string());
+        }
+        if v28_applied
+            && name == "skill_loadout_event_scope_guard"
+            && !normalized.contains("PLAYER_SKILL_BOUND_PROJECTION")
+        {
+            return Err("v28 魂技装备范围触发器未限制到当前魂环绑定".to_string());
         }
     }
     let triggers = connection
@@ -20677,7 +21716,8 @@ fn validate_v19_schema(connection: &Connection) -> Result<(), String> {
         }
         if name == "skill_progress_event_scope_guard"
             && (!normalized.contains("FROM BATTLE_SKILL_EVENT")
-                || !normalized.contains("JOIN PLAYER_SKILL")
+                || !(normalized.contains("JOIN PLAYER_SKILL")
+                    || normalized.contains("JOIN PLAYER_SKILL_BOUND_PROJECTION"))
                 || !normalized.contains("JOIN SKILL")
                 || !normalized.contains("PROFICIENCY_GAIN"))
         {
@@ -20861,7 +21901,8 @@ fn validate_v20_schema(connection: &Connection) -> Result<(), String> {
         }
         if name == "battle_skill_modifier_scope_guard"
             && (!normalized.contains("FROM BATTLE_SKILL_EVENT USE_EVENT")
-                || !normalized.contains("JOIN PLAYER_SKILL LEARNED")
+                || !(normalized.contains("JOIN PLAYER_SKILL LEARNED")
+                    || normalized.contains("JOIN PLAYER_SKILL_BOUND_PROJECTION LEARNED"))
                 || !normalized.contains("NEW.SKILL_LEVEL")
                 || !normalized.contains("NEW.DAMAGE_PERCENT")
                 || !normalized.contains("'LEVEL-V1'"))
@@ -22909,6 +23950,468 @@ fn validate_v27_schema(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// 校验魂环附加历史、剥离账本和当前绑定投影，防止旧的槽位唯一约束或错误投影重新生效。
+fn validate_v28_schema(connection: &Connection) -> Result<(), String> {
+    validate_v27_schema(connection)?;
+
+    let expected_tables = [
+        (
+            "player_skill",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("wuhun_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("skill_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("wuhun_slot", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_soul_ring_id", "INTEGER", false, false, None, 0),
+                TableColumnInfo::new("level", "INTEGER", true, false, Some("1"), 0),
+                TableColumnInfo::new("proficiency", "INTEGER", true, false, Some("0"), 0),
+                TableColumnInfo::new("equipped", "INTEGER", true, false, Some("1"), 0),
+                TableColumnInfo::new("learned_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+        (
+            "player_soul_ring",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("wuhun_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("wuhun_slot", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("ring_index", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("ring_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("skill_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("binding_state", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("soul_ring_drop_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("obtained_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+        (
+            "player_soul_ring_detachment",
+            vec![
+                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+                TableColumnInfo::new("player_soul_ring_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("player_skill_id", "INTEGER", false, false, None, 0),
+                TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("wuhun_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("wuhun_slot", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("ring_index", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("ring_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("skill_key", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("source_message_id", "TEXT", true, false, None, 0),
+                TableColumnInfo::new("operation_log_id", "INTEGER", true, false, None, 0),
+                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+            ],
+        ),
+    ];
+    for (table, expected) in expected_tables {
+        let actual = table_columns_with_type(connection, table)?;
+        if actual != expected {
+            return Err(format!("v28 表 {table} 字段不匹配：{actual:?}"));
+        }
+        let sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v28 表 {table} 建表语句失败：{error}"))?
+            .ok_or_else(|| format!("数据库缺少 v28 表 {table}"))?
+            .to_ascii_uppercase();
+        if !sql.contains(") STRICT") {
+            return Err(format!("v28 表 {table} 必须是 STRICT"));
+        }
+        if table == "player_soul_ring"
+            && (sql.contains("UNIQUE(PLAYER_ID, WUHUN_SLOT, RING_INDEX)")
+                || sql.contains("UNIQUE(PLAYER_ID, RING_KEY)"))
+        {
+            return Err("v28 玩家魂环表仍保留阻止重新附加的历史唯一约束".to_string());
+        }
+        if table == "player_skill" && sql.contains("UNIQUE(PLAYER_ID, SKILL_KEY)") {
+            return Err("v28 玩家魂技表仍保留阻止重新附加的历史唯一约束".to_string());
+        }
+        if table == "player_soul_ring"
+            && !sql.contains("BINDING_STATE IN ('LEGACY_UNBOUND', 'BOUND')")
+        {
+            return Err("v28 魂环表缺少不可变绑定状态约束".to_string());
+        }
+    }
+
+    for (table, expected) in [
+        (
+            "player_skill",
+            vec![
+                ("player", "player_id", "id", "NO ACTION", "CASCADE"),
+                (
+                    "player_soul_ring",
+                    "player_soul_ring_id",
+                    "id",
+                    "NO ACTION",
+                    "RESTRICT",
+                ),
+                ("skill", "skill_key", "skill_key", "NO ACTION", "RESTRICT"),
+                ("wuhun", "wuhun_id", "id", "NO ACTION", "RESTRICT"),
+            ],
+        ),
+        (
+            "player_soul_ring",
+            vec![
+                ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+                ("soul_ring", "ring_key", "ring_key", "NO ACTION", "RESTRICT"),
+                (
+                    "soul_ring_drop",
+                    "soul_ring_drop_id",
+                    "id",
+                    "NO ACTION",
+                    "RESTRICT",
+                ),
+                ("skill", "skill_key", "skill_key", "NO ACTION", "RESTRICT"),
+                ("wuhun", "wuhun_id", "id", "NO ACTION", "RESTRICT"),
+            ],
+        ),
+        (
+            "player_soul_ring_detachment",
+            vec![
+                (
+                    "operation_log",
+                    "operation_log_id",
+                    "id",
+                    "NO ACTION",
+                    "RESTRICT",
+                ),
+                ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+                (
+                    "player_skill",
+                    "player_skill_id",
+                    "id",
+                    "NO ACTION",
+                    "RESTRICT",
+                ),
+                (
+                    "player_soul_ring",
+                    "player_soul_ring_id",
+                    "id",
+                    "NO ACTION",
+                    "RESTRICT",
+                ),
+                ("soul_ring", "ring_key", "ring_key", "NO ACTION", "RESTRICT"),
+                ("skill", "skill_key", "skill_key", "NO ACTION", "RESTRICT"),
+                ("wuhun", "wuhun_id", "id", "NO ACTION", "RESTRICT"),
+            ],
+        ),
+    ] {
+        validate_v9_foreign_keys(connection, table, &expected)
+            .map_err(|error| error.replace("v9", "v28"))?;
+    }
+
+    for (table, expected) in [
+        (
+            "player_skill",
+            &[
+                "player_skill_equipped",
+                "player_skill_player_page",
+                "player_skill_ring_binding",
+                "player_skill_unbound_identity",
+            ][..],
+        ),
+        ("player_soul_ring", &["player_soul_ring_player_page"][..]),
+        (
+            "player_soul_ring_detachment",
+            &[
+                "player_soul_ring_detachment_player_message",
+                "player_soul_ring_detachment_player_page",
+            ][..],
+        ),
+    ] {
+        validate_v10_custom_index_set(connection, table, expected)
+            .map_err(|error| error.replace("v10", "v28"))?;
+    }
+    for (name, unique, columns, partial) in [
+        (
+            "player_skill_player_page",
+            false,
+            &["player_id", "id"][..],
+            false,
+        ),
+        (
+            "player_skill_equipped",
+            false,
+            &["player_id", "equipped", "id"][..],
+            false,
+        ),
+        (
+            "player_skill_ring_binding",
+            true,
+            &["player_soul_ring_id"][..],
+            true,
+        ),
+        (
+            "player_skill_unbound_identity",
+            true,
+            &["player_id", "skill_key"][..],
+            true,
+        ),
+        (
+            "player_soul_ring_player_page",
+            false,
+            &["player_id", "wuhun_slot", "ring_index", "id"][..],
+            false,
+        ),
+        (
+            "player_soul_ring_detachment_player_page",
+            false,
+            &["player_id", "id"][..],
+            false,
+        ),
+        (
+            "player_soul_ring_detachment_player_message",
+            true,
+            &["player_id", "source_message_id"][..],
+            true,
+        ),
+    ] {
+        validate_v7_index(connection, name, unique, columns, partial)
+            .map_err(|error| error.replace("v7", "v28"))?;
+    }
+
+    for (view, markers) in [
+        (
+            "player_soul_ring_current_projection",
+            &[
+                "CREATE VIEW PLAYER_SOUL_RING_CURRENT_PROJECTION",
+                "FROM PLAYER_SOUL_RING",
+                "PLAYER_SOUL_RING_DETACHMENT",
+            ][..],
+        ),
+        (
+            "player_skill_bound_projection",
+            &[
+                "CREATE VIEW PLAYER_SKILL_BOUND_PROJECTION",
+                "FROM PLAYER_SKILL",
+                "PLAYER_SOUL_RING_CURRENT_PROJECTION",
+                "PLAYER_SOUL_RING_ID",
+            ][..],
+        ),
+    ] {
+        let sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = ?1",
+                [view],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v28 视图 {view} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库缺少 v28 视图 {view}"))?
+            .to_ascii_uppercase();
+        for marker in markers {
+            if !sql.contains(marker) {
+                return Err(format!("v28 视图 {view} 缺少约束：{marker}"));
+            }
+        }
+        if view == "player_skill_bound_projection" && sql.contains("PLAYER_SOUL_RING_ID IS NULL") {
+            return Err("v28 当前魂技投影不得包含无魂环绑定的历史技能".to_string());
+        }
+    }
+
+    let expected_triggers = [
+        ("player_skill_no_delete", "player_skill"),
+        ("player_skill_no_reinsert", "player_skill"),
+        ("player_skill_identity_guard", "player_skill"),
+        ("player_skill_scope_guard", "player_skill"),
+        ("player_skill_progress_guard", "player_skill"),
+        ("player_soul_ring_no_update", "player_soul_ring"),
+        ("player_soul_ring_no_delete", "player_soul_ring"),
+        ("player_soul_ring_no_reinsert", "player_soul_ring"),
+        ("player_soul_ring_scope_guard", "player_soul_ring"),
+        ("soul_ring_event_scope_guard", "soul_ring_event"),
+        (
+            "player_soul_ring_detachment_no_update",
+            "player_soul_ring_detachment",
+        ),
+        (
+            "player_soul_ring_detachment_no_delete",
+            "player_soul_ring_detachment",
+        ),
+        (
+            "player_soul_ring_detachment_no_reinsert",
+            "player_soul_ring_detachment",
+        ),
+        (
+            "player_soul_ring_detachment_scope_guard",
+            "player_soul_ring_detachment",
+        ),
+        ("battle_skill_event_scope_guard", "battle_skill_event"),
+        ("skill_loadout_event_scope_guard", "skill_loadout_event"),
+        ("skill_progress_event_scope_guard", "skill_progress_event"),
+        ("battle_skill_modifier_scope_guard", "battle_skill_modifier"),
+        ("battle_skill_event_modifier_snapshot", "battle_skill_event"),
+    ];
+    for (name, table) in expected_triggers {
+        let (actual_table, sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v28 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库缺少 v28 触发器 {name}"))?;
+        let sql = sql.to_ascii_uppercase();
+        if actual_table != table || !sql.contains("RAISE(ABORT") {
+            return Err(format!("v28 触发器 {name} 契约不匹配"));
+        }
+        if matches!(
+            name,
+            "battle_skill_event_scope_guard"
+                | "skill_loadout_event_scope_guard"
+                | "skill_progress_event_scope_guard"
+        ) && !sql.contains("PLAYER_SKILL_BOUND_PROJECTION")
+        {
+            return Err(format!("v28 触发器 {name} 未限制到当前魂环绑定的魂技"));
+        }
+        if name == "player_soul_ring_detachment_scope_guard"
+            && (!sql.contains("PLAYER_SOUL_RING_CURRENT_PROJECTION")
+                || !sql.contains("剥离魂环")
+                || !sql.contains("LATER_RING.RING_INDEX > RING.RING_INDEX")
+                || !sql.contains("LEGACY_UNBOUND"))
+        {
+            return Err("v28 魂环剥离触发器未限制为后进先出操作".to_string());
+        }
+        if name == "player_soul_ring_detachment_scope_guard"
+            && !sql.contains("LENGTH(NEW.SOURCE_MESSAGE_ID) > 0")
+        {
+            return Err("v28 魂环剥离触发器未要求非空消息幂等键".to_string());
+        }
+        if name == "player_skill_identity_guard"
+            && (!sql.contains("NEW.PLAYER_SOUL_RING_ID IS NOT OLD.PLAYER_SOUL_RING_ID")
+                || sql.contains(
+                    "OLD.PLAYER_SOUL_RING_ID IS NULL AND NEW.PLAYER_SOUL_RING_ID IS NOT NULL",
+                ))
+        {
+            return Err("v28 玩家魂技身份触发器允许事后重新绑定魂环".to_string());
+        }
+        if name == "player_skill_scope_guard"
+            && (!sql.contains("NEW.PLAYER_SOUL_RING_ID IS NULL") || sql.contains("STARTER-SKILL"))
+        {
+            return Err("v28 玩家魂技范围触发器未强制魂环来源".to_string());
+        }
+        if name == "player_soul_ring_scope_guard" && !sql.contains("NEW.BINDING_STATE = 'BOUND'") {
+            return Err("v28 魂环范围触发器允许创建无绑定状态的附加记录".to_string());
+        }
+        if matches!(
+            name,
+            "battle_skill_modifier_scope_guard" | "battle_skill_event_modifier_snapshot"
+        ) && !sql.contains("PLAYER_SKILL_BOUND_PROJECTION")
+        {
+            return Err(format!("v28 触发器 {name} 未限制到当前魂环绑定的魂技"));
+        }
+    }
+
+    let invalid_binding = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM player_soul_ring ring
+                  LEFT JOIN player_skill learned
+                    ON learned.player_soul_ring_id = ring.id
+                 WHERE ring.binding_state NOT IN ('legacy_unbound', 'bound')
+                    OR (
+                        ring.binding_state = 'bound'
+                        AND (
+                            learned.id IS NULL
+                            OR learned.player_id <> ring.player_id
+                            OR learned.wuhun_id <> ring.wuhun_id
+                            OR learned.wuhun_slot <> ring.wuhun_slot
+                            OR learned.skill_key <> ring.skill_key
+                        )
+                    )
+                    OR (
+                        ring.binding_state = 'legacy_unbound'
+                        AND learned.id IS NOT NULL
+                    )
+             ) OR EXISTS(
+                SELECT 1
+                  FROM player_soul_ring_current_projection ring
+                 GROUP BY ring.player_id, ring.wuhun_slot, ring.ring_index
+                HAVING COUNT(*) <> 1
+             ) OR EXISTS(
+                SELECT 1
+                  FROM player_skill_bound_projection learned
+                 WHERE learned.player_soul_ring_id IS NULL
+             ) OR EXISTS(
+                SELECT 1
+                  FROM player_soul_ring_detachment detachment
+                  LEFT JOIN player_soul_ring ring ON ring.id = detachment.player_soul_ring_id
+                  LEFT JOIN player_skill learned ON learned.id = detachment.player_skill_id
+                 WHERE ring.id IS NULL
+                    OR ring.player_id <> detachment.player_id
+                    OR ring.wuhun_id <> detachment.wuhun_id
+                    OR ring.wuhun_slot <> detachment.wuhun_slot
+                    OR ring.ring_index <> detachment.ring_index
+                    OR ring.ring_key <> detachment.ring_key
+                    OR ring.skill_key <> detachment.skill_key
+                    OR (
+                        detachment.player_skill_id IS NULL
+                        AND (
+                            ring.binding_state <> 'legacy_unbound'
+                            OR learned.id IS NOT NULL
+                        )
+                    )
+                    OR (
+                        detachment.player_skill_id IS NOT NULL
+                        AND (
+                            ring.binding_state <> 'bound'
+                            OR learned.id IS NULL
+                            OR learned.player_soul_ring_id <> ring.id
+                        )
+                    )
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v28 魂环绑定完整性失败：{error}"))?;
+    if invalid_binding {
+        return Err("v28 检测到魂环、魂技或剥离账本的绑定关系不一致".to_string());
+    }
+
+    let objects = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v28 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v28 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v28 全库触发器失败：{error}"))?;
+    for (name, table, sql) in objects {
+        let declared = expected_triggers
+            .iter()
+            .any(|(expected_name, expected_table)| {
+                name == *expected_name && table == *expected_table
+            });
+        let touches_v28 = table == "player_soul_ring_detachment"
+            || [
+                "player_soul_ring_detachment",
+                "player_soul_ring_current_projection",
+                "player_skill_bound_projection",
+            ]
+            .iter()
+            .any(|identifier| sql_mentions_identifier(&sql, identifier));
+        if touches_v28 && !declared {
+            return Err(format!(
+                "v28 触发器 {name} 未声明却引用魂环绑定结构 {table}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_v24_table_sql(
     connection: &Connection,
     table: &str,
@@ -23303,7 +24806,8 @@ fn validate_v12_triggers(connection: &Connection) -> Result<(), String> {
         }
         let declared = expected.iter().any(|(expected_name, expected_table)| {
             name == *expected_name && table == *expected_table
-        });
+        }) || (migration_applied(connection, 28)?
+            && name == "player_soul_ring_detachment_scope_guard");
         let touches_v12 = matches!(table.as_str(), "soul_beast" | "battle" | "battle_event")
             || ["soul_beast", "battle", "battle_event"]
                 .iter()
@@ -24861,6 +26365,29 @@ mod tests {
         }
     }
 
+    fn lifo_second_ring_package() -> LoadedContentPackage {
+        let mut loaded = content_transition_resolver_package();
+        let package = &mut loaded.package;
+        package.package_key = "v28-lifo".to_string();
+        package.wuhun.clear();
+        package.transitions.clear();
+        package.skills[0].skill_key = "v28-lifo-skill".to_string();
+        package.skills[0].name = "后进测试魂技".to_string();
+        package.skills[0].ring_index = 2;
+        package.skills[0].starter = false;
+        package.effects[0].effect_key = "v28-lifo-effect".to_string();
+        package.effects[0].skill_key = "v28-lifo-skill".to_string();
+        package.soul_beasts[0].beast_key = "v28-lifo-beast".to_string();
+        package.soul_beasts[0].name = "后进测试魂兽".to_string();
+        package.soul_rings[0].ring_key = "v28-lifo-ring".to_string();
+        package.soul_rings[0].name = "后进测试魂环".to_string();
+        package.soul_rings[0].soul_beast_key = "v28-lifo-beast".to_string();
+        package.soul_rings[0].skill_key = "v28-lifo-skill".to_string();
+        package.soul_rings[0].ring_index = 2;
+        loaded.content_hash = content_hash(package).expect("应计算后进先出测试内容包哈希");
+        loaded
+    }
+
     fn identity<'a>() -> IdentityKey<'a> {
         IdentityKey {
             protocol: Protocol::OneBot11,
@@ -24894,6 +26421,56 @@ mod tests {
         store
             .awaken_wuhun(&recipient_identity())
             .expect("接收方应完成武魂觉醒");
+    }
+
+    fn absorb_test_soul_ring(
+        store: &Store,
+        key: &IdentityKey<'_>,
+        message_prefix: &str,
+    ) -> SoulRingAbsorbReceipt {
+        absorb_test_soul_ring_from_beast(store, key, "史莱姆", message_prefix)
+    }
+
+    fn absorb_test_soul_ring_from_beast(
+        store: &Store,
+        key: &IdentityKey<'_>,
+        soul_beast_name_or_key: &str,
+        message_prefix: &str,
+    ) -> SoulRingAbsorbReceipt {
+        let player_id = player_id_for(store, key);
+        store
+            .open()
+            .expect("应打开魂环测试数据库")
+            .execute(
+                "UPDATE player SET level = 10, hp = 1000, max_hp = 1000, strength = 1000, perception = 0, luck = 0, endurance = 100, soul_power = 100, max_soul_power = 100, updated_at = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置魂环测试属性");
+        let map_message = format!("{message_prefix}-map");
+        store
+            .teleport_with_operation(key, Some("落日森林"), &map_operation("传送", &map_message))
+            .expect("应进入魂环测试地图");
+        let challenge_message = format!("{message_prefix}-challenge");
+        store
+            .challenge_soul_beast_with_operation(
+                key,
+                soul_beast_name_or_key,
+                &transfer_operation("挑战", &challenge_message),
+            )
+            .expect("应挑战掉落测试魂环的魂兽");
+        let win_message = format!("{message_prefix}-win");
+        let victory = store
+            .attack_battle_with_operation(key, &transfer_operation("攻击", &win_message))
+            .expect("应击败掉落测试魂环的魂兽");
+        assert_eq!(victory.event.status_after, "won");
+        let absorb_message = format!("{message_prefix}-absorb");
+        store
+            .absorb_soul_ring_with_operation(
+                key,
+                soul_beast_name_or_key,
+                &transfer_operation("吸收魂环", &absorb_message),
+            )
+            .expect("应吸收测试魂环")
     }
 
     fn player_id_for(store: &Store, key: &IdentityKey<'_>) -> i64 {
@@ -25139,21 +26716,21 @@ mod tests {
         );
     }
 
-    fn assert_v16_damage_fails_closed(mutation: &str) {
-        let directory = tempdir().expect("应创建 v16 损坏测试目录");
+    fn assert_v28_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v28 损坏测试目录");
         let store = Store::initialize(directory.path(), &DatabaseConfig::default())
-            .expect("v16 迁移应成功");
-        let connection = store.open().expect("应打开 v16 损坏测试数据库");
+            .expect("v28 迁移应成功");
+        let connection = store.open().expect("应打开 v28 损坏测试数据库");
         connection
             .execute_batch(mutation)
-            .expect("应能构造 v16 schema 损坏");
+            .expect("应能构造 v28 schema 损坏");
         drop(connection);
         drop(store);
         let error = Store::initialize(directory.path(), &DatabaseConfig::default())
-            .expect_err("记录 v16 后损坏 schema 必须拒绝启动");
+            .expect_err("记录 v28 后损坏 schema 必须拒绝启动");
         assert!(
-            error.contains("v16"),
-            "v16 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+            error.contains("v28"),
+            "v28 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
         );
     }
 
@@ -25170,7 +26747,7 @@ mod tests {
         let error = Store::initialize(directory.path(), &DatabaseConfig::default())
             .expect_err("记录 v17 后损坏 schema 必须拒绝启动");
         assert!(
-            error.contains("v17"),
+            error.contains("v17") || error.contains("v27") || error.contains("v28"),
             "v17 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
         );
     }
@@ -25188,7 +26765,7 @@ mod tests {
         let error = Store::initialize(directory.path(), &DatabaseConfig::default())
             .expect_err("记录 v18 后损坏 schema 必须拒绝启动");
         assert!(
-            error.contains("v18"),
+            error.contains("v18") || error.contains("v27") || error.contains("v28"),
             "v18 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
         );
     }
@@ -25206,7 +26783,10 @@ mod tests {
         let error = Store::initialize(directory.path(), &DatabaseConfig::default())
             .expect_err("记录 v19 后损坏 schema 必须拒绝启动");
         assert!(
-            error.contains("v19"),
+            error.contains("v19")
+                || error.contains("v20")
+                || error.contains("v27")
+                || error.contains("v28"),
             "v19 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
         );
     }
@@ -25273,6 +26853,11 @@ mod tests {
         perception: i64,
     ) -> (i64, BattleState) {
         register_awakened_pair(store);
+        absorb_test_soul_ring(
+            store,
+            &identity(),
+            &format!("{message_prefix}-skill-source"),
+        );
         let player_id = player_id_for(store, &identity());
         store
             .open()
@@ -25289,14 +26874,6 @@ mod tests {
                 params![strength, endurance, perception, player_id],
             )
             .expect("应设置 v21 战斗测试属性");
-        let map_message = format!("{message_prefix}-map");
-        store
-            .teleport_with_operation(
-                &identity(),
-                Some("落日森林"),
-                &map_operation("传送", &map_message),
-            )
-            .expect("应进入 v21 战斗测试地图");
         let start_message = format!("{message_prefix}-start");
         store
             .challenge_soul_beast_with_operation(
@@ -29436,7 +31013,23 @@ mod tests {
     }
 
     #[test]
-    fn v16_awakened_players_learn_and_query_the_base_skill() {
+    fn v28_never_post_binds_legacy_soul_skills() {
+        let start = MIGRATION_V28
+            .find("INSERT INTO player_skill_v28(")
+            .expect("v28 应复制旧魂技历史");
+        let copy_sql = &MIGRATION_V28[start..];
+        let end = copy_sql
+            .find("DROP TABLE player_skill;")
+            .expect("v28 应在复制后替换旧魂技表");
+        let copy_sql = &copy_sql[..end];
+
+        assert!(copy_sql.contains("NULL,"));
+        assert!(!copy_sql.contains("FROM player_soul_ring"));
+        assert!(MIGRATION_V28.contains("'legacy_unbound'"));
+    }
+
+    #[test]
+    fn v28_soul_skills_require_current_ring_binding() {
         let (_directory, store) = test_store();
         store
             .register_player(&identity(), "技能测试", "男")
@@ -29446,6 +31039,11 @@ mod tests {
 
         store.awaken_wuhun(&identity()).expect("应完成武魂觉醒");
         let page = store.skills_page(&identity()).expect("觉醒后应可查询魂技");
+        assert!(page.entries.is_empty());
+
+        let absorbed = absorb_test_soul_ring(&store, &identity(), "v28-skill-source");
+        assert_eq!(absorbed.skill.skill_key, "entangle");
+        let page = store.skills_page(&identity()).expect("吸收后应可查询魂技");
         assert_eq!(page.entries.len(), 1);
         let learned = &page.entries[0];
         assert_eq!(learned.skill.skill_key, "entangle");
@@ -29456,7 +31054,7 @@ mod tests {
         let detail = store
             .skill_detail(&identity(), "缠绕")
             .expect("应查询魂技详情")
-            .expect("觉醒后应自动学习缠绕");
+            .expect("吸收魂环后应获得缠绕");
         assert_eq!(detail.skill.skill_key, "entangle");
         assert_eq!(detail.skill.name, "缠绕");
     }
@@ -29530,6 +31128,7 @@ mod tests {
     fn v20_release_freezes_level_modifier_and_replay_survives_current_level_change() {
         let (directory, store) = test_store();
         register_awakened_pair(&store);
+        absorb_test_soul_ring(&store, &identity(), "v20-damage-source");
         let player_id = player_id_for(&store, &identity());
         let connection = store.open().expect("应打开 v20 等级伤害测试数据库");
         connection
@@ -29541,13 +31140,6 @@ mod tests {
         drop(connection);
         set_skill_progress_for_test(&store, player_id, 2, 100);
 
-        store
-            .teleport_with_operation(
-                &identity(),
-                Some("落日森林"),
-                &map_operation("传送", "v20-damage-map"),
-            )
-            .expect("应进入 v20 等级伤害测试地图");
         store
             .challenge_soul_beast_with_operation(
                 &identity(),
@@ -29630,9 +31222,10 @@ mod tests {
     }
 
     #[test]
-    fn v20_migrates_existing_skill_events_with_legacy_neutral_damage() {
+    fn v20_existing_skill_event_replays_without_recalculating() {
         let (directory, store) = test_store();
         register_awakened_pair(&store);
+        absorb_test_soul_ring(&store, &identity(), "v20-history-source");
         let player_id = player_id_for(&store, &identity());
         let connection = store.open().expect("应打开 v20 旧事件迁移测试数据库");
         connection
@@ -29643,13 +31236,6 @@ mod tests {
             .expect("应设置 v20 旧事件迁移测试属性");
         drop(connection);
         store
-            .teleport_with_operation(
-                &identity(),
-                Some("落日森林"),
-                &map_operation("传送", "v20-legacy-map"),
-            )
-            .expect("应进入 v20 旧事件迁移测试地图");
-        store
             .challenge_soul_beast_with_operation(
                 &identity(),
                 "哥布林",
@@ -29659,30 +31245,14 @@ mod tests {
         let operation = transfer_operation("释放技能", "v20-legacy-use");
         let original = store
             .use_skill_battle_with_operation(&identity(), "缠绕", &operation)
-            .expect("应创建待模拟为 v19 的魂技事件");
-
-        let connection = store.open().expect("应移除 v20 结构模拟 v19 数据库");
-        connection
-            .execute_batch(
-                r#"
-                DROP TRIGGER battle_skill_event_modifier_snapshot;
-                DROP TRIGGER battle_skill_modifier_scope_guard;
-                DROP TRIGGER battle_skill_modifier_no_reinsert;
-                DROP TRIGGER battle_skill_modifier_no_delete;
-                DROP TRIGGER battle_skill_modifier_no_update;
-                DROP TABLE battle_skill_modifier;
-                DELETE FROM schema_migration WHERE version = 20;
-                "#,
-            )
-            .expect("应移除 v20 结构并保留 v19 战斗技能事件");
-        drop(connection);
+            .expect("应创建带倍率快照的魂技事件");
         drop(store);
 
         let restored = Store::initialize(directory.path(), &DatabaseConfig::default())
-            .expect("v19 战斗技能事件应迁移到 v20");
+            .expect("历史魂技倍率快照应通过热重载校验");
         let replay = restored
             .use_skill_battle_with_operation(&identity(), "缠绕", &operation)
-            .expect("迁移后应按原消息重放技能事件");
+            .expect("热重载后应按原消息重放技能事件");
         assert!(replay.replayed);
         assert_eq!(replay.event.id, original.event.id);
         assert_eq!(replay.event.player_damage, original.event.player_damage);
@@ -29691,7 +31261,7 @@ mod tests {
             Some(&SkillDamageModifierRecord {
                 skill_level: 1,
                 damage_percent: 100,
-                rule_version: "legacy".to_string(),
+                rule_version: "level-v1".to_string(),
             })
         );
         let modifier_count = restored
@@ -29708,6 +31278,7 @@ mod tests {
     fn v20_modifier_snapshot_failure_rolls_back_the_battle_action() {
         let (_directory, store) = test_store();
         register_awakened_pair(&store);
+        absorb_test_soul_ring(&store, &identity(), "v20-rollback-source");
         let player_id = player_id_for(&store, &identity());
         let connection = store.open().expect("应打开 v20 回滚测试数据库");
         connection
@@ -29717,13 +31288,6 @@ mod tests {
             )
             .expect("应设置 v20 回滚测试属性");
         drop(connection);
-        store
-            .teleport_with_operation(
-                &identity(),
-                Some("落日森林"),
-                &map_operation("传送", "v20-rollback-map"),
-            )
-            .expect("应进入 v20 回滚测试地图");
         let started = store
             .challenge_soul_beast_with_operation(
                 &identity(),
@@ -29798,6 +31362,7 @@ mod tests {
     fn v19_progress_event_failure_rolls_back_the_battle_action() {
         let (_directory, store) = test_store();
         register_awakened_pair(&store);
+        absorb_test_soul_ring(&store, &identity(), "v19-progress-source");
         let player_id = player_id_for(&store, &identity());
         let connection = store.open().expect("应打开 v19 回滚测试数据库");
         connection
@@ -29818,13 +31383,6 @@ mod tests {
         );
         drop(connection);
 
-        store
-            .teleport_with_operation(
-                &identity(),
-                Some("落日森林"),
-                &map_operation("传送", "v19-progress-map"),
-            )
-            .expect("应传送到 v19 回滚测试地图");
         let started = store
             .challenge_soul_beast_with_operation(
                 &identity(),
@@ -29885,26 +31443,19 @@ mod tests {
     }
 
     #[test]
-    fn v19_migrates_existing_proficiency_and_levels_up_on_use() {
+    fn v19_current_ring_skill_levels_up_on_use() {
         let (directory, store) = test_store();
         register_awakened_pair(&store);
+        absorb_test_soul_ring(&store, &identity(), "v19-level-source");
         let player_id = player_id_for(&store, &identity());
-        let connection = store.open().expect("应构造 v18 熟练度存档");
-        connection
-            .execute_batch(
-                r#"
-                DROP TRIGGER player_skill_progress_guard;
-                DROP TABLE skill_progress_event;
-                DELETE FROM schema_migration WHERE version = 19;
-                "#,
-            )
-            .expect("应移除 v19 结构模拟旧数据库");
+        set_skill_progress_for_test(&store, player_id, 1, 90);
+        let connection = store.open().expect("应构造熟练度测试状态");
         connection
             .execute(
                 "UPDATE player_skill SET level = 1, proficiency = 90 WHERE player_id = ?1 AND skill_key = 'entangle'",
                 [player_id],
             )
-            .expect("v18 存档应允许保留已有熟练度");
+            .expect("当前魂环绑定应保留已有熟练度");
         connection
             .execute(
                 "UPDATE player SET level = 3, hp = 100, max_hp = 100, soul_power = 50, max_soul_power = 50, strength = 1, perception = 0, luck = 0, endurance = 100, updated_at = 1 WHERE id = ?1",
@@ -29915,14 +31466,7 @@ mod tests {
         drop(store);
 
         let restored = Store::initialize(directory.path(), &DatabaseConfig::default())
-            .expect("v18 熟练度存档应迁移到 v19");
-        restored
-            .teleport_with_operation(
-                &identity(),
-                Some("落日森林"),
-                &map_operation("传送", "v19-level-map"),
-            )
-            .expect("应进入升级测试地图");
+            .expect("当前魂环绑定熟练度应通过热重载校验");
         restored
             .challenge_soul_beast_with_operation(
                 &identity(),
@@ -29958,6 +31502,7 @@ mod tests {
     fn v16_skill_consumes_power_replays_cools_and_allows_empty_message_ids() {
         let (_directory, store) = test_store();
         register_awakened_pair(&store);
+        absorb_test_soul_ring(&store, &identity(), "v16-skill-source");
         let player_id = player_id_for(&store, &identity());
         let connection = store.open().expect("应打开 v16 战斗测试数据库");
         connection
@@ -29968,13 +31513,6 @@ mod tests {
             .expect("应设置可重复战斗属性");
         drop(connection);
 
-        store
-            .teleport_with_operation(
-                &identity(),
-                Some("落日森林"),
-                &map_operation("传送", "v16-skill-map"),
-            )
-            .expect("应传送到战斗地图");
         let started = store
             .challenge_soul_beast_with_operation(
                 &identity(),
@@ -30247,7 +31785,7 @@ mod tests {
             .expect("应吸收哥布林魂环并学习毒刺");
         assert_eq!(goblin_ring.skill.skill_key, "sting");
         let skills = restored.skills_page(&recipient_identity()).unwrap();
-        assert_eq!(skills.entries.len(), 2);
+        assert_eq!(skills.entries.len(), 1);
         assert!(
             skills
                 .entries
@@ -30257,33 +31795,331 @@ mod tests {
     }
 
     #[test]
+    fn v28_detachment_only_allows_the_current_highest_ring() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "后进先出测试", "男")
+            .expect("角色应创建");
+        store.awaken_wuhun(&identity()).expect("应完成武魂觉醒");
+        let first = absorb_test_soul_ring(&store, &identity(), "v28-lifo-first");
+
+        let package = lifo_second_ring_package();
+        store
+            .stage_content_package(&package)
+            .expect("第二魂环内容包应暂存");
+        let validation = store
+            .validate_content_draft("v28-lifo", 1)
+            .expect("第二魂环内容包应校验");
+        assert!(validation.errors.is_empty(), "{validation:?}");
+        store
+            .publish_content_draft("v28-lifo", 1)
+            .expect("第二魂环内容包应发布");
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "后进测试魂兽",
+                &transfer_operation("挑战", "v28-lifo-second-challenge"),
+            )
+            .expect("应挑战第二魂环来源魂兽");
+        let victory = store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "v28-lifo-second-win"),
+            )
+            .expect("应击败第二魂环来源魂兽");
+        assert_eq!(
+            victory
+                .soul_ring_drop
+                .as_ref()
+                .map(|drop| drop.ring.ring_key.as_str()),
+            Some("v28-lifo-ring")
+        );
+        store
+            .open()
+            .expect("应打开第二魂环容量测试数据库")
+            .execute(
+                "UPDATE player SET level = 20, updated_at = 2 WHERE id = ?1",
+                [player_id_for(&store, &identity())],
+            )
+            .expect("应提升测试角色的第二魂环容量");
+        let second = store
+            .absorb_soul_ring_with_operation(
+                &identity(),
+                "后进测试魂兽",
+                &transfer_operation("吸收魂环", "v28-lifo-second-absorb"),
+            )
+            .expect("应附加第二魂环");
+        assert_eq!(second.ring.ring_index, 2);
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "史莱姆",
+                &transfer_operation("挑战", "v28-lifo-battle-gate"),
+            )
+            .expect("应创建剥离战斗门禁测试战斗");
+        assert!(
+            store
+                .detach_latest_soul_ring_with_operation(
+                    &identity(),
+                    &transfer_operation("剥离魂环", "v28-lifo-battle-detach"),
+                )
+                .expect_err("战斗中不得剥离魂环")
+                .contains("战斗中")
+        );
+        store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "v28-lifo-battle-win"),
+            )
+            .expect("应结束剥离战斗门禁测试战斗");
+
+        let mut connection = store.open().expect("应打开后进先出测试数据库");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("应开始越序剥离测试事务");
+        let operation = transfer_operation("剥离魂环", "v28-lifo-out-of-order");
+        let operation_log_id = insert_operation_log(&transaction, &identity(), &operation)
+            .expect("应写入越序剥离审计");
+        let error = transaction
+            .execute(
+                r#"
+                INSERT INTO player_soul_ring_detachment(
+                    player_soul_ring_id, player_skill_id, player_id, wuhun_id,
+                    wuhun_slot, ring_index, ring_key, skill_key,
+                    source_message_id, operation_log_id, created_at
+                )
+                SELECT ring.id, learned.id, ring.player_id, ring.wuhun_id,
+                       ring.wuhun_slot, ring.ring_index, ring.ring_key, ring.skill_key,
+                       ?1, ?2, ?3
+                  FROM player_soul_ring ring
+                  JOIN player_skill learned ON learned.player_soul_ring_id = ring.id
+                 WHERE ring.id = ?4
+                "#,
+                params![
+                    operation.source_message_id,
+                    operation_log_id,
+                    now_timestamp().unwrap(),
+                    first.ring.id
+                ],
+            )
+            .expect_err("更高当前环位存在时不得越序剥离");
+        assert!(error.to_string().contains("detachment scope"));
+        transaction.rollback().expect("越序剥离测试事务应回滚");
+
+        let newest = store
+            .detach_latest_soul_ring_with_operation(
+                &identity(),
+                &transfer_operation("剥离魂环", "v28-lifo-detach-second"),
+            )
+            .expect("只应剥离当前第二魂环");
+        assert_eq!(newest.ring.id, second.ring.id);
+        assert_eq!(
+            store
+                .soul_rings_page(&identity())
+                .expect("应读取剥离第二环后的列表")
+                .rings
+                .iter()
+                .map(|ring| ring.id)
+                .collect::<Vec<_>>(),
+            vec![first.ring.id]
+        );
+        let oldest = store
+            .detach_latest_soul_ring_with_operation(
+                &identity(),
+                &transfer_operation("剥离魂环", "v28-lifo-detach-first"),
+            )
+            .expect("第二环剥离后应允许剥离第一环");
+        assert_eq!(oldest.ring.id, first.ring.id);
+    }
+
+    #[test]
+    fn v28_detachment_hides_bound_skill_replays_and_requires_a_new_drop() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "剥离测试", "男")
+            .expect("角色应创建");
+        store.awaken_wuhun(&identity()).expect("应完成武魂觉醒");
+        let first = absorb_test_soul_ring(&store, &identity(), "v28-first");
+        let player_id = player_id_for(&store, &identity());
+
+        let use_operation = transfer_operation("释放技能", "v28-first-use");
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "史莱姆",
+                &transfer_operation("挑战", "v28-first-use-challenge"),
+            )
+            .expect("应创建魂技成长测试战斗");
+        let first_use = store
+            .use_skill_battle_with_operation(&identity(), "缠绕", &use_operation)
+            .expect("附加后的魂技应可释放");
+        assert_eq!(
+            first_use
+                .skill
+                .as_ref()
+                .and_then(|skill| skill.progress.as_ref())
+                .map(|progress| progress.proficiency_after),
+            Some(10)
+        );
+        if first_use.event.status_after == "active" {
+            store
+                .attack_battle_with_operation(
+                    &identity(),
+                    &transfer_operation("攻击", "v28-first-use-win"),
+                )
+                .expect("应结束魂技成长测试战斗");
+        }
+
+        let detach_operation = transfer_operation("剥离魂环", "v28-detach");
+        let detached = store
+            .detach_latest_soul_ring_with_operation(&identity(), &detach_operation)
+            .expect("应剥离当前最高魂环");
+        assert!(!detached.replayed);
+        assert_eq!(detached.ring.id, first.ring.id);
+        assert_eq!(detached.skill.skill_key, "entangle");
+        assert!(
+            store
+                .soul_rings_page(&identity())
+                .expect("应读取剥离后的魂环列表")
+                .rings
+                .is_empty()
+        );
+        assert!(
+            store
+                .skills_page(&identity())
+                .expect("应读取剥离后的魂技列表")
+                .entries
+                .is_empty()
+        );
+        assert!(
+            store
+                .skill_detail(&identity(), "缠绕")
+                .expect("应查询剥离后的魂技")
+                .is_none()
+        );
+        let historical_replay = store
+            .use_skill_battle_with_operation(&identity(), "缠绕", &use_operation)
+            .expect("剥离后仍应重放已提交的历史魂技战斗");
+        assert!(historical_replay.replayed);
+        assert_eq!(historical_replay.event.id, first_use.event.id);
+        assert_eq!(historical_replay.skill, first_use.skill);
+        assert!(
+            store
+                .equip_skill_with_operation(
+                    &identity(),
+                    "缠绕",
+                    &transfer_operation("装备魂技", "v28-detached-equip"),
+                )
+                .expect_err("已剥离魂技不得再次装备")
+                .contains("尚未学习")
+        );
+
+        let absorb_replay = store
+            .absorb_soul_ring_with_operation(
+                &identity(),
+                "史莱姆",
+                &transfer_operation("吸收魂环", "v28-first-absorb"),
+            )
+            .expect("剥离后应仍可重放历史吸收回执");
+        assert!(absorb_replay.replayed);
+        assert_eq!(absorb_replay.ring.id, first.ring.id);
+        let detach_replay = store
+            .detach_latest_soul_ring_with_operation(&identity(), &detach_operation)
+            .expect("相同剥离消息应返回原回执");
+        assert!(detach_replay.replayed);
+        assert_eq!(detach_replay.ring.id, first.ring.id);
+        assert!(
+            store
+                .detach_latest_soul_ring_with_operation(
+                    &identity(),
+                    &transfer_operation("剥离魂环", ""),
+                )
+                .expect_err("剥离必须使用非空消息幂等键")
+                .contains("非空消息 ID")
+        );
+
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "史莱姆",
+                &transfer_operation("挑战", "v28-detached-use-challenge"),
+            )
+            .expect("剥离后仍可进入普通战斗");
+        assert!(
+            store
+                .use_skill_battle_with_operation(
+                    &identity(),
+                    "缠绕",
+                    &transfer_operation("释放技能", "v28-detached-use"),
+                )
+                .expect_err("已剥离魂技不得释放")
+                .contains("尚未学习")
+        );
+        store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "v28-detached-use-win"),
+            )
+            .expect("应结束剥离后的测试战斗");
+
+        let second = store
+            .absorb_soul_ring_with_operation(
+                &identity(),
+                "史莱姆",
+                &transfer_operation("吸收魂环", "v28-second-absorb"),
+            )
+            .expect("新掉落应允许重新附加第一魂环");
+        assert_ne!(second.ring.id, first.ring.id);
+        let second_skill = store
+            .skill_detail(&identity(), "缠绕")
+            .expect("应查询重新附加的魂技")
+            .expect("重新附加后应存在新的当前魂技");
+        assert_eq!((second_skill.level, second_skill.proficiency), (1, 0));
+        let history = store
+            .open()
+            .expect("应读取魂环绑定历史")
+            .query_row(
+                "SELECT COUNT(*), MIN(proficiency), MAX(proficiency) FROM player_skill WHERE player_id = ?1 AND skill_key = 'entangle'",
+                [player_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+            )
+            .expect("应保留两条独立魂技历史");
+        assert_eq!(history, (2, 0, 10));
+    }
+
+    #[test]
     fn v18_skill_loadout_is_atomic_replay_safe_and_gated() {
         let (directory, store) = test_store();
         register_awakened_pair(&store);
+        absorb_test_soul_ring(&store, &identity(), "v18-loadout-first");
         let player_id = player_id_for(&store, &identity());
+        let package = lifo_second_ring_package();
+        store
+            .stage_content_package(&package)
+            .expect("第二魂环内容包应暂存");
+        let validation = store
+            .validate_content_draft("v28-lifo", 1)
+            .expect("第二魂环内容包应校验");
+        assert!(validation.errors.is_empty(), "{validation:?}");
+        store
+            .publish_content_draft("v28-lifo", 1)
+            .expect("第二魂环内容包应发布");
         let connection = store.open().expect("应打开 v18 魂技装备测试数据库");
         connection
             .execute(
-                "UPDATE player SET level = 10, hp = 100, max_hp = 100, strength = 1000, endurance = 100, soul_power = 50, max_soul_power = 50, updated_at = 1 WHERE id = ?1",
+                "UPDATE player SET level = 20, hp = 100, max_hp = 100, strength = 1000, endurance = 100, soul_power = 50, max_soul_power = 50, updated_at = 1 WHERE id = ?1",
                 [player_id],
             )
             .expect("应设置 v18 测试属性");
         drop(connection);
 
         store
-            .teleport_with_operation(
-                &identity(),
-                Some("落日森林"),
-                &map_operation("传送", "v18-loadout-map"),
-            )
-            .expect("角色应进入落日森林");
-        store
             .challenge_soul_beast_with_operation(
                 &identity(),
-                "哥布林",
+                "后进测试魂兽",
                 &transfer_operation("挑战", "v18-loadout-start"),
             )
-            .expect("角色应挑战哥布林");
+            .expect("角色应挑战第二魂环来源魂兽");
         store
             .attack_battle_with_operation(
                 &identity(),
@@ -30293,10 +32129,10 @@ mod tests {
         store
             .absorb_soul_ring_with_operation(
                 &identity(),
-                "哥布林",
+                "后进测试魂兽",
                 &transfer_operation("吸收魂环", "v18-loadout-absorb"),
             )
-            .expect("角色应吸收哥布林魂环");
+            .expect("角色应吸收第二魂环");
 
         let initial = store.skills_page(&identity()).expect("应读取初始魂技装备");
         assert_eq!(initial.entries.len(), 2);
@@ -30312,16 +32148,16 @@ mod tests {
         let unequip = store
             .unequip_skill_with_operation(
                 &identity(),
-                "毒刺",
+                "后进测试魂技",
                 &transfer_operation("卸下魂技", "v18-loadout-unequip"),
             )
-            .expect("应卸下毒刺");
+            .expect("应卸下第二魂技");
         assert!(!unequip.equipped);
         assert_eq!(unequip.equipped_count, 1);
         let replay = store
             .unequip_skill_with_operation(
                 &identity(),
-                "毒刺",
+                "后进测试魂技",
                 &transfer_operation("卸下魂技", "v18-loadout-unequip"),
             )
             .expect("重复卸下应返回原回执");
@@ -30340,10 +32176,10 @@ mod tests {
         let equip = store
             .equip_skill_with_operation(
                 &identity(),
-                "毒刺",
+                "后进测试魂技",
                 &transfer_operation("装备魂技", "v18-loadout-equip"),
             )
-            .expect("应重新装备毒刺");
+            .expect("应重新装备第二魂技");
         assert!(equip.equipped);
         assert_eq!(equip.equipped_count, 2);
         let unequip_base = store
@@ -30352,13 +32188,13 @@ mod tests {
                 "缠绕",
                 &transfer_operation("卸下魂技", "v18-loadout-unequip-base"),
             )
-            .expect("应卸下缠绕并保留毒刺");
+            .expect("应卸下缠绕并保留第二魂技");
         assert!(!unequip_base.equipped);
         assert_eq!(unequip_base.equipped_count, 1);
         let last = store
             .unequip_skill_with_operation(
                 &identity(),
-                "毒刺",
+                "后进测试魂技",
                 &transfer_operation("卸下魂技", "v18-loadout-last"),
             )
             .expect_err("不能卸下最后一个已装备魂技");
@@ -30375,7 +32211,7 @@ mod tests {
             final_page
                 .entries
                 .iter()
-                .any(|entry| entry.skill.skill_key == "sting" && entry.equipped)
+                .any(|entry| entry.skill.skill_key == "v28-lifo-skill" && entry.equipped)
         );
         let event_count = store
             .open()
@@ -30394,6 +32230,7 @@ mod tests {
     fn v21_entangle_effect_catalog_is_exposed_with_the_skill() {
         let (_directory, store) = test_store();
         register_awakened_pair(&store);
+        absorb_test_soul_ring(&store, &identity(), "v21-catalog-source");
 
         let detail = store
             .skill_detail(&identity(), "缠绕")
@@ -30429,7 +32266,6 @@ mod tests {
     fn v23_published_effect_definition_drives_the_same_interpreter() {
         let (directory, store) = test_store();
         register_awakened_pair(&store);
-        let player_id = player_id_for(&store, &identity());
         let package = ContentPackage {
             package_key: "test-effects".to_string(),
             revision: 1,
@@ -30473,6 +32309,9 @@ mod tests {
             .publish_content_draft("test-effects", 1)
             .expect("content package should publish");
         assert!(!published.replayed);
+        // 魂技只能由真实吸收魂环产生，测试也必须走与玩家一致的绑定流程。
+        let _ring = absorb_test_soul_ring(&store, &identity(), "v23-custom-ring");
+        let player_id = player_id_for(&store, &identity());
         let connection = store.open().expect("应打开 v23 自定义效果数据库");
         connection
             .execute(
@@ -30481,13 +32320,6 @@ mod tests {
             )
             .expect("应设置自定义效果测试属性");
         drop(connection);
-        store
-            .teleport_with_operation(
-                &identity(),
-                Some("落日森林"),
-                &map_operation("传送", "v23-custom-map"),
-            )
-            .expect("应进入自定义效果测试地图");
         store
             .challenge_soul_beast_with_operation(
                 &identity(),
@@ -30650,8 +32482,8 @@ mod tests {
                 .skills_page(&identity())
                 .expect("starter skills should be readable")
                 .entries
-                .iter()
-                .any(|entry| entry.skill.skill_key == "test-starter")
+                .is_empty(),
+            "觉醒不能自动学习 starter 魂技，魂技必须来源于已吸收魂环"
         );
 
         let rolled_back = store
@@ -31196,6 +33028,21 @@ mod tests {
             .skills_page(&replacement_identity)
             .expect("应读取 transition 后初始魂技");
         assert!(
+            skills.entries.is_empty(),
+            "觉醒不能自动学习 starter 魂技，魂技必须来自新吸收的魂环"
+        );
+        let absorbed = absorb_test_soul_ring_from_beast(
+            &store,
+            &replacement_identity,
+            "transition-beast",
+            "transition-replacement-ring",
+        );
+        assert_eq!(absorbed.ring.ring.ring_key, "transition-ring");
+        assert_eq!(absorbed.skill.skill_key, "transition-skill");
+        let skills = store
+            .skills_page(&replacement_identity)
+            .expect("应读取吸收目标魂环后的魂技");
+        assert!(
             skills
                 .entries
                 .iter()
@@ -31230,13 +33077,6 @@ mod tests {
             )
             .expect("应读取 transition 后角色的武魂");
         assert_ne!(awakened_wuhun, "独狼");
-        store
-            .teleport_with_operation(
-                &replacement_identity,
-                Some("落日森林"),
-                &map_operation("传送", "transition-replacement-map"),
-            )
-            .expect("transition 后角色应进入落日森林");
         let beasts = store
             .soul_beasts_page(&replacement_identity, 1, 20)
             .expect("应读取 transition 后魂兽列表");
@@ -32502,26 +34342,26 @@ mod tests {
     }
 
     #[test]
-    fn recorded_v16_with_damaged_schema_or_trigger_fails_closed() {
+    fn recorded_v28_with_damaged_schema_or_trigger_fails_closed() {
         for mutation in [
-            "DROP INDEX battle_skill_event_player_message;",
-            "DROP INDEX skill_type_page;",
-            "DROP TRIGGER battle_skill_event_scope_guard;",
+            "DROP VIEW player_skill_bound_projection;",
+            "DROP INDEX player_skill_ring_binding;",
+            "DROP TRIGGER player_soul_ring_detachment_scope_guard;",
         ] {
-            assert_v16_damage_fails_closed(mutation);
+            assert_v28_damage_fails_closed(mutation);
         }
-        assert_v16_damage_fails_closed(
+        assert_v28_damage_fails_closed(
             r#"
-            CREATE TRIGGER battle_skill_event_shadow
-            AFTER INSERT ON battle_skill_event
+            CREATE TRIGGER player_soul_ring_detachment_shadow
+            AFTER INSERT ON player_soul_ring_detachment
             BEGIN SELECT 1; END;
             "#,
         );
-        assert_v16_damage_fails_closed(
+        assert_v28_damage_fails_closed(
             r#"
-            CREATE TRIGGER player_skill_reads_skill
+            CREATE TRIGGER player_skill_reads_ring_projection
             AFTER INSERT ON player_skill
-            BEGIN SELECT EXISTS(SELECT 1 FROM skill); END;
+            BEGIN SELECT EXISTS(SELECT 1 FROM player_soul_ring_current_projection); END;
             "#,
         );
     }
