@@ -682,6 +682,13 @@ impl GameService {
     }
 
     fn soul_rings_document(&self, page: SoulRingPage) -> GameDocument {
+        // 列表只携带一张主图：优先展示待吸收魂环，否则展示当前列表第一枚魂环。
+        let illustration = page
+            .pending
+            .first()
+            .map(|drop| drop.ring.color.as_str())
+            .or_else(|| page.rings.first().map(|ring| ring.ring.color.as_str()))
+            .and_then(|color| self.soul_ring_illustration(color));
         let mut document = GameDocument::new("魂环列表").field(
             "魂环槽位",
             format!("{}/{}", page.rings.len(), page.ring_capacity),
@@ -715,10 +722,14 @@ impl GameService {
                     .command(format!("吸收魂环 {}", drop.ring.soul_beast_name));
             }
         }
-        document.command("技能").command("状态")
+        document
+            .illustration_if(illustration)
+            .command("技能")
+            .command("状态")
     }
 
     fn absorb_soul_ring_document(&self, receipt: SoulRingAbsorbReceipt) -> GameDocument {
+        let illustration = self.soul_ring_illustration(&receipt.ring.ring.color);
         GameDocument::new(if receipt.replayed {
             "魂环吸收回执"
         } else {
@@ -730,6 +741,7 @@ impl GameService {
         .field("品质", soul_ring_color_label(&receipt.ring.ring.color))
         .field("魂技", receipt.skill.name)
         .field("魂环槽位", format!("第{}魂环", receipt.ring.ring_index))
+        .illustration_if(illustration)
         .notice(if receipt.replayed {
             "检测到相同消息的重复请求，已返回原吸收回执，未重复占用魂环槽位"
         } else {
@@ -740,6 +752,7 @@ impl GameService {
     }
 
     fn detach_soul_ring_document(&self, receipt: SoulRingDetachmentReceipt) -> GameDocument {
+        let illustration = self.soul_ring_illustration(&receipt.ring.ring.color);
         let skill_name = receipt.skill.name;
         let replayed = receipt.replayed;
         let notice = if replayed {
@@ -755,6 +768,7 @@ impl GameService {
         .field("魂环", receipt.ring.ring.name)
         .field("魂技", skill_name)
         .field("环位", format!("第{}魂环", receipt.ring.ring_index))
+        .illustration_if(illustration)
         .notice(notice)
         .command("魂环")
         .command("魂兽")
@@ -2300,6 +2314,20 @@ impl GameService {
         self.asset_illustration("wuhun", name, "portrait")
     }
 
+    fn soul_ring_illustration(&self, color: &str) -> Option<Illustration> {
+        let entity_key = match color {
+            "white" => "白",
+            "yellow" => "黄",
+            "purple" => "紫",
+            "black" => "黑",
+            "red" => "红",
+            "orange" => "橙",
+            "gold" => "金",
+            _ => return None,
+        };
+        self.asset_illustration("soul_ring", entity_key, "icon")
+    }
+
     fn asset_illustration(
         &self,
         entity_type: &str,
@@ -3017,6 +3045,8 @@ fn format_battle_event(event: &BattleEventRecord) -> String {
 #[cfg(test)]
 mod tests {
     use abi_stable::std_types::RString;
+
+    use crate::store::{PlayerSoulRingRecord, SkillRecord, SoulRingDropRecord, SoulRingRecord};
 
     use super::*;
 
@@ -3981,6 +4011,132 @@ mod tests {
                 .is_some_and(|content| {
                     content.contains("/media/maps/holy-soul-village/cover.webp")
                 })
+        );
+    }
+
+    #[test]
+    fn challenge_and_soul_ring_documents_carry_stable_asset_keys() {
+        let directory = tempfile::tempdir().expect("应创建插图测试临时目录");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("插图测试数据库应初始化");
+        let mut config = PluginConfig::default();
+        config.illustrations.mode = crate::config::IllustrationMode::Remote;
+        config.illustrations.remote_base_url = "https://media.example.com/douluo".to_string();
+        let service = GameService::with_assets(store, config, IllustrationAssets::default());
+
+        service
+            .register(&command_request(
+                "开始穿越",
+                "插图测试 男",
+                "illustration-register",
+            ))
+            .expect("应创建插图测试角色");
+        service
+            .awaken(&command_request("武魂觉醒", "", "illustration-awaken"))
+            .expect("应觉醒插图测试武魂");
+        service
+            .open_wuhun(&command_request("开武魂", "", "illustration-open"))
+            .expect("应开启插图测试武魂");
+        service
+            .move_direction(&command_request("向", "西", "illustration-move"))
+            .expect("应移动到落日森林");
+
+        let challenge_request = command_request("挑战", "史莱姆", "illustration-challenge");
+        let challenge = service
+            .challenge(&challenge_request)
+            .expect("应创建史莱姆战斗");
+        assert!(challenge.has_illustration());
+        let challenge_response = crate::message::response_for(
+            &challenge_request,
+            &challenge,
+            service.message_config(),
+            service.illustration_config(),
+        );
+        let challenge_segments: serde_json::Value =
+            serde_json::from_str(challenge_response.action.segments_json.as_str())
+                .expect("挑战响应应为 JSON");
+        assert_eq!(
+            challenge_segments[1]["data"]["file"],
+            "https://media.example.com/douluo/media/soul-beasts/slime/battle.webp"
+        );
+
+        let skill = SkillRecord {
+            skill_key: "entangle".to_string(),
+            name: "缠绕".to_string(),
+            skill_type: "active".to_string(),
+            wuhun_category: "all".to_string(),
+            ring_index: 1,
+            soul_power_cost: 8,
+            cooldown_rounds: 2,
+            base_damage: 12,
+            spirit_ratio_percent: 100,
+            strength_ratio_percent: 0,
+            description: "测试魂技".to_string(),
+        };
+        let ring = SoulRingRecord {
+            ring_key: "slime-ring".to_string(),
+            name: "史莱姆魂环".to_string(),
+            soul_beast_id: 1,
+            soul_beast_name: "史莱姆".to_string(),
+            soul_beast_age: 10,
+            skill: skill.clone(),
+            ring_index: 1,
+            age: 10,
+            color: "white".to_string(),
+            description: "测试魂环".to_string(),
+        };
+        let player_ring = PlayerSoulRingRecord {
+            id: 1,
+            ring: ring.clone(),
+            ring_index: 1,
+            obtained_at: 0,
+        };
+        let pending = SoulRingDropRecord {
+            id: 1,
+            battle_id: 1,
+            battle_event_id: 1,
+            ring,
+            source_message_id: "illustration-drop".to_string(),
+            status: "pending".to_string(),
+            created_at: 0,
+        };
+        let soul_rings = service.soul_rings_document(SoulRingPage {
+            rings: Vec::new(),
+            pending: vec![pending],
+            ring_capacity: 1,
+        });
+        assert!(soul_rings.has_illustration());
+        assert!(
+            service
+                .absorb_soul_ring_document(SoulRingAbsorbReceipt {
+                    ring: player_ring.clone(),
+                    skill: skill.clone(),
+                    replayed: false,
+                })
+                .has_illustration()
+        );
+        assert!(
+            service
+                .detach_soul_ring_document(SoulRingDetachmentReceipt {
+                    ring: player_ring,
+                    skill,
+                    replayed: false,
+                })
+                .has_illustration()
+        );
+        let ring_request = command_request("魂环", "", "illustration-ring");
+        let ring_response = crate::message::response_for(
+            &ring_request,
+            &soul_rings,
+            service.message_config(),
+            service.illustration_config(),
+        );
+        let ring_segments: serde_json::Value =
+            serde_json::from_str(ring_response.action.segments_json.as_str())
+                .expect("魂环响应应为 JSON");
+        assert_eq!(
+            ring_segments[1]["data"]["file"],
+            "https://media.example.com/douluo/media/soul-rings/white/icon.webp"
         );
     }
 
