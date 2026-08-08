@@ -48,6 +48,7 @@ pub const MAX_ASSET_SIZE: u64 = 20 * 1024 * 1024;
 
 /// Image extensions accepted by the indexer.
 const ALLOWED_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp"];
+const IMAGE_MAGIC_HEADER_BYTES: u64 = 12;
 
 /// Runtime configuration loaded from the environment by [`MediaConfig::from_env`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -829,22 +830,28 @@ fn mime_for_extension(extension: &str) -> Option<&'static str> {
 
 fn detect_image_mime(path: &Path) -> io::Result<Option<&'static str>> {
     let mut file = File::open(path)?;
-    let mut header = [0_u8; 12];
-    let length = file.read(&mut header)?;
-    let mime = if length >= 8 && header[..8] == [137, 80, 78, 71, 13, 10, 26, 10] {
+    let mut header = Vec::with_capacity(IMAGE_MAGIC_HEADER_BYTES as usize);
+    file.by_ref()
+        .take(IMAGE_MAGIC_HEADER_BYTES)
+        .read_to_end(&mut header)?;
+    Ok(detect_image_mime_bytes(&header))
+}
+
+/// 根据实际文件头识别 MIME，扩展名不能参与该判断。
+fn detect_image_mime_bytes(header: &[u8]) -> Option<&'static str> {
+    if header.len() >= 8 && header[..8] == [137, 80, 78, 71, 13, 10, 26, 10] {
         Some("image/png")
-    } else if length >= 3 && header[..3] == [0xff, 0xd8, 0xff] {
+    } else if header.len() >= 3 && header[..3] == [0xff, 0xd8, 0xff] {
         Some("image/jpeg")
-    } else if length >= 12 && &header[..4] == b"RIFF" && &header[8..12] == b"WEBP" {
+    } else if header.len() >= 12 && &header[..4] == b"RIFF" && &header[8..12] == b"WEBP" {
         Some("image/webp")
-    } else if length >= 6 && (&header[..6] == b"GIF87a" || &header[..6] == b"GIF89a") {
+    } else if header.len() >= 6 && (&header[..6] == b"GIF87a" || &header[..6] == b"GIF89a") {
         Some("image/gif")
-    } else if length >= 2 && &header[..2] == b"BM" {
+    } else if header.len() >= 2 && &header[..2] == b"BM" {
         Some("image/bmp")
     } else {
         None
-    };
-    Ok(mime)
+    }
 }
 
 fn hash_file(path: &Path, metadata: &Metadata) -> io::Result<(String, u64)> {
@@ -1033,6 +1040,11 @@ mod tests {
         fs::write(directory.path().join("ignore.txt"), b"ignore").expect("fixture");
         fs::write(directory.path().join("fake.png"), b"not an image").expect("fixture");
         fs::write(directory.path().join("mismatch.jpg"), b"\x89PNG\r\n\x1a\n").expect("fixture");
+        fs::write(
+            directory.path().join("webp-disguised-as-jpeg.jpg"),
+            b"RIFF\x04\x00\x00\x00WEBP",
+        )
+        .expect("fixture");
         let index = MediaIndex::build(directory.path()).expect("index");
         let digest = index.get("maps/village.png").expect("asset").sha256.clone();
         (directory, Arc::new(MediaState::from_index(index)), digest)
@@ -1219,6 +1231,14 @@ mod tests {
         assert!(state.index().get("ignore.txt").is_none());
         assert!(state.index().get("fake.png").is_none());
         assert!(state.index().get("mismatch.jpg").is_none());
+        assert!(state.index().get("webp-disguised-as-jpeg.jpg").is_none());
+    }
+
+    #[test]
+    fn detects_webp_from_bytes_without_trusting_the_jpeg_extension() {
+        let webp = b"RIFF\x04\x00\x00\x00WEBP";
+        assert_eq!(detect_image_mime_bytes(webp), Some("image/webp"));
+        assert_ne!(mime_for_extension("jpg"), detect_image_mime_bytes(webp));
     }
 
     #[tokio::test]
