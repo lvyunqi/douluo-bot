@@ -2770,6 +2770,10 @@ fn skill_effect_label(effect: &SkillEffectRecord) -> String {
             "魂兽攻击 -{}% · {} 回合",
             effect.magnitude_percent, effect.duration_rounds
         ),
+        ("poison_damage", "beast") => format!(
+            "中毒每次 {} 点伤害 · {} 回合",
+            effect.value, effect.duration_rounds
+        ),
         _ => effect.description.clone(),
     }
 }
@@ -2779,6 +2783,7 @@ fn battle_skill_effect_short_label(effect: &BattleSkillEffectRecord) -> String {
         ("beast_attack_reduction", "enemy") => {
             format!("魂兽攻击 -{}%", effect.magnitude_percent)
         }
+        ("poison_damage", "beast") => format!("中毒每次 {} 点伤害", effect.value),
         _ => effect.description.clone(),
     }
 }

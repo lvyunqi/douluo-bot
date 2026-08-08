@@ -12,6 +12,18 @@ use sha2::{Digest, Sha256};
 /// 单个内容包允许读取的最大字节数。
 pub const MAX_PACKAGE_BYTES: usize = 2 * 1024 * 1024;
 
+/// 首版中毒效果冻结到快照中的规则版本。
+pub const POISON_RULE_VERSION: &str = "poison-v1";
+
+/// 首版中毒仅在玩家攻击或释放魂技的直接伤害后结算。
+pub const POISON_TICK_PHASE: &str = "after_player_damage";
+
+/// 首版中毒固定每个符合条件的行动序列结算一次。
+pub const POISON_TICK_INTERVAL: i64 = 1;
+
+/// 单次中毒 tick 的目录上限，与 effect_definition.value 的数据库边界一致。
+pub const MAX_POISON_TICK_DAMAGE: i64 = 1_000_000;
+
 /// 可发布目录数据的文件格式。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -168,6 +180,14 @@ fn default_enabled() -> bool {
 
 fn default_chance() -> i64 {
     100
+}
+
+/// 判断内容包参数是否精确声明首版中毒规则，拒绝任意脚本或附加开关。
+pub fn is_poison_v1_parameters(parameters: &BTreeMap<String, Value>) -> bool {
+    parameters.len() == 3
+        && parameters.get("rule_version").and_then(Value::as_str) == Some(POISON_RULE_VERSION)
+        && parameters.get("tick_phase").and_then(Value::as_str) == Some(POISON_TICK_PHASE)
+        && parameters.get("tick_interval").and_then(Value::as_i64) == Some(POISON_TICK_INTERVAL)
 }
 
 /// 将内容包序列化为用于持久化和哈希的稳定 JSON 表示。
@@ -419,16 +439,29 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
                 entry.effect_key
             ));
         }
-        if entry.operation != "modify_stat" || entry.attribute_key != "beast_attack" {
+        let beast_attack_reduction = entry.operation == "modify_stat"
+            && entry.attribute_key == "beast_attack"
+            && entry.value_mode == "percent_delta";
+        let poison_damage = entry.target_kind == "beast"
+            && entry.operation == "deal_damage"
+            && entry.attribute_key == "beast_hp"
+            && entry.value_mode == "absolute";
+        if !beast_attack_reduction && !poison_damage {
             errors.push(format!(
-                "效果 {} 当前只支持 modify_stat/beast_attack",
+                "效果 {} 当前只支持减攻或 poison-v1 中毒伤害节点",
                 entry.effect_key
             ));
         }
-        if entry.value_mode != "percent_delta" || !(-90..=-1).contains(&entry.value) {
+        if beast_attack_reduction && !(-90..=-1).contains(&entry.value) {
             errors.push(format!(
                 "效果 {} 的 value 必须是 -1 到 -90 的 percent_delta",
                 entry.effect_key
+            ));
+        }
+        if poison_damage && !(1..=MAX_POISON_TICK_DAMAGE).contains(&entry.value) {
+            errors.push(format!(
+                "效果 {} 的 poison-v1 value 必须是 1 到 {} 的 absolute",
+                entry.effect_key, MAX_POISON_TICK_DAMAGE
             ));
         }
         range_field(
@@ -454,9 +487,15 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
                 entry.effect_key
             ));
         }
-        if !entry.parameters.is_empty() {
+        if beast_attack_reduction && !entry.parameters.is_empty() {
             errors.push(format!(
                 "效果 {} 当前不允许非空 parameters",
+                entry.effect_key
+            ));
+        }
+        if poison_damage && !is_poison_v1_parameters(&entry.parameters) {
+            errors.push(format!(
+                "效果 {} 的 poison-v1 parameters 必须固定声明规则版本、结算时机和间隔",
                 entry.effect_key
             ));
         }
@@ -778,6 +817,23 @@ mod tests {
         }
     }
 
+    fn poison_v1_parameters() -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            (
+                "rule_version".to_string(),
+                Value::String(POISON_RULE_VERSION.to_string()),
+            ),
+            (
+                "tick_phase".to_string(),
+                Value::String(POISON_TICK_PHASE.to_string()),
+            ),
+            (
+                "tick_interval".to_string(),
+                Value::from(POISON_TICK_INTERVAL),
+            ),
+        ])
+    }
+
     #[test]
     fn parses_json_and_toml_to_the_same_hash() {
         let package = minimal_package();
@@ -787,6 +843,30 @@ mod tests {
         let toml_loaded = parse_package_text(&toml, "toml").expect("TOML 应可解析");
         assert_eq!(json_loaded.package, toml_loaded.package);
         assert_eq!(json_loaded.content_hash, toml_loaded.content_hash);
+    }
+
+    #[test]
+    fn accepts_only_the_controlled_poison_v1_node() {
+        let mut package = minimal_package();
+        let effect = &mut package.effects[0];
+        effect.target_kind = "beast".to_string();
+        effect.operation = "deal_damage".to_string();
+        effect.attribute_key = "beast_hp".to_string();
+        effect.value_mode = "absolute".to_string();
+        effect.value = 5;
+        effect.duration_rounds = 3;
+        effect.stack_policy = "refresh".to_string();
+        effect.parameters = poison_v1_parameters();
+        assert!(validate_shape(&package).is_empty());
+
+        package.effects[0]
+            .parameters
+            .insert("tick_interval".to_string(), Value::from(2));
+        assert!(
+            validate_shape(&package)
+                .iter()
+                .any(|error| error.contains("poison-v1 parameters"))
+        );
     }
 
     #[test]

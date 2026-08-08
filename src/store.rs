@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -11,8 +11,8 @@ use rusqlite::{
 
 use crate::config::DatabaseConfig;
 use crate::content::{
-    ContentPackage, ContentTransitionPackageEntry, LoadedContentPackage, canonical_json,
-    content_hash, validate_shape,
+    ContentPackage, ContentTransitionPackageEntry, LoadedContentPackage, MAX_POISON_TICK_DAMAGE,
+    canonical_json, content_hash, is_poison_v1_parameters, validate_shape,
 };
 use crate::message::Protocol;
 
@@ -10851,7 +10851,7 @@ impl Store {
                     .checked_mul(2)
                     .ok_or_else(|| "玩家攻击力计算溢出".to_string())?
             };
-            let mut player_damage = battle_damage(
+            let mut direct_player_damage = battle_damage(
                 scale_combat_value(
                     raw_damage,
                     wuhun_attack_percent,
@@ -10866,9 +10866,27 @@ impl Store {
                 player_roll,
             )?;
             if player_critical {
-                player_damage = battle_critical_damage(player_damage, state.player_luck)?;
+                direct_player_damage =
+                    battle_critical_damage(direct_player_damage, state.player_luck)?;
             }
-            let beast_hp_after = state.beast_hp.saturating_sub(player_damage).max(0);
+            let beast_hp_after_direct_damage =
+                state.beast_hp.saturating_sub(direct_player_damage).max(0);
+            // 中毒仅在攻击或释放魂技的直接伤害后结算，直接击杀时没有存活目标可继续受毒。
+            let poison_damage = if beast_hp_after_direct_damage == 0 {
+                0
+            } else {
+                poison_damage_after_skill_effects(
+                    beast_hp_after_direct_damage,
+                    &active_skill_effects,
+                    &pending_skill_effects,
+                )?
+            };
+            let player_damage = direct_player_damage
+                .checked_add(poison_damage)
+                .ok_or_else(|| "玩家与中毒伤害汇总溢出".to_string())?;
+            let beast_hp_after = beast_hp_after_direct_damage
+                .saturating_sub(poison_damage)
+                .max(0);
             if beast_hp_after == 0 {
                 let exp = apply_experience_in_transaction(
                     &transaction,
@@ -14004,6 +14022,12 @@ fn compatibility_effect_kind(
         && value < 0
     {
         "beast_attack_reduction".to_string()
+    } else if operation == "deal_damage"
+        && attribute_key == "beast_hp"
+        && value_mode == "absolute"
+        && value > 0
+    {
+        "poison_damage".to_string()
     } else {
         operation.to_string()
     }
@@ -14540,6 +14564,98 @@ fn scale_combat_value(value: i64, percent: i64, label: &str) -> Result<i64, Stri
     .map_err(|_| format!("{label}超出整数范围"))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EffectStackPolicy {
+    Strongest,
+    Add,
+    Refresh,
+    Replace,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SupportedSkillEffect {
+    BeastAttackReduction {
+        reduction: i64,
+        stack_policy: EffectStackPolicy,
+    },
+    PoisonDamage {
+        damage: i64,
+        stack_policy: EffectStackPolicy,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PoisonDamageAccumulator {
+    stack_policy: EffectStackPolicy,
+    additive_damage: i64,
+    strongest_damage: i64,
+    latest_damage: i64,
+}
+
+fn effect_stack_policy(value: &str) -> Result<EffectStackPolicy, String> {
+    match value {
+        "strongest" => Ok(EffectStackPolicy::Strongest),
+        "add" => Ok(EffectStackPolicy::Add),
+        "refresh" => Ok(EffectStackPolicy::Refresh),
+        "replace" => Ok(EffectStackPolicy::Replace),
+        _ => Err(format!("当前魂技效果解释器不支持叠加策略 {value}")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_supported_skill_effect(
+    trigger_kind: &str,
+    target_kind: &str,
+    operation: &str,
+    attribute_key: &str,
+    value_mode: &str,
+    value: i64,
+    chance_percent: i64,
+    stack_policy: &str,
+    parameters_json: &str,
+) -> Result<SupportedSkillEffect, String> {
+    let parameters = serde_json::from_str::<BTreeMap<String, serde_json::Value>>(parameters_json)
+        .map_err(|error| format!("魂技效果参数不是有效 JSON 对象：{error}"))?;
+    let stack_policy = effect_stack_policy(stack_policy)?;
+    if trigger_kind == "on_release"
+        && matches!(target_kind, "enemy" | "beast")
+        && operation == "modify_stat"
+        && attribute_key == "beast_attack"
+        && value_mode == "percent_delta"
+        && (-90..=-1).contains(&value)
+        && chance_percent == 100
+    {
+        if !parameters.is_empty() {
+            return Err("当前魂技减攻效果不支持非空 parameters".to_string());
+        }
+        return Ok(SupportedSkillEffect::BeastAttackReduction {
+            reduction: value
+                .checked_neg()
+                .ok_or_else(|| "魂技效果数值超出范围".to_string())?,
+            stack_policy,
+        });
+    }
+    if trigger_kind == "on_release"
+        && target_kind == "beast"
+        && operation == "deal_damage"
+        && attribute_key == "beast_hp"
+        && value_mode == "absolute"
+        && (1..=MAX_POISON_TICK_DAMAGE).contains(&value)
+        && chance_percent == 100
+    {
+        if !is_poison_v1_parameters(&parameters) {
+            return Err("poison-v1 参数必须固定声明规则版本、结算时机和间隔".to_string());
+        }
+        return Ok(SupportedSkillEffect::PoisonDamage {
+            damage: value,
+            stack_policy,
+        });
+    }
+    Err(format!(
+        "当前魂技效果解释器不支持 {trigger_kind}/{target_kind}/{operation}/{attribute_key}/{value_mode}/{value}/{chance_percent}"
+    ))
+}
+
 fn beast_attack_after_skill_effects(
     beast_attack: i64,
     active_effects: &[BattleSkillEffectRecord],
@@ -14550,15 +14666,17 @@ fn beast_attack_after_skill_effects(
     let mut replacement = None;
     for effect in active_effects {
         apply_beast_attack_effect(
-            &effect.trigger_kind,
-            &effect.target_kind,
-            &effect.operation,
-            &effect.attribute_key,
-            &effect.value_mode,
-            effect.value,
-            effect.chance_percent,
-            &effect.stack_policy,
-            &effect.parameters_json,
+            parse_supported_skill_effect(
+                &effect.trigger_kind,
+                &effect.target_kind,
+                &effect.operation,
+                &effect.attribute_key,
+                &effect.value_mode,
+                effect.value,
+                effect.chance_percent,
+                &effect.stack_policy,
+                &effect.parameters_json,
+            )?,
             &mut strongest,
             &mut additive,
             &mut replacement,
@@ -14566,15 +14684,17 @@ fn beast_attack_after_skill_effects(
     }
     for effect in pending_effects {
         apply_beast_attack_effect(
-            &effect.trigger_kind,
-            &effect.target_kind,
-            &effect.operation,
-            &effect.attribute_key,
-            &effect.value_mode,
-            effect.value,
-            effect.chance_percent,
-            &effect.stack_policy,
-            &effect.parameters_json,
+            parse_supported_skill_effect(
+                &effect.trigger_kind,
+                &effect.target_kind,
+                &effect.operation,
+                &effect.attribute_key,
+                &effect.value_mode,
+                effect.value,
+                effect.chance_percent,
+                &effect.stack_policy,
+                &effect.parameters_json,
+            )?,
             &mut strongest,
             &mut additive,
             &mut replacement,
@@ -14594,53 +14714,127 @@ fn beast_attack_after_skill_effects(
     scale_combat_value(beast_attack, remaining_percent, "魂技减攻效果").map(|scaled| scaled.max(1))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn apply_beast_attack_effect(
-    trigger_kind: &str,
-    target_kind: &str,
-    operation: &str,
-    attribute_key: &str,
-    value_mode: &str,
-    value: i64,
-    chance_percent: i64,
-    stack_policy: &str,
-    parameters_json: &str,
+    effect: SupportedSkillEffect,
     strongest: &mut i64,
     additive: &mut i64,
     replacement: &mut Option<i64>,
 ) -> Result<(), String> {
-    let parameters = serde_json::from_str::<serde_json::Value>(parameters_json)
-        .map_err(|error| format!("魂技效果参数不是有效 JSON：{error}"))?;
-    if parameters
-        .as_object()
-        .is_none_or(|object| !object.is_empty())
-    {
-        return Err("当前魂技效果解释器不支持非空 parameters".to_string());
-    }
-    if trigger_kind != "on_release"
-        || !matches!(target_kind, "enemy" | "beast")
-        || operation != "modify_stat"
-        || attribute_key != "beast_attack"
-        || value_mode != "percent_delta"
-        || !(-90..=-1).contains(&value)
-        || chance_percent != 100
-    {
-        return Err(format!(
-            "当前魂技效果解释器不支持 {trigger_kind}/{target_kind}/{operation}/{attribute_key}/{value_mode}/{value}/{chance_percent}"
-        ));
-    }
-    let reduction = value
-        .checked_neg()
-        .ok_or_else(|| "魂技效果数值超出范围".to_string())?;
+    let SupportedSkillEffect::BeastAttackReduction {
+        reduction,
+        stack_policy,
+    } = effect
+    else {
+        return Ok(());
+    };
     match stack_policy {
-        "strongest" | "refresh" => *strongest = (*strongest).max(reduction),
-        "add" => {
+        EffectStackPolicy::Strongest | EffectStackPolicy::Refresh => {
+            *strongest = (*strongest).max(reduction);
+        }
+        EffectStackPolicy::Add => {
             *additive = additive
                 .checked_add(reduction)
                 .ok_or_else(|| "魂技效果叠加数值溢出".to_string())?;
         }
-        "replace" => *replacement = Some(reduction),
-        _ => return Err(format!("当前魂技效果解释器不支持叠加策略 {stack_policy}")),
+        EffectStackPolicy::Replace => *replacement = Some(reduction),
+    }
+    Ok(())
+}
+
+/// 汇总当前序列应结算的中毒伤害；pending 定义排在已冻结快照之后，保证 refresh/replace 当回合生效。
+fn poison_damage_after_skill_effects(
+    beast_hp_after_direct_damage: i64,
+    active_effects: &[BattleSkillEffectRecord],
+    pending_effects: &[SkillEffectRecord],
+) -> Result<i64, String> {
+    if beast_hp_after_direct_damage < 0 {
+        return Err("中毒结算前的魂兽生命不能为负数".to_string());
+    }
+    let mut groups = BTreeMap::<String, PoisonDamageAccumulator>::new();
+    for effect in active_effects {
+        collect_poison_effect(
+            &mut groups,
+            &effect.effect_key,
+            parse_supported_skill_effect(
+                &effect.trigger_kind,
+                &effect.target_kind,
+                &effect.operation,
+                &effect.attribute_key,
+                &effect.value_mode,
+                effect.value,
+                effect.chance_percent,
+                &effect.stack_policy,
+                &effect.parameters_json,
+            )?,
+        )?;
+    }
+    for effect in pending_effects {
+        collect_poison_effect(
+            &mut groups,
+            &effect.effect_key,
+            parse_supported_skill_effect(
+                &effect.trigger_kind,
+                &effect.target_kind,
+                &effect.operation,
+                &effect.attribute_key,
+                &effect.value_mode,
+                effect.value,
+                effect.chance_percent,
+                &effect.stack_policy,
+                &effect.parameters_json,
+            )?,
+        )?;
+    }
+    let mut total_damage = 0_i64;
+    for accumulator in groups.into_values() {
+        let damage = match accumulator.stack_policy {
+            EffectStackPolicy::Add => accumulator.additive_damage,
+            EffectStackPolicy::Strongest => accumulator.strongest_damage,
+            EffectStackPolicy::Refresh | EffectStackPolicy::Replace => accumulator.latest_damage,
+        };
+        total_damage = total_damage
+            .checked_add(damage)
+            .ok_or_else(|| "中毒伤害叠加溢出".to_string())?;
+    }
+    Ok(total_damage.min(beast_hp_after_direct_damage))
+}
+
+fn collect_poison_effect(
+    groups: &mut BTreeMap<String, PoisonDamageAccumulator>,
+    effect_key: &str,
+    effect: SupportedSkillEffect,
+) -> Result<(), String> {
+    let SupportedSkillEffect::PoisonDamage {
+        damage,
+        stack_policy,
+    } = effect
+    else {
+        return Ok(());
+    };
+    let accumulator = groups
+        .entry(effect_key.to_string())
+        .or_insert(PoisonDamageAccumulator {
+            stack_policy,
+            additive_damage: 0,
+            strongest_damage: 0,
+            latest_damage: 0,
+        });
+    if accumulator.stack_policy != stack_policy {
+        return Err(format!("中毒效果 {effect_key} 的叠加策略不一致"));
+    }
+    match stack_policy {
+        EffectStackPolicy::Add => {
+            accumulator.additive_damage = accumulator
+                .additive_damage
+                .checked_add(damage)
+                .ok_or_else(|| "中毒伤害叠加溢出".to_string())?;
+        }
+        EffectStackPolicy::Strongest => {
+            accumulator.strongest_damage = accumulator.strongest_damage.max(damage);
+        }
+        EffectStackPolicy::Refresh | EffectStackPolicy::Replace => {
+            accumulator.latest_damage = damage;
+        }
     }
     Ok(())
 }
@@ -22722,15 +22916,33 @@ fn validate_v22_schema(connection: &Connection) -> Result<(), String> {
                 SELECT 1 FROM effect_definition
                  WHERE enabled = 1
                    AND NOT (
-                       trigger_kind = 'on_release'
-                       AND target_kind IN ('enemy', 'beast')
-                       AND operation = 'modify_stat'
-                       AND attribute_key = 'beast_attack'
-                       AND value_mode = 'percent_delta'
-                       AND value BETWEEN -90 AND -1
-                       AND chance_percent = 100
-                       AND stack_policy IN ('strongest', 'add', 'refresh', 'replace')
-                       AND json(parameters_json) = json('{}')
+                       (
+                           trigger_kind = 'on_release'
+                           AND target_kind IN ('enemy', 'beast')
+                           AND operation = 'modify_stat'
+                           AND attribute_key = 'beast_attack'
+                           AND value_mode = 'percent_delta'
+                           AND value BETWEEN -90 AND -1
+                           AND chance_percent = 100
+                           AND stack_policy IN ('strongest', 'add', 'refresh', 'replace')
+                           AND json(parameters_json) = json('{}')
+                       ) OR (
+                           trigger_kind = 'on_release'
+                           AND target_kind = 'beast'
+                           AND operation = 'deal_damage'
+                           AND attribute_key = 'beast_hp'
+                           AND value_mode = 'absolute'
+                           AND value BETWEEN 1 AND 1000000
+                           AND chance_percent = 100
+                           AND stack_policy IN ('strongest', 'add', 'refresh', 'replace')
+                           AND json_type(parameters_json, '$.rule_version') = 'text'
+                           AND json_extract(parameters_json, '$.rule_version') = 'poison-v1'
+                           AND json_type(parameters_json, '$.tick_phase') = 'text'
+                           AND json_extract(parameters_json, '$.tick_phase') = 'after_player_damage'
+                           AND json_type(parameters_json, '$.tick_interval') = 'integer'
+                           AND json_extract(parameters_json, '$.tick_interval') = 1
+                           AND (SELECT COUNT(*) FROM json_each(parameters_json)) = 3
+                       )
                    )
             )
             "#,
@@ -26147,6 +26359,159 @@ mod tests {
             package,
             source_format: "json".to_string(),
         }
+    }
+
+    fn poison_v1_parameters() -> BTreeMap<String, serde_json::Value> {
+        BTreeMap::from([
+            (
+                "rule_version".to_string(),
+                serde_json::Value::String("poison-v1".to_string()),
+            ),
+            (
+                "tick_phase".to_string(),
+                serde_json::Value::String("after_player_damage".to_string()),
+            ),
+            ("tick_interval".to_string(), serde_json::Value::from(1)),
+        ])
+    }
+
+    fn poison_effect_package(
+        package_key: &str,
+        effect_key: &str,
+        skill_key: &str,
+        damage: i64,
+        duration_rounds: i64,
+        stack_policy: &str,
+    ) -> LoadedContentPackage {
+        let package = ContentPackage {
+            package_key: package_key.to_string(),
+            revision: 1,
+            author: "test".to_string(),
+            minimum_runtime: String::new(),
+            wuhun: Vec::new(),
+            skills: Vec::new(),
+            effects: vec![EffectPackageEntry {
+                effect_key: effect_key.to_string(),
+                skill_key: skill_key.to_string(),
+                trigger_kind: "on_release".to_string(),
+                target_kind: "beast".to_string(),
+                operation: "deal_damage".to_string(),
+                attribute_key: "beast_hp".to_string(),
+                value_mode: "absolute".to_string(),
+                value: damage,
+                duration_rounds,
+                chance_percent: 100,
+                stack_policy: stack_policy.to_string(),
+                parameters: poison_v1_parameters(),
+                description: "test poison-v1 effect".to_string(),
+                enabled: true,
+            }],
+            soul_beasts: Vec::new(),
+            soul_rings: Vec::new(),
+            transitions: Vec::new(),
+        };
+        LoadedContentPackage {
+            content_hash: content_hash(&package).expect("应计算中毒内容包哈希"),
+            package,
+            source_format: "json".to_string(),
+        }
+    }
+
+    fn poison_skill_effect_record(
+        effect_key: &str,
+        damage: i64,
+        stack_policy: &str,
+    ) -> SkillEffectRecord {
+        SkillEffectRecord {
+            effect_key: effect_key.to_string(),
+            effect_kind: "poison_damage".to_string(),
+            target_kind: "beast".to_string(),
+            magnitude_percent: damage,
+            duration_rounds: 5,
+            description: "test poison-v1 effect".to_string(),
+            trigger_kind: "on_release".to_string(),
+            operation: "deal_damage".to_string(),
+            attribute_key: "beast_hp".to_string(),
+            value_mode: "absolute".to_string(),
+            value: damage,
+            chance_percent: 100,
+            stack_policy: stack_policy.to_string(),
+            parameters_json: serde_json::to_string(&poison_v1_parameters())
+                .expect("应序列化中毒参数"),
+        }
+    }
+
+    fn poison_battle_effect_record(
+        id: i64,
+        effect_key: &str,
+        damage: i64,
+        stack_policy: &str,
+    ) -> BattleSkillEffectRecord {
+        let effect = poison_skill_effect_record(effect_key, damage, stack_policy);
+        BattleSkillEffectRecord {
+            id,
+            battle_skill_event_id: id,
+            effect_key: effect.effect_key,
+            skill_key: "sting".to_string(),
+            skill_name: "毒刺".to_string(),
+            effect_kind: effect.effect_kind,
+            target_kind: effect.target_kind,
+            magnitude_percent: effect.magnitude_percent,
+            duration_rounds: effect.duration_rounds,
+            started_sequence: id,
+            expires_after_sequence: id + effect.duration_rounds - 1,
+            rule_version: "effect-v2".to_string(),
+            description: effect.description,
+            trigger_kind: effect.trigger_kind,
+            operation: effect.operation,
+            attribute_key: effect.attribute_key,
+            value_mode: effect.value_mode,
+            value: effect.value,
+            chance_percent: effect.chance_percent,
+            stack_policy: effect.stack_policy,
+            parameters_json: effect.parameters_json,
+        }
+    }
+
+    fn expected_direct_attack_damage(state: &BattleState, sequence: i64) -> i64 {
+        let raw_damage = state
+            .player_strength
+            .checked_mul(2)
+            .expect("测试普通攻击原始伤害不应溢出");
+        battle_damage(
+            scale_combat_value(raw_damage, state.wuhun_attack_percent, "测试武魂攻击修正")
+                .expect("测试普通攻击应可缩放"),
+            state.beast_defense,
+            state.player_level,
+            battle_roll(state.random_seed, sequence, 0),
+        )
+        .expect("测试普通攻击伤害应可计算")
+    }
+
+    fn expected_direct_skill_damage(
+        state: &BattleState,
+        skill: &PlayerSkillRecord,
+        sequence: i64,
+    ) -> i64 {
+        let raw_damage = skill_raw_damage(
+            &skill.skill,
+            state.player_strength,
+            state.player_perception,
+            skill_damage_percent(skill.level).expect("测试魂技等级应有效"),
+        )
+        .expect("测试魂技原始伤害应可计算");
+        battle_damage(
+            scale_combat_value(
+                raw_damage,
+                state.wuhun_attack_percent,
+                "测试武魂魂技攻击修正",
+            )
+            .expect("测试魂技应可缩放"),
+            state.beast_defense,
+            state.player_level,
+            battle_roll(state.random_seed, sequence, 10),
+        )
+        .expect("测试魂技伤害应可计算")
     }
 
     fn content_preview_package(package_key: &str) -> LoadedContentPackage {
@@ -32208,6 +32573,45 @@ mod tests {
     }
 
     #[test]
+    fn poison_v1_stack_policies_are_deterministic() {
+        let add = vec![
+            poison_battle_effect_record(1, "poison-add", 5, "add"),
+            poison_battle_effect_record(2, "poison-add", 5, "add"),
+        ];
+        assert_eq!(poison_damage_after_skill_effects(100, &add, &[]), Ok(10));
+
+        let strongest = vec![
+            poison_battle_effect_record(1, "poison-strongest", 5, "strongest"),
+            poison_battle_effect_record(2, "poison-strongest", 5, "strongest"),
+        ];
+        assert_eq!(
+            poison_damage_after_skill_effects(100, &strongest, &[]),
+            Ok(5)
+        );
+
+        let refresh = vec![poison_battle_effect_record(
+            1,
+            "poison-refresh",
+            5,
+            "refresh",
+        )];
+        assert_eq!(
+            poison_damage_after_skill_effects(
+                100,
+                &refresh,
+                &[poison_skill_effect_record("poison-refresh", 5, "refresh")],
+            ),
+            Ok(5)
+        );
+
+        let replace = vec![
+            poison_battle_effect_record(1, "poison-replace", 5, "replace"),
+            poison_battle_effect_record(2, "poison-replace", 5, "replace"),
+        ];
+        assert_eq!(poison_damage_after_skill_effects(100, &replace, &[]), Ok(5));
+    }
+
+    #[test]
     fn v21_entangle_effect_catalog_is_exposed_with_the_skill() {
         let (_directory, store) = test_store();
         register_awakened_pair(&store);
@@ -32369,6 +32773,403 @@ mod tests {
                 .iter()
                 .any(|effect| effect.effect_key == "entangle-heavy")
         );
+    }
+
+    #[test]
+    fn poison_v1_ticks_after_damage_survives_reload_and_replays_without_duplication() {
+        let (directory, store) = test_store();
+        register_awakened_pair(&store);
+        let baseline = store
+            .active_content_revision()
+            .expect("应读取中毒测试的 baseline revision");
+        let poison = poison_effect_package(
+            "poison-v1-test",
+            "sting-poison-test",
+            "sting",
+            5,
+            3,
+            "refresh",
+        );
+        store
+            .stage_content_package(&poison)
+            .expect("中毒内容包应暂存");
+        let validation = store
+            .validate_content_draft("poison-v1-test", 1)
+            .expect("中毒内容包应校验");
+        assert!(validation.errors.is_empty(), "{validation:?}");
+        store
+            .publish_content_draft("poison-v1-test", 1)
+            .expect("中毒内容包应发布");
+        let absorbed =
+            absorb_test_soul_ring_from_beast(&store, &identity(), "哥布林", "poison-v1-source");
+        assert_eq!(absorbed.skill.skill_key, "sting");
+
+        let player_id = player_id_for(&store, &identity());
+        let connection = store.open().expect("应打开中毒战斗数据库");
+        connection
+            .execute(
+                "UPDATE player SET level = 10, hp = 1000, max_hp = 1000, soul_power = 1000, max_soul_power = 1000, strength = 1, endurance = 1000, perception = 0, luck = 0, updated_at = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置中毒战斗属性");
+        drop(connection);
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "哥布林",
+                &transfer_operation("挑战", "poison-v1-challenge"),
+            )
+            .expect("应创建中毒测试战斗");
+
+        let connection = store.open().expect("应读取中毒首回合状态");
+        let before = load_active_battle_state(&connection, player_id)
+            .expect("应读取中毒首回合快照")
+            .expect("中毒测试战斗应处于 active");
+        let sting = load_player_skill_by_name_or_key(&connection, player_id, "sting")
+            .expect("应读取毒刺绑定");
+        let direct_damage = expected_direct_skill_damage(&before, &sting, 1);
+        drop(connection);
+
+        let release = store
+            .use_skill_battle_with_operation(
+                &identity(),
+                "毒刺",
+                &transfer_operation("释放技能", "poison-v1-release"),
+            )
+            .expect("毒刺应完成直接伤害和首个中毒 tick");
+        assert_eq!(release.event.status_after, "active");
+        assert!(!release.event.player_critical);
+        assert_eq!(release.event.player_damage, direct_damage + 5);
+        assert_eq!(
+            release.event.beast_hp_after,
+            before.beast_hp - direct_damage - 5
+        );
+        assert!(
+            release
+                .skill
+                .as_ref()
+                .expect("应有毒刺释放回执")
+                .effects
+                .iter()
+                .any(|effect| effect.effect_key == "sting-poison-test")
+        );
+        assert!(
+            release
+                .battle
+                .active_effects
+                .iter()
+                .any(|effect| effect.effect_key == "sting-poison-test")
+        );
+
+        let snapshot_count_before_replay = store
+            .open()
+            .expect("应读取中毒快照数量")
+            .query_row(
+                "SELECT COUNT(*) FROM battle_effect_snapshot WHERE effect_key = 'sting-poison-test'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("应统计中毒快照");
+        let replay = store
+            .use_skill_battle_with_operation(
+                &identity(),
+                "毒刺",
+                &transfer_operation("释放技能", "poison-v1-release"),
+            )
+            .expect("重复毒刺消息应返回原回执");
+        assert!(replay.replayed);
+        assert_eq!(replay.event, release.event);
+        assert_eq!(replay.skill, release.skill);
+        let snapshot_count_after_replay = store
+            .open()
+            .expect("应读取重放后的中毒快照数量")
+            .query_row(
+                "SELECT COUNT(*) FROM battle_effect_snapshot WHERE effect_key = 'sting-poison-test'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("应统计重放后的中毒快照");
+        assert_eq!(snapshot_count_after_replay, snapshot_count_before_replay);
+
+        store
+            .rollback_content_revision(baseline.id)
+            .expect("战斗中回滚内容 revision 应成功");
+        assert_eq!(
+            store
+                .active_content_revision()
+                .expect("应读取回滚后的 active revision")
+                .id,
+            baseline.id
+        );
+        assert!(
+            !active_content_member_exists(
+                &store.open().expect("应打开回滚后的内容数据库"),
+                "effect",
+                "sting-poison-test"
+            )
+            .expect("应检查回滚后的毒刺效果可见性")
+        );
+
+        drop(store);
+        let restored = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("中毒战斗应可热重载");
+        let second_before =
+            load_active_battle_state(&restored.open().expect("应读取重载后的中毒战斗"), player_id)
+                .expect("应读取第二序列前快照")
+                .expect("中毒战斗应继续");
+        let second_direct = expected_direct_attack_damage(&second_before, 2);
+        let second = restored
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "poison-v1-second"),
+            )
+            .expect("重载后第二序列应结算中毒");
+        assert_eq!(second.event.player_damage, second_direct + 5);
+
+        let third_before =
+            load_active_battle_state(&restored.open().expect("应读取第三序列前状态"), player_id)
+                .expect("应读取第三序列前快照")
+                .expect("第三序列前战斗应继续");
+        let third_direct = expected_direct_attack_damage(&third_before, 3);
+        let third = restored
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "poison-v1-third"),
+            )
+            .expect("第三序列应结算最后一次中毒");
+        assert_eq!(third.event.player_damage, third_direct + 5);
+        assert!(
+            third
+                .expired_effects
+                .iter()
+                .any(|effect| effect.effect_key == "sting-poison-test")
+        );
+        assert!(
+            !third
+                .battle
+                .active_effects
+                .iter()
+                .any(|effect| effect.effect_key == "sting-poison-test")
+        );
+
+        let fourth_before =
+            load_active_battle_state(&restored.open().expect("应读取第四序列前状态"), player_id)
+                .expect("应读取第四序列前快照")
+                .expect("第四序列前战斗应继续");
+        let fourth_direct = expected_direct_attack_damage(&fourth_before, 4);
+        let fourth = restored
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "poison-v1-fourth"),
+            )
+            .expect("到期后普通攻击应继续");
+        assert_eq!(fourth.event.player_damage, fourth_direct);
+        let expiration = restored
+            .open()
+            .expect("应读取中毒到期账本")
+            .query_row(
+                "SELECT expired_sequence, reason FROM battle_effect_expiration WHERE battle_effect_snapshot_id = (SELECT id FROM battle_effect_snapshot WHERE effect_key = 'sting-poison-test')",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("应存在中毒到期账本");
+        assert_eq!(expiration, (3, "scheduled".to_string()));
+    }
+
+    #[test]
+    fn poison_v1_killing_tick_skips_beast_counterattack() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        let poison = poison_effect_package(
+            "poison-v1-kill-test",
+            "sting-poison-kill-test",
+            "sting",
+            60,
+            3,
+            "refresh",
+        );
+        store
+            .stage_content_package(&poison)
+            .expect("中毒击杀包应暂存");
+        let validation = store
+            .validate_content_draft("poison-v1-kill-test", 1)
+            .expect("中毒击杀包应校验");
+        assert!(validation.errors.is_empty(), "{validation:?}");
+        store
+            .publish_content_draft("poison-v1-kill-test", 1)
+            .expect("中毒击杀包应发布");
+        absorb_test_soul_ring_from_beast(&store, &identity(), "哥布林", "poison-v1-kill-source");
+
+        let player_id = player_id_for(&store, &identity());
+        store
+            .open()
+            .expect("应打开中毒击杀测试数据库")
+            .execute(
+                "UPDATE player SET level = 10, hp = 1000, max_hp = 1000, soul_power = 1000, max_soul_power = 1000, strength = 1, endurance = 1000, perception = 0, luck = 0, updated_at = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置中毒击杀测试属性");
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "哥布林",
+                &transfer_operation("挑战", "poison-v1-kill-challenge"),
+            )
+            .expect("应创建中毒击杀测试战斗");
+
+        let connection = store.open().expect("应读取中毒击杀战斗状态");
+        let before = load_active_battle_state(&connection, player_id)
+            .expect("应读取中毒击杀战斗快照")
+            .expect("中毒击杀战斗应处于 active");
+        let sting = load_player_skill_by_name_or_key(&connection, player_id, "sting")
+            .expect("应读取中毒击杀魂技");
+        let direct_damage = expected_direct_skill_damage(&before, &sting, 1);
+        assert!(
+            direct_damage < before.beast_hp,
+            "测试必须由中毒完成击杀，而不是直接伤害击杀"
+        );
+        drop(connection);
+
+        let result = store
+            .use_skill_battle_with_operation(
+                &identity(),
+                "毒刺",
+                &transfer_operation("释放技能", "poison-v1-kill-use"),
+            )
+            .expect("中毒击杀动作应成功");
+        assert_eq!(result.event.status_after, "won");
+        assert_eq!(result.event.beast_hp_after, 0);
+        assert_eq!(result.event.beast_damage, 0);
+        assert_eq!(result.event.player_damage, before.beast_hp);
+        assert_eq!(result.event.experience_awarded, before.exp_reward);
+        assert!(
+            result
+                .expired_effects
+                .iter()
+                .any(|effect| effect.effect_key == "sting-poison-kill-test")
+        );
+        assert!(
+            store
+                .active_battle(&identity())
+                .expect("应读取中毒击杀后的战斗")
+                .is_none()
+        );
+        let expiration_reason = store
+            .open()
+            .expect("应读取中毒击杀过期账本")
+            .query_row(
+                "SELECT reason FROM battle_effect_expiration WHERE battle_effect_snapshot_id = (SELECT id FROM battle_effect_snapshot WHERE effect_key = 'sting-poison-kill-test')",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("中毒击杀应写入过期账本");
+        assert_eq!(expiration_reason, "battle_end");
+    }
+
+    #[test]
+    fn poison_v1_snapshot_failure_rolls_back_the_whole_skill_action() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        let poison = poison_effect_package(
+            "poison-v1-rollback-test",
+            "sting-poison-rollback-test",
+            "sting",
+            5,
+            3,
+            "refresh",
+        );
+        store
+            .stage_content_package(&poison)
+            .expect("中毒回滚包应暂存");
+        let validation = store
+            .validate_content_draft("poison-v1-rollback-test", 1)
+            .expect("中毒回滚包应校验");
+        assert!(validation.errors.is_empty(), "{validation:?}");
+        store
+            .publish_content_draft("poison-v1-rollback-test", 1)
+            .expect("中毒回滚包应发布");
+        absorb_test_soul_ring_from_beast(
+            &store,
+            &identity(),
+            "哥布林",
+            "poison-v1-rollback-source",
+        );
+
+        let player_id = player_id_for(&store, &identity());
+        store
+            .open()
+            .expect("应打开中毒回滚测试数据库")
+            .execute(
+                "UPDATE player SET level = 10, hp = 1000, max_hp = 1000, soul_power = 1000, max_soul_power = 1000, strength = 1, endurance = 1000, perception = 0, luck = 0, updated_at = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置中毒回滚测试属性");
+        let started = store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "哥布林",
+                &transfer_operation("挑战", "poison-v1-rollback-challenge"),
+            )
+            .expect("应创建中毒回滚测试战斗");
+        store
+            .open()
+            .expect("应打开中毒快照失败测试数据库")
+            .execute_batch(
+                r#"
+                CREATE TRIGGER battle_effect_snapshot_poison_test_abort
+                BEFORE INSERT ON battle_effect_snapshot
+                BEGIN SELECT RAISE(ABORT, 'test poison snapshot failure'); END;
+                "#,
+            )
+            .expect("应安装中毒快照失败触发器");
+
+        let error = store
+            .use_skill_battle_with_operation(
+                &identity(),
+                "毒刺",
+                &transfer_operation("释放技能", "poison-v1-rollback-use"),
+            )
+            .expect_err("中毒快照失败必须回滚整个技能动作");
+        assert!(error.contains("战斗魂技事件"), "实际错误：{error}");
+        assert_eq!(
+            store
+                .player_status(&identity())
+                .expect("应读取中毒回滚后的玩家")
+                .expect("中毒回滚后的玩家应存在")
+                .soul_power,
+            1000
+        );
+        let battle = store
+            .active_battle(&identity())
+            .expect("应读取中毒回滚后的战斗")
+            .expect("中毒回滚后战斗应仍处于 active");
+        assert_eq!(battle.id, started.battle.id);
+        assert_eq!(battle.action_count, 0);
+        let counts = store
+            .open()
+            .expect("应检查中毒回滚结果")
+            .query_row(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM battle_event WHERE source_message_id = 'poison-v1-rollback-use'),
+                    (SELECT COUNT(*) FROM operation_log WHERE source_message_id = 'poison-v1-rollback-use'),
+                    (SELECT COUNT(*) FROM battle_skill_event WHERE source_message_id = 'poison-v1-rollback-use'),
+                    (SELECT COUNT(*) FROM battle_effect_snapshot WHERE source_message_id = 'poison-v1-rollback-use'),
+                    (SELECT COUNT(*) FROM battle_effect_expiration WHERE battle_id = ?1)
+                "#,
+                [started.battle.id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .expect("应统计中毒回滚结果");
+        assert_eq!(counts, (0, 0, 0, 0, 0));
     }
 
     #[test]
