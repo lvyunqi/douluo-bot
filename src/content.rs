@@ -759,7 +759,8 @@ fn range_field(errors: &mut Vec<String>, field: &str, key: &str, value: i64, min
     }
 }
 
-fn is_content_key(value: &str) -> bool {
+/// 判断 HTTP 路由与内容解析共用的稳定内容键格式。
+pub(crate) fn is_content_key(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 96
         && value == value.trim()

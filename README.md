@@ -9,7 +9,7 @@ QimenBot 动态插件版斗罗大陆文字游戏，插件 ID 为 `douluo-game`�
 - 跨协议消息：兼容 OneBot 11 与 QQ 官方机器人，回复优先使用通用消息段。
 - 插图支持：支持本地 Base64 图片和公网 HTTPS 图片地址；未配置图片时仍返回完整文本。
 - 可选媒体服务：仓库包含一个独立的静态图片服务示例，可用于向 QQ 官方 Markdown 暴露公网图片。
-- 可选管理服务：默认仅回环监听，提供健康检查、短期管理会话、当前内容 revision 与内容元数据游标列表。
+- 可选管理服务：默认仅回环监听，提供健康检查、短期管理会话、内容元数据、已暂存草稿的校验/发布与追加式管理员审计。
 
 ## Requirements
 
@@ -89,9 +89,13 @@ remote_base_url = ""
 - `GET /api/v1/content/active`：读取当前激活内容 revision，要求 `content_admin` 会话。
 - `GET /api/v1/content/revisions`：读取 revision 元数据和成员数量，使用 `after_id` 游标与 `limit=1..100`。
 - `GET /api/v1/content/drafts`：读取草稿状态、哈希和校验错误，使用相同游标；不返回草稿正文。
+- `GET /api/v1/content/drafts/{package_key}/{package_revision}/diff`：读取草稿相对当前 active revision 的成员差异；不返回正文且不改变草稿状态。
 - `GET /api/v1/content/activations`：读取追加式 activation 历史，使用相同游标。
+- `POST /api/v1/content/drafts/{package_key}/{package_revision}/validate`：校验已暂存草稿；要求 `content_admin` 会话和 `X-CSRF-Token`，不接收草稿正文。
+- `POST /api/v1/content/drafts/{package_key}/{package_revision}/publish`：发布已校验草稿；首次发布返回 `201`，重放返回 `200`，同样要求 CSRF。
+- `GET /api/v1/content/operations`：读取追加式管理员操作审计，使用相同游标；不会返回会话指纹。
 
-当前版本尚未提供草稿正文、内容上传、差异预览或发布/回滚写接口；这些操作只会在后续版本通过 Store API 实现。
+写路由只操作已经由受控文件入口暂存的草稿，并通过 Store 事务同步写入管理员审计；不提供草稿正文、内容上传、目录直写或 rollback 接口，也不会迁移或改写玩家、魂环或魂技状态。
 
 ## Common Commands
 

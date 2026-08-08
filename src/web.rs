@@ -13,7 +13,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use getrandom::fill;
 use serde::{Deserialize, Serialize};
@@ -23,9 +23,11 @@ use tokio::{net::TcpListener, runtime::Builder as RuntimeBuilder, sync::oneshot}
 
 use crate::{
     config::WebConfig,
+    content::is_content_key,
     store::{
-        ContentDraftDiffMember, ContentDraftRecord, ContentRevisionActivationRecord,
-        ContentRevisionRecord, Store,
+        ContentAdminAuditActor, ContentAdminOperationRecord, ContentDraftDiffMember,
+        ContentDraftRecord, ContentRevisionActivationRecord, ContentRevisionRecord,
+        ContentValidationReport, Store,
     },
 };
 
@@ -45,7 +47,10 @@ impl AdminRole {
     fn allows(self, permission: AdminPermission) -> bool {
         matches!(
             (self, permission),
-            (Self::ContentAdmin, AdminPermission::ContentRead)
+            (
+                Self::ContentAdmin,
+                AdminPermission::ContentRead | AdminPermission::ContentWrite
+            )
         )
     }
 
@@ -60,6 +65,7 @@ impl AdminRole {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AdminPermission {
     ContentRead,
+    ContentWrite,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -259,7 +265,16 @@ fn build_router(state: Arc<ManagementState>) -> Router {
             "/api/v1/content/drafts/{package_key}/{package_revision}/diff",
             get(content_draft_diff),
         )
+        .route(
+            "/api/v1/content/drafts/{package_key}/{package_revision}/validate",
+            post(validate_content_draft),
+        )
+        .route(
+            "/api/v1/content/drafts/{package_key}/{package_revision}/publish",
+            post(publish_content_draft),
+        )
         .route("/api/v1/content/activations", get(content_activations))
+        .route("/api/v1/content/operations", get(content_admin_operations))
         .layer(DefaultBodyLimit::max(MAX_API_BODY_BYTES))
         .with_state(state)
 }
@@ -352,6 +367,43 @@ struct ContentDraftDiffResponse {
     active_member_count: i64,
     added_members: Vec<ContentDraftDiffMemberResponse>,
     projected_member_count: i64,
+}
+
+/// 草稿校验结果只返回可运营的摘要，不回传草稿正文。
+#[derive(Serialize)]
+struct ContentValidationResponse {
+    package_key: String,
+    package_revision: i64,
+    content_hash: String,
+    valid: bool,
+    errors: Vec<String>,
+    wuhun_count: usize,
+    skill_count: usize,
+    effect_count: usize,
+    soul_beast_count: usize,
+    soul_ring_count: usize,
+}
+
+#[derive(Serialize)]
+struct ContentPublishResponse {
+    revision: ContentRevisionRecord,
+    active_revision_id: i64,
+    member_count: i64,
+    replayed: bool,
+}
+
+/// 内容管理员审计 API 不返回会话指纹，避免把会话关联信息扩散到页面响应。
+#[derive(Serialize)]
+struct ContentAdminOperationListEntry {
+    id: i64,
+    actor_role: String,
+    action: String,
+    package_key: String,
+    package_revision: i64,
+    content_hash: String,
+    outcome: String,
+    revision_id: Option<i64>,
+    created_at: i64,
 }
 
 async fn login(
@@ -569,6 +621,83 @@ async fn content_draft_diff(
     )
 }
 
+/// 校验已暂存草稿；请求不携带正文，避免 HTTP 层形成目录直写入口。
+async fn validate_content_draft(
+    State(state): State<Arc<ManagementState>>,
+    headers: HeaderMap,
+    Path((package_key, package_revision)): Path<(String, i64)>,
+) -> Response {
+    let (session_id, session) =
+        match require_permission(&state, &headers, AdminPermission::ContentWrite) {
+            Ok(session) => session,
+            Err(error) => return error.into_response(),
+        };
+    if !csrf_matches(&session, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "csrf_required");
+    }
+    if !valid_content_draft_identity(&package_key, package_revision) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_draft_identity");
+    }
+    let session_fingerprint = session_audit_fingerprint(&session_id);
+    let actor = ContentAdminAuditActor {
+        role: session.role.as_str(),
+        session_fingerprint: &session_fingerprint,
+    };
+    match state
+        .store
+        .validate_content_draft_as_admin(&package_key, package_revision, actor)
+    {
+        Ok(report) => json_response(StatusCode::OK, content_validation_response(report)),
+        Err(error) => content_write_error(&error),
+    }
+}
+
+/// 发布已校验草稿；Store 在同一写事务中复核目录、激活 revision 并追加审计。
+async fn publish_content_draft(
+    State(state): State<Arc<ManagementState>>,
+    headers: HeaderMap,
+    Path((package_key, package_revision)): Path<(String, i64)>,
+) -> Response {
+    let (session_id, session) =
+        match require_permission(&state, &headers, AdminPermission::ContentWrite) {
+            Ok(session) => session,
+            Err(error) => return error.into_response(),
+        };
+    if !csrf_matches(&session, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "csrf_required");
+    }
+    if !valid_content_draft_identity(&package_key, package_revision) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_draft_identity");
+    }
+    let session_fingerprint = session_audit_fingerprint(&session_id);
+    let actor = ContentAdminAuditActor {
+        role: session.role.as_str(),
+        session_fingerprint: &session_fingerprint,
+    };
+    match state
+        .store
+        .publish_content_draft_as_admin(&package_key, package_revision, actor)
+    {
+        Ok(receipt) => {
+            let status = if receipt.replayed {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            };
+            json_response(
+                status,
+                ContentPublishResponse {
+                    revision: receipt.revision,
+                    active_revision_id: receipt.active_revision_id,
+                    member_count: receipt.member_count,
+                    replayed: receipt.replayed,
+                },
+            )
+        }
+        Err(error) => content_write_error(&error),
+    }
+}
+
 async fn content_activations(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
@@ -589,6 +718,34 @@ async fn content_activations(
                     .entries
                     .into_iter()
                     .map(content_activation_list_entry)
+                    .collect(),
+                next_after_id: page.next_after_id,
+            },
+        ),
+        Err(_) => api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    }
+}
+
+async fn content_admin_operations(
+    State(state): State<Arc<ManagementState>>,
+    headers: HeaderMap,
+    Query(query): Query<ContentPageQuery>,
+) -> Response {
+    if let Err(error) = require_permission(&state, &headers, AdminPermission::ContentRead) {
+        return error.into_response();
+    }
+    let (after_id, limit) = match content_page_params(query) {
+        Ok(params) => params,
+        Err(code) => return api_error(StatusCode::BAD_REQUEST, code),
+    };
+    match state.store.list_content_admin_operations(after_id, limit) {
+        Ok(page) => json_response(
+            StatusCode::OK,
+            CursorPage {
+                entries: page
+                    .entries
+                    .into_iter()
+                    .map(content_admin_operation_list_entry)
                     .collect(),
                 next_after_id: page.next_after_id,
             },
@@ -638,6 +795,56 @@ fn content_draft_diff_member_response(
     ContentDraftDiffMemberResponse {
         member_kind: member.member_kind,
         member_key: member.member_key,
+    }
+}
+
+fn content_validation_response(report: ContentValidationReport) -> ContentValidationResponse {
+    let valid = report.errors.is_empty();
+    ContentValidationResponse {
+        package_key: report.package_key,
+        package_revision: report.package_revision,
+        content_hash: report.content_hash,
+        valid,
+        errors: report.errors,
+        wuhun_count: report.wuhun_count,
+        skill_count: report.skill_count,
+        effect_count: report.effect_count,
+        soul_beast_count: report.soul_beast_count,
+        soul_ring_count: report.soul_ring_count,
+    }
+}
+
+fn content_admin_operation_list_entry(
+    operation: ContentAdminOperationRecord,
+) -> ContentAdminOperationListEntry {
+    ContentAdminOperationListEntry {
+        id: operation.id,
+        actor_role: operation.actor_role,
+        action: operation.action,
+        package_key: operation.package_key,
+        package_revision: operation.package_revision,
+        content_hash: operation.content_hash,
+        outcome: operation.outcome,
+        revision_id: operation.revision_id,
+        created_at: operation.created_at,
+    }
+}
+
+fn valid_content_draft_identity(package_key: &str, package_revision: i64) -> bool {
+    package_revision > 0 && is_content_key(package_key)
+}
+
+/// 只按稳定错误类别返回写操作失败，避免把 SQLite 或目录内部细节暴露给管理端。
+fn content_write_error(error: &str) -> Response {
+    match error {
+        "内容草稿不存在" => api_error(StatusCode::NOT_FOUND, "not_found"),
+        "内容草稿必须先通过验证才能发布" => {
+            api_error(StatusCode::CONFLICT, "draft_not_validated")
+        }
+        _ if error.starts_with("内容草稿校验失败：") => {
+            api_error(StatusCode::UNPROCESSABLE_ENTITY, "draft_rejected")
+        }
+        _ => api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
     }
 }
 
@@ -693,6 +900,17 @@ fn purge_expired_sessions(sessions: &mut HashMap<String, AdminSession>) {
 
 fn hash_secret(secret: &str) -> [u8; 32] {
     Sha256::digest(secret.as_bytes()).into()
+}
+
+/// 审计只保存会话哈希，避免把可用的 HttpOnly cookie 值写入数据库。
+fn session_audit_fingerprint(session_id: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut fingerprint = String::with_capacity(64);
+    for byte in hash_secret(session_id) {
+        fingerprint.push(HEX[(byte >> 4) as usize] as char);
+        fingerprint.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    fingerprint
 }
 
 fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
@@ -854,6 +1072,45 @@ mod tests {
             .expect("登录应返回 CSRF token")
             .to_string();
         (cookie, csrf_token)
+    }
+
+    fn effect_package(
+        package_key: &str,
+        effect_key: &str,
+        skill_key: &str,
+    ) -> LoadedContentPackage {
+        let package = ContentPackage {
+            package_key: package_key.to_string(),
+            revision: 1,
+            author: "web-test".to_string(),
+            minimum_runtime: String::new(),
+            wuhun: Vec::new(),
+            skills: Vec::new(),
+            effects: vec![EffectPackageEntry {
+                effect_key: effect_key.to_string(),
+                skill_key: skill_key.to_string(),
+                trigger_kind: "on_release".to_string(),
+                target_kind: "enemy".to_string(),
+                operation: "modify_stat".to_string(),
+                attribute_key: "beast_attack".to_string(),
+                value_mode: "percent_delta".to_string(),
+                value: -10,
+                duration_rounds: 1,
+                chance_percent: 100,
+                stack_policy: "strongest".to_string(),
+                parameters: Default::default(),
+                description: "web write test effect".to_string(),
+                enabled: true,
+            }],
+            soul_beasts: Vec::new(),
+            soul_rings: Vec::new(),
+            transitions: Vec::new(),
+        };
+        LoadedContentPackage {
+            content_hash: content_hash(&package).expect("应计算 web 写入内容包哈希"),
+            package,
+            source_format: "json".to_string(),
+        }
     }
 
     #[tokio::test]
@@ -1145,6 +1402,125 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let payload = response_json(response).await;
         assert_eq!(payload["error"], "invalid_draft_identity");
+    }
+
+    #[tokio::test]
+    async fn content_write_routes_require_csrf_and_append_atomic_audits() {
+        let (_directory, state) = state();
+        let valid = effect_package("web-write-valid", "web-write-effect", "entangle");
+        let rejected = effect_package(
+            "web-write-rejected",
+            "web-write-rejected-effect",
+            "missing-web-write-skill",
+        );
+        state
+            .store
+            .stage_content_package(&valid)
+            .expect("应写入可发布 Web 草稿");
+        state
+            .store
+            .stage_content_package(&rejected)
+            .expect("应写入将被拒绝的 Web 草稿");
+        let app = build_router(state);
+        let validate_path = "/api/v1/content/drafts/web-write-valid/1/validate";
+        let publish_path = "/api/v1/content/drafts/web-write-valid/1/publish";
+
+        let response = request(&app, Method::POST, validate_path, &[], b"").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let (cookie, csrf_token) = login_for_test(&app).await;
+        let read_headers = [("cookie", cookie.as_str())];
+        let write_headers = [
+            ("cookie", cookie.as_str()),
+            ("x-csrf-token", csrf_token.as_str()),
+        ];
+        let response = request(&app, Method::POST, validate_path, &read_headers, b"").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = request(&app, Method::POST, validate_path, &write_headers, b"").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["package_key"], "web-write-valid");
+        assert_eq!(payload["valid"], true);
+        assert!(payload["errors"].as_array().unwrap().is_empty());
+        assert!(payload.get("package_json").is_none());
+
+        let response = request(&app, Method::POST, publish_path, &read_headers, b"").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = request(&app, Method::POST, publish_path, &write_headers, b"").await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let payload = response_json(response).await;
+        assert_eq!(payload["replayed"], false);
+        assert_eq!(payload["revision"]["package_key"], "web-write-valid");
+
+        let response = request(&app, Method::POST, publish_path, &write_headers, b"").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["replayed"], true);
+
+        let response = request(
+            &app,
+            Method::POST,
+            "/api/v1/content/drafts/Web-Write-Invalid/1/validate",
+            &write_headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["error"],
+            "invalid_draft_identity"
+        );
+
+        let response = request(
+            &app,
+            Method::POST,
+            "/api/v1/content/drafts/web-write-rejected/1/validate",
+            &write_headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["valid"], false);
+        assert!(!payload["errors"].as_array().unwrap().is_empty());
+
+        let response = request(&app, Method::GET, "/api/v1/content/operations", &[], b"").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/content/operations?limit=4",
+            &read_headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        let entries = payload["entries"].as_array().expect("应返回审计列表");
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0]["action"], "validate");
+        assert_eq!(entries[0]["outcome"], "validated");
+        assert_eq!(entries[1]["action"], "publish");
+        assert_eq!(entries[1]["outcome"], "published");
+        assert_eq!(entries[2]["outcome"], "replayed");
+        assert_eq!(entries[3]["outcome"], "rejected");
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.get("actor_fingerprint").is_none())
+        );
+
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/content/operations?limit=0",
+            &read_headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(response).await["error"], "invalid_pagination");
     }
 
     #[test]

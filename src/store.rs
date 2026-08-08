@@ -5144,6 +5144,105 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_V30: &str = r#"
+CREATE TABLE content_admin_operation (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_role TEXT NOT NULL CHECK(actor_role = 'content_admin'),
+    actor_fingerprint TEXT NOT NULL CHECK(
+        length(actor_fingerprint) = 64
+        AND actor_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    action TEXT NOT NULL CHECK(action IN ('validate', 'publish')),
+    draft_id INTEGER NOT NULL REFERENCES content_draft(id) ON DELETE RESTRICT,
+    package_key TEXT NOT NULL CHECK(
+        length(package_key) BETWEEN 1 AND 96
+        AND package_key = trim(package_key)
+        AND substr(package_key, 1, 1) GLOB '[a-z]'
+        AND package_key NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    package_revision INTEGER NOT NULL CHECK(package_revision > 0),
+    content_hash TEXT NOT NULL CHECK(
+        length(content_hash) = 64
+        AND content_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    outcome TEXT NOT NULL CHECK(outcome IN ('validated', 'rejected', 'published', 'replayed')),
+    revision_id INTEGER REFERENCES content_revision(id) ON DELETE RESTRICT,
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    CHECK(
+        (action = 'validate' AND (
+            (outcome IN ('validated', 'rejected') AND revision_id IS NULL)
+            OR (outcome = 'published' AND revision_id IS NOT NULL)
+        ))
+        OR (action = 'publish' AND (
+            (outcome IN ('published', 'replayed') AND revision_id IS NOT NULL)
+            OR (outcome = 'rejected' AND revision_id IS NULL)
+        ))
+    )
+) STRICT;
+
+CREATE INDEX content_admin_operation_draft_page
+    ON content_admin_operation(draft_id, id);
+CREATE INDEX content_admin_operation_revision_page
+    ON content_admin_operation(revision_id, id);
+
+-- 审计快照必须对应调用时的草稿与发布状态，防止脱离内容事务伪造管理员操作记录。
+CREATE TRIGGER content_admin_operation_state_guard
+BEFORE INSERT ON content_admin_operation
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM content_draft draft
+ LEFT JOIN content_revision revision ON revision.id = NEW.revision_id
+     WHERE draft.id = NEW.draft_id
+       AND draft.package_key = NEW.package_key
+       AND draft.package_revision = NEW.package_revision
+       AND draft.content_hash = NEW.content_hash
+       AND (
+            NEW.revision_id IS NULL
+            OR (
+                revision.id = NEW.revision_id
+                AND revision.package_key = NEW.package_key
+                AND revision.package_revision = NEW.package_revision
+                AND revision.content_hash = NEW.content_hash
+            )
+       )
+       AND (
+            (NEW.action = 'validate' AND (
+                (NEW.outcome = 'validated' AND draft.status = 'validated' AND NEW.revision_id IS NULL)
+                OR (NEW.outcome = 'rejected' AND draft.status = 'rejected' AND NEW.revision_id IS NULL)
+                OR (NEW.outcome = 'published' AND draft.status = 'published'
+                    AND draft.published_revision_id = NEW.revision_id)
+            ))
+            OR (NEW.action = 'publish' AND (
+                (NEW.outcome IN ('published', 'replayed') AND draft.status = 'published'
+                    AND draft.published_revision_id = NEW.revision_id)
+                OR (NEW.outcome = 'rejected' AND draft.status = 'rejected' AND NEW.revision_id IS NULL)
+            ))
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'content admin operation must match the committed draft state');
+END;
+
+CREATE TRIGGER content_admin_operation_no_update
+BEFORE UPDATE ON content_admin_operation
+BEGIN
+    SELECT RAISE(ABORT, 'content admin operation is append-only');
+END;
+
+CREATE TRIGGER content_admin_operation_no_delete
+BEFORE DELETE ON content_admin_operation
+BEGIN
+    SELECT RAISE(ABORT, 'content admin operation is append-only');
+END;
+
+CREATE TRIGGER content_admin_operation_no_reinsert
+BEFORE INSERT ON content_admin_operation
+WHEN EXISTS(SELECT 1 FROM content_admin_operation WHERE id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'content admin operation id cannot be reused');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -5254,6 +5353,36 @@ pub struct ContentPublishReceipt {
     pub active_revision_id: i64,
     pub member_count: i64,
     pub replayed: bool,
+}
+
+/// 内容管理写操作的调用方；只保存角色与会话指纹，禁止持久化会话明文。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentAdminAuditActor<'a> {
+    pub role: &'a str,
+    pub session_fingerprint: &'a str,
+}
+
+/// 内容管理写操作的追加式审计记录。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentAdminOperationRecord {
+    pub id: i64,
+    pub actor_role: String,
+    pub actor_fingerprint: String,
+    pub action: String,
+    pub draft_id: i64,
+    pub package_key: String,
+    pub package_revision: i64,
+    pub content_hash: String,
+    pub outcome: String,
+    pub revision_id: Option<i64>,
+    pub created_at: i64,
+}
+
+/// 内容管理审计的受限游标分页结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentAdminOperationPage {
+    pub entries: Vec<ContentAdminOperationRecord>,
+    pub next_after_id: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6314,6 +6443,24 @@ fn content_draft_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Co
     })
 }
 
+fn content_admin_operation_record_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ContentAdminOperationRecord> {
+    Ok(ContentAdminOperationRecord {
+        id: row.get(0)?,
+        actor_role: row.get(1)?,
+        actor_fingerprint: row.get(2)?,
+        action: row.get(3)?,
+        draft_id: row.get(4)?,
+        package_key: row.get(5)?,
+        package_revision: row.get(6)?,
+        content_hash: row.get(7)?,
+        outcome: row.get(8)?,
+        revision_id: row.get(9)?,
+        created_at: row.get(10)?,
+    })
+}
+
 fn content_revision_record_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<ContentRevisionRecord> {
@@ -6403,6 +6550,60 @@ fn content_cursor_page_args(after_id: Option<i64>, limit: usize) -> Result<(i64,
     let fetch_limit =
         i64::try_from(limit + 1).map_err(|_| "内容分页数量无法转换为 SQLite 整数".to_string())?;
     Ok((after_id, fetch_limit))
+}
+
+/// 验证进入持久审计的管理员调用方，拒绝角色伪造与会话明文。
+fn validate_content_admin_actor(actor: ContentAdminAuditActor<'_>) -> Result<(), String> {
+    if actor.role != "content_admin" {
+        return Err("内容管理员审计角色不合法".to_string());
+    }
+    if !is_lower_hex_digest(actor.session_fingerprint) {
+        return Err("内容管理员会话指纹不合法".to_string());
+    }
+    Ok(())
+}
+
+fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+        })
+}
+
+/// 将已改变的草稿状态与管理员操作写入同一事务，审计失败时完整回滚业务写入。
+fn record_content_admin_operation(
+    transaction: &Transaction<'_>,
+    actor: ContentAdminAuditActor<'_>,
+    action: &str,
+    draft: &ContentDraftRecord,
+    outcome: &str,
+    revision_id: Option<i64>,
+    timestamp: i64,
+) -> Result<(), String> {
+    validate_content_admin_actor(actor)?;
+    transaction
+        .execute(
+            r#"
+            INSERT INTO content_admin_operation(
+                actor_role, actor_fingerprint, action, draft_id, package_key,
+                package_revision, content_hash, outcome, revision_id, created_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                actor.role,
+                actor.session_fingerprint,
+                action,
+                draft.id,
+                draft.package_key,
+                draft.package_revision,
+                draft.content_hash,
+                outcome,
+                revision_id,
+                timestamp,
+            ],
+        )
+        .map_err(|error| format!("写入内容管理员审计失败：{error}"))?;
+    Ok(())
 }
 
 fn content_revision_member_count(connection: &Connection, revision_id: i64) -> Result<i64, String> {
@@ -7245,6 +7446,26 @@ impl Store {
         package_key: &str,
         package_revision: i64,
     ) -> Result<ContentValidationReport, String> {
+        self.validate_content_draft_with_actor(package_key, package_revision, None)
+    }
+
+    /// 以已认证管理员身份校验草稿，并将校验结果与审计记录原子提交。
+    pub fn validate_content_draft_as_admin(
+        &self,
+        package_key: &str,
+        package_revision: i64,
+        actor: ContentAdminAuditActor<'_>,
+    ) -> Result<ContentValidationReport, String> {
+        validate_content_admin_actor(actor)?;
+        self.validate_content_draft_with_actor(package_key, package_revision, Some(actor))
+    }
+
+    fn validate_content_draft_with_actor(
+        &self,
+        package_key: &str,
+        package_revision: i64,
+        actor: Option<ContentAdminAuditActor<'_>>,
+    ) -> Result<ContentValidationReport, String> {
         let mut connection = self.open()?;
         let transaction = self.begin_immediate(&mut connection, "开始内容草稿校验事务失败")?;
         let draft = load_content_draft_by_identity(&transaction, package_key, package_revision)?
@@ -7256,7 +7477,7 @@ impl Store {
         if expected_hash != draft.content_hash {
             return Err("内容草稿哈希与保存内容不一致".to_string());
         }
-        let errors = if draft.status == "published" {
+        let (errors, audit_outcome, audit_revision_id) = if draft.status == "published" {
             let mut errors = validate_shape(&package);
             let published_revision_id = draft
                 .published_revision_id
@@ -7270,11 +7491,18 @@ impl Store {
             {
                 errors.push("已发布内容 revision 与草稿不一致".to_string());
             }
-            errors
+            (errors, "published", Some(published_revision_id))
         } else {
-            validate_content_package_against_database(&transaction, &package)?
+            let errors = validate_content_package_against_database(&transaction, &package)?;
+            let outcome = if errors.is_empty() {
+                "validated"
+            } else {
+                "rejected"
+            };
+            (errors, outcome, None)
         };
         let report = content_validation_report(&package, expected_hash, errors);
+        let timestamp = now_timestamp()?;
         if draft.status != "published" {
             let validation_json = serde_json::to_string(&report.errors)
                 .map_err(|error| format!("序列化内容校验结果失败：{error}"))?;
@@ -7286,9 +7514,20 @@ impl Store {
             transaction
                 .execute(
                     "UPDATE content_draft SET status = ?1, validation_json = ?2, updated_at = ?3 WHERE id = ?4",
-                    params![status, validation_json, now_timestamp()?, draft.id],
+                    params![status, validation_json, timestamp, draft.id],
                 )
                 .map_err(|error| format!("保存内容草稿校验结果失败：{error}"))?;
+        }
+        if let Some(actor) = actor {
+            record_content_admin_operation(
+                &transaction,
+                actor,
+                "validate",
+                &draft,
+                audit_outcome,
+                audit_revision_id,
+                timestamp,
+            )?;
         }
         transaction
             .commit()
@@ -7302,6 +7541,26 @@ impl Store {
         package_key: &str,
         package_revision: i64,
     ) -> Result<ContentPublishReceipt, String> {
+        self.publish_content_draft_with_actor(package_key, package_revision, None)
+    }
+
+    /// 以已认证管理员身份发布草稿，并将发布或重放结果与审计原子提交。
+    pub fn publish_content_draft_as_admin(
+        &self,
+        package_key: &str,
+        package_revision: i64,
+        actor: ContentAdminAuditActor<'_>,
+    ) -> Result<ContentPublishReceipt, String> {
+        validate_content_admin_actor(actor)?;
+        self.publish_content_draft_with_actor(package_key, package_revision, Some(actor))
+    }
+
+    fn publish_content_draft_with_actor(
+        &self,
+        package_key: &str,
+        package_revision: i64,
+        actor: Option<ContentAdminAuditActor<'_>>,
+    ) -> Result<ContentPublishReceipt, String> {
         let mut connection = self.open()?;
         let transaction = self.begin_immediate(&mut connection, "开始内容发布事务失败")?;
         let draft = load_content_draft_by_identity(&transaction, package_key, package_revision)?
@@ -7313,16 +7572,28 @@ impl Store {
             let revision = load_content_revision_by_id(&transaction, revision_id)?
                 .ok_or_else(|| "已发布内容 revision 不存在".to_string())?;
             let mut active_revision_id = current_content_revision_id(&transaction)?;
+            let timestamp = now_timestamp()?;
             if active_revision_id != revision_id {
                 transaction
                     .execute(
                         "INSERT INTO content_revision_activation(revision_id, reason, created_at) VALUES(?1, 'replay', ?2)",
-                        params![revision_id, now_timestamp()?],
+                        params![revision_id, timestamp],
                     )
                     .map_err(|error| format!("重新激活已发布内容 revision 失败：{error}"))?;
                 active_revision_id = revision_id;
             }
             let member_count = content_revision_member_count(&transaction, revision_id)?;
+            if let Some(actor) = actor {
+                record_content_admin_operation(
+                    &transaction,
+                    actor,
+                    "publish",
+                    &draft,
+                    "replayed",
+                    Some(revision_id),
+                    timestamp,
+                )?;
+            }
             transaction
                 .commit()
                 .map_err(|error| format!("提交内容发布重放查询失败：{error}"))?;
@@ -7347,12 +7618,24 @@ impl Store {
         if !errors.is_empty() {
             let validation_json = serde_json::to_string(&errors)
                 .map_err(|error| format!("序列化内容校验失败失败：{error}"))?;
+            let timestamp = now_timestamp()?;
             transaction
                 .execute(
                     "UPDATE content_draft SET status = 'rejected', validation_json = ?1, updated_at = ?2 WHERE id = ?3",
-                    params![validation_json, now_timestamp()?, draft.id],
+                    params![validation_json, timestamp, draft.id],
                 )
                 .map_err(|error| format!("更新被拒绝内容草稿失败：{error}"))?;
+            if let Some(actor) = actor {
+                record_content_admin_operation(
+                    &transaction,
+                    actor,
+                    "publish",
+                    &draft,
+                    "rejected",
+                    None,
+                    timestamp,
+                )?;
+            }
             transaction
                 .commit()
                 .map_err(|error| format!("提交被拒绝内容草稿失败：{error}"))?;
@@ -7436,6 +7719,17 @@ impl Store {
         let revision = load_content_revision_by_id(&transaction, revision_id)?
             .ok_or_else(|| "保存内容 revision 后无法读取记录".to_string())?;
         let member_count = content_revision_member_count(&transaction, revision_id)?;
+        if let Some(actor) = actor {
+            record_content_admin_operation(
+                &transaction,
+                actor,
+                "publish",
+                &draft,
+                "published",
+                Some(revision_id),
+                timestamp,
+            )?;
+        }
         transaction
             .commit()
             .map_err(|error| format!("提交内容发布事务失败：{error}"))?;
@@ -7641,6 +7935,46 @@ impl Store {
         })
     }
 
+    /// 按稳定自增 ID 游标读取内容管理员写操作审计，不返回会话明文。
+    pub fn list_content_admin_operations(
+        &self,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> Result<ContentAdminOperationPage, String> {
+        let (after_id, fetch_limit) = content_cursor_page_args(after_id, limit)?;
+        let connection = self.open()?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT id, actor_role, actor_fingerprint, action, draft_id,
+                       package_key, package_revision, content_hash, outcome,
+                       revision_id, created_at
+                  FROM content_admin_operation
+                 WHERE id > ?1
+                 ORDER BY id ASC
+                 LIMIT ?2
+                "#,
+            )
+            .map_err(|error| format!("准备内容管理员审计分页查询失败：{error}"))?;
+        let mut entries = statement
+            .query_map(
+                params![after_id, fetch_limit],
+                content_admin_operation_record_from_row,
+            )
+            .map_err(|error| format!("查询内容管理员审计分页失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析内容管理员审计分页失败：{error}"))?;
+        let has_more = entries.len() > limit;
+        entries.truncate(limit);
+        let next_after_id = has_more
+            .then(|| entries.last().map(|entry| entry.id))
+            .flatten();
+        Ok(ContentAdminOperationPage {
+            entries,
+            next_after_id,
+        })
+    }
+
     /// 读取最后一条 activation 所指向的当前内容 revision。
     #[allow(dead_code)]
     pub fn active_content_revision(&self) -> Result<ContentRevisionRecord, String> {
@@ -7745,7 +8079,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
                     format!(
-                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29 失败：{error}"
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30 失败：{error}"
                     )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
@@ -8194,10 +8528,25 @@ impl Store {
                 validate_v29_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 30)? {
+                transaction
+                    .execute_batch(MIGRATION_V30)
+                    .map_err(|error| format!("执行数据库迁移 v30 失败：{error}"))?;
+                validate_v30_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(30, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v30 失败：{error}"))?;
+            } else {
+                validate_v30_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30 失败：{error}"
                 )
             })?;
             Ok(())
@@ -8233,6 +8582,7 @@ impl Store {
                 validate_v27_schema(connection)?;
                 validate_v28_schema(connection)?;
                 validate_v29_schema(connection)?;
+                validate_v30_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -23874,7 +24224,9 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
                     | "battle_skill_event_scope_guard"
                     | "battle_effect_snapshot_scope_guard"
                     | "soul_ring_drop_scope_guard"
-            );
+            )
+            || (name == "content_admin_operation_state_guard"
+                && table == "content_admin_operation");
         let touches_v23 = matches!(
             table.as_str(),
             "content_revision"
@@ -24954,6 +25306,179 @@ fn validate_v29_schema(connection: &Connection) -> Result<(), String> {
         {
             return Err(format!(
                 "v29 触发器 {name} 未声明却引用玩家快捷键结构 {table}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 校验内容管理员审计表与草稿/发布状态的原子关联，损坏时拒绝启动。
+fn validate_v30_schema(connection: &Connection) -> Result<(), String> {
+    validate_v29_schema(connection)?;
+
+    let actual = table_columns_with_type(connection, "content_admin_operation")?;
+    let expected = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("actor_role", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("actor_fingerprint", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("action", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("draft_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("package_key", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("package_revision", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("content_hash", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("outcome", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("revision_id", "INTEGER", false, false, None, 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+    ];
+    if actual != expected {
+        return Err(format!(
+            "v30 表 content_admin_operation 字段不匹配：{actual:?}"
+        ));
+    }
+
+    validate_v10_table_sql(
+        connection,
+        "content_admin_operation",
+        &[
+            ") STRICT",
+            "ACTOR_ROLE = 'CONTENT_ADMIN'",
+            "ACTION IN ('VALIDATE', 'PUBLISH')",
+            "OUTCOME IN ('VALIDATED', 'REJECTED', 'PUBLISHED', 'REPLAYED')",
+            "REFERENCES CONTENT_DRAFT(ID) ON DELETE RESTRICT",
+            "REFERENCES CONTENT_REVISION(ID) ON DELETE RESTRICT",
+        ],
+    )
+    .map_err(|error| error.replace("v10", "v30"))?;
+    validate_v9_foreign_keys(
+        connection,
+        "content_admin_operation",
+        &[
+            ("content_draft", "draft_id", "id", "NO ACTION", "RESTRICT"),
+            (
+                "content_revision",
+                "revision_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+        ],
+    )
+    .map_err(|error| error.replace("v9", "v30"))?;
+    validate_v10_custom_index_set(
+        connection,
+        "content_admin_operation",
+        &[
+            "content_admin_operation_draft_page",
+            "content_admin_operation_revision_page",
+        ],
+    )
+    .map_err(|error| error.replace("v10", "v30"))?;
+    for (name, columns) in [
+        (
+            "content_admin_operation_draft_page",
+            &["draft_id", "id"][..],
+        ),
+        (
+            "content_admin_operation_revision_page",
+            &["revision_id", "id"][..],
+        ),
+    ] {
+        validate_v7_index(connection, name, false, columns, false)
+            .map_err(|error| error.replace("v7", "v30"))?;
+    }
+
+    let expected_triggers = [
+        (
+            "content_admin_operation_state_guard",
+            "content_admin_operation",
+            &["BEFORE INSERT", "JOIN CONTENT_REVISION", "RAISE(ABORT"] as &[&str],
+        ),
+        (
+            "content_admin_operation_no_update",
+            "content_admin_operation",
+            &["BEFORE UPDATE", "RAISE(ABORT"],
+        ),
+        (
+            "content_admin_operation_no_delete",
+            "content_admin_operation",
+            &["BEFORE DELETE", "RAISE(ABORT"],
+        ),
+        (
+            "content_admin_operation_no_reinsert",
+            "content_admin_operation",
+            &["BEFORE INSERT", "RAISE(ABORT"],
+        ),
+    ];
+    for (name, table, markers) in expected_triggers {
+        let (actual_table, trigger_sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v30 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库缺少 v30 触发器 {name}"))?;
+        let trigger_sql = trigger_sql.to_ascii_uppercase();
+        if actual_table != table || markers.iter().any(|marker| !trigger_sql.contains(marker)) {
+            return Err(format!("v30 触发器 {name} 契约不匹配"));
+        }
+    }
+
+    let invalid_audit = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM content_admin_operation operation
+             LEFT JOIN content_draft draft ON draft.id = operation.draft_id
+             LEFT JOIN content_revision revision ON revision.id = operation.revision_id
+                 WHERE draft.id IS NULL
+                    OR draft.package_key <> operation.package_key
+                    OR draft.package_revision <> operation.package_revision
+                    OR (
+                        operation.revision_id IS NOT NULL AND (
+                            revision.id IS NULL
+                            OR revision.package_key <> operation.package_key
+                            OR revision.package_revision <> operation.package_revision
+                            OR revision.content_hash <> operation.content_hash
+                        )
+                    )
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v30 内容管理员审计失败：{error}"))?;
+    if invalid_audit {
+        return Err("v30 检测到与草稿身份或 revision 快照不一致的管理员审计".to_string());
+    }
+
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v30 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v30 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v30 全库触发器失败：{error}"))?;
+    for (name, table, trigger_sql) in triggers {
+        let declared = expected_triggers
+            .iter()
+            .any(|(expected_name, expected_table, _)| {
+                name == *expected_name && table == *expected_table
+            });
+        if (table == "content_admin_operation"
+            || sql_mentions_identifier(&trigger_sql, "content_admin_operation"))
+            && !declared
+        {
+            return Err(format!(
+                "v30 触发器 {name} 未声明却引用内容管理员审计结构 {table}"
             ));
         }
     }
@@ -35691,6 +36216,184 @@ mod tests {
             .map(|entry| entry.command.as_str())
             .collect::<Vec<_>>();
         assert_eq!(commands, vec!["设置快捷键", "设置快捷键", "删除快捷键"]);
+    }
+
+    #[test]
+    fn v30_content_admin_audit_is_atomic_and_replay_safe() {
+        let (directory, store) = test_store();
+        let actor = ContentAdminAuditActor {
+            role: "content_admin",
+            session_fingerprint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        };
+        let valid = content_effect_package("v30-valid", "v30-valid-effect", "entangle");
+        store
+            .stage_content_package(&valid)
+            .expect("应写入 v30 可发布草稿");
+        assert!(
+            store
+                .validate_content_draft_as_admin("v30-valid", 1, actor)
+                .expect("管理员应校验 v30 草稿")
+                .errors
+                .is_empty()
+        );
+        let published = store
+            .publish_content_draft_as_admin("v30-valid", 1, actor)
+            .expect("管理员应发布 v30 草稿");
+        assert!(!published.replayed);
+        assert!(
+            store
+                .publish_content_draft_as_admin("v30-valid", 1, actor)
+                .expect("管理员重复发布应重放")
+                .replayed
+        );
+
+        let rejected =
+            content_effect_package("v30-rejected", "v30-rejected-effect", "missing-v30-skill");
+        store
+            .stage_content_package(&rejected)
+            .expect("应写入 v30 被拒绝草稿");
+        assert!(
+            !store
+                .validate_content_draft_as_admin("v30-rejected", 1, actor)
+                .expect("管理员应返回 v30 拒绝报告")
+                .errors
+                .is_empty()
+        );
+
+        let operations = store
+            .list_content_admin_operations(None, 100)
+            .expect("应读取 v30 管理员审计");
+        assert_eq!(operations.entries.len(), 4);
+        assert_eq!(
+            operations
+                .entries
+                .iter()
+                .map(|entry| (entry.action.as_str(), entry.outcome.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("validate", "validated"),
+                ("publish", "published"),
+                ("publish", "replayed"),
+                ("validate", "rejected"),
+            ]
+        );
+        assert!(
+            operations
+                .entries
+                .iter()
+                .all(|entry| entry.actor_fingerprint == actor.session_fingerprint)
+        );
+        assert_eq!(
+            operations.entries[1].revision_id,
+            Some(published.revision.id)
+        );
+        assert_eq!(
+            operations.entries[2].revision_id,
+            Some(published.revision.id)
+        );
+        assert!(operations.entries[3].revision_id.is_none());
+
+        let restaged = content_effect_package("v30-rejected", "v30-restaged-effect", "entangle");
+        let restaged_draft = store
+            .stage_content_package(&restaged)
+            .expect("被拒绝草稿应允许以相同身份重新暂存");
+        assert_eq!(restaged_draft.status, "draft");
+        drop(store);
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("重暂存后历史管理员审计不应阻断启动");
+
+        let invalid_actor = ContentAdminAuditActor {
+            role: "owner",
+            session_fingerprint: actor.session_fingerprint,
+        };
+        assert!(
+            store
+                .validate_content_draft_as_admin("v30-valid", 1, invalid_actor)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .list_content_admin_operations(None, 100)
+                .expect("非法角色后审计应保持不变")
+                .entries
+                .len(),
+            4
+        );
+
+        let atomic = content_effect_package("v30-atomic", "v30-atomic-effect", "entangle");
+        store
+            .stage_content_package(&atomic)
+            .expect("应写入 v30 原子性草稿");
+        let connection = store.open().expect("应打开 v30 原子性数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER content_admin_operation_test_failure
+                BEFORE INSERT ON content_admin_operation
+                BEGIN
+                    SELECT RAISE(ABORT, 'test audit failure');
+                END;
+                "#,
+            )
+            .expect("应构造审计写入失败");
+        drop(connection);
+        assert!(
+            store
+                .validate_content_draft_as_admin("v30-atomic", 1, actor)
+                .is_err()
+        );
+        let atomic_draft = store
+            .list_content_drafts(None, 100)
+            .expect("应读取原子性草稿")
+            .entries
+            .into_iter()
+            .find(|entry| entry.package_key == "v30-atomic")
+            .expect("应保留 v30 原子性草稿");
+        assert_eq!(atomic_draft.status, "draft");
+        assert_eq!(
+            store
+                .list_content_admin_operations(None, 100)
+                .expect("审计失败后不应追加记录")
+                .entries
+                .len(),
+            4
+        );
+    }
+
+    fn assert_v30_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v30 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v30 迁移应成功");
+        let connection = store.open().expect("应打开 v30 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v30 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v30 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v30") || error.contains("content_admin_operation"),
+            "v30 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    #[test]
+    fn recorded_v30_with_damaged_schema_or_trigger_fails_closed() {
+        for mutation in [
+            "DROP TABLE content_admin_operation;",
+            "DROP INDEX content_admin_operation_draft_page;",
+            "DROP TRIGGER content_admin_operation_state_guard;",
+        ] {
+            assert_v30_damage_fails_closed(mutation);
+        }
+        assert_v30_damage_fails_closed(
+            r#"
+            CREATE TRIGGER content_admin_operation_shadow
+            AFTER INSERT ON content_admin_operation
+            BEGIN SELECT 1; END;
+            "#,
+        );
     }
 
     fn assert_v29_damage_fails_closed(mutation: &str) {
