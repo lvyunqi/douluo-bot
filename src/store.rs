@@ -4276,381 +4276,30 @@ BEGIN
 END;
 "#;
 
-// v24.3.4 为玩家魂技建立追加式迁移账本和当前投影，不改写历史技能或战斗事件。
-const MIGRATION_V26: &str = r#"
-CREATE TABLE player_skill_migration_request (
-    operation_log_id INTEGER PRIMARY KEY REFERENCES operation_log(id) ON DELETE RESTRICT,
-    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
-    source_player_skill_id INTEGER NOT NULL REFERENCES player_skill(id) ON DELETE RESTRICT,
-    target_skill_key TEXT NOT NULL REFERENCES skill(skill_key) ON DELETE RESTRICT,
-    source_revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
-    target_revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
-    level_before INTEGER NOT NULL CHECK(level_before BETWEEN 1 AND 10),
-    proficiency_before INTEGER NOT NULL CHECK(proficiency_before BETWEEN 0 AND 4500),
-    equipped_before INTEGER NOT NULL CHECK(equipped_before IN (0, 1)),
-    source_message_id TEXT NOT NULL CHECK(
-        length(source_message_id) BETWEEN 1 AND 256
-        AND source_message_id = trim(source_message_id)
-        AND instr(source_message_id, char(0)) = 0
-        AND source_message_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
-    ),
-    created_at INTEGER NOT NULL CHECK(created_at >= 0),
-    UNIQUE(player_id, source_message_id)
-) STRICT;
+// v27 只清理错误的 v26 数据库结构；它不是玩家魂环或魂技的转移功能。
+const MIGRATION_V27: &str = r#"
+DROP TRIGGER IF EXISTS content_revision_activation_skill_migration_guard;
+DROP TRIGGER IF EXISTS player_skill_migration_request_no_update;
+DROP TRIGGER IF EXISTS player_skill_migration_request_no_reinsert;
+DROP TRIGGER IF EXISTS player_skill_migration_request_scope_guard;
+DROP TRIGGER IF EXISTS player_skill_migration_request_delete_guard;
+DROP TRIGGER IF EXISTS player_skill_migration_no_update;
+DROP TRIGGER IF EXISTS player_skill_migration_no_delete;
+DROP TRIGGER IF EXISTS player_skill_migration_no_reinsert;
+DROP TRIGGER IF EXISTS player_skill_migration_scope_guard;
+DROP TRIGGER IF EXISTS skill_loadout_event_scope_guard;
+DROP TRIGGER IF EXISTS skill_progress_event_scope_guard;
+DROP VIEW IF EXISTS content_active_skill_transition_terminal;
+DROP VIEW IF EXISTS player_skill_current_projection;
+DROP TABLE IF EXISTS player_skill_migration_request;
+DROP TABLE IF EXISTS player_skill_migration;
+DROP VIEW content_revision_visible_member;
 
-CREATE TABLE player_skill_migration (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
-    source_player_skill_id INTEGER NOT NULL REFERENCES player_skill(id) ON DELETE RESTRICT,
-    source_skill_key TEXT NOT NULL REFERENCES skill(skill_key) ON DELETE RESTRICT,
-    target_player_skill_id INTEGER NOT NULL REFERENCES player_skill(id) ON DELETE RESTRICT,
-    target_skill_key TEXT NOT NULL REFERENCES skill(skill_key) ON DELETE RESTRICT,
-    source_revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
-    target_revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
-    level_before INTEGER NOT NULL CHECK(level_before BETWEEN 1 AND 10),
-    proficiency_before INTEGER NOT NULL CHECK(proficiency_before BETWEEN 0 AND 4500),
-    equipped_before INTEGER NOT NULL CHECK(equipped_before IN (0, 1)),
-    level_after INTEGER NOT NULL CHECK(level_after BETWEEN 1 AND 10),
-    proficiency_after INTEGER NOT NULL CHECK(proficiency_after BETWEEN 0 AND 4500),
-    equipped_after INTEGER NOT NULL CHECK(equipped_after IN (0, 1)),
-    source_message_id TEXT NOT NULL CHECK(
-        length(source_message_id) BETWEEN 1 AND 256
-        AND source_message_id = trim(source_message_id)
-        AND instr(source_message_id, char(0)) = 0
-        AND source_message_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
-    ),
-    operation_log_id INTEGER NOT NULL UNIQUE REFERENCES operation_log(id) ON DELETE RESTRICT,
-    created_at INTEGER NOT NULL CHECK(created_at >= 0),
-    UNIQUE(source_player_skill_id),
-    UNIQUE(target_player_skill_id),
-    UNIQUE(player_id, source_message_id),
-    CHECK(source_player_skill_id <> target_player_skill_id),
-    CHECK(source_skill_key <> target_skill_key),
-    CHECK(level_after = level_before),
-    CHECK(proficiency_after = proficiency_before),
-    CHECK(equipped_after = equipped_before)
-) STRICT;
-
-CREATE INDEX player_skill_migration_player_page
-    ON player_skill_migration(player_id, id);
-CREATE INDEX player_skill_migration_target_revision
-    ON player_skill_migration(target_revision_id, target_skill_key, id);
-
--- 迁移后只让 target 出现在当前技能投影中，source 继续作为历史记录保存。
-CREATE VIEW player_skill_current_projection AS
-SELECT player_skill.*
-  FROM player_skill
- WHERE NOT EXISTS(
-    SELECT 1
-      FROM player_skill_migration migration
-     WHERE migration.source_player_skill_id = player_skill.id
- );
-
--- 将 active revision 中可能存在的替换链收敛为可迁移的最终魂技 target。
-CREATE VIEW content_active_skill_transition_terminal AS
-WITH RECURSIVE
-active_revision(revision_id, source_revision_id) AS (
-    SELECT revision.id, revision.parent_revision_id
-      FROM content_revision revision
-     WHERE revision.id = (
-         SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1
-     )
-),
-walk(source_key, current_key, depth) AS (
-    SELECT transition.source_key, transition.target_key, 1
-      FROM content_revision_transition transition
-      JOIN active_revision active ON active.revision_id = transition.revision_id
-     WHERE transition.entity_kind = 'skill' AND transition.target_key IS NOT NULL
-    UNION ALL
-    SELECT walk.source_key, transition.target_key, walk.depth + 1
-      FROM walk
-      JOIN active_revision active
-      JOIN content_revision_transition transition
-        ON transition.revision_id = active.revision_id
-       AND transition.entity_kind = 'skill'
-       AND transition.source_key = walk.current_key
-     WHERE transition.target_key IS NOT NULL
-       AND walk.depth < 200
-)
-SELECT active.revision_id,
-       active.source_revision_id,
-       walk.source_key,
-       walk.current_key AS target_key
-  FROM active_revision active
- CROSS JOIN walk
- WHERE NOT EXISTS(
-    SELECT 1
-      FROM content_revision_transition next_transition
-     WHERE next_transition.revision_id = active.revision_id
-       AND next_transition.entity_kind = 'skill'
-       AND next_transition.source_key = walk.current_key
-       AND next_transition.target_key IS NOT NULL
- );
-
--- 激活任一 revision 前，已迁移魂技的 target 必须继续对当前玩家可见。
-CREATE TRIGGER content_revision_activation_skill_migration_guard
-BEFORE INSERT ON content_revision_activation
-WHEN EXISTS(
-    SELECT 1
-      FROM player_skill_migration migration
-     WHERE NOT EXISTS(
-        SELECT 1
-          FROM content_revision_visible_member member
-         WHERE member.revision_id = NEW.revision_id
-           AND member.member_kind = 'skill'
-           AND member.member_key = migration.target_skill_key
-     )
-)
-BEGIN
-    SELECT RAISE(ABORT, 'content revision hides migrated player skill target');
-END;
-
-CREATE TRIGGER player_skill_migration_request_no_update
-BEFORE UPDATE ON player_skill_migration_request
-BEGIN
-    SELECT RAISE(ABORT, 'player skill migration request is immutable');
-END;
-CREATE TRIGGER player_skill_migration_request_no_reinsert
-BEFORE INSERT ON player_skill_migration_request
-WHEN EXISTS(
-    SELECT 1 FROM player_skill_migration_request
-     WHERE operation_log_id = NEW.operation_log_id
-        OR (player_id = NEW.player_id AND source_message_id = NEW.source_message_id)
-)
-BEGIN
-    SELECT RAISE(ABORT, 'player skill migration request is append-only');
-END;
-CREATE TRIGGER player_skill_migration_request_scope_guard
-BEFORE INSERT ON player_skill_migration_request
-WHEN NOT EXISTS(
-    SELECT 1
-      FROM player_skill_current_projection source
-      JOIN player_wuhun_state state
-        ON state.player_id = source.player_id
-       AND state.wuhun_id = source.wuhun_id
-       AND state.slot = source.wuhun_slot
-      JOIN wuhun w ON w.id = state.wuhun_id
-      JOIN skill source_skill ON source_skill.skill_key = source.skill_key
-      JOIN skill target_skill ON target_skill.skill_key = NEW.target_skill_key
-      JOIN content_active_skill_transition_terminal transition
-        ON transition.source_key = source.skill_key
-       AND transition.target_key = NEW.target_skill_key
-      JOIN content_revision_visible_member member
-        ON member.revision_id = transition.revision_id
-       AND member.member_kind = 'skill'
-       AND member.member_key = target_skill.skill_key
-      JOIN operation_log audit ON audit.id = NEW.operation_log_id
-     WHERE source.id = NEW.source_player_skill_id
-       AND source.player_id = NEW.player_id
-       AND transition.source_revision_id = NEW.source_revision_id
-       AND transition.revision_id = NEW.target_revision_id
-       AND source.level = NEW.level_before
-       AND source.proficiency = NEW.proficiency_before
-       AND source.equipped = NEW.equipped_before
-       AND target_skill.enabled = 1
-       AND target_skill.skill_type = source_skill.skill_type
-       AND target_skill.ring_index = source_skill.ring_index
-       AND (target_skill.wuhun_category = 'all' OR target_skill.wuhun_category = w.category)
-       AND audit.protocol = (SELECT i.protocol FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = source.player_id)
-       AND audit.account_id = (SELECT i.account_id FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = source.player_id)
-       AND audit.namespace = (SELECT i.namespace FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = source.player_id)
-       AND audit.subject_kind = (SELECT i.subject_kind FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = source.player_id)
-       AND audit.subject_id = (SELECT i.subject_id FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = source.player_id)
-       AND audit.command = '迁移魂技'
-       AND audit.outcome = 'ok'
-       AND audit.source_message_id = NEW.source_message_id
-       AND NOT EXISTS(
-           SELECT 1 FROM player_skill existing
-            WHERE existing.player_id = source.player_id
-              AND existing.skill_key = target_skill.skill_key
-       )
-)
-BEGIN
-    SELECT RAISE(ABORT, 'player skill migration request scope mismatch');
-END;
-CREATE TRIGGER player_skill_migration_request_delete_guard
-BEFORE DELETE ON player_skill_migration_request
-WHEN NOT EXISTS(
-    SELECT 1 FROM player_skill_migration migration
-     WHERE migration.operation_log_id = OLD.operation_log_id
-       AND migration.player_id = OLD.player_id
-       AND migration.source_player_skill_id = OLD.source_player_skill_id
-       AND migration.target_skill_key = OLD.target_skill_key
-)
-BEGIN
-    SELECT RAISE(ABORT, 'player skill migration request must produce a ledger');
-END;
-
-CREATE TRIGGER player_skill_migration_no_update
-BEFORE UPDATE ON player_skill_migration
-BEGIN
-    SELECT RAISE(ABORT, 'player skill migration is immutable');
-END;
-CREATE TRIGGER player_skill_migration_no_delete
-BEFORE DELETE ON player_skill_migration
-BEGIN
-    SELECT RAISE(ABORT, 'player skill migration is immutable');
-END;
-CREATE TRIGGER player_skill_migration_no_reinsert
-BEFORE INSERT ON player_skill_migration
-WHEN EXISTS(
-    SELECT 1 FROM player_skill_migration
-     WHERE id = NEW.id
-        OR source_player_skill_id = NEW.source_player_skill_id
-        OR target_player_skill_id = NEW.target_player_skill_id
-        OR operation_log_id = NEW.operation_log_id
-        OR (player_id = NEW.player_id AND source_message_id = NEW.source_message_id)
-)
-BEGIN
-    SELECT RAISE(ABORT, 'player skill migration is append-only');
-END;
-CREATE TRIGGER player_skill_migration_scope_guard
-BEFORE INSERT ON player_skill_migration
-WHEN NOT EXISTS(
-    SELECT 1
-      FROM player_skill_migration_request request
-      JOIN player_skill_current_projection source
-        ON source.id = request.source_player_skill_id
-      JOIN player_skill target ON target.id = NEW.target_player_skill_id
-     WHERE request.operation_log_id = NEW.operation_log_id
-       AND request.player_id = NEW.player_id
-       AND request.source_player_skill_id = NEW.source_player_skill_id
-       AND source.skill_key = NEW.source_skill_key
-       AND target.player_id = NEW.player_id
-       AND target.wuhun_id = source.wuhun_id
-       AND target.wuhun_slot = source.wuhun_slot
-       AND target.skill_key = request.target_skill_key
-       AND target.skill_key = NEW.target_skill_key
-       AND target.level = request.level_before
-       AND target.proficiency = request.proficiency_before
-       AND target.equipped = request.equipped_before
-       AND target.learned_at = request.created_at
-       AND request.source_revision_id = NEW.source_revision_id
-       AND request.target_revision_id = NEW.target_revision_id
-       AND request.level_before = NEW.level_before
-       AND request.proficiency_before = NEW.proficiency_before
-       AND request.equipped_before = NEW.equipped_before
-       AND request.source_message_id = NEW.source_message_id
-       AND request.created_at = NEW.created_at
-       AND NEW.level_after = NEW.level_before
-       AND NEW.proficiency_after = NEW.proficiency_before
-       AND NEW.equipped_after = NEW.equipped_before
-)
-BEGIN
-    SELECT RAISE(ABORT, 'player skill migration scope mismatch');
-END;
-
-DROP TRIGGER player_skill_scope_guard;
-CREATE TRIGGER player_skill_scope_guard
-BEFORE INSERT ON player_skill
-WHEN NOT EXISTS(
-    SELECT 1
-      FROM player_wuhun_state state
-      JOIN wuhun w ON w.id = state.wuhun_id
-      JOIN skill ON skill.skill_key = NEW.skill_key
-     WHERE state.player_id = NEW.player_id
-       AND state.wuhun_id = NEW.wuhun_id
-       AND state.slot = NEW.wuhun_slot
-       AND skill.enabled = 1
-       AND (skill.wuhun_category = 'all' OR skill.wuhun_category = w.category)
-       AND (
-           EXISTS(
-               SELECT 1
-                 FROM content_revision_visible_member member
-                WHERE member.revision_id = (
-                          SELECT revision_id
-                            FROM content_revision_activation
-                           ORDER BY id DESC
-                           LIMIT 1
-                      )
-                  AND member.member_kind = 'starter-skill'
-                  AND member.member_key = NEW.skill_key
-           )
-           OR EXISTS(
-               SELECT 1
-                 FROM soul_ring_drop pending
-                 JOIN soul_ring ring ON ring.ring_key = pending.ring_key
-                WHERE pending.player_id = NEW.player_id
-                  AND pending.status = 'pending'
-                  AND ring.skill_key = NEW.skill_key
-           )
-           OR EXISTS(
-               SELECT 1
-                 FROM player_skill_migration_request request
-                 JOIN player_skill_current_projection source
-                   ON source.id = request.source_player_skill_id
-                WHERE request.player_id = NEW.player_id
-                  AND request.target_skill_key = NEW.skill_key
-                  AND source.wuhun_id = NEW.wuhun_id
-                  AND source.wuhun_slot = NEW.wuhun_slot
-                  AND NEW.level = request.level_before
-                  AND NEW.proficiency = request.proficiency_before
-                  AND NEW.equipped = request.equipped_before
-                  AND NEW.learned_at = request.created_at
-           )
-       )
-)
-BEGIN
-    SELECT RAISE(ABORT, 'player skill scope mismatch');
-END;
-
-DROP TRIGGER battle_skill_event_scope_guard;
-CREATE TRIGGER battle_skill_event_scope_guard
-BEFORE INSERT ON battle_skill_event
-WHEN NOT EXISTS(
-    SELECT 1
-      FROM battle_event event
-      JOIN battle b ON b.id = event.battle_id
-      JOIN player p ON p.id = event.player_id
-      JOIN player_skill_current_projection learned ON learned.id = NEW.player_skill_id
-      JOIN skill ON skill.skill_key = NEW.skill_key
-      JOIN content_revision_visible_member member
-        ON member.member_kind = 'skill' AND member.member_key = skill.skill_key
-      JOIN operation_log audit ON audit.id = NEW.operation_log_id
-     WHERE event.id = NEW.battle_event_id
-       AND event.battle_id = NEW.battle_id
-       AND event.player_id = NEW.player_id
-       AND event.sequence = NEW.sequence
-       AND event.event_kind = 'attack'
-       AND event.player_damage = NEW.damage
-       AND b.status = event.status_after
-       AND member.revision_id = (
-           SELECT revision_id FROM content_revision_activation ORDER BY id DESC LIMIT 1
-       )
-       AND learned.player_id = NEW.player_id
-       AND learned.skill_key = NEW.skill_key
-       AND learned.equipped = 1
-       AND skill.enabled = 1
-       AND skill.skill_type = 'active'
-       AND NEW.soul_power_cost = skill.soul_power_cost
-       AND NEW.cooldown_rounds = skill.cooldown_rounds
-       AND p.soul_power = NEW.soul_power_after
-       AND audit.protocol = (SELECT i.protocol FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
-       AND audit.account_id = (SELECT i.account_id FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
-       AND audit.namespace = (SELECT i.namespace FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
-       AND audit.subject_kind = (SELECT i.subject_kind FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
-       AND audit.subject_id = (SELECT i.subject_id FROM identity i JOIN player owner ON owner.identity_id = i.id WHERE owner.id = p.id)
-       AND audit.command = '释放技能'
-       AND audit.outcome = 'ok'
-       AND audit.source_message_id = NEW.source_message_id
-       AND NOT EXISTS(
-           SELECT 1
-             FROM battle_skill_event previous
-            WHERE previous.battle_id = NEW.battle_id
-              AND previous.player_skill_id = NEW.player_skill_id
-              AND NEW.sequence - previous.sequence < NEW.cooldown_rounds
-       )
-)
-BEGIN
-    SELECT RAISE(ABORT, 'battle skill event scope, current projection, cooldown, or audit mismatch');
-END;
-
-DROP TRIGGER skill_loadout_event_scope_guard;
 CREATE TRIGGER skill_loadout_event_scope_guard
 BEFORE INSERT ON skill_loadout_event
 WHEN NOT EXISTS(
     SELECT 1
-      FROM player_skill_current_projection learned
+      FROM player_skill learned
       JOIN skill ON skill.skill_key = learned.skill_key
       JOIN player p ON p.id = learned.player_id
       JOIN identity i ON i.id = p.identity_id
@@ -4673,28 +4322,27 @@ WHEN NOT EXISTS(
        AND audit.source_message_id = NEW.source_message_id
        AND (
            (NEW.action = 'equip' AND (
-               SELECT COUNT(*) FROM player_skill_current_projection
+               SELECT COUNT(*) FROM player_skill
                 WHERE player_id = NEW.player_id AND equipped = 1
            ) < 4)
            OR
            (NEW.action = 'unequip' AND (
-               SELECT COUNT(*) FROM player_skill_current_projection
+               SELECT COUNT(*) FROM player_skill
                 WHERE player_id = NEW.player_id AND equipped = 1
            ) > 1)
        )
 )
 BEGIN
-    SELECT RAISE(ABORT, 'skill loadout scope, current projection, audit, or capacity mismatch');
+    SELECT RAISE(ABORT, 'skill loadout scope, audit, or capacity mismatch');
 END;
 
-DROP TRIGGER skill_progress_event_scope_guard;
 CREATE TRIGGER skill_progress_event_scope_guard
 BEFORE INSERT ON skill_progress_event
 WHEN NOT EXISTS(
     SELECT 1
       FROM battle_skill_event use_event
       JOIN battle_event battle_event ON battle_event.id = use_event.battle_event_id
-      JOIN player_skill_current_projection learned ON learned.id = NEW.player_skill_id
+      JOIN player_skill learned ON learned.id = NEW.player_skill_id
       JOIN skill ON skill.skill_key = NEW.skill_key
      WHERE use_event.id = NEW.battle_skill_event_id
        AND use_event.player_id = NEW.player_id
@@ -4722,7 +4370,7 @@ WHEN NOT EXISTS(
        END
 )
 BEGIN
-    SELECT RAISE(ABORT, 'skill progress scope, current projection, or formula mismatch');
+    SELECT RAISE(ABORT, 'skill progress scope or formula mismatch');
 END;
 "#;
 
@@ -5387,30 +5035,6 @@ pub struct SkillLoadoutReceipt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-/// 迁移账本固化的单个魂技状态快照。
-pub struct PlayerSkillMigrationSnapshot {
-    pub player_skill_id: i64,
-    pub skill: SkillRecord,
-    pub level: i64,
-    pub proficiency: i64,
-    pub equipped: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-/// 魂技迁移的幂等回执，重放时仍返回原始等级和熟练度快照。
-pub struct PlayerSkillMigrationReceipt {
-    pub id: i64,
-    pub source: PlayerSkillMigrationSnapshot,
-    pub target: PlayerSkillMigrationSnapshot,
-    pub source_revision_id: i64,
-    pub target_revision_id: i64,
-    pub created_at: i64,
-    pub replayed: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BattleActionReceipt {
     pub battle: BattleSnapshot,
     pub event: BattleEventRecord,
@@ -5436,25 +5060,6 @@ struct GroundDropClaimRecord {
     item_key: String,
     quantity: i64,
     inventory_after: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-struct PlayerSkillMigrationRecord {
-    id: i64,
-    source_player_skill_id: i64,
-    source_skill_key: String,
-    target_player_skill_id: i64,
-    target_skill_key: String,
-    source_revision_id: i64,
-    target_revision_id: i64,
-    level_before: i64,
-    proficiency_before: i64,
-    equipped_before: bool,
-    level_after: i64,
-    proficiency_after: i64,
-    equipped_after: bool,
-    created_at: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5992,39 +5597,6 @@ fn current_content_revision_id(connection: &Connection) -> Result<i64, String> {
             |row| row.get::<_, i64>(0),
         )
         .map_err(|error| format!("读取当前内容 revision 失败：{error}"))
-}
-
-/// 拒绝激活会隐藏已迁移魂技 target 的候选内容 revision。
-fn ensure_migrated_skill_targets_visible(
-    connection: &Connection,
-    candidate_revision_id: i64,
-) -> Result<(), String> {
-    let hidden_target = connection
-        .query_row(
-            r#"
-            SELECT migration.target_skill_key
-              FROM player_skill_migration migration
-             WHERE NOT EXISTS(
-                SELECT 1
-                  FROM content_revision_visible_member member
-                 WHERE member.revision_id = ?1
-                   AND member.member_kind = 'skill'
-                   AND member.member_key = migration.target_skill_key
-             )
-             ORDER BY migration.id
-             LIMIT 1
-            "#,
-            [candidate_revision_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|error| format!("检查内容 revision 的迁移魂技可见性失败：{error}"))?;
-    if let Some(target_skill_key) = hidden_target {
-        return Err(format!(
-            "目标内容 revision 会隐藏已迁移魂技 target“{target_skill_key}”，拒绝激活"
-        ));
-    }
-    Ok(())
 }
 
 fn content_cursor_page_args(after_id: Option<i64>, limit: usize) -> Result<(i64, i64), String> {
@@ -6949,7 +6521,6 @@ impl Store {
                 .ok_or_else(|| "已发布内容 revision 不存在".to_string())?;
             let mut active_revision_id = current_content_revision_id(&transaction)?;
             if active_revision_id != revision_id {
-                ensure_migrated_skill_targets_visible(&transaction, revision_id)?;
                 transaction
                     .execute(
                         "INSERT INTO content_revision_activation(revision_id, reason, created_at) VALUES(?1, 'replay', ?2)",
@@ -7047,7 +6618,6 @@ impl Store {
             .map_err(|error| format!("继承父内容 revision transition 失败：{error}"))?;
         publish_content_package_rows(&transaction, revision_id, &package, timestamp)?;
         publish_content_transitions(&transaction, revision_id, &package.transitions, timestamp)?;
-        ensure_migrated_skill_targets_visible(&transaction, revision_id)?;
         let updated = transaction
             .execute(
                 r#"
@@ -7297,7 +6867,6 @@ impl Store {
         let transaction = self.begin_immediate(&mut connection, "开始内容回滚事务失败")?;
         let revision = load_content_revision_by_id(&transaction, revision_id)?
             .ok_or_else(|| "目标内容 revision 不存在".to_string())?;
-        ensure_migrated_skill_targets_visible(&transaction, revision_id)?;
         transaction
             .execute(
                 "INSERT INTO content_revision_activation(revision_id, reason, created_at) VALUES(?1, 'rollback', ?2)",
@@ -7383,7 +6952,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
                     format!(
-                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v26 失败：{error}"
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27 失败：{error}"
                     )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
@@ -7770,25 +7339,29 @@ impl Store {
                 validate_v25_schema(&transaction)?;
             }
 
-            if !migration_applied(&transaction, 26)? {
+            if !migration_applied(&transaction, 27)? {
+                ensure_v26_retirement_is_safe(&transaction)?;
                 transaction
-                    .execute_batch(MIGRATION_V26)
-                    .map_err(|error| format!("执行数据库迁移 v26 失败：{error}"))?;
-                validate_v26_schema(&transaction)?;
+                    .execute_batch(MIGRATION_V27)
+                    .map_err(|error| format!("执行数据库清理 v27 失败：{error}"))?;
+                transaction
+                    .execute_batch(MIGRATION_V25)
+                    .map_err(|error| format!("重建 v25 魂技校验触发器失败：{error}"))?;
+                validate_v27_schema(&transaction)?;
                 transaction
                     .execute(
-                        "INSERT INTO schema_migration(version, applied_at) VALUES(26, ?1)",
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(27, ?1)",
                         [now_timestamp()?],
                     )
-                    .map_err(|error| format!("记录数据库迁移 v26 失败：{error}"))?;
+                    .map_err(|error| format!("记录数据库清理 v27 失败：{error}"))?;
             } else {
-                validate_v26_schema(&transaction)?;
+                validate_v27_schema(&transaction)?;
             }
 
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v26 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27 失败：{error}"
                 )
             })?;
             Ok(())
@@ -7821,7 +7394,7 @@ impl Store {
                 validate_v23_schema(connection)?;
                 validate_v24_schema(connection)?;
                 validate_v25_schema(connection)?;
-                validate_v26_schema(connection)?;
+                validate_v27_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -9803,208 +9376,6 @@ impl Store {
             capacity: MAX_EQUIPPED_SKILLS,
             replayed: false,
         })
-    }
-
-    /// 按当前 active transition 迁移玩家魂技，旧技能行和历史战斗事件保持不变。
-    #[allow(dead_code)]
-    pub fn migrate_skill_with_operation(
-        &self,
-        key: &IdentityKey<'_>,
-        source_skill_name_or_key: &str,
-        target_skill_name_or_key: &str,
-        operation: &OperationLogInput<'_>,
-    ) -> Result<PlayerSkillMigrationReceipt, String> {
-        validate_identity_key(key)?;
-        validate_catalog_lookup(source_skill_name_or_key, "源魂技名称")?;
-        validate_catalog_lookup(target_skill_name_or_key, "目标魂技名称")?;
-        validate_skill_migration_operation(operation)?;
-        let mut connection = self.open()?;
-        let transaction = self.begin_immediate(&mut connection, "开始魂技迁移事务失败")?;
-        ensure_no_legacy_identity(&transaction, key)?;
-        let player = load_transfer_sender(&transaction, key)?;
-        ensure_transfer_participant_eligible(&player, "你的角色")?;
-        let source_skill =
-            load_catalog_skill_by_name_or_key(&transaction, source_skill_name_or_key)?;
-        let target_skill =
-            load_catalog_skill_by_name_or_key(&transaction, target_skill_name_or_key)?;
-
-        if let Some(existing) = load_player_skill_migration_by_message(
-            &transaction,
-            player.player_id,
-            operation.source_message_id,
-        )? {
-            if existing.source_skill_key != source_skill.skill_key
-                || existing.target_skill_key != target_skill.skill_key
-            {
-                return Err("该消息 ID 已用于不同的魂技迁移，拒绝重放".to_string());
-            }
-            let receipt = player_skill_migration_receipt(&transaction, &existing, true)?;
-            transaction
-                .commit()
-                .map_err(|error| format!("提交魂技迁移重放事务失败：{error}"))?;
-            return Ok(receipt);
-        }
-
-        let source = load_player_skill_history_by_key(
-            &transaction,
-            player.player_id,
-            &source_skill.skill_key,
-        )?
-        .ok_or_else(|| format!("你尚未学习魂技“{}”", source_skill_name_or_key))?;
-        if let Some(existing) = load_player_skill_migration_by_source(&transaction, source.id)? {
-            if existing.target_skill_key != target_skill.skill_key {
-                return Err("该源魂技已经迁移到其他 target，拒绝冲突迁移".to_string());
-            }
-            let receipt = player_skill_migration_receipt(&transaction, &existing, true)?;
-            transaction
-                .commit()
-                .map_err(|error| format!("提交魂技迁移重放事务失败：{error}"))?;
-            return Ok(receipt);
-        }
-        let source_is_current = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM player_skill_current_projection WHERE id = ?1 AND player_id = ?2)",
-                params![source.id, player.player_id],
-                |row| row.get::<_, bool>(0),
-            )
-            .map_err(|error| format!("检查源魂技当前投影失败：{error}"))?;
-        if !source_is_current {
-            return Err("源魂技不在当前投影中，拒绝迁移".to_string());
-        }
-        let (source_revision_id, target_revision_id) = load_active_skill_transition_terminal(
-            &transaction,
-            &source.skill.skill_key,
-            &target_skill.skill_key,
-        )?
-        .ok_or_else(|| "目标魂技不是当前 active transition 的合法终点".to_string())?;
-        let target_already_learned = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM player_skill WHERE player_id = ?1 AND skill_key = ?2)",
-                params![player.player_id, target_skill.skill_key],
-                |row| row.get::<_, bool>(0),
-            )
-            .map_err(|error| format!("检查目标魂技历史身份失败：{error}"))?;
-        if target_already_learned {
-            return Err("目标魂技已经存在于该玩家的历史技能中，拒绝迁移".to_string());
-        }
-
-        let timestamp = now_timestamp()?;
-        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
-        transaction
-            .execute(
-                r#"
-                INSERT INTO player_skill_migration_request(
-                    operation_log_id, player_id, source_player_skill_id, target_skill_key,
-                    source_revision_id, target_revision_id, level_before, proficiency_before,
-                    equipped_before, source_message_id, created_at
-                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                "#,
-                params![
-                    operation_log_id,
-                    player.player_id,
-                    source.id,
-                    target_skill.skill_key,
-                    source_revision_id,
-                    target_revision_id,
-                    source.level,
-                    source.proficiency,
-                    source.equipped,
-                    operation.source_message_id,
-                    timestamp,
-                ],
-            )
-            .map_err(|error| format!("暂存魂技迁移授权失败：{error}"))?;
-        let inserted_target = transaction
-            .execute(
-                r#"
-                INSERT INTO player_skill(
-                    player_id, wuhun_id, skill_key, wuhun_slot,
-                    level, proficiency, equipped, learned_at
-                )
-                SELECT player_id, wuhun_id, ?1, wuhun_slot, ?2, ?3, ?4, ?5
-                  FROM player_skill
-                 WHERE id = ?6 AND player_id = ?7
-                "#,
-                params![
-                    target_skill.skill_key,
-                    source.level,
-                    source.proficiency,
-                    source.equipped,
-                    timestamp,
-                    source.id,
-                    player.player_id,
-                ],
-            )
-            .map_err(|error| format!("创建迁移目标魂技失败：{error}"))?;
-        if inserted_target != 1 {
-            return Err("创建迁移目标魂技时源记录发生变化".to_string());
-        }
-        let target_player_skill_id = transaction.last_insert_rowid();
-        transaction
-            .execute(
-                r#"
-                INSERT INTO player_skill_migration(
-                    player_id, source_player_skill_id, source_skill_key,
-                    target_player_skill_id, target_skill_key,
-                    source_revision_id, target_revision_id,
-                    level_before, proficiency_before, equipped_before,
-                    level_after, proficiency_after, equipped_after,
-                    source_message_id, operation_log_id, created_at
-                ) VALUES(
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
-                )
-                "#,
-                params![
-                    player.player_id,
-                    source.id,
-                    source.skill.skill_key,
-                    target_player_skill_id,
-                    target_skill.skill_key,
-                    source_revision_id,
-                    target_revision_id,
-                    source.level,
-                    source.proficiency,
-                    source.equipped,
-                    source.level,
-                    source.proficiency,
-                    source.equipped,
-                    operation.source_message_id,
-                    operation_log_id,
-                    timestamp,
-                ],
-            )
-            .map_err(|error| format!("写入魂技迁移账本失败：{error}"))?;
-        let migration_id = transaction.last_insert_rowid();
-        let deleted_request = transaction
-            .execute(
-                "DELETE FROM player_skill_migration_request WHERE operation_log_id = ?1",
-                [operation_log_id],
-            )
-            .map_err(|error| format!("完成魂技迁移授权失败：{error}"))?;
-        if deleted_request != 1 {
-            return Err("魂技迁移授权记录发生变化".to_string());
-        }
-        let migration = PlayerSkillMigrationRecord {
-            id: migration_id,
-            source_player_skill_id: source.id,
-            source_skill_key: source.skill.skill_key,
-            target_player_skill_id,
-            target_skill_key: target_skill.skill_key,
-            source_revision_id,
-            target_revision_id,
-            level_before: source.level,
-            proficiency_before: source.proficiency,
-            equipped_before: source.equipped,
-            level_after: source.level,
-            proficiency_after: source.proficiency,
-            equipped_after: source.equipped,
-            created_at: timestamp,
-        };
-        let receipt = player_skill_migration_receipt(&transaction, &migration, false)?;
-        transaction
-            .commit()
-            .map_err(|error| format!("提交魂技迁移事务失败：{error}"))?;
-        Ok(receipt)
     }
 
     pub fn soul_rings_page(&self, key: &IdentityKey<'_>) -> Result<SoulRingPage, String> {
@@ -13871,18 +13242,6 @@ fn player_skill_select_sql() -> &'static str {
            s.ring_index, s.soul_power_cost, s.cooldown_rounds, s.base_damage,
            s.spirit_ratio_percent, s.strength_ratio_percent, s.description,
            ps.level, ps.proficiency, ps.equipped, ps.learned_at
-      FROM player_skill_current_projection ps
-      JOIN skill s ON s.skill_key = ps.skill_key
-    "#
-}
-
-fn player_skill_history_select_sql() -> &'static str {
-    r#"
-    SELECT ps.id,
-           s.skill_key, s.name, s.skill_type, s.wuhun_category,
-           s.ring_index, s.soul_power_cost, s.cooldown_rounds, s.base_damage,
-           s.spirit_ratio_percent, s.strength_ratio_percent, s.description,
-           ps.level, ps.proficiency, ps.equipped, ps.learned_at
       FROM player_skill ps
       JOIN skill s ON s.skill_key = ps.skill_key
     "#
@@ -13956,175 +13315,10 @@ fn load_player_skill_by_name_or_key(
     Ok(record)
 }
 
-/// 从不可变历史中按 key 读取玩家魂技，供迁移账本和旧回执使用。
-fn load_player_skill_history_by_key(
-    connection: &Connection,
-    player_id: i64,
-    skill_key: &str,
-) -> Result<Option<PlayerSkillRecord>, String> {
-    let mut record = connection
-        .query_row(
-            &format!(
-                "{} WHERE ps.player_id = ?1 AND ps.skill_key = ?2 LIMIT 1",
-                player_skill_history_select_sql()
-            ),
-            params![player_id, skill_key],
-            player_skill_record_from_row,
-        )
-        .optional()
-        .map_err(|error| format!("读取玩家历史魂技失败：{error}"))?;
-    if let Some(skill) = &mut record {
-        skill.effects = load_skill_effects(connection, &skill.skill.skill_key)?;
-    }
-    Ok(record)
-}
-
-/// 按目录名称或 key 解析不可变魂技定义，不依赖当前 active 可见性。
-fn load_catalog_skill_by_name_or_key(
-    connection: &Connection,
-    requested_name_or_key: &str,
-) -> Result<SkillRecord, String> {
-    connection
-        .query_row(
-            r#"
-            SELECT skill_key, name, skill_type, wuhun_category,
-                   ring_index, soul_power_cost, cooldown_rounds, base_damage,
-                   spirit_ratio_percent, strength_ratio_percent, description
-              FROM skill
-             WHERE name = ?1 OR skill_key = ?1
-             LIMIT 1
-            "#,
-            [requested_name_or_key],
-            |row| skill_record_from_row(row, 0),
-        )
-        .optional()
-        .map_err(|error| format!("读取魂技目录失败：{error}"))?
-        .ok_or_else(|| format!("当前世界不存在魂技“{requested_name_or_key}”"))
-}
-
-fn player_skill_migration_select_sql() -> &'static str {
-    r#"
-    SELECT id, source_player_skill_id, source_skill_key,
-           target_player_skill_id, target_skill_key,
-           source_revision_id, target_revision_id,
-           level_before, proficiency_before, equipped_before,
-           level_after, proficiency_after, equipped_after,
-           created_at
-      FROM player_skill_migration
-    "#
-}
-
-fn player_skill_migration_record_from_row(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<PlayerSkillMigrationRecord> {
-    Ok(PlayerSkillMigrationRecord {
-        id: row.get(0)?,
-        source_player_skill_id: row.get(1)?,
-        source_skill_key: row.get(2)?,
-        target_player_skill_id: row.get(3)?,
-        target_skill_key: row.get(4)?,
-        source_revision_id: row.get(5)?,
-        target_revision_id: row.get(6)?,
-        level_before: row.get(7)?,
-        proficiency_before: row.get(8)?,
-        equipped_before: row.get(9)?,
-        level_after: row.get(10)?,
-        proficiency_after: row.get(11)?,
-        equipped_after: row.get(12)?,
-        created_at: row.get(13)?,
-    })
-}
-
-fn load_player_skill_migration_by_message(
-    connection: &Connection,
-    player_id: i64,
-    source_message_id: &str,
-) -> Result<Option<PlayerSkillMigrationRecord>, String> {
-    connection
-        .query_row(
-            &format!(
-                "{} WHERE player_id = ?1 AND source_message_id = ?2 LIMIT 1",
-                player_skill_migration_select_sql()
-            ),
-            params![player_id, source_message_id],
-            player_skill_migration_record_from_row,
-        )
-        .optional()
-        .map_err(|error| format!("读取魂技迁移重放记录失败：{error}"))
-}
-
-fn load_player_skill_migration_by_source(
-    connection: &Connection,
-    source_player_skill_id: i64,
-) -> Result<Option<PlayerSkillMigrationRecord>, String> {
-    connection
-        .query_row(
-            &format!(
-                "{} WHERE source_player_skill_id = ?1 LIMIT 1",
-                player_skill_migration_select_sql()
-            ),
-            [source_player_skill_id],
-            player_skill_migration_record_from_row,
-        )
-        .optional()
-        .map_err(|error| format!("读取源魂技迁移记录失败：{error}"))
-}
-
-/// 读取账本快照，保证后续成长不会改变原迁移回执。
-fn player_skill_migration_receipt(
-    connection: &Connection,
-    migration: &PlayerSkillMigrationRecord,
-    replayed: bool,
-) -> Result<PlayerSkillMigrationReceipt, String> {
-    let source_skill = load_catalog_skill_by_name_or_key(connection, &migration.source_skill_key)?;
-    let target_skill = load_catalog_skill_by_name_or_key(connection, &migration.target_skill_key)?;
-    Ok(PlayerSkillMigrationReceipt {
-        id: migration.id,
-        source: PlayerSkillMigrationSnapshot {
-            player_skill_id: migration.source_player_skill_id,
-            skill: source_skill,
-            level: migration.level_before,
-            proficiency: migration.proficiency_before,
-            equipped: migration.equipped_before,
-        },
-        target: PlayerSkillMigrationSnapshot {
-            player_skill_id: migration.target_player_skill_id,
-            skill: target_skill,
-            level: migration.level_after,
-            proficiency: migration.proficiency_after,
-            equipped: migration.equipped_after,
-        },
-        source_revision_id: migration.source_revision_id,
-        target_revision_id: migration.target_revision_id,
-        created_at: migration.created_at,
-        replayed,
-    })
-}
-
-fn load_active_skill_transition_terminal(
-    connection: &Connection,
-    source_skill_key: &str,
-    target_skill_key: &str,
-) -> Result<Option<(i64, i64)>, String> {
-    connection
-        .query_row(
-            r#"
-            SELECT source_revision_id, revision_id
-              FROM content_active_skill_transition_terminal
-             WHERE source_key = ?1 AND target_key = ?2
-             LIMIT 1
-            "#,
-            params![source_skill_key, target_skill_key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(|error| format!("读取当前魂技替换终点失败：{error}"))
-}
-
 fn count_equipped_skills(connection: &Connection, player_id: i64) -> Result<i64, String> {
     connection
         .query_row(
-            "SELECT COUNT(*) FROM player_skill_current_projection WHERE player_id = ?1 AND equipped = 1",
+            "SELECT COUNT(*) FROM player_skill WHERE player_id = ?1 AND equipped = 1",
             [player_id],
             |row| row.get::<_, i64>(0),
         )
@@ -15930,17 +15124,6 @@ fn validate_skill_loadout_operation(
     }
     if !valid_audit_value(operation.source_message_id, 256) {
         return Err("魂技装备要求 1 到 256 个无控制字符的非空消息 ID".to_string());
-    }
-    Ok(())
-}
-
-fn validate_skill_migration_operation(operation: &OperationLogInput<'_>) -> Result<(), String> {
-    validate_operation_input(operation)?;
-    if operation.command != "迁移魂技" || operation.outcome != "ok" {
-        return Err("魂技迁移成功审计必须使用规范命令“迁移魂技”和 ok 结果".to_string());
-    }
-    if !valid_audit_value(operation.source_message_id, 256) {
-        return Err("魂技迁移要求 1 到 256 个无控制字符的非空消息 ID".to_string());
     }
     Ok(())
 }
@@ -20027,7 +19210,6 @@ fn validate_v13_schema(connection: &Connection) -> Result<(), String> {
             || name == "wuhun_state_event_scope_guard"
             || table == "battle_wuhun_modifier"
             || name == "player_skill_scope_guard"
-            || name == "player_skill_migration_request_scope_guard"
             || matches!(
                 table.as_str(),
                 "soul_ring" | "soul_ring_drop" | "player_soul_ring" | "soul_ring_event"
@@ -20641,6 +19823,7 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
         return Err("数据库已标记迁移 v16，但存在孤立战斗技能事件".to_string());
     }
 
+    let legacy_v26_present = migration_applied(connection, 26)?;
     let expected_triggers = [
         ("skill_no_update", "skill"),
         ("skill_no_delete", "skill"),
@@ -20678,7 +19861,8 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
         if name == "battle_skill_event_scope_guard"
             && (!normalized.contains("FROM BATTLE_EVENT EVENT")
                 || !(normalized.contains("JOIN PLAYER_SKILL LEARNED")
-                    || normalized.contains("JOIN PLAYER_SKILL_CURRENT_PROJECTION LEARNED"))
+                    || (legacy_v26_present
+                        && normalized.contains("JOIN PLAYER_SKILL_CURRENT_PROJECTION LEARNED")))
                 || !normalized.contains("NEW.COOLDOWN_ROUNDS")
                 || !normalized.contains("释放技能"))
         {
@@ -20732,11 +19916,12 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
                 name == *expected_name && table == *expected_table
             })
             || name == "battle_event_scope_guard"
-            || name == "content_revision_activation_skill_migration_guard"
-            || matches!(
-                table.as_str(),
-                "player_skill_migration_request" | "player_skill_migration"
-            )
+            || (legacy_v26_present
+                && (name == "content_revision_activation_skill_migration_guard"
+                    || matches!(
+                        table.as_str(),
+                        "player_skill_migration_request" | "player_skill_migration"
+                    )))
             || table == "skill_loadout_event"
             || table == "skill_progress_event"
             || table == "battle_skill_modifier"
@@ -23224,6 +22409,7 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
         .map_err(|error| format!("查询 v23 全库触发器失败：{error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("解析 v23 全库触发器失败：{error}"))?;
+    let legacy_v26_present = migration_applied(connection, 26)?;
     for (name, table, sql) in triggers {
         let declared = expected_triggers
             .iter()
@@ -23233,7 +22419,7 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
             || name == "battle_skill_event_effect_v2_snapshot"
             || name == "player_skill_scope_guard"
             || name == "content_revision_transition_scope_guard"
-            || name == "content_revision_activation_skill_migration_guard"
+            || (legacy_v26_present && name == "content_revision_activation_skill_migration_guard")
             || matches!(
                 name.as_str(),
                 "battle_scope_guard"
@@ -23599,420 +22785,102 @@ fn validate_v25_schema(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-/// 校验 v24.3.4 魂技迁移账本、当前投影和激活门控。
-fn validate_v26_schema(connection: &Connection) -> Result<(), String> {
-    let expected_tables = [
-        (
+/// 只允许清理从错误 v26 留下的空结构，绝不猜测或改写已生成的玩家数据。
+fn ensure_v26_retirement_is_safe(connection: &Connection) -> Result<(), String> {
+    if !migration_applied(connection, 26)? {
+        for name in [
             "player_skill_migration_request",
-            vec![
-                TableColumnInfo::new("operation_log_id", "INTEGER", false, true, None, 0),
-                TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("source_player_skill_id", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("target_skill_key", "TEXT", true, false, None, 0),
-                TableColumnInfo::new("source_revision_id", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("target_revision_id", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("level_before", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("proficiency_before", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("equipped_before", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("source_message_id", "TEXT", true, false, None, 0),
-                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
-            ],
-        ),
-        (
             "player_skill_migration",
-            vec![
-                TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
-                TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("source_player_skill_id", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("source_skill_key", "TEXT", true, false, None, 0),
-                TableColumnInfo::new("target_player_skill_id", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("target_skill_key", "TEXT", true, false, None, 0),
-                TableColumnInfo::new("source_revision_id", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("target_revision_id", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("level_before", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("proficiency_before", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("equipped_before", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("level_after", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("proficiency_after", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("equipped_after", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("source_message_id", "TEXT", true, false, None, 0),
-                TableColumnInfo::new("operation_log_id", "INTEGER", true, false, None, 0),
-                TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
-            ],
-        ),
-    ];
-    for (table, expected) in expected_tables {
-        let actual = table_columns_with_type(connection, table)?;
-        if actual != expected {
-            return Err(format!(
-                "数据库已标记迁移 v26，但表 {table} 字段不匹配：{actual:?}"
-            ));
-        }
-    }
-
-    validate_v26_table_sql(
-        connection,
-        "player_skill_migration_request",
-        &[
-            ") STRICT",
-            "UNIQUE(PLAYER_ID, SOURCE_MESSAGE_ID)",
-            "LEVEL_BEFORE BETWEEN 1 AND 10",
-            "PROFICIENCY_BEFORE BETWEEN 0 AND 4500",
-            "EQUIPPED_BEFORE IN (0, 1)",
-        ],
-    )?;
-    validate_v26_table_sql(
-        connection,
-        "player_skill_migration",
-        &[
-            ") STRICT",
-            "UNIQUE(SOURCE_PLAYER_SKILL_ID)",
-            "UNIQUE(TARGET_PLAYER_SKILL_ID)",
-            "UNIQUE(PLAYER_ID, SOURCE_MESSAGE_ID)",
-            "CHECK(SOURCE_PLAYER_SKILL_ID <> TARGET_PLAYER_SKILL_ID)",
-            "CHECK(SOURCE_SKILL_KEY <> TARGET_SKILL_KEY)",
-            "CHECK(LEVEL_AFTER = LEVEL_BEFORE)",
-            "CHECK(PROFICIENCY_AFTER = PROFICIENCY_BEFORE)",
-            "CHECK(EQUIPPED_AFTER = EQUIPPED_BEFORE)",
-        ],
-    )?;
-    validate_v26_foreign_keys(
-        connection,
-        "player_skill_migration_request",
-        &[
-            (
-                "operation_log",
-                "operation_log_id",
-                "id",
-                "NO ACTION",
-                "RESTRICT",
-            ),
-            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
-            (
-                "player_skill",
-                "source_player_skill_id",
-                "id",
-                "NO ACTION",
-                "RESTRICT",
-            ),
-            (
-                "skill",
-                "target_skill_key",
-                "skill_key",
-                "NO ACTION",
-                "RESTRICT",
-            ),
-            (
-                "content_revision",
-                "source_revision_id",
-                "id",
-                "NO ACTION",
-                "RESTRICT",
-            ),
-            (
-                "content_revision",
-                "target_revision_id",
-                "id",
-                "NO ACTION",
-                "RESTRICT",
-            ),
-        ],
-    )?;
-    validate_v26_foreign_keys(
-        connection,
-        "player_skill_migration",
-        &[
-            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
-            (
-                "player_skill",
-                "source_player_skill_id",
-                "id",
-                "NO ACTION",
-                "RESTRICT",
-            ),
-            (
-                "skill",
-                "source_skill_key",
-                "skill_key",
-                "NO ACTION",
-                "RESTRICT",
-            ),
-            (
-                "player_skill",
-                "target_player_skill_id",
-                "id",
-                "NO ACTION",
-                "RESTRICT",
-            ),
-            (
-                "skill",
-                "target_skill_key",
-                "skill_key",
-                "NO ACTION",
-                "RESTRICT",
-            ),
-            (
-                "content_revision",
-                "source_revision_id",
-                "id",
-                "NO ACTION",
-                "RESTRICT",
-            ),
-            (
-                "content_revision",
-                "target_revision_id",
-                "id",
-                "NO ACTION",
-                "RESTRICT",
-            ),
-            (
-                "operation_log",
-                "operation_log_id",
-                "id",
-                "NO ACTION",
-                "RESTRICT",
-            ),
-        ],
-    )?;
-    validate_v26_custom_index_set(connection, "player_skill_migration_request", &[])?;
-    validate_v26_custom_index_set(
-        connection,
-        "player_skill_migration",
-        &[
-            "player_skill_migration_player_page",
-            "player_skill_migration_target_revision",
-        ],
-    )?;
-    validate_v26_index(
-        connection,
-        "player_skill_migration_player_page",
-        false,
-        &["player_id", "id"],
-        false,
-    )?;
-    validate_v26_index(
-        connection,
-        "player_skill_migration_target_revision",
-        false,
-        &["target_revision_id", "target_skill_key", "id"],
-        false,
-    )?;
-
-    for (view, markers) in [
-        (
             "player_skill_current_projection",
-            &[
-                "CREATE VIEW PLAYER_SKILL_CURRENT_PROJECTION",
-                "FROM PLAYER_SKILL",
-                "FROM PLAYER_SKILL_MIGRATION",
-                "SOURCE_PLAYER_SKILL_ID = PLAYER_SKILL.ID",
-            ][..],
-        ),
-        (
             "content_active_skill_transition_terminal",
-            &[
-                "CREATE VIEW CONTENT_ACTIVE_SKILL_TRANSITION_TERMINAL",
-                "WITH RECURSIVE",
-                "CONTENT_REVISION_ACTIVATION",
-                "CONTENT_REVISION_TRANSITION",
-                "WALK.DEPTH < 200",
-            ][..],
-        ),
-    ] {
-        let view_sql = connection
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = ?1",
-                [view],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| format!("读取 v26 视图 {view} 失败：{error}"))?
-            .ok_or_else(|| format!("数据库已标记迁移 v26，但缺少视图 {view}"))?
-            .to_ascii_uppercase();
-        for marker in markers {
-            if !view_sql.contains(marker) {
-                return Err(format!("v26 视图 {view} 缺少约束：{marker}"));
+        ] {
+            let exists = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1)",
+                    [name],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|error| format!("检查 v26 遗留结构 {name} 失败：{error}"))?;
+            if exists {
+                return Err(format!(
+                    "检测到未标记的错误 v26 遗留结构 {name}，已拒绝自动清理"
+                ));
             }
         }
-    }
-
-    let expected_triggers = [
-        (
-            "content_revision_activation_skill_migration_guard",
-            "content_revision_activation",
-            &["PLAYER_SKILL_MIGRATION", "CONTENT_REVISION_VISIBLE_MEMBER"][..],
-        ),
-        (
-            "player_skill_migration_request_no_update",
-            "player_skill_migration_request",
-            &[][..],
-        ),
-        (
-            "player_skill_migration_request_no_reinsert",
-            "player_skill_migration_request",
-            &["SOURCE_MESSAGE_ID"][..],
-        ),
-        (
-            "player_skill_migration_request_scope_guard",
-            "player_skill_migration_request",
-            &[
-                "PLAYER_SKILL_CURRENT_PROJECTION",
-                "CONTENT_ACTIVE_SKILL_TRANSITION_TERMINAL",
-                "CONTENT_REVISION_VISIBLE_MEMBER",
-                "OPERATION_LOG",
-            ][..],
-        ),
-        (
-            "player_skill_migration_request_delete_guard",
-            "player_skill_migration_request",
-            &["PLAYER_SKILL_MIGRATION"][..],
-        ),
-        (
-            "player_skill_migration_no_update",
-            "player_skill_migration",
-            &[][..],
-        ),
-        (
-            "player_skill_migration_no_delete",
-            "player_skill_migration",
-            &[][..],
-        ),
-        (
-            "player_skill_migration_no_reinsert",
-            "player_skill_migration",
-            &["SOURCE_PLAYER_SKILL_ID", "TARGET_PLAYER_SKILL_ID"][..],
-        ),
-        (
-            "player_skill_migration_scope_guard",
-            "player_skill_migration",
-            &[
-                "PLAYER_SKILL_MIGRATION_REQUEST",
-                "PLAYER_SKILL_CURRENT_PROJECTION",
-            ][..],
-        ),
-        (
-            "player_skill_scope_guard",
-            "player_skill",
-            &[
-                "PLAYER_SKILL_MIGRATION_REQUEST",
-                "CONTENT_REVISION_VISIBLE_MEMBER",
-            ][..],
-        ),
-        (
-            "battle_skill_event_scope_guard",
-            "battle_skill_event",
-            &["PLAYER_SKILL_CURRENT_PROJECTION"][..],
-        ),
-        (
-            "skill_loadout_event_scope_guard",
-            "skill_loadout_event",
-            &["PLAYER_SKILL_CURRENT_PROJECTION"][..],
-        ),
-        (
-            "skill_progress_event_scope_guard",
-            "skill_progress_event",
-            &["PLAYER_SKILL_CURRENT_PROJECTION"][..],
-        ),
-    ];
-    for (name, table, markers) in expected_triggers {
-        let (actual_table, sql) = connection
-            .query_row(
-                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
-                [name],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .map_err(|error| format!("读取 v26 触发器 {name} 失败：{error}"))?
-            .ok_or_else(|| format!("数据库已标记迁移 v26，但缺少触发器 {name}"))?;
-        let sql = sql.to_ascii_uppercase();
-        if actual_table != table || !sql.contains("RAISE(ABORT") {
-            return Err(format!("v26 触发器 {name} 契约不匹配"));
-        }
-        for marker in markers {
-            if !sql.contains(marker) {
-                return Err(format!("v26 触发器 {name} 缺少约束：{marker}"));
-            }
-        }
+        return Ok(());
     }
 
     let pending_request = connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM player_skill_migration_request)",
+            "SELECT COUNT(*) FROM player_skill_migration_request",
             [],
-            |row| row.get::<_, bool>(0),
+            |row| row.get::<_, i64>(0),
         )
-        .map_err(|error| format!("检查 v26 遗留迁移请求失败：{error}"))?;
-    if pending_request {
-        return Err("v26 检测到未完成的魂技迁移请求".to_string());
+        .map_err(|error| format!("读取错误 v26 魂技迁移请求失败：{error}"))?;
+    let migration_count = connection
+        .query_row("SELECT COUNT(*) FROM player_skill_migration", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|error| format!("读取错误 v26 魂技迁移账本失败：{error}"))?;
+    if pending_request != 0 || migration_count != 0 {
+        return Err(
+            "检测到错误 v26 魂技迁移账本，已拒绝自动清理；请先人工确认玩家历史数据".to_string(),
+        );
     }
-    let invalid_migration = connection
-        .query_row(
-            r#"
-            SELECT EXISTS(
-                SELECT 1
-                  FROM player_skill_migration migration
-                  LEFT JOIN player_skill source
-                    ON source.id = migration.source_player_skill_id
-                  LEFT JOIN player_skill target
-                    ON target.id = migration.target_player_skill_id
-                 WHERE source.id IS NULL
-                    OR target.id IS NULL
-                    OR source.player_id <> migration.player_id
-                    OR target.player_id <> migration.player_id
-                    OR source.skill_key <> migration.source_skill_key
-                    OR target.skill_key <> migration.target_skill_key
-                    OR NOT EXISTS(
-                        SELECT 1
-                          FROM player_skill_current_projection current_target
-                         WHERE current_target.id = migration.target_player_skill_id
-                    )
-                    OR EXISTS(
-                        SELECT 1
-                          FROM player_skill_current_projection current_source
-                         WHERE current_source.id = migration.source_player_skill_id
-                    )
-                    OR NOT EXISTS(
-                        SELECT 1
-                          FROM content_revision child
-                         WHERE child.id = migration.target_revision_id
-                           AND child.parent_revision_id = migration.source_revision_id
-                    )
-                    OR NOT EXISTS(
-                        SELECT 1
-                          FROM content_revision_visible_member member
-                         WHERE member.revision_id = migration.target_revision_id
-                           AND member.member_kind = 'skill'
-                           AND member.member_key = migration.target_skill_key
-                    )
-                    OR NOT EXISTS(
-                        SELECT 1
-                          FROM operation_log audit
-                          JOIN player owner ON owner.id = migration.player_id
-                          JOIN identity identity_record ON identity_record.id = owner.identity_id
-                         WHERE audit.id = migration.operation_log_id
-                           AND audit.protocol = identity_record.protocol
-                           AND audit.account_id = identity_record.account_id
-                           AND audit.namespace = identity_record.namespace
-                           AND audit.subject_kind = identity_record.subject_kind
-                           AND audit.subject_id = identity_record.subject_id
-                           AND audit.command = '迁移魂技'
-                           AND audit.outcome = 'ok'
-                           AND audit.source_message_id = migration.source_message_id
-                    )
-            )
-            "#,
-            [],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(|error| format!("校验 v26 魂技迁移账本失败：{error}"))?;
-    if invalid_migration {
-        return Err("v26 魂技迁移账本包含越界或不一致记录".to_string());
-    }
-    ensure_migrated_skill_targets_visible(connection, current_content_revision_id(connection)?)?;
+    Ok(())
+}
 
-    let triggers = connection
-        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
-        .map_err(|error| format!("读取 v26 全库触发器失败：{error}"))?
+/// 校验错误 v26 结构已被清除，且被其重写的魂技校验触发器已经恢复。
+fn validate_v27_schema(connection: &Connection) -> Result<(), String> {
+    validate_v25_schema(connection)?;
+
+    for (object_type, name) in [
+        ("table", "player_skill_migration_request"),
+        ("table", "player_skill_migration"),
+        ("view", "player_skill_current_projection"),
+        ("view", "content_active_skill_transition_terminal"),
+        (
+            "trigger",
+            "content_revision_activation_skill_migration_guard",
+        ),
+    ] {
+        let exists = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2)",
+                params![object_type, name],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("检查 v27 清理对象 {name} 失败：{error}"))?;
+        if exists {
+            return Err(format!("数据库已标记清理 v27，但仍保留错误结构 {name}"));
+        }
+    }
+
+    for (name, expected_marker) in [
+        ("skill_loadout_event_scope_guard", "FROM PLAYER_SKILL"),
+        ("skill_progress_event_scope_guard", "JOIN PLAYER_SKILL"),
+    ] {
+        let sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v27 恢复触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库已标记清理 v27，但缺少恢复触发器 {name}"))?
+            .to_ascii_uppercase();
+        if !sql.contains(expected_marker)
+            || sql_mentions_identifier(&sql, "player_skill_current_projection")
+            || sql_mentions_identifier(&sql, "player_skill_migration")
+        {
+            return Err(format!("v27 恢复触发器 {name} 仍包含错误的迁移投影约束"));
+        }
+    }
+
+    let objects = connection
+        .prepare("SELECT type, name, COALESCE(sql, '') FROM sqlite_master")
+        .map_err(|error| format!("读取 v27 全库对象失败：{error}"))?
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -24020,29 +22888,21 @@ fn validate_v26_schema(connection: &Connection) -> Result<(), String> {
                 row.get::<_, String>(2)?,
             ))
         })
-        .map_err(|error| format!("查询 v26 全库触发器失败：{error}"))?
+        .map_err(|error| format!("查询 v27 全库对象失败：{error}"))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("解析 v26 全库触发器失败：{error}"))?;
-    for (name, table, sql) in triggers {
-        let declared = expected_triggers
-            .iter()
-            .any(|(expected_name, expected_table, _)| {
-                name == *expected_name && table == *expected_table
-            });
-        let touches_v26 = matches!(
-            table.as_str(),
-            "player_skill_migration_request" | "player_skill_migration"
-        ) || [
+        .map_err(|error| format!("解析 v27 全库对象失败：{error}"))?;
+    for (object_type, name, sql) in objects {
+        if [
             "player_skill_migration_request",
             "player_skill_migration",
             "player_skill_current_projection",
             "content_active_skill_transition_terminal",
         ]
         .iter()
-        .any(|identifier| sql_mentions_identifier(&sql, identifier));
-        if touches_v26 && !declared {
+        .any(|identifier| sql_mentions_identifier(&sql, identifier))
+        {
             return Err(format!(
-                "v26 触发器 {name} 未声明却引用迁移账本结构 {table}"
+                "v27 数据库对象 {object_type} {name} 仍引用错误的魂技迁移结构"
             ));
         }
     }
@@ -24084,43 +22944,6 @@ fn validate_v24_index(
 ) -> Result<(), String> {
     validate_v7_index(connection, index_name, unique, columns, partial)
         .map_err(|error| error.replace("v7", "v24"))
-}
-
-fn validate_v26_table_sql(
-    connection: &Connection,
-    table: &str,
-    markers: &[&str],
-) -> Result<(), String> {
-    validate_v10_table_sql(connection, table, markers).map_err(|error| error.replace("v10", "v26"))
-}
-
-fn validate_v26_foreign_keys(
-    connection: &Connection,
-    table: &str,
-    expected: &[(&str, &str, &str, &str, &str)],
-) -> Result<(), String> {
-    validate_v9_foreign_keys(connection, table, expected)
-        .map_err(|error| error.replace("v9", "v26"))
-}
-
-fn validate_v26_custom_index_set(
-    connection: &Connection,
-    table: &str,
-    expected: &[&str],
-) -> Result<(), String> {
-    validate_v10_custom_index_set(connection, table, expected)
-        .map_err(|error| error.replace("v10", "v26"))
-}
-
-fn validate_v26_index(
-    connection: &Connection,
-    index_name: &str,
-    unique: bool,
-    columns: &[&str],
-    partial: bool,
-) -> Result<(), String> {
-    validate_v7_index(connection, index_name, unique, columns, partial)
-        .map_err(|error| error.replace("v7", "v26"))
 }
 
 fn validate_v23_table_sql(
@@ -25907,50 +24730,6 @@ mod tests {
         };
         LoadedContentPackage {
             content_hash: content_hash(&package).expect("应计算预览内容包哈希"),
-            package,
-            source_format: "json".to_string(),
-        }
-    }
-
-    fn content_skill_replacement_package(
-        package_key: &str,
-        source_skill_key: &str,
-        target_skill_key: &str,
-    ) -> LoadedContentPackage {
-        let package = ContentPackage {
-            package_key: package_key.to_string(),
-            revision: 1,
-            author: "test".to_string(),
-            minimum_runtime: String::new(),
-            wuhun: Vec::new(),
-            skills: vec![SkillPackageEntry {
-                skill_key: target_skill_key.to_string(),
-                name: format!("{target_skill_key} name"),
-                skill_type: "active".to_string(),
-                wuhun_category: "all".to_string(),
-                ring_index: 1,
-                soul_power_cost: 10,
-                cooldown_rounds: 1,
-                base_damage: 20,
-                spirit_ratio_percent: 100,
-                strength_ratio_percent: 0,
-                description: format!("{target_skill_key} replacement skill"),
-                enabled: true,
-                starter: true,
-            }],
-            effects: Vec::new(),
-            soul_beasts: Vec::new(),
-            soul_rings: Vec::new(),
-            transitions: vec![ContentTransitionPackageEntry {
-                entity_kind: "skill".to_string(),
-                source_key: source_skill_key.to_string(),
-                target_key: Some(target_skill_key.to_string()),
-                transition_kind: "replaced".to_string(),
-                reason: "测试魂技迁移替换".to_string(),
-            }],
-        };
-        LoadedContentPackage {
-            content_hash: content_hash(&package).expect("应计算魂技替换内容包哈希"),
             package,
             source_format: "json".to_string(),
         }
@@ -30637,16 +29416,11 @@ mod tests {
                 DROP TRIGGER battle_wuhun_modifier_no_update;
                 DROP INDEX battle_wuhun_modifier_player_page;
                 DROP TABLE battle_wuhun_modifier;
-                DROP TRIGGER content_revision_activation_skill_migration_guard;
-                DROP VIEW content_active_skill_transition_terminal;
-                DROP VIEW player_skill_current_projection;
-                DROP TABLE player_skill_migration_request;
-                DROP TABLE player_skill_migration;
                 DROP VIEW content_revision_visible_member;
-                DELETE FROM schema_migration WHERE version IN (15, 25, 26);
+                DELETE FROM schema_migration WHERE version IN (15, 25);
                 "#,
             )
-            .expect("应移除 v15、v25 和 v26 结构并保留旧战斗");
+            .expect("应移除 v15 和 v25 结构并保留旧战斗");
         drop(connection);
         drop(store);
 
@@ -31121,15 +29895,10 @@ mod tests {
                 r#"
                 DROP TRIGGER player_skill_progress_guard;
                 DROP TABLE skill_progress_event;
-                DROP TRIGGER content_revision_activation_skill_migration_guard;
-                DROP VIEW content_active_skill_transition_terminal;
-                DROP VIEW player_skill_current_projection;
-                DROP TABLE player_skill_migration_request;
-                DROP TABLE player_skill_migration;
-                DELETE FROM schema_migration WHERE version IN (19, 26);
+                DELETE FROM schema_migration WHERE version = 19;
                 "#,
             )
-            .expect("应移除 v19 和 v26 结构模拟旧数据库");
+            .expect("应移除 v19 结构模拟旧数据库");
         connection
             .execute(
                 "UPDATE player_skill SET level = 1, proficiency = 90 WHERE player_id = ?1 AND skill_key = 'entangle'",
@@ -32536,365 +31305,109 @@ mod tests {
         assert!(error.contains("v25") && error.contains("可见成员视图"));
     }
 
-    #[test]
-    fn v26_player_skill_migration_projects_current_skill_and_replays() {
-        let (_directory, store) = test_store();
-        store
-            .register_player(&identity(), "魂技迁移角色", "男")
-            .expect("应创建魂技迁移角色");
-        store.awaken_wuhun(&identity()).expect("应完成武魂觉醒");
-        let player_id = player_id_for(&store, &identity());
-        set_skill_progress_for_test(&store, player_id, 3, 300);
-
-        let package = content_skill_replacement_package(
-            "player-skill-migration",
-            "entangle",
-            "migration-skill",
-        );
-        store
-            .stage_content_package(&package)
-            .expect("应写入魂技迁移内容包");
-        assert!(
-            store
-                .validate_content_draft("player-skill-migration", 1)
-                .expect("应校验魂技迁移内容包")
-                .errors
-                .is_empty()
-        );
-        let published = store
-            .publish_content_draft("player-skill-migration", 1)
-            .expect("应发布魂技迁移内容包");
-
-        let operation = transfer_operation("迁移魂技", "player-skill-migration-1");
-        let first = store
-            .migrate_skill_with_operation(&identity(), "entangle", "migration-skill", &operation)
-            .expect("应迁移当前魂技");
-        assert!(!first.replayed);
-        assert_ne!(first.source.player_skill_id, first.target.player_skill_id);
-        assert_eq!(first.source.skill.skill_key, "entangle");
-        assert_eq!(first.target.skill.skill_key, "migration-skill");
-        assert_eq!(first.source.level, 3);
-        assert_eq!(first.target.level, 3);
-        assert_eq!(first.source.proficiency, 300);
-        assert_eq!(first.target.proficiency, 300);
-        assert!(first.source.equipped);
-        assert!(first.target.equipped);
-        assert_eq!(first.target_revision_id, published.revision.id);
-        assert_eq!(
-            first.source_revision_id,
-            published.revision.parent_revision_id.unwrap()
-        );
-
-        let page = store.skills_page(&identity()).expect("应读取当前魂技投影");
-        assert_eq!(page.entries.len(), 1);
-        assert_eq!(page.entries[0].id, first.target.player_skill_id);
-        assert_eq!(page.entries[0].skill.skill_key, "migration-skill");
-        assert_eq!(page.entries[0].level, 3);
-        assert_eq!(page.entries[0].proficiency, 300);
-        assert!(page.entries[0].equipped);
-
-        let connection = store.open().expect("应读取魂技迁移账本");
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT COUNT(*) FROM player_skill WHERE player_id = ?1",
-                    [player_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .expect("应统计历史魂技"),
-            2
-        );
-        assert_eq!(
-            count_equipped_skills(&connection, player_id).expect("应统计当前装备魂技"),
-            1
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    r#"
-                    SELECT source_skill_key, target_skill_key,
-                           level_before, proficiency_before, equipped_before,
-                           level_after, proficiency_after, equipped_after
-                      FROM player_skill_migration
-                     WHERE id = ?1
-                    "#,
-                    [first.id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, bool>(4)?,
-                            row.get::<_, i64>(5)?,
-                            row.get::<_, i64>(6)?,
-                            row.get::<_, bool>(7)?,
-                        ))
-                    },
-                )
-                .expect("应读取魂技迁移快照"),
-            (
-                "entangle".to_string(),
-                "migration-skill".to_string(),
-                3,
-                300,
-                true,
-                3,
-                300,
-                true,
-            )
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT COUNT(*) FROM player_skill_migration_request",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .expect("应统计迁移暂存授权"),
-            0
-        );
-        drop(connection);
-
-        let replay = store
-            .migrate_skill_with_operation(&identity(), "entangle", "migration-skill", &operation)
-            .expect("相同消息应重放魂技迁移回执");
-        assert!(replay.replayed);
-        assert_eq!(replay.id, first.id);
-        assert_eq!(replay.source, first.source);
-        assert_eq!(replay.target, first.target);
-        let source_replay = store
-            .migrate_skill_with_operation(
-                &identity(),
-                "entangle",
-                "migration-skill",
-                &transfer_operation("迁移魂技", "player-skill-migration-2"),
-            )
-            .expect("相同源魂技应返回既有迁移回执");
-        assert!(source_replay.replayed);
-        assert_eq!(source_replay.id, first.id);
-        assert!(
-            store
-                .migrate_skill_with_operation(&identity(), "entangle", "entangle", &operation)
-                .expect_err("改变 target 的重放应拒绝")
-                .contains("不同的魂技迁移")
-        );
-    }
-
-    #[test]
-    fn v26_failed_migration_rolls_back_operation_request_and_target() {
-        let (_directory, store) = test_store();
-        store
-            .register_player(&identity(), "迁移回滚角色", "男")
-            .expect("应创建迁移回滚角色");
-        store.awaken_wuhun(&identity()).expect("应完成武魂觉醒");
-        let player_id = player_id_for(&store, &identity());
-
-        let mut package = content_skill_replacement_package(
-            "player-skill-migration-invalid",
-            "entangle",
-            "migration-invalid-skill",
-        );
-        package.package.skills[0].ring_index = 2;
-        package.package.skills[0].starter = false;
-        package.content_hash = content_hash(&package.package).expect("应重算不兼容迁移内容包哈希");
-        store
-            .stage_content_package(&package)
-            .expect("应写入不兼容迁移内容包");
-        assert!(
-            store
-                .validate_content_draft("player-skill-migration-invalid", 1)
-                .expect("内容 transition 仍应可发布")
-                .errors
-                .is_empty()
-        );
-        store
-            .publish_content_draft("player-skill-migration-invalid", 1)
-            .expect("应发布不兼容迁移内容包");
-
-        let error = store
-            .migrate_skill_with_operation(
-                &identity(),
-                "entangle",
-                "migration-invalid-skill",
-                &transfer_operation("迁移魂技", "player-skill-migration-invalid-1"),
-            )
-            .expect_err("魂环位不兼容时应拒绝迁移");
-        assert!(error.contains("暂存魂技迁移授权"));
-        let connection = store.open().expect("应验证迁移回滚结果");
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT COUNT(*) FROM operation_log WHERE command = '迁移魂技'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .expect("应统计迁移操作日志"),
-            0
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT COUNT(*) FROM player_skill_migration_request",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .expect("应统计迁移暂存授权"),
-            0
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM player_skill_migration", [], |row| row
-                    .get::<_, i64>(0),)
-                .expect("应统计迁移账本"),
-            0
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT COUNT(*) FROM player_skill WHERE player_id = ?1",
-                    [player_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .expect("应统计历史魂技"),
-            1
-        );
-    }
-
-    #[test]
-    fn v26_activation_rejects_hidden_migrated_skill_targets() {
-        let (_directory, store) = test_store();
-        store
-            .register_player(&identity(), "激活门控角色", "男")
-            .expect("应创建激活门控角色");
-        store.awaken_wuhun(&identity()).expect("应完成武魂觉醒");
-
-        let before_package = content_effect_package(
-            "player-skill-migration-before",
-            "player-skill-migration-before-effect",
-            "entangle",
-        );
-        store
-            .stage_content_package(&before_package)
-            .expect("应写入迁移前内容包");
-        assert!(
-            store
-                .validate_content_draft("player-skill-migration-before", 1)
-                .expect("应校验迁移前内容包")
-                .errors
-                .is_empty()
-        );
-        let before = store
-            .publish_content_draft("player-skill-migration-before", 1)
-            .expect("应发布迁移前内容包");
-
-        let transition_package = content_skill_replacement_package(
-            "player-skill-migration-gate",
-            "entangle",
-            "migration-gate-skill",
-        );
-        store
-            .stage_content_package(&transition_package)
-            .expect("应写入迁移门控内容包");
-        assert!(
-            store
-                .validate_content_draft("player-skill-migration-gate", 1)
-                .expect("应校验迁移门控内容包")
-                .errors
-                .is_empty()
-        );
-        let transition = store
-            .publish_content_draft("player-skill-migration-gate", 1)
-            .expect("应发布迁移门控内容包");
-        store
-            .migrate_skill_with_operation(
-                &identity(),
-                "entangle",
-                "migration-gate-skill",
-                &transfer_operation("迁移魂技", "player-skill-migration-gate-1"),
-            )
-            .expect("应完成门控前迁移");
-
-        let blocked_package = content_skill_replacement_package(
-            "player-skill-migration-blocked",
-            "migration-gate-skill",
-            "migration-gate-next-skill",
-        );
-        store
-            .stage_content_package(&blocked_package)
-            .expect("应写入会隐藏迁移 target 的内容包");
-        assert!(
-            store
-                .validate_content_draft("player-skill-migration-blocked", 1)
-                .expect("候选内容包本身应通过目录校验")
-                .errors
-                .is_empty()
-        );
-        let activation_count = store
-            .open()
-            .expect("应读取激活记录")
-            .query_row(
-                "SELECT COUNT(*) FROM content_revision_activation",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("应统计激活记录");
-        assert!(
-            store
-                .publish_content_draft("player-skill-migration-blocked", 1)
-                .expect_err("发布不能隐藏已迁移 target")
-                .contains("隐藏已迁移魂技 target")
-        );
-        assert!(
-            store
-                .publish_content_draft("player-skill-migration-before", 1)
-                .expect_err("重放不能隐藏已迁移 target")
-                .contains("隐藏已迁移魂技 target")
-        );
-        assert!(
-            store
-                .rollback_content_revision(before.revision.id)
-                .expect_err("回滚不能隐藏已迁移 target")
-                .contains("隐藏已迁移魂技 target")
-        );
-        let connection = store.open().expect("应验证激活门控结果");
-        assert_eq!(
-            current_content_revision_id(&connection).expect("应读取当前 revision"),
-            transition.revision.id
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT COUNT(*) FROM content_revision_activation",
-                    [],
-                    |row| { row.get::<_, i64>(0) }
-                )
-                .expect("应统计门控后的激活记录"),
-            activation_count
-        );
-    }
-
-    #[test]
-    fn v26_migration_schema_fails_closed() {
-        let (directory, store) = test_store();
-        let connection = store.open().expect("应打开 v26 schema 测试数据库");
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT COUNT(*) FROM schema_migration WHERE version = 26",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .expect("应读取 v26 迁移记录"),
-            1
-        );
+    fn install_empty_v26_schema_for_retirement_test(connection: &Connection) {
         connection
-            .execute_batch("DROP VIEW player_skill_current_projection;")
-            .expect("应移除 v26 当前技能投影视图以验证 fail-closed");
+            .execute("DELETE FROM schema_migration WHERE version = 27", [])
+            .expect("应移除 v27 记录以模拟旧数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE player_skill_migration_request(id INTEGER PRIMARY KEY);
+                CREATE TABLE player_skill_migration(id INTEGER PRIMARY KEY);
+                CREATE VIEW player_skill_current_projection AS
+                    SELECT * FROM player_skill;
+                CREATE VIEW content_active_skill_transition_terminal AS
+                    SELECT 'source' AS source_key, 'target' AS target_key;
+                CREATE TRIGGER content_revision_activation_skill_migration_guard
+                BEFORE INSERT ON content_revision_activation
+                BEGIN
+                    SELECT 1;
+                END;
+                INSERT INTO schema_migration(version, applied_at) VALUES(26, 0);
+                "#,
+            )
+            .expect("应写入空的错误 v26 结构");
+    }
+
+    #[test]
+    fn v27_retires_empty_v26_skill_migration_schema() {
+        let (directory, store) = test_store();
+        let connection = store.open().expect("应打开 v27 清理测试数据库");
+        install_empty_v26_schema_for_retirement_test(&connection);
         drop(connection);
+
+        let restored = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("空的错误 v26 结构应可被安全清理");
+        let connection = restored.open().expect("应读取清理后的数据库");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migration WHERE version = 27",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("应读取 v27 清理记录"),
+            1
+        );
+        for name in [
+            "player_skill_migration_request",
+            "player_skill_migration",
+            "player_skill_current_projection",
+            "content_active_skill_transition_terminal",
+            "content_revision_activation_skill_migration_guard",
+        ] {
+            assert!(
+                !connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1)",
+                        [name],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .expect("应检查错误 v26 结构是否已删除"),
+                "{name} 应被 v27 清理"
+            );
+        }
+        let loadout_guard = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'skill_loadout_event_scope_guard'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("应恢复装备魂技校验触发器")
+            .to_ascii_uppercase();
+        assert!(
+            loadout_guard.contains("FROM PLAYER_SKILL")
+                && !loadout_guard.contains("PLAYER_SKILL_CURRENT_PROJECTION")
+        );
+    }
+
+    #[test]
+    fn v27_refuses_to_clean_nonempty_v26_skill_migration_ledger() {
+        let (directory, store) = test_store();
+        let connection = store.open().expect("应打开 v27 非空账本测试数据库");
+        install_empty_v26_schema_for_retirement_test(&connection);
+        connection
+            .execute("INSERT INTO player_skill_migration(id) VALUES(1)", [])
+            .expect("应写入错误 v26 账本记录");
+        drop(connection);
+
         let error = Store::initialize(directory.path(), &DatabaseConfig::default())
-            .expect_err("缺少 v26 当前技能投影视图时应拒绝启动");
-        assert!(error.contains("v26") && error.contains("player_skill_current_projection"));
+            .expect_err("非空错误 v26 账本不得被自动清理");
+        assert!(error.contains("错误 v26 魂技迁移账本"));
+    }
+
+    #[test]
+    fn v27_schema_fails_closed_when_restored_guard_is_missing() {
+        let (directory, store) = test_store();
+        let connection = store.open().expect("应打开 v27 schema 测试数据库");
+        connection
+            .execute("DROP TRIGGER skill_loadout_event_scope_guard", [])
+            .expect("应移除 v27 恢复触发器以验证 fail-closed");
+        drop(connection);
+
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("缺少 v27 恢复触发器时应拒绝启动");
+        assert!(error.contains("skill_loadout_event_scope_guard"));
     }
 
     #[test]
