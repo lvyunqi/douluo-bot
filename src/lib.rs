@@ -15,12 +15,13 @@ mod web;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-use abi_stable::std_types::RString;
 use abi_stable_host_api::{
-    CommandRequest, CommandResponse, PluginConfigRequest, PluginConfigResult, PluginInitConfig,
-    PluginInitResult,
+    ACTION_REPLY, BotApi, CommandRequest, CommandResponse, DynamicActionResponse,
+    InterceptorRequest, InterceptorResponse, PluginConfigRequest, PluginConfigResult,
+    PluginInitConfig, PluginInitResult, SendBuilder,
 };
 use qimen_dynamic_plugin_derive::dynamic_plugin;
+use serde_json::{Value, json};
 
 use crate::assets::IllustrationAssets;
 use crate::config::parse_config;
@@ -129,30 +130,178 @@ fn shutdown_runtime() {
     }
 }
 
-/// 为支持该可选符号的宿主返回当前玩家的 canonical 快捷键目标；空字符串表示未命中。
+/// 动态拦截器只接收原始消息文本，先拆出无空白的快捷键和其余参数。
+fn parse_player_alias_message(message_text: &str) -> Option<(&str, &str)> {
+    let message_text = message_text.trim();
+    if message_text.is_empty() || message_text.chars().any(char::is_control) {
+        return None;
+    }
+    let (alias, args) = message_text
+        .split_once(char::is_whitespace)
+        .map_or((message_text, ""), |(alias, args)| (alias, args.trim()));
+    (!alias.is_empty()).then_some((alias, args))
+}
+
+/// 将拦截器事件转换为现有游戏命令请求，保留身份、会话和幂等所需的宿主上下文。
+fn command_request_from_interceptor(
+    request: &InterceptorRequest,
+    command_name: &str,
+    args: &str,
+) -> CommandRequest {
+    CommandRequest {
+        args: abi_stable::std_types::RString::from(args),
+        command_name: abi_stable::std_types::RString::from(command_name),
+        sender_id: request.sender_id.clone(),
+        group_id: request.group_id.clone(),
+        raw_event_json: request.raw_event_json.clone(),
+        sender_nickname: request.sender_nickname.clone(),
+        message_id: request.message_id.clone(),
+        timestamp: request.timestamp,
+    }
+}
+
+/// 查询当前玩家的快捷键，并构造用于执行 canonical 游戏命令的请求。
+fn resolve_player_alias_interceptor(request: &InterceptorRequest) -> Option<CommandRequest> {
+    let (alias, args) = parse_player_alias_message(request.message_text.as_str())?;
+    let lookup_request = command_request_from_interceptor(request, alias, args);
+    let service = runtime_slot().read().ok()?.clone()?;
+    let command_name = service.resolve_player_alias_command(&lookup_request)?;
+    Some(command_request_from_interceptor(
+        request,
+        &command_name,
+        args,
+    ))
+}
+
+enum InterceptorReplyTarget {
+    Group(String),
+    Private(String),
+    Channel(String),
+    ChannelPrivate(String),
+}
+
+/// 解析拦截器回复的目标，不依赖发送者可伪造的文本字段。
+fn interceptor_reply_target(request: &InterceptorRequest) -> Option<InterceptorReplyTarget> {
+    if !crate::message::detect_protocol(request.raw_event_json.as_str())
+        .eq(&crate::message::Protocol::QqOfficial)
+    {
+        return (!request.group_id.is_empty())
+            .then(|| InterceptorReplyTarget::Group(request.group_id.to_string()))
+            .or_else(|| {
+                (!request.sender_id.is_empty())
+                    .then(|| InterceptorReplyTarget::Private(request.sender_id.to_string()))
+            });
+    }
+
+    let raw_event: Value = serde_json::from_str(request.raw_event_json.as_str()).ok()?;
+    let root = raw_event.as_object()?;
+    let payload = root.get("qqbot_payload")?.as_object()?;
+    let event_type = root
+        .get("event_type")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("event_type").and_then(Value::as_str))?;
+    let field = |name: &str| {
+        root.get(name)
+            .and_then(Value::as_str)
+            .or_else(|| payload.get(name).and_then(Value::as_str))
+    };
+
+    match event_type {
+        "GROUP_AT_MESSAGE_CREATE" | "GROUP_MESSAGE_CREATE" => field("group_openid")
+            .filter(|value| !value.is_empty())
+            .map(|value| InterceptorReplyTarget::Group(value.to_string())),
+        "C2C_MESSAGE_CREATE" => (!request.sender_id.is_empty())
+            .then(|| InterceptorReplyTarget::Private(request.sender_id.to_string())),
+        "AT_MESSAGE_CREATE" | "MESSAGE_CREATE" => field("channel_id")
+            .filter(|value| !value.is_empty())
+            .map(|value| InterceptorReplyTarget::Channel(value.to_string())),
+        "DIRECT_MESSAGE_CREATE" => field("guild_id")
+            .filter(|value| !value.is_empty())
+            .map(|value| InterceptorReplyTarget::ChannelPrivate(value.to_string())),
+        _ => None,
+    }
+}
+
+/// 在插件拦截器中把正常命令回执写入宿主的回调发送队列。
 ///
-/// # Safety
-///
-/// 调用方必须传入与当前 ABI 兼容、在本次调用期间保持有效的 `CommandRequest` 引用。
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn qimen_plugin_command_rewrite(req: &CommandRequest) -> RString {
-    let service = match runtime_slot().read() {
-        Ok(slot) => slot.clone(),
-        Err(_) => None,
+/// OneBot 与 QQ 群/C2C 可保留原富文本；频道/DMS 的主动发送仅安全降级为文本。
+fn queue_interceptor_response(request: &InterceptorRequest, response: &CommandResponse) -> bool {
+    if response.action.action_kind != ACTION_REPLY {
+        return true;
+    }
+    let Some(target) = interceptor_reply_target(request) else {
+        return false;
     };
-    let Some(service) = service else {
-        return RString::new();
+    let is_onebot = crate::message::detect_protocol(request.raw_event_json.as_str())
+        == crate::message::Protocol::OneBot11;
+    let Some(segments_json) = interceptor_response_segments(&response.action, request, is_onebot)
+    else {
+        return false;
     };
-    let Some(command) = service.resolve_player_alias_command(req) else {
-        return RString::new();
+
+    match target {
+        InterceptorReplyTarget::Group(group_id) => {
+            BotApi::send_group_rich(&group_id, &segments_json)
+        }
+        InterceptorReplyTarget::Private(user_id) => {
+            BotApi::send_private_rich(&user_id, &segments_json)
+        }
+        InterceptorReplyTarget::Channel(channel_id) => {
+            let Some(text) = interceptor_response_text(&response.action) else {
+                return false;
+            };
+            SendBuilder::channel(&channel_id).text(&text).send();
+        }
+        InterceptorReplyTarget::ChannelPrivate(guild_id) => {
+            let Some(text) = interceptor_response_text(&response.action) else {
+                return false;
+            };
+            SendBuilder::channel_private(&guild_id).text(&text).send();
+        }
+    }
+    true
+}
+
+/// 构造可由宿主发送队列消费的消息段；OneBot 额外保留对原消息的引用。
+fn interceptor_response_segments(
+    action: &DynamicActionResponse,
+    request: &InterceptorRequest,
+    include_reply: bool,
+) -> Option<String> {
+    let mut segments = if action.segments_json.is_empty() {
+        vec![json!({"type":"text","data":{"text":action.message.as_str()}})]
+    } else {
+        serde_json::from_str::<Vec<Value>>(action.segments_json.as_str()).ok()?
     };
-    RString::from(
-        serde_json::json!({
-            "command": command,
-            "args": req.args.as_str(),
+    if include_reply && !request.message_id.is_empty() {
+        segments.insert(
+            0,
+            json!({"type":"reply","data":{"id":request.message_id.as_str()}}),
+        );
+    }
+    serde_json::to_string(&segments).ok()
+}
+
+/// 从富文本回执提取频道/DMS 主动发送可承载的文本降级内容。
+fn interceptor_response_text(action: &DynamicActionResponse) -> Option<String> {
+    if !action.message.is_empty() {
+        return Some(action.message.to_string());
+    }
+    let segments = serde_json::from_str::<Vec<Value>>(action.segments_json.as_str()).ok()?;
+    let text = segments
+        .iter()
+        .filter_map(|segment| {
+            let data = segment.get("data")?.as_object()?;
+            match segment.get("type")?.as_str()? {
+                "text" => data.get("text")?.as_str(),
+                "markdown" => data.get("content")?.as_str(),
+                _ => None,
+            }
         })
-        .to_string(),
-    )
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
 }
 
 fn with_service(
@@ -209,6 +358,86 @@ fn execute_service_operation(
     (result, denied)
 }
 
+/// 执行已由快捷键解析器限制过的游戏主命令，保持正式命令的授权、审计和事务语义。
+fn dispatch_player_alias_command(request: &CommandRequest) -> CommandResponse {
+    match request.command_name.as_str() {
+        "斗罗系统" => with_service(request, true, true, |service| {
+            service.menu(request.args.as_str())
+        }),
+        "开始穿越" => with_service(request, false, true, |service| service.register(request)),
+        "武魂觉醒" => with_service(request, false, true, |service| service.awaken(request)),
+        "开武魂" => with_service(request, false, true, |service| service.open_wuhun(request)),
+        "关武魂" => with_service(request, false, true, |service| service.close_wuhun(request)),
+        "技能" => with_service(request, true, true, |service| service.skills(request)),
+        "技能详情" => {
+            with_service(request, true, true, |service| service.skill_detail(request))
+        }
+        "装备魂技" => {
+            with_service(request, false, true, |service| service.equip_skill(request))
+        }
+        "卸下魂技" => with_service(request, false, true, |service| {
+            service.unequip_skill(request)
+        }),
+        "魂环" => with_service(request, true, true, |service| service.soul_rings(request)),
+        "吸收魂环" => with_service(request, false, true, |service| {
+            service.absorb_soul_ring(request)
+        }),
+        "剥离魂环" => with_service(request, false, true, |service| {
+            service.detach_soul_ring(request)
+        }),
+        "释放技能" => with_service(request, false, true, |service| service.use_skill(request)),
+        "签到" => with_service(request, false, true, |service| {
+            service.daily_checkin(request)
+        }),
+        "钱包" => with_service(request, true, true, |service| service.wallet(request)),
+        "转账" => with_service(request, false, true, |service| {
+            service.transfer_gold(request)
+        }),
+        "NPC" => with_service(request, true, true, |service| service.npcs(request)),
+        "对话" => with_service(request, false, true, |service| service.talk(request)),
+        "商店" => with_service(request, true, true, |service| service.shop(request)),
+        "背包" => with_service(request, true, true, |service| service.inventory(request)),
+        "购买" => with_service(request, false, true, |service| service.buy(request)),
+        "出售" => with_service(request, false, true, |service| service.sell(request)),
+        "使用" => with_service(request, false, true, |service| service.use_item(request)),
+        "发送物品" => with_service(request, false, true, |service| service.gift_item(request)),
+        "状态" => with_service(request, true, true, |service| service.status(request)),
+        "位置" => with_service(request, true, true, |service| service.location(request)),
+        "地图列表" => with_service(request, true, true, |service| service.map_list(request)),
+        "向" => with_service(request, false, true, |service| {
+            service.move_direction(request)
+        }),
+        "传送" => with_service(request, false, true, |service| service.teleport(request)),
+        "掉落" => with_service(request, true, true, |service| service.ground_drops(request)),
+        "拾取" => with_service(request, false, true, |service| {
+            service.pick_up_ground_drop(request)
+        }),
+        "任务" => with_service(request, true, true, |service| service.quests(request)),
+        "接取任务" => with_service(request, false, true, |service| {
+            service.accept_quest(request)
+        }),
+        "任务进度" => with_service(request, true, true, |service| {
+            service.quest_progress(request)
+        }),
+        "提交任务" => with_service(request, false, true, |service| {
+            service.submit_quest(request)
+        }),
+        "放弃任务" => with_service(request, false, true, |service| {
+            service.abandon_quest(request)
+        }),
+        "魂兽" => with_service(request, true, true, |service| service.soul_beasts(request)),
+        "挑战" => with_service(request, false, true, |service| service.challenge(request)),
+        "攻击" => with_service(request, false, true, |service| service.attack(request)),
+        "逃跑" => with_service(request, false, true, |service| service.flee(request)),
+        "战斗状态" => with_service(request, true, true, |service| {
+            service.battle_status(request)
+        }),
+        "战斗日志" => with_service(request, true, true, |service| service.battle_logs(request)),
+        // 解析层已经验证目标集合；意外值保持忽略，避免自行扩大命令权限。
+        _ => CommandResponse::ignore(),
+    }
+}
+
 #[dynamic_plugin(
     id = "douluo-game",
     version = "0.1.0",
@@ -236,6 +465,20 @@ mod plugin {
         match parse_config(request.config_json.as_str()) {
             Ok(_) => PluginConfigResult::ok(),
             Err(error) => PluginConfigResult::err(&error),
+        }
+    }
+
+    /// 在宿主命令匹配前处理玩家快捷键；未命中或无法安全回复时放行原消息。
+    #[pre_handle]
+    fn player_alias_interceptor(request: &InterceptorRequest) -> InterceptorResponse {
+        let Some(canonical_request) = resolve_player_alias_interceptor(request) else {
+            return InterceptorResponse::allow();
+        };
+        let response = dispatch_player_alias_command(&canonical_request);
+        if queue_interceptor_response(request, &response) {
+            InterceptorResponse::block()
+        } else {
+            InterceptorResponse::allow()
         }
     }
 
