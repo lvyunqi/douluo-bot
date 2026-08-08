@@ -211,6 +211,29 @@ function Invoke-OneBotCommand {
     }
 }
 
+function Invoke-SlimeVictory {
+    param(
+        [string]$Endpoint,
+        [int]$MaxAttacks = 8
+    )
+    $challenge = Invoke-OneBotCommand $Endpoint "挑战 史莱姆"
+    Write-Output ("onebot 挑战 史莱姆: {0} [{1}]" -f $challenge.ActionName, $challenge.Text)
+    Assert-Condition ($challenge.Text.Contains("战斗开始")) "soul beast challenge did not start"
+    Assert-Condition ($challenge.Text.Contains("武魂战斗修正")) "battle challenge did not expose wuhun modifiers"
+
+    $finished = $false
+    for ($round = 1; $round -le $MaxAttacks; $round++) {
+        $attack = Invoke-OneBotCommand $Endpoint "攻击"
+        Write-Output ("onebot 普通攻击 {0}: {1} [{2}]" -f $round, $attack.ActionName, $attack.Text)
+        if ($attack.Text.Contains("战斗胜利")) {
+            $finished = $true
+            break
+        }
+        Assert-Condition (-not $attack.Text.Contains("战斗失败")) "soul beast battle was lost before victory"
+    }
+    Assert-Condition $finished "soul beast battle did not finish within $MaxAttacks normal attacks"
+}
+
 function Wait-Health {
     param([string]$Url, [int]$Seconds, [System.Diagnostics.Process]$Process, [string]$ErrorLog)
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
@@ -419,8 +442,9 @@ try {
         @{ Message = "开始穿越 协议冒烟 男"; Contains = "穿越成功" },
         @{ Message = "武魂觉醒"; Contains = "觉醒仪式完成" },
         @{ Message = "状态"; Contains = "武魂稳定度" },
-        @{ Message = "装备魂技 缠绕"; Contains = "已经装备" },
-        @{ Message = "卸下魂技 缠绕"; Contains = "至少保留一个" },
+        @{ Message = "技能"; Contains = "你还没有学习任何魂技" },
+        @{ Message = "装备魂技 缠绕"; Contains = "尚未学习魂技" },
+        @{ Message = "技能详情 缠绕"; Contains = "尚未学习魂技" },
         @{ Message = "签到"; Contains = "签到成功" },
         @{ Message = "签到"; Contains = "今日已签到" },
         @{ Message = "钱包"; Contains = "金魂币" },
@@ -463,15 +487,48 @@ try {
     $beasts = Invoke-OneBotCommand $endpoint "魂兽"
     Write-Output ("onebot 魂兽: {0} [{1}]" -f $beasts.ActionName, $beasts.Text)
     Assert-Condition ($beasts.Text.Contains("史莱姆")) "soul beast list did not expose slime"
-    $challenge = Invoke-OneBotCommand $endpoint "挑战 史莱姆"
-    Write-Output ("onebot 挑战 史莱姆: {0} [{1}]" -f $challenge.ActionName, $challenge.Text)
-    Assert-Condition ($challenge.Text.Contains("战斗开始")) "soul beast challenge did not start"
-    Assert-Condition ($challenge.Text.Contains("武魂战斗修正")) "battle challenge did not expose wuhun modifiers"
-    $skills = Invoke-OneBotCommand $endpoint "技能"
-    Write-Output ("onebot 技能: {0} [{1}]" -f $skills.ActionName, $skills.Text)
-    Assert-Condition ($skills.Text.Contains("缠绕")) "skill list did not expose the base skill"
+    # 先用普通攻击生成真实 pending 掉落，证明觉醒本身不会凭空产生魂技。
+    Invoke-SlimeVictory $endpoint
+    $rings = Invoke-OneBotCommand $endpoint "魂环"
+    Write-Output ("onebot 魂环: {0} [{1}]" -f $rings.ActionName, $rings.Text)
+    Assert-Condition ($rings.Text.Contains("待吸收魂环")) "soul ring list did not expose pending drops"
+    Assert-Condition ($rings.Text.Contains("史莱姆")) "soul ring list did not expose the slime drop"
+    $absorbBlocked = Invoke-OneBotCommand $endpoint "吸收魂环 史莱姆"
+    Write-Output ("onebot 吸收魂环 史莱姆 (低等级): {0} [{1}]" -f $absorbBlocked.ActionName, $absorbBlocked.Text)
+    Assert-Condition ($absorbBlocked.Text.Contains("魂环槽位已满")) "low-level soul ring absorption was not gated by capacity"
+    $skillsAfterVictory = Invoke-OneBotCommand $endpoint "技能"
+    Assert-Condition ($skillsAfterVictory.Text.Contains("你还没有学习任何魂技")) "skill appeared before soul ring absorption"
+    Assert-Condition (-not $skillsAfterVictory.Text.Contains("毒刺")) "locked soul skill appeared before ring absorption"
+
+    $levelingBattles = 0
+    while ($true) {
+        $statusForLevel = Invoke-OneBotCommand $endpoint "状态"
+        $levelMatch = [regex]::Match($statusForLevel.Text, "境界：(?<level>\d+)级")
+        Assert-Condition $levelMatch.Success "status did not expose a parseable player level"
+        $currentLevel = [int]$levelMatch.Groups["level"].Value
+        if ($currentLevel -ge 10) {
+            Write-Output ("onebot level gate reached: level {0} after {1} additional slime victories" -f $currentLevel, $levelingBattles)
+            break
+        }
+        Assert-Condition ($levelingBattles -lt 60) "player did not reach soul ring capacity level within 60 additional victories"
+        Invoke-SlimeVictory $endpoint
+        $levelingBattles++
+    }
+
+    $absorbed = Invoke-OneBotCommand $endpoint "吸收魂环 史莱姆"
+    Write-Output ("onebot 吸收魂环 史莱姆 (capacity unlocked): {0} [{1}]" -f $absorbed.ActionName, $absorbed.Text)
+    Assert-Condition ($absorbed.Text.Contains("魂环吸收成功")) "pending soul ring was not absorbed after reaching level 10"
+    $skillsAfterAbsorb = Invoke-OneBotCommand $endpoint "技能"
+    Write-Output ("onebot 魂技 after soul ring absorption: {0} [{1}]" -f $skillsAfterAbsorb.ActionName, $skillsAfterAbsorb.Text)
+    Assert-Condition ($skillsAfterAbsorb.Text.Contains("缠绕")) "absorbed soul ring did not grant its bound skill"
+    Assert-Condition ($skillsAfterAbsorb.Text.Contains("熟练度：0/100")) "newly bound skill did not start at zero proficiency"
+    $alreadyEquipped = Invoke-OneBotCommand $endpoint "装备魂技 缠绕"
+    Assert-Condition ($alreadyEquipped.Text.Contains("已经装备")) "absorbed skill was not equipped by default"
+    $lastUnequip = Invoke-OneBotCommand $endpoint "卸下魂技 缠绕"
+    Assert-Condition ($lastUnequip.Text.Contains("至少保留一个")) "last equipped soul skill could be removed"
+
+    $skills = $skillsAfterAbsorb
     Assert-Condition ($skills.Text.Contains("魂力")) "skill list did not expose soul power"
-    Assert-Condition ($skills.Text.Contains("熟练度：0/100")) "skill list did not expose initial proficiency"
     $skillDetail = Invoke-OneBotCommand $endpoint "技能详情 缠绕"
     Write-Output ("onebot 技能详情 缠绕: {0} [{1}]" -f $skillDetail.ActionName, $skillDetail.Text)
     Assert-Condition ($skillDetail.Text.Contains("魂力消耗")) "skill detail did not expose cost"
@@ -480,6 +537,9 @@ try {
     Assert-Condition ($skillDetail.Text.Contains("100%")) "level-one skill detail did not expose a 100% damage modifier"
     Assert-Condition ($skillDetail.Text.Contains("附加效果")) "skill detail did not expose the attached effect"
     Assert-Condition ($skillDetail.Text.Contains("魂兽攻击 -30% · 3 回合")) "skill detail did not expose the entangle reduction contract"
+    $skillChallenge = Invoke-OneBotCommand $endpoint "挑战 史莱姆"
+    Write-Output ("onebot 技能战斗挑战: {0} [{1}]" -f $skillChallenge.ActionName, $skillChallenge.Text)
+    Assert-Condition ($skillChallenge.Text.Contains("战斗开始")) "skill battle challenge did not start"
     $skill = Invoke-OneBotCommand $endpoint "释放技能 缠绕"
     Write-Output ("onebot 释放技能 缠绕: {0} [{1}]" -f $skill.ActionName, $skill.Text)
     Assert-Condition ($skill.Text.Contains("魂技")) "skill release did not expose skill receipt"
@@ -504,17 +564,6 @@ try {
         }
     }
     Assert-Condition $battleFinished "soul beast battle did not finish within five turns"
-    $rings = Invoke-OneBotCommand $endpoint "魂环"
-    Write-Output ("onebot 魂环: {0} [{1}]" -f $rings.ActionName, $rings.Text)
-    Assert-Condition ($rings.Text.Contains("待吸收魂环")) "soul ring list did not expose pending drops"
-    Assert-Condition ($rings.Text.Contains("史莱姆")) "soul ring list did not expose the slime drop"
-    $absorbBlocked = Invoke-OneBotCommand $endpoint "吸收魂环 史莱姆"
-    Write-Output ("onebot 吸收魂环 史莱姆 (低等级): {0} [{1}]" -f $absorbBlocked.ActionName, $absorbBlocked.Text)
-    Assert-Condition ($absorbBlocked.Text.Contains("魂环槽位已满")) "low-level soul ring absorption was not gated by capacity"
-    $skillsAfterVictory = Invoke-OneBotCommand $endpoint "技能"
-    Assert-Condition ($skillsAfterVictory.Text.Contains("缠绕")) "base skill disappeared after a ring drop"
-    Assert-Condition ($skillsAfterVictory.Text.Contains("熟练度：10/100")) "skill proficiency did not persist after battle"
-    Assert-Condition (-not $skillsAfterVictory.Text.Contains("毒刺")) "locked soul skill appeared before ring absorption"
     $toVillage = Invoke-OneBotCommand $endpoint "传送 圣魂村"
     Assert-Condition ($toVillage.Text.Contains("圣魂村")) "could not leave the battle map"
 
