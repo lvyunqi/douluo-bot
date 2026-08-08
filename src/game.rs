@@ -1,6 +1,8 @@
 use abi_stable_host_api::CommandRequest;
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::alias::{validate_player_alias_name, validate_player_alias_target};
 use crate::assets::IllustrationAssets;
 use crate::catalog;
 use crate::config::{AuthorizationMode, IllustrationMode, PluginConfig};
@@ -73,6 +75,22 @@ const MENU_PAGES: &[MenuPage] = &[
             MenuEntry {
                 command: "钱包",
                 description: "查看金魂币余额",
+            },
+            MenuEntry {
+                command: "设置快捷键 <原指令>-<新指令>",
+                description: "为普通游戏命令设置个人快捷键",
+            },
+            MenuEntry {
+                command: "快捷键列表",
+                description: "查看已设置的个人快捷键",
+            },
+            MenuEntry {
+                command: "查看快捷键 <原指令>",
+                description: "查看某条原指令下的快捷键",
+            },
+            MenuEntry {
+                command: "删除快捷键 <原指令>-<快捷键>",
+                description: "删除个人快捷键",
             },
         ],
     },
@@ -300,6 +318,118 @@ impl GameService {
                 }
             ))
         }
+    }
+
+    /// 为当前稳定身份设置个人快捷键，目标仅限普通游戏主命令。
+    pub fn set_player_alias(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let (target_command, alias) = parse_player_alias_pair(
+            req.args.as_str(),
+            "设置快捷键 <原指令>-<新指令>，例如：设置快捷键 状态-查",
+        )?;
+        validate_player_alias_target(target_command)?;
+        validate_player_alias_name(alias)?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt =
+            self.store
+                .set_player_alias_with_operation(&key, target_command, alias, &operation)?;
+        let title = if receipt.created {
+            "快捷键设置成功"
+        } else {
+            "快捷键已存在"
+        };
+        let notice = if receipt.created {
+            "快捷键仅属于当前玩家和当前机器人账号，不会影响其他玩家或宿主命令"
+        } else {
+            "相同映射此前已存在，本次没有覆盖或新增记录"
+        };
+        Ok(GameDocument::new(title)
+            .field("原指令", receipt.alias.target_command)
+            .field("快捷键", receipt.alias.alias)
+            .command("快捷键列表")
+            .notice(notice))
+    }
+
+    /// 按原指令分组展示当前玩家的快捷键。
+    pub fn list_player_aliases(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        if !req.args.as_str().trim().is_empty() {
+            return Err("用法：快捷键列表".to_string());
+        }
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let aliases = self.store.list_player_aliases(&key)?;
+        let mut grouped = BTreeMap::<String, Vec<String>>::new();
+        for entry in aliases {
+            grouped
+                .entry(entry.target_command)
+                .or_default()
+                .push(entry.alias);
+        }
+        let mut document = GameDocument::new("快捷键列表").field(
+            "数量",
+            grouped.values().map(Vec::len).sum::<usize>().to_string(),
+        );
+        if grouped.is_empty() {
+            document = document.line("当前没有设置快捷键。");
+        } else {
+            for (target_command, aliases) in grouped {
+                document = document
+                    .line(format!("【{target_command}】{}", aliases.join("、")))
+                    .command(format!("查看快捷键 {target_command}"));
+            }
+        }
+        Ok(document.notice("快捷键按当前协议、Bot account_id、namespace 和玩家身份隔离"))
+    }
+
+    /// 查看指定普通游戏主命令下的个人快捷键。
+    pub fn player_alias_detail(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let target_command =
+            parse_player_alias_target_arg(req.args.as_str(), "查看快捷键 <原指令>")?;
+        validate_player_alias_target(target_command)?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let aliases = self
+            .store
+            .list_player_aliases(&key)?
+            .into_iter()
+            .filter(|entry| entry.target_command == target_command)
+            .map(|entry| entry.alias)
+            .collect::<Vec<_>>();
+        if aliases.is_empty() {
+            return Err(format!("原指令“{target_command}”尚未设置快捷键"));
+        }
+        let mut document = GameDocument::new(format!("快捷键 · {target_command}"))
+            .field("数量", aliases.len().to_string());
+        for alias in &aliases {
+            document = document.line(format!("· {alias}"));
+        }
+        Ok(document.command(format!("删除快捷键 {target_command}-<快捷键>")))
+    }
+
+    /// 删除当前玩家指定原指令下的快捷键。
+    pub fn delete_player_alias(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let (target_command, alias) = parse_player_alias_pair(
+            req.args.as_str(),
+            "删除快捷键 <原指令>-<快捷键>，例如：删除快捷键 状态-查",
+        )?;
+        validate_player_alias_target(target_command)?;
+        validate_player_alias_name(alias)?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let deleted = self.store.delete_player_alias_with_operation(
+            &key,
+            target_command,
+            alias,
+            &operation,
+        )?;
+        Ok(GameDocument::new("快捷键删除成功")
+            .field("原指令", deleted.target_command)
+            .field("快捷键", deleted.alias)
+            .command("快捷键列表"))
     }
 
     pub fn menu(&self, args: &str) -> Result<GameDocument, String> {
@@ -2243,6 +2373,28 @@ fn parse_registration_args(args: &str, legacy_hyphen: bool) -> Result<(&str, &st
     Err("用法：开始穿越 <角色名> <男|女>；也兼容旧格式“角色名-性别”".to_string())
 }
 
+fn parse_player_alias_pair<'a>(args: &'a str, usage: &str) -> Result<(&'a str, &'a str), String> {
+    let args = args.trim();
+    let Some((target_command, alias)) = args.split_once('-') else {
+        return Err(format!("用法：{usage}"));
+    };
+    let target_command = target_command.trim();
+    let alias = alias.trim();
+    if target_command.is_empty() || alias.is_empty() {
+        return Err(format!("用法：{usage}"));
+    }
+    Ok((target_command, alias))
+}
+
+fn parse_player_alias_target_arg<'a>(args: &'a str, usage: &str) -> Result<&'a str, String> {
+    let mut parts = args.split_whitespace();
+    let target_command = parts.next().unwrap_or_default();
+    if target_command.is_empty() || parts.next().is_some() {
+        return Err(format!("用法：{usage}"));
+    }
+    Ok(target_command)
+}
+
 fn parse_grant_context_args(args: &str) -> Result<(String, String, String), String> {
     let parts = args.split_whitespace().collect::<Vec<_>>();
     match parts.as_slice() {
@@ -2881,6 +3033,107 @@ mod tests {
             Ok(("唐-小三", "男"))
         );
         assert!(parse_registration_args("唐小三-男", false).is_err());
+    }
+
+    #[test]
+    fn player_alias_arguments_require_exact_legacy_shapes() {
+        assert_eq!(
+            parse_player_alias_pair("状态-查", "设置快捷键 <原指令>-<新指令>"),
+            Ok(("状态", "查"))
+        );
+        assert_eq!(
+            parse_player_alias_pair("状态-查-看", "设置快捷键 <原指令>-<新指令>"),
+            Ok(("状态", "查-看"))
+        );
+        assert!(parse_player_alias_pair("状态", "设置快捷键 <原指令>-<新指令>").is_err());
+        assert!(parse_player_alias_pair("状态-", "设置快捷键 <原指令>-<新指令>").is_err());
+        assert_eq!(
+            parse_player_alias_target_arg("状态", "查看快捷键 <原指令>"),
+            Ok("状态")
+        );
+        assert!(parse_player_alias_target_arg("状态 额外", "查看快捷键 <原指令>").is_err());
+    }
+
+    #[test]
+    fn player_alias_commands_keep_registered_player_and_command_boundaries() {
+        let directory = tempfile::tempdir().expect("应创建快捷键临时目录");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("快捷键数据库应初始化");
+        let service = GameService::with_assets(
+            store,
+            PluginConfig::default(),
+            IllustrationAssets::default(),
+        );
+
+        assert!(
+            service
+                .set_player_alias(&command_request(
+                    "设置快捷键",
+                    "状态-查状态",
+                    "alias-before-register"
+                ))
+                .is_err()
+        );
+        service
+            .register(&command_request(
+                "开始穿越",
+                "快捷键测试 男",
+                "alias-register",
+            ))
+            .expect("应创建快捷键测试角色");
+
+        let created = crate::message::render_text(
+            &service
+                .set_player_alias(&command_request(
+                    "设置快捷键",
+                    "状态-查状态",
+                    "alias-create",
+                ))
+                .expect("应设置快捷键"),
+        );
+        assert!(created.contains("快捷键设置成功"));
+        assert!(created.contains("原指令：状态"));
+        assert!(created.contains("快捷键：查状态"));
+
+        let list = crate::message::render_text(
+            &service
+                .list_player_aliases(&command_request("快捷键列表", "", "alias-list"))
+                .expect("应读取快捷键列表"),
+        );
+        assert!(list.contains("【状态】查状态"));
+        let detail = crate::message::render_text(
+            &service
+                .player_alias_detail(&command_request("查看快捷键", "状态", "alias-detail"))
+                .expect("应读取快捷键详情"),
+        );
+        assert!(detail.contains("· 查状态"));
+
+        for (args, expected) in [
+            ("旧档认领-认领", "原指令必须是可执行的游戏主命令"),
+            ("状态-plugins", "不能覆盖 QimenBot"),
+            ("状态-状态", "不能与已注册的斗罗命令"),
+        ] {
+            let error = service
+                .set_player_alias(&command_request("设置快捷键", args, "alias-conflict"))
+                .expect_err("保留或高权限命令不能作为快捷键");
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let deleted = crate::message::render_text(
+            &service
+                .delete_player_alias(&command_request(
+                    "删除快捷键",
+                    "状态-查状态",
+                    "alias-delete",
+                ))
+                .expect("应删除快捷键"),
+        );
+        assert!(deleted.contains("快捷键删除成功"));
+        assert!(
+            service
+                .player_alias_detail(&command_request("查看快捷键", "状态", "alias-after-delete"))
+                .is_err()
+        );
     }
 
     #[test]

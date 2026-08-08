@@ -5099,6 +5099,51 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_V29: &str = r#"
+CREATE TABLE player_alias (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    identity_id INTEGER NOT NULL REFERENCES identity(id) ON DELETE CASCADE,
+    target_command TEXT NOT NULL CHECK(
+        length(target_command) BETWEEN 1 AND 128
+        AND target_command = trim(target_command)
+        AND instr(target_command, char(0)) = 0
+        AND target_command NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    alias TEXT NOT NULL CHECK(
+        length(alias) BETWEEN 1 AND 128
+        AND alias = trim(alias)
+        AND instr(alias, char(0)) = 0
+        AND alias NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0)
+) STRICT;
+
+CREATE UNIQUE INDEX player_alias_identity_alias
+    ON player_alias(identity_id, alias);
+CREATE INDEX player_alias_identity_page
+    ON player_alias(identity_id, id);
+
+-- 快捷键只能属于已经创建角色的稳定身份，不能作为游离身份数据写入。
+CREATE TRIGGER player_alias_identity_guard
+BEFORE INSERT ON player_alias
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM identity i
+      JOIN player p ON p.identity_id = i.id
+     WHERE i.id = NEW.identity_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'player alias requires a registered player');
+END;
+
+-- 目标命令和快捷键名称一经创建不可改写，修改必须显式删除后重新设置。
+CREATE TRIGGER player_alias_no_update
+BEFORE UPDATE ON player_alias
+BEGIN
+    SELECT RAISE(ABORT, 'player alias is immutable');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -5218,6 +5263,22 @@ pub struct IdentityKey<'a> {
     pub namespace: &'a str,
     pub subject_kind: &'a str,
     pub subject_id: &'a str,
+}
+
+/// 玩家自定义快捷键的稳定身份归属记录。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerAliasRecord {
+    pub id: i64,
+    pub target_command: String,
+    pub alias: String,
+    pub created_at: i64,
+}
+
+/// 设置快捷键后的写入结果；相同映射重复设置不会覆盖原记录。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerAliasSetReceipt {
+    pub alias: PlayerAliasRecord,
+    pub created: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7684,7 +7745,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
                     format!(
-                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27 失败：{error}"
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29 失败：{error}"
                     )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
@@ -8118,10 +8179,25 @@ impl Store {
                 validate_v28_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 29)? {
+                transaction
+                    .execute_batch(MIGRATION_V29)
+                    .map_err(|error| format!("执行数据库迁移 v29 失败：{error}"))?;
+                validate_v29_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(29, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v29 失败：{error}"))?;
+            } else {
+                validate_v29_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29 失败：{error}"
                 )
             })?;
             Ok(())
@@ -8156,6 +8232,7 @@ impl Store {
                 validate_v25_schema(connection)?;
                 validate_v27_schema(connection)?;
                 validate_v28_schema(connection)?;
+                validate_v29_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -8222,6 +8299,147 @@ impl Store {
             .map_err(|error| format!("提交注册事务失败：{error}"))?;
         self.player_status(key)?
             .ok_or_else(|| "角色已经创建，但重新读取失败".to_string())
+    }
+
+    /// 读取当前稳定身份已设置的快捷键；未创建角色时拒绝返回游离数据。
+    pub fn list_player_aliases(
+        &self,
+        key: &IdentityKey<'_>,
+    ) -> Result<Vec<PlayerAliasRecord>, String> {
+        validate_identity_key(key)?;
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let identity_id = registered_player_identity_id(&connection, key)?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT id, target_command, alias, created_at
+                  FROM player_alias
+                 WHERE identity_id = ?1
+                 ORDER BY id ASC
+                "#,
+            )
+            .map_err(|error| format!("准备读取快捷键列表失败：{error}"))?;
+        statement
+            .query_map([identity_id], player_alias_record_from_row)
+            .map_err(|error| format!("查询快捷键列表失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析快捷键列表失败：{error}"))
+    }
+
+    /// 为宿主命令改写提供只读查找；未创建角色或未设置快捷键均返回空结果。
+    pub fn resolve_player_alias(
+        &self,
+        key: &IdentityKey<'_>,
+        alias: &str,
+    ) -> Result<Option<PlayerAliasRecord>, String> {
+        validate_identity_key(key)?;
+        validate_player_alias_token(alias, "快捷键")?;
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let Some(identity_id) = find_registered_player_identity_id(&connection, key)? else {
+            return Ok(None);
+        };
+        load_player_alias(&connection, identity_id, alias)
+    }
+
+    /// 新建玩家快捷键；相同映射可重复提交，但不会覆盖已绑定到其他命令的名称。
+    pub fn set_player_alias_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        target_command: &str,
+        alias: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<PlayerAliasSetReceipt, String> {
+        validate_identity_key(key)?;
+        validate_player_alias_token(target_command, "原指令")?;
+        validate_player_alias_token(alias, "快捷键")?;
+        validate_operation_input(operation)?;
+        let mut connection = self.open()?;
+        let transaction = self.begin_immediate(&mut connection, "开始设置快捷键事务失败")?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let identity_id = registered_player_identity_id(&transaction, key)?;
+        reject_replayed_operation(&transaction, key, operation)?;
+
+        let receipt = match load_player_alias(&transaction, identity_id, alias)? {
+            Some(existing) if existing.target_command == target_command => PlayerAliasSetReceipt {
+                alias: existing,
+                created: false,
+            },
+            Some(existing) => {
+                return Err(format!(
+                    "快捷键“{alias}”已绑定到“{}”，请先删除后再设置",
+                    existing.target_command
+                ));
+            }
+            None => {
+                let created_at = now_timestamp()?;
+                transaction
+                    .execute(
+                        r#"
+                        INSERT INTO player_alias(identity_id, target_command, alias, created_at)
+                        VALUES(?1, ?2, ?3, ?4)
+                        "#,
+                        params![identity_id, target_command, alias, created_at],
+                    )
+                    .map_err(|error| format!("保存快捷键失败：{error}"))?;
+                PlayerAliasSetReceipt {
+                    alias: PlayerAliasRecord {
+                        id: transaction.last_insert_rowid(),
+                        target_command: target_command.to_string(),
+                        alias: alias.to_string(),
+                        created_at,
+                    },
+                    created: true,
+                }
+            }
+        };
+        insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交设置快捷键事务失败：{error}"))?;
+        Ok(receipt)
+    }
+
+    /// 删除指定原指令下的快捷键，避免同名快捷键被错误删除。
+    pub fn delete_player_alias_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        target_command: &str,
+        alias: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<PlayerAliasRecord, String> {
+        validate_identity_key(key)?;
+        validate_player_alias_token(target_command, "原指令")?;
+        validate_player_alias_token(alias, "快捷键")?;
+        validate_operation_input(operation)?;
+        let mut connection = self.open()?;
+        let transaction = self.begin_immediate(&mut connection, "开始删除快捷键事务失败")?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let identity_id = registered_player_identity_id(&transaction, key)?;
+        reject_replayed_operation(&transaction, key, operation)?;
+        let record = load_player_alias(&transaction, identity_id, alias)?
+            .ok_or_else(|| format!("没有找到快捷键“{alias}”"))?;
+        if record.target_command != target_command {
+            return Err(format!(
+                "快捷键“{alias}”不属于原指令“{target_command}”，当前绑定为“{}”",
+                record.target_command
+            ));
+        }
+        let changed = transaction
+            .execute(
+                "DELETE FROM player_alias WHERE id = ?1 AND identity_id = ?2",
+                params![record.id, identity_id],
+            )
+            .map_err(|error| format!("删除快捷键失败：{error}"))?;
+        if changed != 1 {
+            return Err("删除快捷键时记录状态发生变化".to_string());
+        }
+        insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交删除快捷键事务失败：{error}"))?;
+        Ok(record)
     }
 
     pub fn player_status(&self, key: &IdentityKey<'_>) -> Result<Option<PlayerStatus>, String> {
@@ -24601,6 +24819,147 @@ fn validate_v28_schema(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// 校验玩家快捷键表及其身份边界，已记录 v29 的数据库缺失任一约束都拒绝启动。
+fn validate_v29_schema(connection: &Connection) -> Result<(), String> {
+    validate_v28_schema(connection)?;
+
+    let actual = table_columns_with_type(connection, "player_alias")?;
+    let expected = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("identity_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("target_command", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("alias", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+    ];
+    if actual != expected {
+        return Err(format!("v29 表 player_alias 字段不匹配：{actual:?}"));
+    }
+
+    let sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'player_alias'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 v29 玩家快捷键表失败：{error}"))?
+        .ok_or_else(|| "数据库缺少 v29 表 player_alias".to_string())?
+        .to_ascii_uppercase();
+    for marker in [
+        "REFERENCES IDENTITY(ID) ON DELETE CASCADE",
+        "TARGET_COMMAND TEXT NOT NULL",
+        "ALIAS TEXT NOT NULL",
+        ") STRICT",
+    ] {
+        if !sql.contains(marker) {
+            return Err(format!("v29 表 player_alias 缺少约束：{marker}"));
+        }
+    }
+
+    validate_v9_foreign_keys(
+        connection,
+        "player_alias",
+        &[("identity", "identity_id", "id", "NO ACTION", "CASCADE")],
+    )
+    .map_err(|error| error.replace("v9", "v29"))?;
+    validate_v10_custom_index_set(
+        connection,
+        "player_alias",
+        &["player_alias_identity_alias", "player_alias_identity_page"],
+    )
+    .map_err(|error| error.replace("v10", "v29"))?;
+    for (name, unique, columns) in [
+        (
+            "player_alias_identity_alias",
+            true,
+            &["identity_id", "alias"][..],
+        ),
+        (
+            "player_alias_identity_page",
+            false,
+            &["identity_id", "id"][..],
+        ),
+    ] {
+        validate_v7_index(connection, name, unique, columns, false)
+            .map_err(|error| error.replace("v7", "v29"))?;
+    }
+
+    let expected_triggers = [
+        (
+            "player_alias_identity_guard",
+            "player_alias",
+            &["BEFORE INSERT", "JOIN PLAYER", "RAISE(ABORT"] as &[&str],
+        ),
+        (
+            "player_alias_no_update",
+            "player_alias",
+            &["BEFORE UPDATE", "RAISE(ABORT"] as &[&str],
+        ),
+    ];
+    for (name, table, markers) in expected_triggers {
+        let (actual_table, trigger_sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v29 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库缺少 v29 触发器 {name}"))?;
+        let trigger_sql = trigger_sql.to_ascii_uppercase();
+        if actual_table != table || markers.iter().any(|marker| !trigger_sql.contains(marker)) {
+            return Err(format!("v29 触发器 {name} 契约不匹配"));
+        }
+    }
+
+    let invalid_alias = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM player_alias alias
+             LEFT JOIN player p ON p.identity_id = alias.identity_id
+                 WHERE p.id IS NULL
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v29 快捷键归属失败：{error}"))?;
+    if invalid_alias {
+        return Err("v29 检测到未归属角色的玩家快捷键".to_string());
+    }
+
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v29 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v29 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v29 全库触发器失败：{error}"))?;
+    for (name, table, trigger_sql) in triggers {
+        let declared = expected_triggers
+            .iter()
+            .any(|(expected_name, expected_table, _)| {
+                name == *expected_name && table == *expected_table
+            });
+        if (table == "player_alias" || sql_mentions_identifier(&trigger_sql, "player_alias"))
+            && !declared
+        {
+            return Err(format!(
+                "v29 触发器 {name} 未声明却引用玩家快捷键结构 {table}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_v24_table_sql(
     connection: &Connection,
     table: &str,
@@ -26226,6 +26585,78 @@ fn validate_claim_actor(actor: &LegacyClaimActor<'_>) -> Result<(), String> {
 fn valid_audit_value(value: &str, max_chars: usize) -> bool {
     let count = value.chars().count();
     (1..=max_chars).contains(&count) && !value.chars().any(char::is_control)
+}
+
+fn validate_player_alias_token(value: &str, label: &str) -> Result<(), String> {
+    if value != value.trim()
+        || !valid_audit_value(value, 128)
+        || value.chars().any(char::is_whitespace)
+    {
+        return Err(format!("{label}必须是 1 到 128 个无空白或控制字符的字符串"));
+    }
+    Ok(())
+}
+
+fn find_registered_player_identity_id(
+    connection: &Connection,
+    key: &IdentityKey<'_>,
+) -> Result<Option<i64>, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT i.id
+              FROM identity i
+              JOIN player p ON p.identity_id = i.id
+             WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+               AND i.subject_kind = ?4 AND i.subject_id = ?5
+            "#,
+            params![
+                key.protocol.as_str(),
+                key.account_id,
+                key.namespace,
+                key.subject_kind,
+                key.subject_id
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| format!("查询快捷键角色归属失败：{error}"))
+}
+
+fn registered_player_identity_id(
+    connection: &Connection,
+    key: &IdentityKey<'_>,
+) -> Result<i64, String> {
+    find_registered_player_identity_id(connection, key)?
+        .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())
+}
+
+fn load_player_alias(
+    connection: &Connection,
+    identity_id: i64,
+    alias: &str,
+) -> Result<Option<PlayerAliasRecord>, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT id, target_command, alias, created_at
+              FROM player_alias
+             WHERE identity_id = ?1 AND alias = ?2
+            "#,
+            params![identity_id, alias],
+            player_alias_record_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("查询快捷键失败：{error}"))
+}
+
+fn player_alias_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlayerAliasRecord> {
+    Ok(PlayerAliasRecord {
+        id: row.get(0)?,
+        target_command: row.get(1)?,
+        alias: row.get(2)?,
+        created_at: row.get(3)?,
+    })
 }
 
 fn ensure_no_legacy_identity(connection: &Connection, key: &IdentityKey<'_>) -> Result<(), String> {
@@ -35144,6 +35575,156 @@ mod tests {
             CREATE TRIGGER player_skill_reads_ring_projection
             AFTER INSERT ON player_skill
             BEGIN SELECT EXISTS(SELECT 1 FROM player_soul_ring_current_projection); END;
+            "#,
+        );
+    }
+
+    #[test]
+    fn player_alias_crud_is_scoped_audited_and_conflict_safe() {
+        let (_directory, store) = test_store();
+        let owner = identity();
+        let other = recipient_identity();
+        let create = transfer_operation("设置快捷键", "alias-create");
+        assert!(
+            store
+                .set_player_alias_with_operation(&owner, "状态", "查", &create)
+                .is_err()
+        );
+
+        store
+            .register_player(&owner, "快捷键玩家", "男")
+            .expect("应创建快捷键测试角色");
+        store
+            .register_player(&other, "隔离玩家", "女")
+            .expect("应创建隔离测试角色");
+
+        let created = store
+            .set_player_alias_with_operation(&owner, "状态", "查", &create)
+            .expect("应创建快捷键");
+        assert!(created.created);
+        assert_eq!(created.alias.target_command, "状态");
+        assert_eq!(created.alias.alias, "查");
+
+        let replay = store
+            .set_player_alias_with_operation(&owner, "状态", "查", &create)
+            .expect_err("相同消息 ID 不能重复写入快捷键");
+        assert!(replay.contains("已经处理"));
+
+        let repeated = store
+            .set_player_alias_with_operation(
+                &owner,
+                "状态",
+                "查",
+                &transfer_operation("设置快捷键", "alias-repeat"),
+            )
+            .expect("相同映射可幂等确认");
+        assert!(!repeated.created);
+        assert_eq!(repeated.alias.id, created.alias.id);
+
+        let conflict = store
+            .set_player_alias_with_operation(
+                &owner,
+                "背包",
+                "查",
+                &transfer_operation("设置快捷键", "alias-conflict"),
+            )
+            .expect_err("不同原指令不能覆盖已占用快捷键");
+        assert!(conflict.contains("已绑定"));
+
+        let aliases = store.list_player_aliases(&owner).expect("应读取快捷键列表");
+        assert_eq!(aliases, vec![created.alias.clone()]);
+        assert_eq!(
+            store
+                .resolve_player_alias(&owner, "查")
+                .expect("应按稳定身份解析快捷键"),
+            Some(created.alias.clone())
+        );
+        assert_eq!(
+            store
+                .resolve_player_alias(&other, "查")
+                .expect("其他玩家读取不应失败"),
+            None
+        );
+
+        let wrong_target = store
+            .delete_player_alias_with_operation(
+                &owner,
+                "背包",
+                "查",
+                &transfer_operation("删除快捷键", "alias-wrong-target"),
+            )
+            .expect_err("删除时必须核对原指令");
+        assert!(wrong_target.contains("不属于原指令"));
+        assert!(
+            store
+                .delete_player_alias_with_operation(
+                    &owner,
+                    "状态",
+                    "不存在",
+                    &transfer_operation("删除快捷键", "alias-missing"),
+                )
+                .is_err()
+        );
+
+        let deleted = store
+            .delete_player_alias_with_operation(
+                &owner,
+                "状态",
+                "查",
+                &transfer_operation("删除快捷键", "alias-delete"),
+            )
+            .expect("应删除快捷键");
+        assert_eq!(deleted, created.alias);
+        assert!(
+            store
+                .list_player_aliases(&owner)
+                .expect("删除后仍应读取列表")
+                .is_empty()
+        );
+
+        let operations = store
+            .list_operation_logs(&owner, None, 100)
+            .expect("应读取快捷键操作审计");
+        let commands = operations
+            .entries
+            .iter()
+            .map(|entry| entry.command.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(commands, vec!["设置快捷键", "设置快捷键", "删除快捷键"]);
+    }
+
+    fn assert_v29_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v29 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v29 迁移应成功");
+        let connection = store.open().expect("应打开 v29 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v29 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v29 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v29") || error.contains("player_alias"),
+            "v29 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    #[test]
+    fn recorded_v29_with_damaged_schema_or_trigger_fails_closed() {
+        for mutation in [
+            "DROP TABLE player_alias;",
+            "DROP INDEX player_alias_identity_alias;",
+            "DROP TRIGGER player_alias_identity_guard;",
+        ] {
+            assert_v29_damage_fails_closed(mutation);
+        }
+        assert_v29_damage_fails_closed(
+            r#"
+            CREATE TRIGGER player_alias_shadow
+            AFTER INSERT ON player_alias
+            BEGIN SELECT 1; END;
             "#,
         );
     }

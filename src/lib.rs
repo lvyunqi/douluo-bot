@@ -1,5 +1,6 @@
 //! QimenBot 动态插件入口。
 
+mod alias;
 mod assets;
 mod catalog;
 pub mod config;
@@ -378,6 +379,46 @@ mod plugin {
     )]
     fn wallet(req: &CommandRequest) -> CommandResponse {
         with_service(req, true, true, |service| service.wallet(req))
+    }
+
+    #[command(
+        name = "设置快捷键",
+        description = "设置个人命令快捷键：设置快捷键 <原指令>-<新指令>",
+        category = "斗罗大陆·角色",
+        scope = "all"
+    )]
+    fn set_player_alias(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.set_player_alias(req))
+    }
+
+    #[command(
+        name = "快捷键列表",
+        description = "查看个人快捷键列表",
+        category = "斗罗大陆·角色",
+        scope = "all"
+    )]
+    fn list_player_aliases(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.list_player_aliases(req))
+    }
+
+    #[command(
+        name = "查看快捷键",
+        description = "查看原指令下的个人快捷键：查看快捷键 <原指令>",
+        category = "斗罗大陆·角色",
+        scope = "all"
+    )]
+    fn player_alias_detail(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.player_alias_detail(req))
+    }
+
+    #[command(
+        name = "删除快捷键",
+        description = "删除个人快捷键：删除快捷键 <原指令>-<快捷键>",
+        category = "斗罗大陆·角色",
+        scope = "all"
+    )]
+    fn delete_player_alias(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.delete_player_alias(req))
     }
 
     #[command(
