@@ -19,8 +19,8 @@ use crate::store::{
     BattleSkillEffectRecord, BattleSnapshot, DailyCheckinInput, DailyCheckinResult, GOLD_SOUL_COIN,
     IdentityKey, LegacyClaimActor, LegacyClaimResult, LegacyIdentityState, MAX_SKILL_LEVEL,
     MAX_SKILL_PROFICIENCY, MapExit, MapRecord, MapTravelReceipt, OperationLogInput, PlayerStatus,
-    QuestActionReceipt, QuestListEntry, SkillDamageModifierRecord, SkillEffectRecord,
-    SkillLoadoutReceipt, SkillPage, SoulBeastPage, SoulRingAbsorbReceipt,
+    QuestActionReceipt, QuestListEntry, REVIVE_WINDOW_SECONDS, SkillDamageModifierRecord,
+    SkillEffectRecord, SkillLoadoutReceipt, SkillPage, SoulBeastPage, SoulRingAbsorbReceipt,
     SoulRingDetachmentReceipt, SoulRingPage, Store, WuhunToggleReceipt, experience_progress,
     skill_damage_percent, skill_proficiency_threshold,
 };
@@ -1575,8 +1575,23 @@ impl GameService {
             });
         } else if event.status_after == "defeated" {
             document = document
-                .line("你被魂兽击败，系统将你救回到濒死状态")
-                .notice("死亡与复活系统尚未开放，本阶段不会删除角色或扣除转生次数");
+                .line("你被魂兽击败，已进入死亡状态，实际生命归零")
+                .field("复活窗口", format!("{} 秒", REVIVE_WINDOW_SECONDS));
+            if receipt.death_drops.is_empty() {
+                document = document.line("普通随身物品未掉落，复活物品仍保留在背包");
+            } else {
+                for drop in &receipt.death_drops {
+                    document = document.line(format!(
+                        "死亡掉落：{} x{}（掉落 #{}）",
+                        drop.item.name, drop.quantity, drop.id
+                    ));
+                }
+            }
+            document = document.notice(if receipt.replayed {
+                "检测到相同消息的重复请求，已返回原战斗回执和死亡掉落"
+            } else {
+                "死亡状态、武魂收回、普通背包掉落和复活窗口已在同一事务完成"
+            });
         } else if receipt.replayed {
             document = document.notice("检测到相同消息的重复请求，已返回原战斗回执，未重复执行");
         } else {
@@ -1590,7 +1605,7 @@ impl GameService {
             document = document.notice(if receipt.replayed {
                 "检测到相同消息的重复请求，已返回原回执；该回合武魂因稳定度过低自动脱落"
             } else if event.status_after == "defeated" {
-                "武魂因稳定度过低自动脱落；你已被救回濒死状态，死亡与复活系统尚未开放"
+                "武魂因死亡被强制收回，稳定度已归零；复活后仍需重新开启"
             } else {
                 "武魂稳定度过低，武魂已自动脱落；结束战斗后可重新开启"
             });
@@ -1610,6 +1625,10 @@ impl GameService {
                 }
                 document
             }
+            "defeated" => document
+                .command("状态")
+                .command("使用 <复活物品>")
+                .command("掉落"),
             _ => document.command("魂兽").command("状态"),
         }
     }
@@ -1886,6 +1905,11 @@ impl GameService {
             document = document.notice("物品已消耗");
         } else {
             document = document.notice("当前属性已满，物品未消耗");
+        }
+        if receipt.item.effect_kind == "revive" {
+            document = document
+                .line("复活成功，武魂仍处于收回状态，请使用“开武魂”重新开启")
+                .notice("复活物品已消耗，魂环、魂技和绑定历史保持不变");
         }
         Ok(document.command("背包").command("状态"))
     }
@@ -2299,6 +2323,9 @@ impl GameService {
             .field("位置", player.map_name)
             .field("转生", format!("第 {} 世", player.life_count))
             .field("状态", player.state);
+        if let Some(seconds) = player.revive_window_seconds_remaining {
+            document = document.field("复活窗口", format!("剩余 {} 秒", seconds));
+        }
         if let Some(enabled) = player.wuhun_enabled {
             document = document.field("武魂状态", if enabled { "开启" } else { "关闭" });
             if let (Some(stability), Some(max_stability)) =

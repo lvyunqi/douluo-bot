@@ -5630,6 +5630,7 @@ pub struct PlayerStatus {
     pub wuhun_enabled: Option<bool>,
     pub wuhun_stability: Option<i64>,
     pub wuhun_max_stability: Option<i64>,
+    pub revive_window_seconds_remaining: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6140,6 +6141,7 @@ pub struct BattleActionReceipt {
     pub event: BattleEventRecord,
     pub experience: Option<ExperienceGrantReceipt>,
     pub ground_drop: Option<GroundDropRecord>,
+    pub death_drops: Vec<GroundDropRecord>,
     pub wuhun_effect: Option<WuhunStateEffect>,
     pub skill: Option<SkillUseRecord>,
     pub expired_effects: Vec<BattleSkillEffectRecord>,
@@ -6377,6 +6379,8 @@ pub const GOLD_SOUL_COIN: &str = "gold_soul_coin";
 pub const MAX_EQUIPPED_SKILLS: i64 = 4;
 pub const MAX_SKILL_LEVEL: i64 = 10;
 pub const MAX_SKILL_PROFICIENCY: i64 = 4_500;
+/// 角色死亡后允许使用复活物品的固定窗口，窗口起点复用 player.updated_at。
+pub const REVIVE_WINDOW_SECONDS: i64 = 300;
 pub const BASE_SKILL_DAMAGE_PERCENT: i64 = 100;
 pub const SKILL_DAMAGE_PERCENT_PER_LEVEL: i64 = 5;
 const SKILL_DAMAGE_RULE_LEVEL_V1: &str = "level-v1";
@@ -9250,12 +9254,12 @@ impl Store {
         validate_identity_key(key)?;
         let connection = self.open()?;
         ensure_no_legacy_identity(&connection, key)?;
-        connection
+        let Some((mut status, updated_at)) = connection
             .query_row(
                 r#"
                 SELECT p.name, p.gender, p.level, p.exp, p.hp, p.max_hp,
                        p.soul_power, p.max_soul_power, COALESCE(m.name, p.map_name),
-                       p.life_count, p.state,
+                       p.life_count, p.state, p.updated_at,
                        w.name, w.category, pws.enabled, pws.stability, pws.max_stability
                   FROM identity i
                   JOIN player p ON p.identity_id = i.id
@@ -9275,28 +9279,44 @@ impl Store {
                     key.subject_id
                 ],
                 |row| {
-                    Ok(PlayerStatus {
-                        name: row.get(0)?,
-                        gender: row.get(1)?,
-                        level: row.get(2)?,
-                        exp: row.get(3)?,
-                        hp: row.get(4)?,
-                        max_hp: row.get(5)?,
-                        soul_power: row.get(6)?,
-                        max_soul_power: row.get(7)?,
-                        map_name: row.get(8)?,
-                        life_count: row.get(9)?,
-                        state: row.get(10)?,
-                        wuhun_name: row.get(11)?,
-                        wuhun_category: row.get(12)?,
-                        wuhun_enabled: row.get(13)?,
-                        wuhun_stability: row.get(14)?,
-                        wuhun_max_stability: row.get(15)?,
-                    })
+                    Ok((
+                        PlayerStatus {
+                            name: row.get(0)?,
+                            gender: row.get(1)?,
+                            level: row.get(2)?,
+                            exp: row.get(3)?,
+                            hp: row.get(4)?,
+                            max_hp: row.get(5)?,
+                            soul_power: row.get(6)?,
+                            max_soul_power: row.get(7)?,
+                            map_name: row.get(8)?,
+                            life_count: row.get(9)?,
+                            state: row.get(10)?,
+                            wuhun_name: row.get(12)?,
+                            wuhun_category: row.get(13)?,
+                            wuhun_enabled: row.get(14)?,
+                            wuhun_stability: row.get(15)?,
+                            wuhun_max_stability: row.get(16)?,
+                            revive_window_seconds_remaining: None,
+                        },
+                        row.get(11)?,
+                    ))
                 },
             )
             .optional()
-            .map_err(|error| format!("查询角色状态失败：{error}"))
+            .map_err(|error| format!("查询角色状态失败：{error}"))?
+        else {
+            return Ok(None);
+        };
+        status.revive_window_seconds_remaining = if status.state == "dead" {
+            Some(revive_window_seconds_remaining(
+                updated_at,
+                now_timestamp()?,
+            )?)
+        } else {
+            None
+        };
+        Ok(Some(status))
     }
 
     pub fn current_map(&self, key: &IdentityKey<'_>) -> Result<Option<MapRecord>, String> {
@@ -9445,6 +9465,7 @@ impl Store {
             .map_err(|error| format!("开始移动事务失败：{error}"))?;
         ensure_no_legacy_identity(&transaction, key)?;
         let (player_id, level, from) = load_player_map_for_identity(&transaction, key)?;
+        ensure_player_alive_for_action(&transaction, player_id, "移动")?;
         ensure_no_active_battle_for_player(&transaction, player_id)?;
         let (to, edge_level) = transaction
             .query_row(
@@ -9512,6 +9533,7 @@ impl Store {
             .map_err(|error| format!("开始传送事务失败：{error}"))?;
         ensure_no_legacy_identity(&transaction, key)?;
         let (player_id, level, from) = load_player_map_for_identity(&transaction, key)?;
+        ensure_player_alive_for_action(&transaction, player_id, "传送")?;
         ensure_no_active_battle_for_player(&transaction, player_id)?;
         if !from.teleport_enabled {
             return Err("当前地图没有传送阵，无法传送".to_string());
@@ -11490,6 +11512,9 @@ impl Store {
             .map_err(|error| format!("开始挑战魂兽事务失败：{error}"))?;
         ensure_no_legacy_identity(&transaction, key)?;
         let player = load_battle_player(&transaction, key)?;
+        if player.state != "alive" || player.hp <= 0 {
+            return Err("当前角色状态不能挑战魂兽".to_string());
+        }
         if !player.awakened {
             return Err("角色尚未完成武魂觉醒，不能挑战魂兽".to_string());
         }
@@ -11498,9 +11523,6 @@ impl Store {
                 .ok_or_else(|| "角色缺少武魂状态，请联系管理员".to_string())?;
         if !wuhun_state.enabled || wuhun_state.stability <= 0 {
             return Err("请先使用“开武魂”再挑战魂兽".to_string());
-        }
-        if player.state != "alive" || player.hp <= 0 {
-            return Err("当前角色状态不能挑战魂兽".to_string());
         }
         if let Some(existing) = load_battle_event_by_message(
             &transaction,
@@ -11528,6 +11550,7 @@ impl Store {
                 event: existing,
                 experience: None,
                 ground_drop: drop,
+                death_drops: Vec::new(),
                 wuhun_effect: None,
                 skill: None,
                 expired_effects: Vec::new(),
@@ -11634,6 +11657,7 @@ impl Store {
             event,
             experience: None,
             ground_drop: None,
+            death_drops: Vec::new(),
             wuhun_effect: None,
             skill: None,
             expired_effects: Vec::new(),
@@ -11708,6 +11732,7 @@ impl Store {
                 .flatten();
             let wuhun_effect = load_wuhun_state_event_by_battle_event(&transaction, existing.id)?;
             let soul_ring_drop = load_soul_ring_drop_by_battle_event(&transaction, existing.id)?;
+            let death_drops = load_death_drops_by_battle_event(&transaction, existing.id)?;
             let expired_effects =
                 load_expired_battle_skill_effects_by_event(&transaction, existing.id)?;
             transaction
@@ -11718,6 +11743,7 @@ impl Store {
                 event: existing,
                 experience: None,
                 ground_drop: drop,
+                death_drops,
                 wuhun_effect,
                 skill: previous_skill,
                 expired_effects,
@@ -12036,16 +12062,20 @@ impl Store {
                 if beast_critical {
                     beast_damage = battle_critical_damage(beast_damage, 10)?;
                 }
-                let player_hp_after = player_hp_after_healing.saturating_sub(beast_damage).max(1);
-                let status = if player_hp_after == 1 && beast_damage >= player_hp_after_healing {
-                    "defeated"
-                } else {
-                    "active"
-                };
+                let player_hp_after_actual =
+                    player_hp_after_healing.saturating_sub(beast_damage).max(0);
+                let defeated = player_hp_after_actual == 0;
+                let player_hp_after = player_hp_after_actual.max(1);
+                let status = if defeated { "defeated" } else { "active" };
                 transaction
                     .execute(
-                        "UPDATE player SET hp = ?1, updated_at = ?2 WHERE id = ?3",
-                        params![player_hp_after, timestamp, state.player_id],
+                        "UPDATE player SET hp = ?1, state = CASE WHEN ?2 THEN 'dead' ELSE state END, updated_at = ?3 WHERE id = ?4",
+                        params![
+                            player_hp_after_actual,
+                            defeated,
+                            timestamp,
+                            state.player_id
+                        ],
                     )
                     .map_err(|error| format!("保存战斗生命失败：{error}"))?;
                 transaction
@@ -12106,16 +12136,19 @@ impl Store {
                 if beast_critical {
                     beast_damage = battle_critical_damage(beast_damage, 10)?;
                 }
-                let player_hp_after = state.player_hp.saturating_sub(beast_damage).max(1);
-                let status = if player_hp_after == 1 && beast_damage >= state.player_hp {
-                    "defeated"
-                } else {
-                    "active"
-                };
+                let player_hp_after_actual = state.player_hp.saturating_sub(beast_damage).max(0);
+                let defeated = player_hp_after_actual == 0;
+                let player_hp_after = player_hp_after_actual.max(1);
+                let status = if defeated { "defeated" } else { "active" };
                 transaction
                     .execute(
-                        "UPDATE player SET hp = ?1, updated_at = ?2 WHERE id = ?3",
-                        params![player_hp_after, timestamp, state.player_id],
+                        "UPDATE player SET hp = ?1, state = CASE WHEN ?2 THEN 'dead' ELSE state END, updated_at = ?3 WHERE id = ?4",
+                        params![
+                            player_hp_after_actual,
+                            defeated,
+                            timestamp,
+                            state.player_id
+                        ],
                     )
                     .map_err(|error| format!("保存逃跑失败生命状态失败：{error}"))?;
                 transaction
@@ -12141,9 +12174,14 @@ impl Store {
         };
         let mut wuhun_effect = None;
         if beast_damage > 0 {
+            let actual_player_hp_after = if status_after == "defeated" {
+                0
+            } else {
+                player_hp_after
+            };
             let effect = wuhun_effect_after_damage(
                 &wuhun_state,
-                player_hp_after,
+                actual_player_hp_after,
                 state.player_max_hp,
                 battle_roll(state.random_seed, sequence, 7),
             )?;
@@ -12197,6 +12235,17 @@ impl Store {
             },
         )?;
         let event_id = transaction.last_insert_rowid();
+        let death_drops = if status_after == "defeated" {
+            insert_death_drops(
+                &transaction,
+                state.player_id,
+                &state.map_key,
+                event_id,
+                timestamp,
+            )?
+        } else {
+            Vec::new()
+        };
         let soul_ring_drop = if status_after == "won" {
             insert_soul_ring_drop(
                 &transaction,
@@ -12314,6 +12363,7 @@ impl Store {
             event,
             experience,
             ground_drop,
+            death_drops,
             wuhun_effect,
             skill: persisted_skill_use,
             expired_effects,
@@ -12340,6 +12390,7 @@ impl Store {
         ensure_no_legacy_identity(&transaction, key)?;
         reject_replayed_operation(&transaction, key, operation)?;
         let (player_id, level, map) = load_player_map_for_identity(&transaction, key)?;
+        ensure_player_alive_for_action(&transaction, player_id, "购买")?;
         let bound_npc = load_bound_npc_for_player(&transaction, player_id, &map.map_key, None)?;
         if bound_npc.npc_kind != "merchant" || !bound_npc.has_shop {
             return Err(format!("当前对话 NPC“{}”没有可用商店", bound_npc.name));
@@ -12484,6 +12535,7 @@ impl Store {
         ensure_no_legacy_identity(&transaction, key)?;
         reject_replayed_operation(&transaction, key, operation)?;
         let (player_id, level, map) = load_player_map_for_identity(&transaction, key)?;
+        ensure_player_alive_for_action(&transaction, player_id, "出售")?;
         let bound_npc = load_bound_npc_for_player(&transaction, player_id, &map.map_key, None)?;
         if bound_npc.npc_kind != "merchant" || !bound_npc.has_shop {
             return Err(format!("当前对话 NPC“{}”没有可用商店", bound_npc.name));
@@ -12603,39 +12655,48 @@ impl Store {
             .map_err(|error| format!("开始使用物品事务失败：{error}"))?;
         ensure_no_legacy_identity(&transaction, key)?;
         reject_replayed_operation(&transaction, key, operation)?;
-        let (player_id, level, hp_before, max_hp, soul_power_before, max_soul_power, state_before) =
-            transaction
-                .query_row(
-                    r#"
+        let (
+            player_id,
+            level,
+            hp_before,
+            max_hp,
+            soul_power_before,
+            max_soul_power,
+            state_before,
+            updated_at,
+        ) = transaction
+            .query_row(
+                r#"
                     SELECT p.id, p.level, p.hp, p.max_hp,
-                           p.soul_power, p.max_soul_power, p.state
+                           p.soul_power, p.max_soul_power, p.state, p.updated_at
                       FROM identity i
                       JOIN player p ON p.identity_id = i.id
                      WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
                        AND i.subject_kind = ?4 AND i.subject_id = ?5
                     "#,
-                    params![
-                        key.protocol.as_str(),
-                        key.account_id,
-                        key.namespace,
-                        key.subject_kind,
-                        key.subject_id
-                    ],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, i64>(4)?,
-                            row.get::<_, i64>(5)?,
-                            row.get::<_, String>(6)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(|error| format!("读取使用物品角色失败：{error}"))?
-                .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())?;
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind,
+                    key.subject_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("读取使用物品角色失败：{error}"))?
+            .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())?;
         ensure_no_active_battle_for_player(&transaction, player_id)?;
         let wuhun_before = load_wuhun_state_with_id_by_player(&transaction, player_id)?;
         if state_before == "deleted" {
@@ -12658,7 +12719,7 @@ impl Store {
             .optional()
             .map_err(|error| format!("查询使用物品定义失败：{error}"))?
             .ok_or_else(|| "当前世界不存在该物品".to_string())?;
-        if !item.usable {
+        if !item.usable && item.effect_kind != "revive" {
             return Err("该物品不能直接使用".to_string());
         }
         if level < item.level_required {
@@ -12672,6 +12733,7 @@ impl Store {
             return Err(format!("你的背包中没有{}", item.name));
         }
 
+        let timestamp = now_timestamp()?;
         let mut hp_after = hp_before;
         let mut soul_power_after = soul_power_before;
         let mut state_after = state_before.clone();
@@ -12708,6 +12770,9 @@ impl Store {
                 if state_before != "dead" {
                     return Err("复活物品只能在角色死亡时使用".to_string());
                 }
+                if revive_window_seconds_remaining(updated_at, timestamp)? <= 0 {
+                    return Err("复活窗口已结束，当前角色不能再使用复活物品".to_string());
+                }
                 hp_after = max_hp
                     .checked_mul(item.revive_hp_percent)
                     .ok_or_else(|| "复活生命计算溢出".to_string())?
@@ -12727,7 +12792,6 @@ impl Store {
         } else {
             inventory_before
         };
-        let timestamp = now_timestamp()?;
         let mut wuhun_stability_after = wuhun_before.as_ref().map(|(_, state)| state.stability);
         if consumed {
             let updated = transaction
@@ -14048,6 +14112,107 @@ fn load_ground_drop_by_source(
         )
         .optional()
         .map_err(|error| format!("读取掉落来源幂等记录失败：{error}"))
+}
+
+fn insert_death_drops(
+    connection: &Connection,
+    player_id: i64,
+    map_key: &str,
+    battle_event_id: i64,
+    created_at: i64,
+) -> Result<Vec<GroundDropRecord>, String> {
+    // 普通随身物品转成公共掉落；复活物品必须留在背包，否则死亡角色无法进入复活路径。
+    let expires_at = created_at
+        .checked_add(REVIVE_WINDOW_SECONDS)
+        .ok_or_else(|| "死亡掉落过期时间溢出".to_string())?;
+    let inventory = connection
+        .prepare(
+            r#"
+            SELECT inv.item_key, inv.quantity
+              FROM inventory inv
+              JOIN item i ON i.item_key = inv.item_key
+             WHERE inv.player_id = ?1 AND i.effect_kind <> 'revive'
+             ORDER BY inv.item_key
+            "#,
+        )
+        .map_err(|error| format!("准备死亡背包掉落查询失败：{error}"))?
+        .query_map([player_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| format!("查询死亡背包掉落失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析死亡背包掉落失败：{error}"))?;
+
+    let mut drops = Vec::new();
+    for (item_key, quantity) in inventory {
+        if quantity <= 0 {
+            return Err("死亡背包中存在无效物品数量".to_string());
+        }
+        let mut remaining = quantity;
+        let mut chunk = 1_i64;
+        while remaining > 0 {
+            let chunk_quantity = remaining.min(9_999);
+            let source_event_id = format!("death:{battle_event_id}:{item_key}:{chunk}");
+            validate_ground_drop_source("system", &source_event_id)?;
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO ground_drop(
+                        map_key, item_key, quantity, owner_identity_id, owner_subject_id,
+                        source_kind, source_event_id, expires_at, created_at
+                    ) VALUES(?1, ?2, ?3, NULL, NULL, 'system', ?4, ?5, ?6)
+                    "#,
+                    params![
+                        map_key,
+                        item_key,
+                        chunk_quantity,
+                        source_event_id,
+                        expires_at,
+                        created_at
+                    ],
+                )
+                .map_err(|error| format!("写入死亡地面掉落失败：{error}"))?;
+            let drop_id = connection.last_insert_rowid();
+            drops.push(
+                load_ground_drop_by_id(connection, drop_id)?
+                    .ok_or_else(|| "写入死亡地面掉落后无法读取记录".to_string())?,
+            );
+            remaining -= chunk_quantity;
+            chunk = chunk
+                .checked_add(1)
+                .ok_or_else(|| "死亡掉落堆编号溢出".to_string())?;
+        }
+    }
+
+    connection
+        .execute(
+            r#"
+            DELETE FROM inventory
+             WHERE player_id = ?1
+               AND item_key IN (
+                   SELECT item_key FROM item WHERE effect_kind <> 'revive'
+               )
+            "#,
+            [player_id],
+        )
+        .map_err(|error| format!("清空死亡普通背包失败：{error}"))?;
+    Ok(drops)
+}
+
+fn load_death_drops_by_battle_event(
+    connection: &Connection,
+    battle_event_id: i64,
+) -> Result<Vec<GroundDropRecord>, String> {
+    let prefix = format!("death:{battle_event_id}:");
+    connection
+        .prepare(&format!(
+            "{GROUND_DROP_SELECT} WHERE d.source_kind = 'system' AND d.source_event_id LIKE ?1 || '%' ORDER BY d.id"
+        ))
+        .map_err(|error| format!("准备死亡掉落重放查询失败：{error}"))?
+        .query_map([prefix], ground_drop_record_from_row)
+        .map_err(|error| format!("查询死亡掉落重放记录失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析死亡掉落重放记录失败：{error}"))
 }
 
 fn load_active_ground_drop(
@@ -16490,7 +16655,8 @@ fn wuhun_effect_after_damage(
     roll: u64,
 ) -> Result<WuhunStateEffect, String> {
     let stability_after = stability_from_hp(hp_after, max_hp, state.max_stability)?;
-    let auto_dropped = state.enabled && should_auto_drop_wuhun(stability_after, roll);
+    let auto_dropped =
+        state.enabled && (hp_after == 0 || should_auto_drop_wuhun(stability_after, roll));
     Ok(WuhunStateEffect {
         enabled_before: state.enabled,
         enabled_after: state.enabled && !auto_dropped,
@@ -16690,6 +16856,24 @@ fn ensure_no_active_battle_for_player(
         .map_err(|error| format!("检查当前战斗状态失败：{error}"))?;
     if active {
         return Err("当前正在魂兽战斗中，不能移动、传送或使用物品".to_string());
+    }
+    Ok(())
+}
+
+fn ensure_player_alive_for_action(
+    connection: &Connection,
+    player_id: i64,
+    action: &str,
+) -> Result<(), String> {
+    let (state, hp) = connection
+        .query_row(
+            "SELECT state, hp FROM player WHERE id = ?1",
+            [player_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(|error| format!("读取{action}角色状态失败：{error}"))?;
+    if state != "alive" || hp <= 0 {
+        return Err(format!("当前角色状态不能{action}"));
     }
     Ok(())
 }
@@ -28513,6 +28697,16 @@ fn now_timestamp() -> Result<i64, String> {
         .map_err(|error| format!("系统时间早于 Unix epoch：{error}"))
 }
 
+fn revive_window_seconds_remaining(dead_at: i64, now: i64) -> Result<i64, String> {
+    if dead_at < 0 || now < 0 {
+        return Err("复活窗口时间戳不能为负数".to_string());
+    }
+    let deadline = dead_at
+        .checked_add(REVIVE_WINDOW_SECONDS)
+        .ok_or_else(|| "复活窗口截止时间溢出".to_string())?;
+    Ok(deadline.saturating_sub(now).clamp(0, REVIVE_WINDOW_SECONDS))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Barrier};
@@ -32132,8 +32326,8 @@ mod tests {
                     "复活草",
                     &map_operation("使用", "revival-disabled"),
                 )
-                .expect_err("死亡系统完成前复活物品必须 fail closed")
-                .contains("不能直接使用")
+                .expect_err("活着时不能使用复活物品")
+                .contains("只能在角色死亡时使用")
         );
     }
 
@@ -33380,6 +33574,272 @@ mod tests {
                 .expect_err("同消息改动作必须拒绝")
                 .contains("不同的战斗操作")
         );
+    }
+
+    #[test]
+    fn p4_death_drops_inventory_replays_and_revives_within_window() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "死亡测试角色", "男")
+            .expect("应创建死亡测试角色");
+        store
+            .awaken_wuhun(&identity())
+            .expect("死亡测试角色应完成武魂觉醒");
+        seed_inventory(&store, &identity(), "small-healing-potion", 2);
+        seed_inventory(&store, &identity(), "soul-power-potion", 1);
+        seed_inventory(&store, &identity(), "revival-grass", 1);
+        let player_id = player_id_for(&store, &identity());
+        let connection = store.open().expect("应打开死亡测试数据库");
+        connection
+            .execute(
+                "UPDATE player SET hp = 1, max_hp = 1, strength = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置可复现的致命战斗属性");
+        drop(connection);
+
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "p4-death-map"),
+            )
+            .expect("应进入死亡测试地图");
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "史莱姆",
+                &transfer_operation("挑战", "p4-death-challenge"),
+            )
+            .expect("应开始死亡测试战斗");
+        let defeated = store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "p4-death-attack"),
+            )
+            .expect("致命反击应完成战斗结算");
+        assert_eq!(defeated.event.status_after, "defeated");
+        assert_eq!(defeated.event.player_hp_after, 1);
+        assert_eq!(defeated.battle.player_hp, 1);
+        assert_eq!(defeated.death_drops.len(), 2);
+        assert!(
+            defeated
+                .death_drops
+                .iter()
+                .all(|drop| drop.owner_subject_id.is_none())
+        );
+        assert_eq!(
+            inventory_for(&store, &identity(), "small-healing-potion"),
+            0
+        );
+        assert_eq!(inventory_for(&store, &identity(), "soul-power-potion"), 0);
+        assert_eq!(inventory_for(&store, &identity(), "revival-grass"), 1);
+
+        let dead = store
+            .player_status(&identity())
+            .expect("应读取死亡状态")
+            .expect("死亡角色应存在");
+        assert_eq!(dead.state, "dead");
+        assert_eq!(dead.hp, 0);
+        assert_eq!(dead.wuhun_enabled, Some(false));
+        assert_eq!(dead.wuhun_stability, Some(0));
+        assert!(matches!(
+            dead.revive_window_seconds_remaining,
+            Some(remaining) if (1..=REVIVE_WINDOW_SECONDS).contains(&remaining)
+        ));
+        assert!(
+            store
+                .challenge_soul_beast_with_operation(
+                    &identity(),
+                    "史莱姆",
+                    &transfer_operation("挑战", "p4-death-challenge-again"),
+                )
+                .expect_err("死亡角色不能再次挑战魂兽")
+                .contains("不能挑战")
+        );
+
+        let connection = store.open().expect("应检查死亡持久化状态");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT hp, state FROM player WHERE id = ?1",
+                    [player_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .expect("应读取实际死亡生命"),
+            (0, "dead".to_string())
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM ground_drop WHERE source_kind = 'system' AND source_event_id LIKE ?1 || '%'",
+                    [format!("death:{}:", defeated.event.id)],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("应统计死亡掉落"),
+            2
+        );
+        drop(connection);
+
+        let replay = store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "p4-death-attack"),
+            )
+            .expect("死亡战斗消息应可重放");
+        assert!(replay.replayed);
+        assert_eq!(replay.event, defeated.event);
+        assert_eq!(replay.death_drops, defeated.death_drops);
+
+        store
+            .use_item_with_operation(
+                &identity(),
+                "小回复药",
+                &transfer_operation("使用", "p4-death-normal-item"),
+            )
+            .expect_err("死亡角色不能使用普通恢复药");
+        assert!(
+            store
+                .teleport_with_operation(
+                    &identity(),
+                    Some("圣魂村"),
+                    &map_operation("传送", "p4-death-teleport"),
+                )
+                .expect_err("死亡角色不能传送")
+                .contains("不能传送")
+        );
+        assert!(
+            store
+                .pick_up_ground_drop_with_operation(
+                    &identity(),
+                    defeated.death_drops[0].id,
+                    &map_operation("拾取", "p4-death-pickup"),
+                )
+                .expect_err("死亡角色不能拾取死亡掉落")
+                .contains("不能拾取")
+        );
+
+        let expired_at = now_timestamp().expect("应读取当前时间") - REVIVE_WINDOW_SECONDS - 1;
+        let connection = store.open().expect("应打开窗口过期测试数据库");
+        connection
+            .execute(
+                "UPDATE player SET updated_at = ?1 WHERE id = ?2",
+                params![expired_at, player_id],
+            )
+            .expect("应设置过期复活窗口");
+        drop(connection);
+        let expired = store
+            .player_status(&identity())
+            .expect("应读取过期窗口")
+            .expect("角色应存在");
+        assert_eq!(expired.revive_window_seconds_remaining, Some(0));
+        assert!(
+            store
+                .use_item_with_operation(
+                    &identity(),
+                    "复活草",
+                    &transfer_operation("使用", "p4-death-revive-expired"),
+                )
+                .expect_err("过期窗口不能复活")
+                .contains("复活窗口已结束")
+        );
+        assert_eq!(inventory_for(&store, &identity(), "revival-grass"), 1);
+
+        let connection = store.open().expect("应重新打开复活测试数据库");
+        connection
+            .execute(
+                "UPDATE player SET updated_at = ?1 WHERE id = ?2",
+                params![now_timestamp().expect("应读取当前时间"), player_id],
+            )
+            .expect("应恢复有效复活窗口");
+        drop(connection);
+        let revived = store
+            .use_item_with_operation(
+                &identity(),
+                "复活草",
+                &transfer_operation("使用", "p4-death-revive"),
+            )
+            .expect("有效窗口内应可复活");
+        assert_eq!(revived.state_before, "dead");
+        assert_eq!(revived.state_after, "alive");
+        assert_eq!(revived.hp_after, 1);
+        assert_eq!(inventory_for(&store, &identity(), "revival-grass"), 0);
+        let alive = store
+            .player_status(&identity())
+            .expect("应读取复活状态")
+            .expect("角色应存在");
+        assert_eq!(alive.state, "alive");
+        assert_eq!(alive.hp, 1);
+        assert_eq!(alive.revive_window_seconds_remaining, None);
+        assert_eq!(alive.wuhun_enabled, Some(false));
+    }
+
+    #[test]
+    fn p4_failed_flee_can_enter_dead_without_lowering_history_hp() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "逃跑死亡测试角色", "男")
+            .expect("应创建逃跑死亡测试角色");
+        store
+            .awaken_wuhun(&identity())
+            .expect("逃跑死亡测试角色应完成武魂觉醒");
+        let player_id = player_id_for(&store, &identity());
+        let connection = store.open().expect("应打开逃跑死亡测试数据库");
+        connection
+            .execute(
+                "UPDATE player SET hp = 1, max_hp = 1, strength = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置逃跑致命属性");
+        drop(connection);
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "p4-flee-death-map"),
+            )
+            .expect("应进入逃跑死亡测试地图");
+        let started = store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "史莱姆",
+                &transfer_operation("挑战", "p4-flee-death-challenge"),
+            )
+            .expect("应开始逃跑死亡测试战斗");
+        let failed_flee_seed = (1_i64..)
+            .find(|seed| battle_roll(*seed, 1, 4) % 100 >= 50)
+            .expect("应找到确定失败的逃跑随机种子");
+        let connection = store.open().expect("应设置逃跑随机种子");
+        connection
+            .execute_batch("DROP TRIGGER battle_transition_guard;")
+            .expect("应暂时解除测试战斗快照更新门控");
+        connection
+            .execute(
+                "UPDATE battle SET random_seed = ?1 WHERE id = ?2",
+                params![failed_flee_seed, started.battle.id],
+            )
+            .expect("应设置确定失败的逃跑随机种子");
+        drop(connection);
+
+        let defeated = store
+            .flee_battle_with_operation(
+                &identity(),
+                &transfer_operation("逃跑", "p4-flee-death-action"),
+            )
+            .expect("失败逃跑的致命反击应完成战斗结算");
+        assert_eq!(defeated.event.event_kind, "flee");
+        assert_eq!(defeated.event.flee_success, Some(false));
+        assert_eq!(defeated.event.status_after, "defeated");
+        assert_eq!(defeated.event.player_hp_after, 1);
+        assert_eq!(defeated.battle.player_hp, 1);
+        let player = store
+            .player_status(&identity())
+            .expect("应读取逃跑死亡状态")
+            .expect("逃跑死亡角色应存在");
+        assert_eq!(player.state, "dead");
+        assert_eq!(player.hp, 0);
+        assert_eq!(player.wuhun_enabled, Some(false));
+        assert_eq!(player.wuhun_stability, Some(0));
     }
 
     #[test]
