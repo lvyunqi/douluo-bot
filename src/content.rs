@@ -24,6 +24,21 @@ pub const POISON_TICK_INTERVAL: i64 = 1;
 /// 单次中毒 tick 的目录上限，与 effect_definition.value 的数据库边界一致。
 pub const MAX_POISON_TICK_DAMAGE: i64 = 1_000_000;
 
+/// 首版眩晕效果冻结到快照中的规则版本。
+pub const STUN_RULE_VERSION: &str = "stun-v1";
+
+/// 首版眩晕只在玩家直接伤害后阻止本次魂兽反击。
+pub const STUN_APPLY_PHASE: &str = "after_player_damage";
+
+/// 首版眩晕的唯一结算结果是跳过魂兽反击。
+pub const STUN_COUNTERATTACK_BEHAVIOR: &str = "skip";
+
+/// 首版眩晕只允许单点控制，持续区间由 duration_rounds 冻结。
+pub const STUN_VALUE: i64 = 1;
+
+/// 首版眩晕的持续时间上限，避免内容包声明无法审计的超长控制。
+pub const MAX_STUN_DURATION_ROUNDS: i64 = 10;
+
 /// 可发布目录数据的文件格式。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -188,6 +203,15 @@ pub fn is_poison_v1_parameters(parameters: &BTreeMap<String, Value>) -> bool {
         && parameters.get("rule_version").and_then(Value::as_str) == Some(POISON_RULE_VERSION)
         && parameters.get("tick_phase").and_then(Value::as_str) == Some(POISON_TICK_PHASE)
         && parameters.get("tick_interval").and_then(Value::as_i64) == Some(POISON_TICK_INTERVAL)
+}
+
+/// 判断内容包参数是否精确声明首版眩晕规则，拒绝任意脚本或附加开关。
+pub fn is_stun_v1_parameters(parameters: &BTreeMap<String, Value>) -> bool {
+    parameters.len() == 3
+        && parameters.get("rule_version").and_then(Value::as_str) == Some(STUN_RULE_VERSION)
+        && parameters.get("apply_phase").and_then(Value::as_str) == Some(STUN_APPLY_PHASE)
+        && parameters.get("counterattack").and_then(Value::as_str)
+            == Some(STUN_COUNTERATTACK_BEHAVIOR)
 }
 
 /// 将内容包序列化为用于持久化和哈希的稳定 JSON 表示。
@@ -446,9 +470,13 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
             && entry.operation == "deal_damage"
             && entry.attribute_key == "beast_hp"
             && entry.value_mode == "absolute";
-        if !beast_attack_reduction && !poison_damage {
+        let stun_control = entry.target_kind == "beast"
+            && entry.operation == "control"
+            && entry.attribute_key == "stunned"
+            && entry.value_mode == "absolute";
+        if !beast_attack_reduction && !poison_damage && !stun_control {
             errors.push(format!(
-                "效果 {} 当前只支持减攻或 poison-v1 中毒伤害节点",
+                "效果 {} 当前只支持减攻、poison-v1 中毒伤害或 stun-v1 眩晕节点",
                 entry.effect_key
             ));
         }
@@ -462,6 +490,12 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
             errors.push(format!(
                 "效果 {} 的 poison-v1 value 必须是 1 到 {} 的 absolute",
                 entry.effect_key, MAX_POISON_TICK_DAMAGE
+            ));
+        }
+        if stun_control && entry.value != STUN_VALUE {
+            errors.push(format!(
+                "效果 {} 的 stun-v1 value 必须固定为 {} 的 absolute",
+                entry.effect_key, STUN_VALUE
             ));
         }
         range_field(
@@ -496,6 +530,24 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
         if poison_damage && !is_poison_v1_parameters(&entry.parameters) {
             errors.push(format!(
                 "效果 {} 的 poison-v1 parameters 必须固定声明规则版本、结算时机和间隔",
+                entry.effect_key
+            ));
+        }
+        if stun_control && entry.stack_policy != "refresh" {
+            errors.push(format!(
+                "效果 {} 的 stun-v1 stack_policy 必须是 refresh",
+                entry.effect_key
+            ));
+        }
+        if stun_control && !(1..=MAX_STUN_DURATION_ROUNDS).contains(&entry.duration_rounds) {
+            errors.push(format!(
+                "效果 {} 的 stun-v1 duration_rounds 必须在 1 到 {} 之间",
+                entry.effect_key, MAX_STUN_DURATION_ROUNDS
+            ));
+        }
+        if stun_control && !is_stun_v1_parameters(&entry.parameters) {
+            errors.push(format!(
+                "效果 {} 的 stun-v1 parameters 必须固定声明规则版本、结算时机和反击行为",
                 entry.effect_key
             ));
         }
@@ -867,6 +919,44 @@ mod tests {
             validate_shape(&package)
                 .iter()
                 .any(|error| error.contains("poison-v1 parameters"))
+        );
+    }
+
+    #[test]
+    fn accepts_only_the_controlled_stun_v1_node() {
+        let mut package = minimal_package();
+        let effect = &mut package.effects[0];
+        effect.target_kind = "beast".to_string();
+        effect.operation = "control".to_string();
+        effect.attribute_key = "stunned".to_string();
+        effect.value_mode = "absolute".to_string();
+        effect.value = 1;
+        effect.duration_rounds = 2;
+        effect.stack_policy = "refresh".to_string();
+        effect.parameters = BTreeMap::from([
+            (
+                "rule_version".to_string(),
+                Value::String("stun-v1".to_string()),
+            ),
+            (
+                "apply_phase".to_string(),
+                Value::String("after_player_damage".to_string()),
+            ),
+            (
+                "counterattack".to_string(),
+                Value::String("skip".to_string()),
+            ),
+        ]);
+        assert!(validate_shape(&package).is_empty());
+
+        package.effects[0].parameters.insert(
+            "counterattack".to_string(),
+            Value::String("block".to_string()),
+        );
+        assert!(
+            validate_shape(&package)
+                .iter()
+                .any(|error| error.contains("stun-v1 parameters"))
         );
     }
 
