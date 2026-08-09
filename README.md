@@ -94,8 +94,10 @@ remote_base_url = ""
 - `POST /api/v1/content/drafts/{package_key}/{package_revision}/validate`：校验已暂存草稿；要求 `content_admin` 会话和 `X-CSRF-Token`，不接收草稿正文。
 - `POST /api/v1/content/drafts/{package_key}/{package_revision}/publish`：发布已校验草稿；首次发布返回 `201`，重放返回 `200`，同样要求 CSRF。
 - `GET /api/v1/content/operations`：读取追加式管理员操作审计，使用相同游标；不会返回会话指纹。
+- `POST /api/v1/content/revisions/{revision_id}/rollback`：回滚到已存在的正 revision；要求 `content_admin` 会话和 `X-CSRF-Token`，只追加一条 `rollback` activation，返回 `201`。
+- `GET /api/v1/content/rollback-operations`：读取 rollback 专用的追加式管理员审计，使用相同游标；不会返回会话指纹。
 
-写路由只操作已经由受控文件入口暂存的草稿，并通过 Store 事务同步写入管理员审计；不提供草稿正文、内容上传、目录直写或 rollback 接口，也不会迁移或改写玩家、魂环或魂技状态。
+写路由只操作已暂存草稿或既有 revision，并通过 Store 事务同步写入管理员审计；不提供草稿正文、内容上传或目录直写。rollback 不删除目录、草稿或 revision，不恢复已剥离魂环/魂技，也不会迁移或改写任何玩家、魂环或魂技状态。
 
 ## Common Commands
 
