@@ -39,6 +39,21 @@ pub const STUN_VALUE: i64 = 1;
 /// 首版眩晕的持续时间上限，避免内容包声明无法审计的超长控制。
 pub const MAX_STUN_DURATION_ROUNDS: i64 = 10;
 
+/// 首版序列护盾冻结到快照中的规则版本。
+pub const SHIELD_RULE_VERSION: &str = "shield-v1";
+
+/// 首版护盾在玩家直接伤害后保护本序列的魂兽反击。
+pub const SHIELD_APPLY_PHASE: &str = "after_player_damage";
+
+/// 首版护盾吸收本序列的一次魂兽反击。
+pub const SHIELD_COUNTERATTACK_BEHAVIOR: &str = "absorb";
+
+/// 首版护盾每个受影响序列吸收一次完整反击。
+pub const SHIELD_VALUE: i64 = 1;
+
+/// 首版护盾的持续时间上限，避免内容包声明无法审计的超长保护。
+pub const MAX_SHIELD_DURATION_ROUNDS: i64 = 10;
+
 /// 可发布目录数据的文件格式。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -212,6 +227,15 @@ pub fn is_stun_v1_parameters(parameters: &BTreeMap<String, Value>) -> bool {
         && parameters.get("apply_phase").and_then(Value::as_str) == Some(STUN_APPLY_PHASE)
         && parameters.get("counterattack").and_then(Value::as_str)
             == Some(STUN_COUNTERATTACK_BEHAVIOR)
+}
+
+/// 判断内容包参数是否精确声明首版护盾规则，拒绝任意脚本或附加开关。
+pub fn is_shield_v1_parameters(parameters: &BTreeMap<String, Value>) -> bool {
+    parameters.len() == 3
+        && parameters.get("rule_version").and_then(Value::as_str) == Some(SHIELD_RULE_VERSION)
+        && parameters.get("apply_phase").and_then(Value::as_str) == Some(SHIELD_APPLY_PHASE)
+        && parameters.get("counterattack").and_then(Value::as_str)
+            == Some(SHIELD_COUNTERATTACK_BEHAVIOR)
 }
 
 /// 将内容包序列化为用于持久化和哈希的稳定 JSON 表示。
@@ -457,9 +481,9 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
         if entry.trigger_kind != "on_release" {
             errors.push(format!("效果 {} 当前只支持 on_release", entry.effect_key));
         }
-        if !matches!(entry.target_kind.as_str(), "enemy" | "beast") {
+        if !matches!(entry.target_kind.as_str(), "self" | "enemy" | "beast") {
             errors.push(format!(
-                "效果 {} 当前只支持 enemy 或 beast",
+                "效果 {} 当前只支持 self、enemy 或 beast",
                 entry.effect_key
             ));
         }
@@ -474,9 +498,13 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
             && entry.operation == "control"
             && entry.attribute_key == "stunned"
             && entry.value_mode == "absolute";
-        if !beast_attack_reduction && !poison_damage && !stun_control {
+        let shield_protection = entry.target_kind == "self"
+            && entry.operation == "absorb_damage"
+            && entry.attribute_key == "beast_counterattack"
+            && entry.value_mode == "absolute";
+        if !beast_attack_reduction && !poison_damage && !stun_control && !shield_protection {
             errors.push(format!(
-                "效果 {} 当前只支持减攻、poison-v1 中毒伤害或 stun-v1 眩晕节点",
+                "效果 {} 当前只支持减攻、poison-v1 中毒伤害、stun-v1 眩晕或 shield-v1 护盾节点",
                 entry.effect_key
             ));
         }
@@ -548,6 +576,30 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
         if stun_control && !is_stun_v1_parameters(&entry.parameters) {
             errors.push(format!(
                 "效果 {} 的 stun-v1 parameters 必须固定声明规则版本、结算时机和反击行为",
+                entry.effect_key
+            ));
+        }
+        if shield_protection && entry.value != SHIELD_VALUE {
+            errors.push(format!(
+                "效果 {} 的 shield-v1 value 必须固定为 {} 的 absolute",
+                entry.effect_key, SHIELD_VALUE
+            ));
+        }
+        if shield_protection && entry.stack_policy != "refresh" {
+            errors.push(format!(
+                "效果 {} 的 shield-v1 stack_policy 必须是 refresh",
+                entry.effect_key
+            ));
+        }
+        if shield_protection && !(1..=MAX_SHIELD_DURATION_ROUNDS).contains(&entry.duration_rounds) {
+            errors.push(format!(
+                "效果 {} 的 shield-v1 duration_rounds 必须在 1 到 {} 之间",
+                entry.effect_key, MAX_SHIELD_DURATION_ROUNDS
+            ));
+        }
+        if shield_protection && !is_shield_v1_parameters(&entry.parameters) {
+            errors.push(format!(
+                "效果 {} 的 shield-v1 parameters 必须固定声明规则版本、结算时机和反击行为",
                 entry.effect_key
             ));
         }
@@ -957,6 +1009,44 @@ mod tests {
             validate_shape(&package)
                 .iter()
                 .any(|error| error.contains("stun-v1 parameters"))
+        );
+    }
+
+    #[test]
+    fn accepts_only_the_controlled_shield_v1_node() {
+        let mut package = minimal_package();
+        let effect = &mut package.effects[0];
+        effect.target_kind = "self".to_string();
+        effect.operation = "absorb_damage".to_string();
+        effect.attribute_key = "beast_counterattack".to_string();
+        effect.value_mode = "absolute".to_string();
+        effect.value = 1;
+        effect.duration_rounds = 2;
+        effect.stack_policy = "refresh".to_string();
+        effect.parameters = BTreeMap::from([
+            (
+                "rule_version".to_string(),
+                Value::String("shield-v1".to_string()),
+            ),
+            (
+                "apply_phase".to_string(),
+                Value::String("after_player_damage".to_string()),
+            ),
+            (
+                "counterattack".to_string(),
+                Value::String("absorb".to_string()),
+            ),
+        ]);
+        assert!(validate_shape(&package).is_empty());
+
+        package.effects[0].parameters.insert(
+            "counterattack".to_string(),
+            Value::String("skip".to_string()),
+        );
+        assert!(
+            validate_shape(&package)
+                .iter()
+                .any(|error| error.contains("shield-v1 parameters"))
         );
     }
 

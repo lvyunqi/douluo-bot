@@ -2968,6 +2968,7 @@ fn skill_effect_label(effect: &SkillEffectRecord) -> String {
             effect.value, effect.duration_rounds
         ),
         ("stun", "beast") => format!("眩晕 · {} 回合", effect.duration_rounds),
+        ("shield", "self") => format!("护盾吸收魂兽反击 · {} 回合", effect.duration_rounds),
         _ => effect.description.clone(),
     }
 }
@@ -2979,6 +2980,7 @@ fn battle_skill_effect_short_label(effect: &BattleSkillEffectRecord) -> String {
         }
         ("poison_damage", "beast") => format!("中毒每次 {} 点伤害", effect.value),
         ("stun", "beast") => "眩晕跳过魂兽反击".to_string(),
+        ("shield", "self") => "护盾吸收魂兽反击".to_string(),
         _ => effect.description.clone(),
     }
 }

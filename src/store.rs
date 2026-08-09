@@ -12,8 +12,8 @@ use rusqlite::{
 use crate::config::DatabaseConfig;
 use crate::content::{
     ContentPackage, ContentTransitionPackageEntry, LoadedContentPackage, MAX_POISON_TICK_DAMAGE,
-    STUN_VALUE, canonical_json, content_hash, is_poison_v1_parameters, is_stun_v1_parameters,
-    validate_shape,
+    SHIELD_VALUE, STUN_VALUE, canonical_json, content_hash, is_poison_v1_parameters,
+    is_shield_v1_parameters, is_stun_v1_parameters, validate_shape,
 };
 use crate::message::Protocol;
 
@@ -11832,6 +11832,8 @@ impl Store {
         )?;
         let beast_stunned =
             beast_is_stunned_after_skill_effects(&active_skill_effects, &pending_skill_effects)?;
+        let beast_shielded =
+            beast_is_shielded_after_skill_effects(&active_skill_effects, &pending_skill_effects)?;
         let event_kind = action_event_kind(action);
         let (
             status_after,
@@ -11971,8 +11973,8 @@ impl Store {
                     Some(drop_id),
                     Some(exp),
                 )
-            } else if beast_stunned {
-                // 眩晕只阻止当前攻击/魂技动作后的魂兽反击，不修改玩家状态或历史快照。
+            } else if beast_stunned || beast_shielded {
+                // 眩晕或护盾只处理当前攻击/魂技动作后的反击，不修改玩家状态或历史快照。
                 transaction
                     .execute(
                         "UPDATE battle SET status = 'active', player_hp = ?1, beast_hp = ?2, action_count = ?3, updated_at = ?4, ended_at = NULL WHERE id = ?5",
@@ -15077,6 +15079,12 @@ fn compatibility_effect_kind(
         && value == STUN_VALUE
     {
         "stun".to_string()
+    } else if operation == "absorb_damage"
+        && attribute_key == "beast_counterattack"
+        && value_mode == "absolute"
+        && value == SHIELD_VALUE
+    {
+        "shield".to_string()
     } else {
         operation.to_string()
     }
@@ -15634,6 +15642,9 @@ enum SupportedSkillEffect {
     BeastStun {
         stack_policy: EffectStackPolicy,
     },
+    BeastShield {
+        stack_policy: EffectStackPolicy,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15718,6 +15729,22 @@ fn parse_supported_skill_effect(
             return Err("stun-v1 只支持 refresh 叠加策略".to_string());
         }
         return Ok(SupportedSkillEffect::BeastStun { stack_policy });
+    }
+    if trigger_kind == "on_release"
+        && target_kind == "self"
+        && operation == "absorb_damage"
+        && attribute_key == "beast_counterattack"
+        && value_mode == "absolute"
+        && value == SHIELD_VALUE
+        && chance_percent == 100
+    {
+        if !is_shield_v1_parameters(&parameters) {
+            return Err("shield-v1 参数必须固定声明规则版本、结算时机和反击行为".to_string());
+        }
+        if stack_policy != EffectStackPolicy::Refresh {
+            return Err("shield-v1 只支持 refresh 叠加策略".to_string());
+        }
+        return Ok(SupportedSkillEffect::BeastShield { stack_policy });
     }
     Err(format!(
         "当前魂技效果解释器不支持 {trigger_kind}/{target_kind}/{operation}/{attribute_key}/{value_mode}/{value}/{chance_percent}"
@@ -15852,6 +15879,51 @@ fn beast_is_stunned_after_skill_effects(
         }
     }
     Ok(stunned)
+}
+
+/// 判断当前玩家攻击或魂技动作是否有护盾吸收魂兽反击。
+fn beast_is_shielded_after_skill_effects(
+    active_effects: &[BattleSkillEffectRecord],
+    pending_effects: &[SkillEffectRecord],
+) -> Result<bool, String> {
+    let mut shielded = false;
+    for effect in active_effects {
+        if matches!(
+            parse_supported_skill_effect(
+                &effect.trigger_kind,
+                &effect.target_kind,
+                &effect.operation,
+                &effect.attribute_key,
+                &effect.value_mode,
+                effect.value,
+                effect.chance_percent,
+                &effect.stack_policy,
+                &effect.parameters_json,
+            )?,
+            SupportedSkillEffect::BeastShield { .. }
+        ) {
+            shielded = true;
+        }
+    }
+    for effect in pending_effects {
+        if matches!(
+            parse_supported_skill_effect(
+                &effect.trigger_kind,
+                &effect.target_kind,
+                &effect.operation,
+                &effect.attribute_key,
+                &effect.value_mode,
+                effect.value,
+                effect.chance_percent,
+                &effect.stack_policy,
+                &effect.parameters_json,
+            )?,
+            SupportedSkillEffect::BeastShield { .. }
+        ) {
+            shielded = true;
+        }
+    }
+    Ok(shielded)
 }
 
 /// 汇总当前序列应结算的中毒伤害；pending 定义排在已冻结快照之后，保证 refresh/replace 当回合生效。
@@ -24072,6 +24144,23 @@ fn validate_v22_schema(connection: &Connection) -> Result<(), String> {
                            AND json_type(parameters_json, '$.counterattack') = 'text'
                            AND json_extract(parameters_json, '$.counterattack') = 'skip'
                            AND (SELECT COUNT(*) FROM json_each(parameters_json)) = 3
+                       ) OR (
+                           trigger_kind = 'on_release'
+                           AND target_kind = 'self'
+                           AND operation = 'absorb_damage'
+                           AND attribute_key = 'beast_counterattack'
+                           AND value_mode = 'absolute'
+                           AND value = 1
+                           AND duration_rounds BETWEEN 1 AND 10
+                           AND chance_percent = 100
+                           AND stack_policy = 'refresh'
+                           AND json_type(parameters_json, '$.rule_version') = 'text'
+                           AND json_extract(parameters_json, '$.rule_version') = 'shield-v1'
+                           AND json_type(parameters_json, '$.apply_phase') = 'text'
+                           AND json_extract(parameters_json, '$.apply_phase') = 'after_player_damage'
+                           AND json_type(parameters_json, '$.counterattack') = 'text'
+                           AND json_extract(parameters_json, '$.counterattack') = 'absorb'
+                           AND (SELECT COUNT(*) FROM json_each(parameters_json)) = 3
                        )
                    )
             )
@@ -28260,6 +28349,70 @@ mod tests {
         }
     }
 
+    fn shield_v1_parameters() -> BTreeMap<String, serde_json::Value> {
+        BTreeMap::from([
+            (
+                "rule_version".to_string(),
+                serde_json::Value::String("shield-v1".to_string()),
+            ),
+            (
+                "apply_phase".to_string(),
+                serde_json::Value::String("after_player_damage".to_string()),
+            ),
+            (
+                "counterattack".to_string(),
+                serde_json::Value::String("absorb".to_string()),
+            ),
+        ])
+    }
+
+    fn shield_skill_effect_record(effect_key: &str) -> SkillEffectRecord {
+        SkillEffectRecord {
+            effect_key: effect_key.to_string(),
+            effect_kind: "shield".to_string(),
+            target_kind: "self".to_string(),
+            magnitude_percent: 1,
+            duration_rounds: 2,
+            description: "test shield-v1 effect".to_string(),
+            trigger_kind: "on_release".to_string(),
+            operation: "absorb_damage".to_string(),
+            attribute_key: "beast_counterattack".to_string(),
+            value_mode: "absolute".to_string(),
+            value: 1,
+            chance_percent: 100,
+            stack_policy: "refresh".to_string(),
+            parameters_json: serde_json::to_string(&shield_v1_parameters())
+                .expect("应序列化护盾参数"),
+        }
+    }
+
+    fn shield_battle_effect_record(id: i64, effect_key: &str) -> BattleSkillEffectRecord {
+        let effect = shield_skill_effect_record(effect_key);
+        BattleSkillEffectRecord {
+            id,
+            battle_skill_event_id: id,
+            effect_key: effect.effect_key,
+            skill_key: "entangle".to_string(),
+            skill_name: "缠绕".to_string(),
+            effect_kind: effect.effect_kind,
+            target_kind: effect.target_kind,
+            magnitude_percent: effect.magnitude_percent,
+            duration_rounds: effect.duration_rounds,
+            started_sequence: id,
+            expires_after_sequence: id + effect.duration_rounds - 1,
+            rule_version: "effect-v2".to_string(),
+            description: effect.description,
+            trigger_kind: effect.trigger_kind,
+            operation: effect.operation,
+            attribute_key: effect.attribute_key,
+            value_mode: effect.value_mode,
+            value: effect.value,
+            chance_percent: effect.chance_percent,
+            stack_policy: effect.stack_policy,
+            parameters_json: effect.parameters_json,
+        }
+    }
+
     fn poison_effect_package(
         package_key: &str,
         effect_key: &str,
@@ -28337,6 +28490,46 @@ mod tests {
         };
         LoadedContentPackage {
             content_hash: content_hash(&package).expect("应计算眩晕内容包哈希"),
+            package,
+            source_format: "json".to_string(),
+        }
+    }
+
+    fn shield_effect_package(
+        package_key: &str,
+        effect_key: &str,
+        skill_key: &str,
+        duration_rounds: i64,
+    ) -> LoadedContentPackage {
+        let package = ContentPackage {
+            package_key: package_key.to_string(),
+            revision: 1,
+            author: "test".to_string(),
+            minimum_runtime: String::new(),
+            wuhun: Vec::new(),
+            skills: Vec::new(),
+            effects: vec![EffectPackageEntry {
+                effect_key: effect_key.to_string(),
+                skill_key: skill_key.to_string(),
+                trigger_kind: "on_release".to_string(),
+                target_kind: "self".to_string(),
+                operation: "absorb_damage".to_string(),
+                attribute_key: "beast_counterattack".to_string(),
+                value_mode: "absolute".to_string(),
+                value: 1,
+                duration_rounds,
+                chance_percent: 100,
+                stack_policy: "refresh".to_string(),
+                parameters: shield_v1_parameters(),
+                description: "test shield-v1 effect".to_string(),
+                enabled: true,
+            }],
+            soul_beasts: Vec::new(),
+            soul_rings: Vec::new(),
+            transitions: Vec::new(),
+        };
+        LoadedContentPackage {
+            content_hash: content_hash(&package).expect("应计算护盾内容包哈希"),
             package,
             source_format: "json".to_string(),
         }
@@ -34546,6 +34739,15 @@ mod tests {
     }
 
     #[test]
+    fn shield_v1_absorbs_the_current_beast_counterattack() {
+        let active = vec![shield_battle_effect_record(1, "shield-active")];
+        let pending = vec![shield_skill_effect_record("shield-pending")];
+        assert!(beast_is_shielded_after_skill_effects(&active, &[]).unwrap());
+        assert!(beast_is_shielded_after_skill_effects(&[], &pending).unwrap());
+        assert!(!beast_is_shielded_after_skill_effects(&[], &[]).unwrap());
+    }
+
+    #[test]
     fn v21_entangle_effect_catalog_is_exposed_with_the_skill() {
         let (_directory, store) = test_store();
         register_awakened_pair(&store);
@@ -34814,6 +35016,86 @@ mod tests {
             .expect("眩晕到期后普通攻击应继续受到反击");
         assert_eq!(third.event.sequence, 3);
         assert!(third.event.beast_damage > 0);
+    }
+
+    #[test]
+    fn shield_v1_absorbs_counterattack_and_expires() {
+        let (directory, store) = test_store();
+        register_awakened_pair(&store);
+        let shield = shield_effect_package("shield-v1-test", "entangle-shield-test", "entangle", 2);
+        store
+            .stage_content_package(&shield)
+            .expect("护盾内容包应暂存");
+        let validation = store
+            .validate_content_draft("shield-v1-test", 1)
+            .expect("护盾内容包应校验");
+        assert!(validation.errors.is_empty(), "{validation:?}");
+        store
+            .publish_content_draft("shield-v1-test", 1)
+            .expect("护盾内容包应发布");
+        absorb_test_soul_ring(&store, &identity(), "shield-v1-source");
+
+        let player_id = player_id_for(&store, &identity());
+        let connection = store.open().expect("应打开护盾战斗数据库");
+        connection
+            .execute(
+                "UPDATE player SET level = 10, hp = 1000, max_hp = 1000, soul_power = 1000, max_soul_power = 1000, strength = 1, endurance = 1000, perception = 0, luck = 0, updated_at = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置护盾战斗属性");
+        drop(connection);
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "哥布林",
+                &transfer_operation("挑战", "shield-v1-challenge"),
+            )
+            .expect("应创建护盾测试战斗");
+
+        let first = store
+            .use_skill_battle_with_operation(
+                &identity(),
+                "缠绕",
+                &transfer_operation("释放技能", "shield-v1-first"),
+            )
+            .expect("首个护盾魂技释放应成功");
+        assert_eq!(first.event.sequence, 1);
+        assert_eq!(first.event.beast_damage, 0);
+        assert_eq!(first.event.player_hp_after, first.event.player_hp_before);
+
+        let second = store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "shield-v1-second"),
+            )
+            .expect("第二序列应继续吸收魂兽反击");
+        assert_eq!(second.event.sequence, 2);
+        assert_eq!(second.event.beast_damage, 0);
+        assert!(
+            second
+                .expired_effects
+                .iter()
+                .any(|effect| effect.effect_key == "entangle-shield-test")
+        );
+        assert!(
+            !second
+                .battle
+                .active_effects
+                .iter()
+                .any(|effect| effect.effect_key == "entangle-shield-test")
+        );
+
+        let third = store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "shield-v1-third"),
+            )
+            .expect("护盾到期后普通攻击应继续受到反击");
+        assert_eq!(third.event.sequence, 3);
+        assert!(third.event.beast_damage > 0);
+        drop(store);
+        let _restored = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("护盾战斗数据库应可热重载");
     }
 
     #[test]
