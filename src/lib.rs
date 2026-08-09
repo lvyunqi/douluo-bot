@@ -6,6 +6,7 @@ mod catalog;
 pub mod config;
 mod content;
 mod context;
+mod embedded_web;
 mod game;
 mod identity;
 pub mod message;

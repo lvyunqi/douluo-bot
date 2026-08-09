@@ -26,6 +26,7 @@ use tokio::{net::TcpListener, runtime::Builder as RuntimeBuilder, sync::oneshot}
 use crate::{
     config::{WebConfig, is_safe_data_relative_path},
     content::{is_content_key, load_package_file},
+    embedded_web::ManagementWebAssets,
     store::{
         ContentAdminAuditActor, ContentAdminDraftStageOperationRecord, ContentAdminOperationRecord,
         ContentAdminRollbackOperationRecord, ContentDraftDiffMember, ContentDraftRecord,
@@ -38,6 +39,7 @@ const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_SESSIONS: usize = 128;
 const MAX_API_BODY_BYTES: usize = 1024;
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
+const MANAGEMENT_PAGE_CSP: &str = "default-src 'none'; base-uri 'none'; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'";
 
 /// 管理端当前拥有的最小角色集合；后续可扩展到独立管理员目录。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -302,8 +304,27 @@ fn build_router(state: Arc<ManagementState>) -> Router {
             "/api/v1/content/stage-operations",
             get(content_admin_draft_stage_operations),
         )
+        .route("/", get(management_page))
+        .route("/assets/{*asset_path}", get(management_asset))
         .layer(DefaultBodyLimit::max(MAX_API_BODY_BYTES))
         .with_state(state)
+}
+
+/// 返回打包进动态插件的管理端登录页面，不为未知路径提供 SPA 回退。
+async fn management_page() -> Response {
+    embedded_asset_response("index.html")
+}
+
+/// 只接受 Vite 产物中的资源路径，避免静态入口成为任意文件读取接口。
+async fn management_asset(Path(asset_path): Path<String>) -> Response {
+    if asset_path.is_empty()
+        || asset_path
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return static_not_found_response();
+    }
+    embedded_asset_response(&format!("assets/{asset_path}"))
 }
 
 async fn healthz() -> Response {
@@ -1251,6 +1272,43 @@ fn api_error(status: StatusCode, code: &'static str) -> Response {
     json_response(status, json!({ "error": code }))
 }
 
+/// 从 DLL 内嵌资源中返回精确文件，缺失资源不会降级为页面或目录读取。
+fn embedded_asset_response(path: &str) -> Response {
+    let Some(asset) = ManagementWebAssets::get(path) else {
+        return static_not_found_response();
+    };
+    let mut response = secure_response((StatusCode::OK, asset.data.into_owned()).into_response());
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(embedded_asset_content_type(path)),
+    );
+    response.headers_mut().insert(
+        "content-security-policy",
+        HeaderValue::from_static(MANAGEMENT_PAGE_CSP),
+    );
+    response
+}
+
+fn static_not_found_response() -> Response {
+    plain_response(StatusCode::NOT_FOUND, "not found\n")
+}
+
+fn embedded_asset_content_type(path: &str) -> &'static str {
+    match path.rsplit_once('.').map(|(_, extension)| extension) {
+        Some("css") => "text/css; charset=utf-8",
+        Some("html") => "text/html; charset=utf-8",
+        Some("ico") => "image/x-icon",
+        Some("jpeg" | "jpg") => "image/jpeg",
+        Some("js" | "mjs") => "text/javascript; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("webp") => "image/webp",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
 fn secure_response(mut response: Response) -> Response {
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -1409,6 +1467,62 @@ mod tests {
             .await
             .expect("应读取就绪检查");
         assert_eq!(body.as_ref(), b"ready\n");
+    }
+
+    #[tokio::test]
+    async fn embedded_management_spa_is_cache_safe_and_preserves_api_boundaries() {
+        let (_directory, state) = state();
+        let app = build_router(state);
+
+        let response = request(&app, Method::GET, "/", &[], b"").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            response.headers().get("content-security-policy").unwrap(),
+            MANAGEMENT_PAGE_CSP
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
+        assert_eq!(response.headers().get("x-frame-options").unwrap(), "DENY");
+        assert_eq!(
+            response.headers().get("referrer-policy").unwrap(),
+            "no-referrer"
+        );
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("应读取内置管理页面");
+        let page = std::str::from_utf8(&body).expect("内置管理页面应为 UTF-8");
+        assert!(page.contains("<div id=\"root\"></div>"));
+        assert!(!page.contains("0123456789abcdef"));
+        let bundle_path = page
+            .split('\"')
+            .find(|value| value.starts_with("/assets/") && value.ends_with(".js"))
+            .expect("页面应引用哈希 JavaScript bundle");
+
+        let response = request(&app, Method::GET, bundle_path, &[], b"").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/javascript; charset=utf-8"
+        );
+
+        let response = request(&app, Method::GET, "/assets/missing.js", &[], b"").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = request(&app, Method::GET, "/api/v1/content/drafts", &[], b"").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

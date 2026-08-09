@@ -10,6 +10,7 @@ QimenBot 动态插件版斗罗大陆文字游戏，插件 ID 为 `douluo-game`�
 - 插图支持：支持本地 Base64 图片和公网 HTTPS 图片地址；未配置图片时仍返回完整文本。
 - 可选媒体服务：仓库包含一个独立的静态图片服务示例，可用于向 QQ 官方 Markdown 暴露公网图片。
 - 可选管理服务：默认仅回环监听，提供健康检查、短期管理会话、内容元数据、受限内容文件暂存、草稿校验/发布/回滚与追加式管理员审计。
+- 内置管理端：使用 React、Vite 和 shadcn/ui 构建，只读呈现内容 revision 与脱敏审计数据；构建产物编入动态插件，不依赖 QimenBot 宿主页。
 
 ## Requirements
 
@@ -20,7 +21,13 @@ QimenBot 动态插件版斗罗大陆文字游戏，插件 ID 为 `douluo-game`�
 
 ## Build
 
-构建动态插件：
+构建动态插件前，构建机需要 Node.js、pnpm 和管理端依赖；它们只在编译期使用：
+
+```powershell
+pnpm --dir web install --frozen-lockfile
+```
+
+随后构建动态插件：
 
 ```powershell
 cargo build --release --locked
@@ -30,6 +37,8 @@ cargo build --release --locked
 
 - Windows：`target/release/qimen_dynamic_plugin_douluo_game.dll`
 - Linux：`target/release/libqimen_dynamic_plugin_douluo_game.so`
+
+`build.rs` 会执行 `pnpm --dir web run build`，再将 `web/dist` 的哈希 CSS、JavaScript 和本地字体通过 `rust-embed` 编入动态库。部署运行时不需要 Node.js、pnpm、`web/node_modules` 或 `web/dist`。
 
 可选构建静态图片服务：
 
@@ -101,6 +110,16 @@ remote_base_url = ""
 
 写路由只操作既有文件、已暂存草稿或既有 revision，并通过 Store 事务同步写入管理员审计；不提供草稿正文、目录直写或文件系统写入。暂存不会创建、覆盖或删除文件。rollback 不删除目录、草稿或 revision，不恢复已剥离魂环/魂技，也不会迁移或改写任何玩家、魂环或魂技状态。
 
+## Management UI
+
+启用 `[web]` 后，访问配置的管理端根地址（默认 `http://127.0.0.1:18181/`）即可使用内置页面。它由 shadcn/ui 的 Button、Input、Tabs、Table、Badge、Skeleton、Alert 和 Tooltip 组成，并且只请求以下既有接口：
+
+- 会话建立、读取和退出。
+- active revision、草稿、revision、activation 元数据。
+- `operations`、`rollback-operations` 与 `stage-operations` 的脱敏游标分页。
+
+页面不调用 stage、validate、publish 或 rollback，不提供文件、目录或玩家状态写控件。管理密钥仅用于登录请求；cookie 由 HttpOnly/SameSite 会话管理，CSRF token 只保留在页面内存。服务只提供 `/` 和精确的 `/assets/*` 静态资源路径，未知路径返回 404；页面 CSP 限制脚本、样式、连接和字体为同源，所有静态响应均使用 `no-store`、`nosniff`、`DENY` 和 `no-referrer`。
+
 ## Common Commands
 
 插件会在 QimenBot 命令系统中注册游戏命令。常用入口包括：
@@ -117,6 +136,7 @@ remote_base_url = ""
 
 ```powershell
 cargo fmt --all -- --check
+pnpm --dir web build
 cargo check --locked --offline
 cargo test --locked --offline --lib
 cargo clippy --locked --offline --all-targets -- -D warnings
