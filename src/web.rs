@@ -2,7 +2,9 @@
 
 use std::{
     collections::HashMap,
+    fs,
     net::{SocketAddr, TcpListener as StdTcpListener},
+    path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -22,12 +24,12 @@ use sha2::{Digest, Sha256};
 use tokio::{net::TcpListener, runtime::Builder as RuntimeBuilder, sync::oneshot};
 
 use crate::{
-    config::WebConfig,
-    content::is_content_key,
+    config::{WebConfig, is_safe_data_relative_path},
+    content::{is_content_key, load_package_file},
     store::{
-        ContentAdminAuditActor, ContentAdminOperationRecord, ContentAdminRollbackOperationRecord,
-        ContentDraftDiffMember, ContentDraftRecord, ContentRevisionActivationRecord,
-        ContentRevisionRecord, ContentValidationReport, Store,
+        ContentAdminAuditActor, ContentAdminDraftStageOperationRecord, ContentAdminOperationRecord,
+        ContentAdminRollbackOperationRecord, ContentDraftDiffMember, ContentDraftRecord,
+        ContentRevisionActivationRecord, ContentRevisionRecord, ContentValidationReport, Store,
     },
 };
 
@@ -97,20 +99,27 @@ struct AdminSession {
 /// 管理服务共享状态。数据库仍通过 Store API 访问，路由不直接写目录表。
 struct ManagementState {
     store: Store,
+    data_dir: PathBuf,
     admin_secret_hash: [u8; 32],
     sessions: Mutex<HashMap<String, AdminSession>>,
     secure_cookie: bool,
 }
 
 impl ManagementState {
-    fn new(store: Store, web_config: &WebConfig) -> Self {
-        Self {
+    fn new(store: Store, web_config: &WebConfig, data_dir: &FsPath) -> Result<Self, String> {
+        let data_dir = fs::canonicalize(data_dir)
+            .map_err(|error| format!("解析管理内容根目录失败：{error}"))?;
+        if !data_dir.is_dir() {
+            return Err("管理内容根目录必须是目录".to_string());
+        }
+        Ok(Self {
             store,
+            data_dir,
             admin_secret_hash: hash_secret(&web_config.admin_secret),
             sessions: Mutex::new(HashMap::new()),
             // 只有配置了 HTTPS 公开基址时才附加 Secure，避免本地回环 HTTP 无法建立会话。
             secure_cookie: !web_config.public_base_url.is_empty(),
-        }
+        })
     }
 
     fn secret_matches(&self, supplied_secret: &str) -> bool {
@@ -131,17 +140,22 @@ impl ManagementServer {
     pub(crate) fn start_if_enabled(
         web_config: &WebConfig,
         store: Store,
+        data_dir: &FsPath,
     ) -> Result<Option<Self>, String> {
         if !web_config.enabled {
             return Ok(None);
         }
-        Self::start(web_config, store).map(Some)
+        Self::start(web_config, store, data_dir).map(Some)
     }
 
     /// 同步完成端口绑定和线程就绪握手，确保插件 init 不会报告一个未启动的服务。
-    pub(crate) fn start(web_config: &WebConfig, store: Store) -> Result<Self, String> {
+    pub(crate) fn start(
+        web_config: &WebConfig,
+        store: Store,
+        data_dir: &FsPath,
+    ) -> Result<Self, String> {
         let listen_addr = web_config.socket_addr()?;
-        let state = Arc::new(ManagementState::new(store, web_config));
+        let state = Arc::new(ManagementState::new(store, web_config, data_dir)?);
         Self::start_with_state(listen_addr, state)
     }
 
@@ -261,6 +275,7 @@ fn build_router(state: Arc<ManagementState>) -> Router {
         .route("/api/v1/content/active", get(active_content_revision))
         .route("/api/v1/content/revisions", get(content_revisions))
         .route("/api/v1/content/drafts", get(content_drafts))
+        .route("/api/v1/content/drafts/stage", post(stage_content_draft))
         .route(
             "/api/v1/content/drafts/{package_key}/{package_revision}/diff",
             get(content_draft_diff),
@@ -283,6 +298,10 @@ fn build_router(state: Arc<ManagementState>) -> Router {
             "/api/v1/content/rollback-operations",
             get(content_admin_rollback_operations),
         )
+        .route(
+            "/api/v1/content/stage-operations",
+            get(content_admin_draft_stage_operations),
+        )
         .layer(DefaultBodyLimit::max(MAX_API_BODY_BYTES))
         .with_state(state)
 }
@@ -303,6 +322,13 @@ async fn readyz(State(state): State<Arc<ManagementState>>) -> Response {
 #[serde(deny_unknown_fields)]
 struct LoginRequest {
     secret: String,
+}
+
+/// 仅引用 data_dir 内已由部署面放置的内容文件，管理 API 不接收内容正文。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContentDraftStageRequest {
+    package_file: String,
 }
 
 #[derive(Serialize)]
@@ -401,6 +427,12 @@ struct ContentPublishResponse {
 }
 
 #[derive(Serialize)]
+struct ContentDraftStageResponse {
+    draft: ContentDraftListEntry,
+    replayed: bool,
+}
+
+#[derive(Serialize)]
 struct ContentRollbackResponse {
     revision: ContentRevisionRecord,
     active_revision_id: i64,
@@ -428,6 +460,19 @@ struct ContentAdminRollbackOperationListEntry {
     actor_role: String,
     revision_id: i64,
     activation_id: i64,
+    created_at: i64,
+}
+
+/// 暂存审计列表不返回文件路径或会话指纹，只暴露草稿快照与结果。
+#[derive(Serialize)]
+struct ContentAdminDraftStageOperationListEntry {
+    id: i64,
+    actor_role: String,
+    package_key: String,
+    package_revision: i64,
+    content_hash: String,
+    source_format: String,
+    outcome: String,
     created_at: i64,
 }
 
@@ -646,6 +691,47 @@ async fn content_draft_diff(
     )
 }
 
+/// 暂存 data_dir 内受控内容文件；请求只传安全相对路径，不接收内容正文。
+async fn stage_content_draft(
+    State(state): State<Arc<ManagementState>>,
+    headers: HeaderMap,
+    Json(request): Json<ContentDraftStageRequest>,
+) -> Response {
+    let (session_id, session) =
+        match require_permission(&state, &headers, AdminPermission::ContentWrite) {
+            Ok(session) => session,
+            Err(error) => return error.into_response(),
+        };
+    if !csrf_matches(&session, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "csrf_required");
+    }
+    if !valid_content_package_file_path(&request.package_file) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_package_file");
+    }
+    let loaded = match load_package_file(&state.data_dir, &request.package_file) {
+        Ok(loaded) => loaded,
+        Err(_) => return api_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_package_file"),
+    };
+    let session_fingerprint = session_audit_fingerprint(&session_id);
+    let actor = ContentAdminAuditActor {
+        role: session.role.as_str(),
+        session_fingerprint: &session_fingerprint,
+    };
+    match state.store.stage_content_package_as_admin(&loaded, actor) {
+        Ok(receipt) => match content_draft_list_entry(receipt.draft) {
+            Ok(draft) => json_response(
+                StatusCode::OK,
+                ContentDraftStageResponse {
+                    draft,
+                    replayed: receipt.replayed,
+                },
+            ),
+            Err(_) => api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+        },
+        Err(error) => content_stage_error(&error),
+    }
+}
+
 /// 校验已暂存草稿；请求不携带正文，避免 HTTP 层形成目录直写入口。
 async fn validate_content_draft(
     State(state): State<Arc<ManagementState>>,
@@ -848,6 +934,37 @@ async fn content_admin_rollback_operations(
     }
 }
 
+async fn content_admin_draft_stage_operations(
+    State(state): State<Arc<ManagementState>>,
+    headers: HeaderMap,
+    Query(query): Query<ContentPageQuery>,
+) -> Response {
+    if let Err(error) = require_permission(&state, &headers, AdminPermission::ContentRead) {
+        return error.into_response();
+    }
+    let (after_id, limit) = match content_page_params(query) {
+        Ok(params) => params,
+        Err(code) => return api_error(StatusCode::BAD_REQUEST, code),
+    };
+    match state
+        .store
+        .list_content_admin_draft_stage_operations(after_id, limit)
+    {
+        Ok(page) => json_response(
+            StatusCode::OK,
+            CursorPage {
+                entries: page
+                    .entries
+                    .into_iter()
+                    .map(content_admin_draft_stage_operation_list_entry)
+                    .collect(),
+                next_after_id: page.next_after_id,
+            },
+        ),
+        Err(_) => api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    }
+}
+
 fn content_page_params(query: ContentPageQuery) -> Result<(Option<i64>, usize), &'static str> {
     if query.after_id.is_some_and(|after_id| after_id < 0) || !(1..=100).contains(&query.limit) {
         return Err("invalid_pagination");
@@ -936,8 +1053,37 @@ fn content_admin_rollback_operation_list_entry(
     }
 }
 
+fn content_admin_draft_stage_operation_list_entry(
+    operation: ContentAdminDraftStageOperationRecord,
+) -> ContentAdminDraftStageOperationListEntry {
+    ContentAdminDraftStageOperationListEntry {
+        id: operation.id,
+        actor_role: operation.actor_role,
+        package_key: operation.package_key,
+        package_revision: operation.package_revision,
+        content_hash: operation.content_hash,
+        source_format: operation.source_format,
+        outcome: operation.outcome,
+        created_at: operation.created_at,
+    }
+}
+
 fn valid_content_draft_identity(package_key: &str, package_revision: i64) -> bool {
     package_revision > 0 && is_content_key(package_key)
+}
+
+fn valid_content_package_file_path(package_file: &str) -> bool {
+    if !is_safe_data_relative_path(package_file) {
+        return false;
+    }
+    matches!(
+        FsPath::new(package_file)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("json" | "toml")
+    )
 }
 
 /// 只按稳定错误类别返回写操作失败，避免把 SQLite 或目录内部细节暴露给管理端。
@@ -959,6 +1105,20 @@ fn content_rollback_error(error: &str) -> Response {
     match error {
         "目标内容 revision 不存在" => api_error(StatusCode::NOT_FOUND, "not_found"),
         _ => api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    }
+}
+
+/// 暂存文件失败时只返回稳定类别，避免把 data_dir 结构或解析细节泄露给管理端。
+fn content_stage_error(error: &str) -> Response {
+    if error.starts_with("内容包 ") && error.contains("已发布且内容不同") {
+        api_error(StatusCode::CONFLICT, "published_draft_conflict")
+    } else if error.starts_with("内容包字段校验失败：")
+        || error == "内容包哈希与规范化内容不一致"
+        || error == "内容包来源格式必须是 json 或 toml"
+    {
+        api_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_package")
+    } else {
+        api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
     }
 }
 
@@ -1118,6 +1278,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Method, Request},
     };
+    use std::fs;
     use tempfile::TempDir;
     use tower::ServiceExt;
 
@@ -1130,10 +1291,10 @@ mod tests {
             admin_secret: "0123456789abcdef".to_string(),
             ..WebConfig::default()
         };
-        (
-            directory,
-            Arc::new(ManagementState::new(store, &web_config)),
-        )
+        let state = Arc::new(
+            ManagementState::new(store, &web_config, directory.path()).expect("应创建管理服务状态"),
+        );
+        (directory, state)
     }
 
     async fn request(
@@ -1638,6 +1799,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn content_stage_route_requires_csrf_and_uses_constrained_file_input() {
+        let (directory, state) = state();
+        let package = effect_package("web-stage", "web-stage-effect", "entangle");
+        fs::write(
+            directory.path().join("web-stage.json"),
+            serde_json::to_vec(&package.package).expect("应序列化 Web 暂存内容包"),
+        )
+        .expect("应写入受控 Web 暂存文件");
+        let app = build_router(state.clone());
+        let stage_path = "/api/v1/content/drafts/stage";
+        let stage_body = br#"{"package_file":"web-stage.json"}"#;
+
+        let response = request(
+            &app,
+            Method::POST,
+            stage_path,
+            &[("content-type", "application/json")],
+            stage_body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let (cookie, csrf_token) = login_for_test(&app).await;
+        let read_headers = [("cookie", cookie.as_str())];
+        let csrf_missing_headers = [
+            ("cookie", cookie.as_str()),
+            ("content-type", "application/json"),
+        ];
+        let write_headers = [
+            ("cookie", cookie.as_str()),
+            ("x-csrf-token", csrf_token.as_str()),
+            ("content-type", "application/json"),
+        ];
+        let response = request(
+            &app,
+            Method::POST,
+            stage_path,
+            &csrf_missing_headers,
+            stage_body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = request(
+            &app,
+            Method::POST,
+            stage_path,
+            &write_headers,
+            br#"{"package_file":"../outside.json"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["error"],
+            "invalid_package_file"
+        );
+
+        let response = request(
+            &app,
+            Method::POST,
+            stage_path,
+            &write_headers,
+            br#"{"package_file":"web-stage.txt"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["error"],
+            "invalid_package_file"
+        );
+
+        let response = request(
+            &app,
+            Method::POST,
+            stage_path,
+            &write_headers,
+            br#"{"package_file":"missing.json"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(response).await["error"],
+            "invalid_package_file"
+        );
+
+        let response = request(&app, Method::POST, stage_path, &write_headers, stage_body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let first = response_json(response).await;
+        assert_eq!(first["draft"]["package_key"], "web-stage");
+        assert_eq!(first["draft"]["status"], "draft");
+        assert_eq!(first["replayed"], false);
+        assert!(first["draft"].get("package_json").is_none());
+
+        let response = request(&app, Method::POST, stage_path, &write_headers, stage_body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["replayed"], false);
+
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/content/stage-operations",
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/content/stage-operations?limit=2",
+            &read_headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        let entries = payload["entries"].as_array().expect("应返回暂存审计列表");
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| {
+            entry["actor_role"] == "content_admin"
+                && entry["package_key"] == "web-stage"
+                && entry["outcome"] == "staged"
+                && entry.get("actor_fingerprint").is_none()
+        }));
+
+        assert!(
+            state
+                .store
+                .validate_content_draft("web-stage", 1)
+                .expect("应校验 Web 暂存草稿")
+                .errors
+                .is_empty()
+        );
+        state
+            .store
+            .publish_content_draft("web-stage", 1)
+            .expect("应发布 Web 暂存草稿");
+        let response = request(&app, Method::POST, stage_path, &write_headers, stage_body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["replayed"], true);
+
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/content/stage-operations?limit=3",
+            &read_headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["entries"][2]["outcome"], "replayed");
+
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/content/stage-operations?limit=0",
+            &read_headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(response).await["error"], "invalid_pagination");
+    }
+
+    #[tokio::test]
     async fn content_rollback_route_requires_csrf_and_appends_audit() {
         let (_directory, state) = state();
         let baseline = state
@@ -1774,7 +2101,8 @@ mod tests {
             ..WebConfig::default()
         };
         let mut server =
-            ManagementServer::start(&web_config, state.store.clone()).expect("管理服务应启动");
+            ManagementServer::start(&web_config, state.store.clone(), directory.path())
+                .expect("管理服务应启动");
         assert!(server.local_addr().ip().is_loopback());
         assert_ne!(server.local_addr().port(), 0);
         let mut stream = TcpStream::connect(server.local_addr()).expect("应连接管理服务");

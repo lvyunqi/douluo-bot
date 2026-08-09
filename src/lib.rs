@@ -77,7 +77,7 @@ fn initialize(config: PluginInitConfig) -> Result<(), String> {
         parsed,
         illustration_assets,
     ));
-    replace_management_server(&web_config, store)?;
+    replace_management_server(&web_config, store, data_dir)?;
     let mut slot = runtime_slot()
         .write()
         .map_err(|_| "插件运行时锁已损坏".to_string())?;
@@ -89,6 +89,7 @@ fn initialize(config: PluginInitConfig) -> Result<(), String> {
 fn replace_management_server(
     web_config: &crate::config::WebConfig,
     store: Store,
+    data_dir: &Path,
 ) -> Result<(), String> {
     let mut slot = management_server_slot()
         .lock()
@@ -97,7 +98,7 @@ fn replace_management_server(
     if let Some(server) = previous.as_mut() {
         server.stop()?;
     }
-    match ManagementServer::start_if_enabled(web_config, store) {
+    match ManagementServer::start_if_enabled(web_config, store, data_dir) {
         Ok(replacement) => {
             *slot = replacement;
             Ok(())
@@ -1134,7 +1135,8 @@ mod tests {
             admin_secret: "0123456789abcdef".to_string(),
             ..WebConfig::default()
         };
-        replace_management_server(&enabled, store.clone()).expect("应启动初始管理服务");
+        replace_management_server(&enabled, store.clone(), directory.path())
+            .expect("应启动初始管理服务");
         assert!(
             management_server_slot()
                 .lock()
@@ -1146,7 +1148,7 @@ mod tests {
             bind: "invalid-bind".to_string(),
             ..enabled
         };
-        assert!(replace_management_server(&invalid, store.clone()).is_err());
+        assert!(replace_management_server(&invalid, store.clone(), directory.path()).is_err());
         assert!(
             management_server_slot()
                 .lock()
@@ -1155,7 +1157,8 @@ mod tests {
         );
 
         let disabled = WebConfig::default();
-        replace_management_server(&disabled, store).expect("禁用配置应停止管理服务");
+        replace_management_server(&disabled, store, directory.path())
+            .expect("禁用配置应停止管理服务");
         assert!(
             management_server_slot()
                 .lock()

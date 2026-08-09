@@ -5295,6 +5295,75 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_V32: &str = r#"
+CREATE TABLE content_admin_draft_stage_operation (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_role TEXT NOT NULL CHECK(actor_role = 'content_admin'),
+    actor_fingerprint TEXT NOT NULL CHECK(
+        length(actor_fingerprint) = 64
+        AND actor_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    draft_id INTEGER NOT NULL REFERENCES content_draft(id) ON DELETE RESTRICT,
+    package_key TEXT NOT NULL CHECK(
+        length(package_key) BETWEEN 1 AND 96
+        AND package_key = trim(package_key)
+        AND substr(package_key, 1, 1) GLOB '[a-z]'
+        AND package_key NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    package_revision INTEGER NOT NULL CHECK(package_revision > 0),
+    content_hash TEXT NOT NULL CHECK(
+        length(content_hash) = 64
+        AND content_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    source_format TEXT NOT NULL CHECK(source_format IN ('json', 'toml')),
+    outcome TEXT NOT NULL CHECK(outcome IN ('staged', 'replayed')),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0)
+) STRICT;
+
+-- 暂存审计只能对应当前草稿快照，防止 HTTP 文件导入绕过 Store 事务或伪造操作记录。
+CREATE TRIGGER content_admin_draft_stage_operation_state_guard
+BEFORE INSERT ON content_admin_draft_stage_operation
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM content_draft draft
+     WHERE draft.id = NEW.draft_id
+       AND draft.package_key = NEW.package_key
+       AND draft.package_revision = NEW.package_revision
+       AND draft.content_hash = NEW.content_hash
+       AND draft.source_format = NEW.source_format
+       AND (
+            (NEW.outcome = 'staged'
+                AND draft.status = 'draft'
+                AND draft.published_revision_id IS NULL)
+            OR (NEW.outcome = 'replayed'
+                AND draft.status = 'published'
+                AND draft.published_revision_id IS NOT NULL)
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'content admin draft stage audit must match the committed draft state');
+END;
+
+CREATE TRIGGER content_admin_draft_stage_operation_no_update
+BEFORE UPDATE ON content_admin_draft_stage_operation
+BEGIN
+    SELECT RAISE(ABORT, 'content admin draft stage audit is append-only');
+END;
+
+CREATE TRIGGER content_admin_draft_stage_operation_no_delete
+BEFORE DELETE ON content_admin_draft_stage_operation
+BEGIN
+    SELECT RAISE(ABORT, 'content admin draft stage audit is append-only');
+END;
+
+CREATE TRIGGER content_admin_draft_stage_operation_no_reinsert
+BEFORE INSERT ON content_admin_draft_stage_operation
+WHEN EXISTS(SELECT 1 FROM content_admin_draft_stage_operation WHERE id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'content admin draft stage audit id cannot be reused');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -5460,6 +5529,35 @@ pub struct ContentAdminRollbackOperationPage {
 pub struct ContentRollbackReceipt {
     pub revision: ContentRevisionRecord,
     pub activation_id: i64,
+}
+
+/// 管理员暂存内容文件时的不可变审计记录，不保存文件路径或会话明文。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentAdminDraftStageOperationRecord {
+    pub id: i64,
+    pub actor_role: String,
+    pub actor_fingerprint: String,
+    pub draft_id: i64,
+    pub package_key: String,
+    pub package_revision: i64,
+    pub content_hash: String,
+    pub source_format: String,
+    pub outcome: String,
+    pub created_at: i64,
+}
+
+/// 管理员内容暂存审计的受限游标分页结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentAdminDraftStageOperationPage {
+    pub entries: Vec<ContentAdminDraftStageOperationRecord>,
+    pub next_after_id: Option<i64>,
+}
+
+/// 暂存内容文件后的草稿元数据与幂等结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentDraftStageReceipt {
+    pub draft: ContentDraftRecord,
+    pub replayed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6551,6 +6649,23 @@ fn content_admin_rollback_operation_record_from_row(
     })
 }
 
+fn content_admin_draft_stage_operation_record_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ContentAdminDraftStageOperationRecord> {
+    Ok(ContentAdminDraftStageOperationRecord {
+        id: row.get(0)?,
+        actor_role: row.get(1)?,
+        actor_fingerprint: row.get(2)?,
+        draft_id: row.get(3)?,
+        package_key: row.get(4)?,
+        package_revision: row.get(5)?,
+        content_hash: row.get(6)?,
+        source_format: row.get(7)?,
+        outcome: row.get(8)?,
+        created_at: row.get(9)?,
+    })
+}
+
 fn content_revision_record_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<ContentRevisionRecord> {
@@ -6721,6 +6836,39 @@ fn record_content_admin_rollback_operation(
             ],
         )
         .map_err(|error| format!("写入内容管理员回滚审计失败：{error}"))?;
+    Ok(())
+}
+
+/// 将暂存后的草稿快照与管理员审计写入同一事务，避免文件导入留下无审计状态。
+fn record_content_admin_draft_stage_operation(
+    transaction: &Transaction<'_>,
+    actor: ContentAdminAuditActor<'_>,
+    draft: &ContentDraftRecord,
+    outcome: &str,
+    timestamp: i64,
+) -> Result<(), String> {
+    validate_content_admin_actor(actor)?;
+    transaction
+        .execute(
+            r#"
+            INSERT INTO content_admin_draft_stage_operation(
+                actor_role, actor_fingerprint, draft_id, package_key, package_revision,
+                content_hash, source_format, outcome, created_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                actor.role,
+                actor.session_fingerprint,
+                draft.id,
+                draft.package_key,
+                draft.package_revision,
+                draft.content_hash,
+                draft.source_format,
+                outcome,
+                timestamp,
+            ],
+        )
+        .map_err(|error| format!("写入内容管理员暂存审计失败：{error}"))?;
     Ok(())
 }
 
@@ -7471,6 +7619,25 @@ impl Store {
         &self,
         loaded: &LoadedContentPackage,
     ) -> Result<ContentDraftRecord, String> {
+        self.stage_content_package_with_actor(loaded, None)
+            .map(|receipt| receipt.draft)
+    }
+
+    /// 以已认证管理员身份暂存受控内容文件，并将草稿快照与审计原子提交。
+    pub fn stage_content_package_as_admin(
+        &self,
+        loaded: &LoadedContentPackage,
+        actor: ContentAdminAuditActor<'_>,
+    ) -> Result<ContentDraftStageReceipt, String> {
+        validate_content_admin_actor(actor)?;
+        self.stage_content_package_with_actor(loaded, Some(actor))
+    }
+
+    fn stage_content_package_with_actor(
+        &self,
+        loaded: &LoadedContentPackage,
+        actor: Option<ContentAdminAuditActor<'_>>,
+    ) -> Result<ContentDraftStageReceipt, String> {
         let shape_errors = validate_shape(&loaded.package);
         if !shape_errors.is_empty() {
             return Err(format!("内容包字段校验失败：{}", shape_errors.join("；")));
@@ -7494,10 +7661,22 @@ impl Store {
         if let Some(existing) = existing {
             if existing.status == "published" {
                 if existing.content_hash == expected_hash {
+                    if let Some(actor) = actor {
+                        record_content_admin_draft_stage_operation(
+                            &transaction,
+                            actor,
+                            &existing,
+                            "replayed",
+                            timestamp,
+                        )?;
+                    }
                     transaction
                         .commit()
                         .map_err(|error| format!("提交已发布内容草稿查询失败：{error}"))?;
-                    return Ok(existing);
+                    return Ok(ContentDraftStageReceipt {
+                        draft: existing,
+                        replayed: true,
+                    });
                 }
                 return Err(format!(
                     "内容包 {} rev.{} 已发布且内容不同；必须使用更大的 revision",
@@ -7552,10 +7731,22 @@ impl Store {
             loaded.package.revision,
         )?
         .ok_or_else(|| "保存内容草稿后无法读取记录".to_string())?;
+        if let Some(actor) = actor {
+            record_content_admin_draft_stage_operation(
+                &transaction,
+                actor,
+                &record,
+                "staged",
+                timestamp,
+            )?;
+        }
         transaction
             .commit()
             .map_err(|error| format!("提交内容草稿事务失败：{error}"))?;
-        Ok(record)
+        Ok(ContentDraftStageReceipt {
+            draft: record,
+            replayed: false,
+        })
     }
 
     /// 校验草稿与当前目录引用，并持久化可供运营端展示的错误结果。
@@ -8131,6 +8322,45 @@ impl Store {
         })
     }
 
+    /// 按稳定自增 ID 游标读取管理员内容暂存审计，不返回文件路径或会话明文。
+    pub fn list_content_admin_draft_stage_operations(
+        &self,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> Result<ContentAdminDraftStageOperationPage, String> {
+        let (after_id, fetch_limit) = content_cursor_page_args(after_id, limit)?;
+        let connection = self.open()?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT id, actor_role, actor_fingerprint, draft_id, package_key,
+                       package_revision, content_hash, source_format, outcome, created_at
+                  FROM content_admin_draft_stage_operation
+                 WHERE id > ?1
+                 ORDER BY id ASC
+                 LIMIT ?2
+                "#,
+            )
+            .map_err(|error| format!("准备内容管理员暂存审计分页查询失败：{error}"))?;
+        let mut entries = statement
+            .query_map(
+                params![after_id, fetch_limit],
+                content_admin_draft_stage_operation_record_from_row,
+            )
+            .map_err(|error| format!("查询内容管理员暂存审计分页失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析内容管理员暂存审计分页失败：{error}"))?;
+        let has_more = entries.len() > limit;
+        entries.truncate(limit);
+        let next_after_id = has_more
+            .then(|| entries.last().map(|entry| entry.id))
+            .flatten();
+        Ok(ContentAdminDraftStageOperationPage {
+            entries,
+            next_after_id,
+        })
+    }
+
     /// 读取最后一条 activation 所指向的当前内容 revision。
     #[allow(dead_code)]
     pub fn active_content_revision(&self) -> Result<ContentRevisionRecord, String> {
@@ -8268,7 +8498,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
                     format!(
-                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31 失败：{error}"
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32 失败：{error}"
                     )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
@@ -8747,10 +8977,25 @@ impl Store {
                 validate_v31_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 32)? {
+                transaction
+                    .execute_batch(MIGRATION_V32)
+                    .map_err(|error| format!("执行数据库迁移 v32 失败：{error}"))?;
+                validate_v32_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(32, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v32 失败：{error}"))?;
+            } else {
+                validate_v32_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32 失败：{error}"
                 )
             })?;
             Ok(())
@@ -8788,6 +9033,7 @@ impl Store {
                 validate_v29_schema(connection)?;
                 validate_v30_schema(connection)?;
                 validate_v31_schema(connection)?;
+                validate_v32_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -24433,7 +24679,9 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
             || (name == "content_admin_operation_state_guard"
                 && table == "content_admin_operation")
             || (name == "content_admin_rollback_operation_state_guard"
-                && table == "content_admin_rollback_operation");
+                && table == "content_admin_rollback_operation")
+            || (name == "content_admin_draft_stage_operation_state_guard"
+                && table == "content_admin_draft_stage_operation");
         let touches_v23 = matches!(
             table.as_str(),
             "content_revision"
@@ -25842,6 +26090,149 @@ fn validate_v31_schema(connection: &Connection) -> Result<(), String> {
         {
             return Err(format!(
                 "v31 触发器 {name} 未声明却引用内容管理员回滚审计结构 {table}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 校验管理员内容暂存审计与当前草稿状态的原子关联，损坏时拒绝启动。
+fn validate_v32_schema(connection: &Connection) -> Result<(), String> {
+    validate_v31_schema(connection)?;
+
+    let actual = table_columns_with_type(connection, "content_admin_draft_stage_operation")?;
+    let expected = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("actor_role", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("actor_fingerprint", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("draft_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("package_key", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("package_revision", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("content_hash", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("source_format", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("outcome", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+    ];
+    if actual != expected {
+        return Err(format!(
+            "v32 表 content_admin_draft_stage_operation 字段不匹配：{actual:?}"
+        ));
+    }
+
+    validate_v10_table_sql(
+        connection,
+        "content_admin_draft_stage_operation",
+        &[
+            ") STRICT",
+            "ACTOR_ROLE = 'CONTENT_ADMIN'",
+            "SOURCE_FORMAT IN ('JSON', 'TOML')",
+            "OUTCOME IN ('STAGED', 'REPLAYED')",
+            "REFERENCES CONTENT_DRAFT(ID) ON DELETE RESTRICT",
+        ],
+    )
+    .map_err(|error| error.replace("v10", "v32"))?;
+    validate_v9_foreign_keys(
+        connection,
+        "content_admin_draft_stage_operation",
+        &[("content_draft", "draft_id", "id", "NO ACTION", "RESTRICT")],
+    )
+    .map_err(|error| error.replace("v9", "v32"))?;
+    validate_v10_custom_index_set(connection, "content_admin_draft_stage_operation", &[])
+        .map_err(|error| error.replace("v10", "v32"))?;
+
+    let expected_triggers = [
+        (
+            "content_admin_draft_stage_operation_state_guard",
+            "content_admin_draft_stage_operation",
+            &[
+                "BEFORE INSERT",
+                "FROM CONTENT_DRAFT",
+                "NEW.OUTCOME = 'STAGED'",
+                "RAISE(ABORT",
+            ] as &[&str],
+        ),
+        (
+            "content_admin_draft_stage_operation_no_update",
+            "content_admin_draft_stage_operation",
+            &["BEFORE UPDATE", "RAISE(ABORT"],
+        ),
+        (
+            "content_admin_draft_stage_operation_no_delete",
+            "content_admin_draft_stage_operation",
+            &["BEFORE DELETE", "RAISE(ABORT"],
+        ),
+        (
+            "content_admin_draft_stage_operation_no_reinsert",
+            "content_admin_draft_stage_operation",
+            &["BEFORE INSERT", "RAISE(ABORT"],
+        ),
+    ];
+    for (name, table, markers) in expected_triggers {
+        let (actual_table, trigger_sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v32 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库缺少 v32 触发器 {name}"))?;
+        let trigger_sql = trigger_sql.to_ascii_uppercase();
+        if actual_table != table || markers.iter().any(|marker| !trigger_sql.contains(marker)) {
+            return Err(format!("v32 触发器 {name} 契约不匹配"));
+        }
+    }
+
+    let invalid_audit = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM content_admin_draft_stage_operation operation
+             LEFT JOIN content_draft draft ON draft.id = operation.draft_id
+                 WHERE draft.id IS NULL
+                    OR draft.package_key <> operation.package_key
+                    OR draft.package_revision <> operation.package_revision
+                    OR operation.actor_role <> 'content_admin'
+                    OR length(operation.actor_fingerprint) <> 64
+                    OR operation.actor_fingerprint GLOB '*[^0-9a-f]*'
+                    OR operation.source_format NOT IN ('json', 'toml')
+                    OR operation.outcome NOT IN ('staged', 'replayed')
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v32 内容管理员暂存审计失败：{error}"))?;
+    if invalid_audit {
+        return Err("v32 检测到与草稿身份不一致的管理员暂存审计".to_string());
+    }
+
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v32 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v32 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v32 全库触发器失败：{error}"))?;
+    for (name, table, trigger_sql) in triggers {
+        let declared = expected_triggers
+            .iter()
+            .any(|(expected_name, expected_table, _)| {
+                name == *expected_name && table == *expected_table
+            });
+        if (table == "content_admin_draft_stage_operation"
+            || sql_mentions_identifier(&trigger_sql, "content_admin_draft_stage_operation"))
+            && !declared
+        {
+            return Err(format!(
+                "v32 触发器 {name} 未声明却引用内容管理员暂存审计结构 {table}"
             ));
         }
     }
@@ -36863,6 +37254,131 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v32_content_admin_draft_stage_audit_is_atomic_and_replay_safe() {
+        let (directory, store) = test_store();
+        let actor = ContentAdminAuditActor {
+            role: "content_admin",
+            session_fingerprint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        };
+        let package = content_effect_package("v32-stage", "v32-stage-effect", "entangle");
+        let staged = store
+            .stage_content_package_as_admin(&package, actor)
+            .expect("管理员应暂存 v32 内容包");
+        assert!(!staged.replayed);
+        assert_eq!(staged.draft.status, "draft");
+
+        let restaged = store
+            .stage_content_package_as_admin(&package, actor)
+            .expect("未发布草稿应允许管理员重新暂存");
+        assert!(!restaged.replayed);
+        assert_eq!(restaged.draft.id, staged.draft.id);
+        let operations = store
+            .list_content_admin_draft_stage_operations(None, 100)
+            .expect("应读取 v32 管理员暂存审计");
+        assert_eq!(operations.entries.len(), 2);
+        assert!(operations.entries.iter().all(|entry| {
+            entry.actor_role == "content_admin"
+                && entry.actor_fingerprint == actor.session_fingerprint
+                && entry.package_key == "v32-stage"
+                && entry.outcome == "staged"
+        }));
+
+        let restaged_package =
+            content_effect_package("v32-stage", "v32-restaged-effect", "entangle");
+        let restaged = store
+            .stage_content_package_as_admin(&restaged_package, actor)
+            .expect("未发布草稿应允许以新内容重新暂存");
+        assert_ne!(restaged.draft.content_hash, staged.draft.content_hash);
+        drop(store);
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("重暂存后历史暂存审计不应阻断启动");
+        assert_eq!(
+            store
+                .list_content_admin_draft_stage_operations(None, 100)
+                .expect("应读取重启后的暂存审计")
+                .entries
+                .len(),
+            3
+        );
+
+        assert!(
+            store
+                .validate_content_draft("v32-stage", 1)
+                .expect("应校验 v32 暂存草稿")
+                .errors
+                .is_empty()
+        );
+        store
+            .publish_content_draft("v32-stage", 1)
+            .expect("应发布 v32 暂存草稿");
+        let replayed = store
+            .stage_content_package_as_admin(&restaged_package, actor)
+            .expect("已发布同哈希草稿应幂等暂存");
+        assert!(replayed.replayed);
+        assert_eq!(replayed.draft.status, "published");
+        let operations = store
+            .list_content_admin_draft_stage_operations(None, 100)
+            .expect("应读取已发布草稿暂存审计");
+        assert_eq!(operations.entries.len(), 4);
+        assert_eq!(operations.entries[3].outcome, "replayed");
+
+        let invalid_actor = ContentAdminAuditActor {
+            role: "owner",
+            session_fingerprint: actor.session_fingerprint,
+        };
+        assert!(
+            store
+                .stage_content_package_as_admin(&restaged_package, invalid_actor)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .list_content_admin_draft_stage_operations(None, 100)
+                .expect("非法角色后审计应保持不变")
+                .entries
+                .len(),
+            4
+        );
+
+        let atomic = content_effect_package("v32-atomic", "v32-atomic-effect", "entangle");
+        let connection = store.open().expect("应打开 v32 原子性数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER content_admin_draft_stage_operation_test_failure
+                BEFORE INSERT ON content_admin_draft_stage_operation
+                BEGIN
+                    SELECT RAISE(ABORT, 'test stage audit failure');
+                END;
+                "#,
+            )
+            .expect("应构造暂存审计写入失败");
+        drop(connection);
+        assert!(
+            store
+                .stage_content_package_as_admin(&atomic, actor)
+                .is_err()
+        );
+        assert!(
+            !store
+                .list_content_drafts(None, 100)
+                .expect("审计失败后应读取草稿列表")
+                .entries
+                .iter()
+                .any(|entry| entry.package_key == "v32-atomic"),
+            "审计失败不能留下半写入草稿"
+        );
+        assert_eq!(
+            store
+                .list_content_admin_draft_stage_operations(None, 100)
+                .expect("审计失败后不应追加暂存记录")
+                .entries
+                .len(),
+            4
+        );
+    }
+
     fn assert_v30_damage_fails_closed(mutation: &str) {
         let directory = tempdir().expect("应创建 v30 损坏测试目录");
         let store = Store::initialize(directory.path(), &DatabaseConfig::default())
@@ -36929,6 +37445,41 @@ mod tests {
             r#"
             CREATE TRIGGER content_admin_rollback_operation_shadow
             AFTER INSERT ON content_admin_rollback_operation
+            BEGIN SELECT 1; END;
+            "#,
+        );
+    }
+
+    fn assert_v32_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v32 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v32 迁移应成功");
+        let connection = store.open().expect("应打开 v32 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v32 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v32 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v32") || error.contains("content_admin_draft_stage_operation"),
+            "v32 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    #[test]
+    fn recorded_v32_with_damaged_schema_or_trigger_fails_closed() {
+        for mutation in [
+            "DROP TABLE content_admin_draft_stage_operation;",
+            "DROP TRIGGER content_admin_draft_stage_operation_state_guard;",
+        ] {
+            assert_v32_damage_fails_closed(mutation);
+        }
+        assert_v32_damage_fails_closed(
+            r#"
+            CREATE TRIGGER content_admin_draft_stage_operation_shadow
+            AFTER INSERT ON content_admin_draft_stage_operation
             BEGIN SELECT 1; END;
             "#,
         );
