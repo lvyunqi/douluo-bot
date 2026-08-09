@@ -75,6 +75,24 @@ pub const TARGET_SELECTOR: &str = "current_battle_beast";
 /// 首版目标选择节点的标记值。
 pub const TARGET_SELECTION_VALUE: i64 = 1;
 
+/// 首版禁技效果冻结到快照中的规则版本。
+pub const FORBID_SKILL_RULE_VERSION: &str = "forbid-skill-v1";
+
+/// 首版禁技在玩家行动前检查。
+pub const FORBID_SKILL_APPLY_PHASE: &str = "before_player_action";
+
+/// 首版禁技只阻止魂技释放动作。
+pub const FORBID_SKILL_BLOCKED_ACTION: &str = "release_skill";
+
+/// 首版禁技的受控标记值。
+pub const FORBID_SKILL_VALUE: i64 = 1;
+
+/// 禁技至少覆盖施放后的下一条行动序列。
+pub const MIN_FORBID_SKILL_DURATION_ROUNDS: i64 = 2;
+
+/// 首版禁技持续时间上限，避免内容包声明无法审计的超长控制。
+pub const MAX_FORBID_SKILL_DURATION_ROUNDS: i64 = 10;
+
 /// 可发布目录数据的文件格式。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -272,6 +290,15 @@ pub fn is_target_v1_parameters(parameters: &BTreeMap<String, Value>) -> bool {
     parameters.len() == 2
         && parameters.get("rule_version").and_then(Value::as_str) == Some(TARGET_RULE_VERSION)
         && parameters.get("selector").and_then(Value::as_str) == Some(TARGET_SELECTOR)
+}
+
+/// 判断内容包参数是否精确声明首版玩家禁技规则。
+pub fn is_forbid_skill_v1_parameters(parameters: &BTreeMap<String, Value>) -> bool {
+    parameters.len() == 3
+        && parameters.get("rule_version").and_then(Value::as_str) == Some(FORBID_SKILL_RULE_VERSION)
+        && parameters.get("apply_phase").and_then(Value::as_str) == Some(FORBID_SKILL_APPLY_PHASE)
+        && parameters.get("blocked_action").and_then(Value::as_str)
+            == Some(FORBID_SKILL_BLOCKED_ACTION)
 }
 
 /// 将内容包序列化为用于持久化和哈希的稳定 JSON 表示。
@@ -546,15 +573,20 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
             && entry.operation == "select_target"
             && entry.attribute_key == "battle_target"
             && entry.value_mode == "absolute";
+        let forbid_skill = entry.target_kind == "self"
+            && entry.operation == "control"
+            && entry.attribute_key == "skill_usage"
+            && entry.value_mode == "absolute";
         if !beast_attack_reduction
             && !poison_damage
             && !stun_control
             && !shield_protection
             && !heal_restore
             && !target_selection
+            && !forbid_skill
         {
             errors.push(format!(
-                "效果 {} 当前只支持减攻、poison-v1 中毒伤害、stun-v1 眩晕、shield-v1 护盾、heal-v1 治疗或 target-v1 目标节点",
+                "效果 {} 当前只支持减攻、poison-v1 中毒伤害、stun-v1 眩晕、shield-v1 护盾、heal-v1 治疗、target-v1 目标或 forbid-skill-v1 禁技节点",
                 entry.effect_key
             ));
         }
@@ -677,6 +709,35 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
                 entry.effect_key
             ));
         }
+        if forbid_skill && entry.value != FORBID_SKILL_VALUE {
+            errors.push(format!(
+                "效果 {} 的 forbid-skill-v1 value 必须固定为 {} 的 absolute",
+                entry.effect_key, FORBID_SKILL_VALUE
+            ));
+        }
+        if forbid_skill
+            && !(MIN_FORBID_SKILL_DURATION_ROUNDS..=MAX_FORBID_SKILL_DURATION_ROUNDS)
+                .contains(&entry.duration_rounds)
+        {
+            errors.push(format!(
+                "效果 {} 的 forbid-skill-v1 duration_rounds 必须在 {} 到 {} 之间",
+                entry.effect_key,
+                MIN_FORBID_SKILL_DURATION_ROUNDS,
+                MAX_FORBID_SKILL_DURATION_ROUNDS
+            ));
+        }
+        if forbid_skill && entry.stack_policy != "refresh" {
+            errors.push(format!(
+                "效果 {} 的 forbid-skill-v1 stack_policy 必须是 refresh",
+                entry.effect_key
+            ));
+        }
+        if forbid_skill && !is_forbid_skill_v1_parameters(&entry.parameters) {
+            errors.push(format!(
+                "效果 {} 的 forbid-skill-v1 parameters 必须固定声明规则版本、结算时机和阻断动作",
+                entry.effect_key
+            ));
+        }
         if target_selection {
             if entry.value != TARGET_SELECTION_VALUE {
                 errors.push(format!(
@@ -698,7 +759,7 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
             }
             if !is_target_v1_parameters(&entry.parameters) {
                 errors.push(format!(
-                    "效果 {} 的 target-v1 parameters 必须固定声明选择器、快照来源和缺失行为",
+                    "效果 {} 的 target-v1 parameters 必须固定声明当前战斗魂兽选择器",
                     entry.effect_key
                 ));
             }
@@ -1219,6 +1280,44 @@ mod tests {
             validate_shape(&package)
                 .iter()
                 .any(|error| error.contains("target-v1 parameters"))
+        );
+    }
+
+    #[test]
+    fn accepts_only_the_controlled_forbid_skill_v1_node() {
+        let mut package = minimal_package();
+        let effect = &mut package.effects[0];
+        effect.target_kind = "self".to_string();
+        effect.operation = "control".to_string();
+        effect.attribute_key = "skill_usage".to_string();
+        effect.value_mode = "absolute".to_string();
+        effect.value = FORBID_SKILL_VALUE;
+        effect.duration_rounds = MIN_FORBID_SKILL_DURATION_ROUNDS;
+        effect.stack_policy = "refresh".to_string();
+        effect.parameters = BTreeMap::from([
+            (
+                "rule_version".to_string(),
+                Value::String(FORBID_SKILL_RULE_VERSION.to_string()),
+            ),
+            (
+                "apply_phase".to_string(),
+                Value::String(FORBID_SKILL_APPLY_PHASE.to_string()),
+            ),
+            (
+                "blocked_action".to_string(),
+                Value::String(FORBID_SKILL_BLOCKED_ACTION.to_string()),
+            ),
+        ]);
+        assert!(validate_shape(&package).is_empty());
+
+        package.effects[0].parameters.insert(
+            "blocked_action".to_string(),
+            Value::String("attack".to_string()),
+        );
+        assert!(
+            validate_shape(&package)
+                .iter()
+                .any(|error| error.contains("forbid-skill-v1 parameters"))
         );
     }
 

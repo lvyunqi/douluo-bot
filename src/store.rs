@@ -11,10 +11,11 @@ use rusqlite::{
 
 use crate::config::DatabaseConfig;
 use crate::content::{
-    ContentPackage, ContentTransitionPackageEntry, LoadedContentPackage, MAX_HEAL_AMOUNT,
-    MAX_POISON_TICK_DAMAGE, SHIELD_VALUE, STUN_VALUE, TARGET_SELECTION_VALUE, canonical_json,
-    content_hash, is_heal_v1_parameters, is_poison_v1_parameters, is_shield_v1_parameters,
-    is_stun_v1_parameters, is_target_v1_parameters, validate_shape,
+    ContentPackage, ContentTransitionPackageEntry, FORBID_SKILL_VALUE, LoadedContentPackage,
+    MAX_HEAL_AMOUNT, MAX_POISON_TICK_DAMAGE, SHIELD_VALUE, STUN_VALUE, TARGET_SELECTION_VALUE,
+    canonical_json, content_hash, is_forbid_skill_v1_parameters, is_heal_v1_parameters,
+    is_poison_v1_parameters, is_shield_v1_parameters, is_stun_v1_parameters,
+    is_target_v1_parameters, validate_shape,
 };
 use crate::message::Protocol;
 
@@ -11765,6 +11766,9 @@ impl Store {
         if matches!(action, "攻击" | "释放技能") {
             validate_target_selection(&state, &active_skill_effects, &pending_skill_effects)?;
         }
+        if action == "释放技能" && player_skill_is_forbidden(&active_skill_effects)? {
+            return Err("当前禁技效果生效，暂不能释放魂技".to_string());
+        }
         let timestamp = now_timestamp()?;
         let (player_skill_id, skill_use, soul_power_before, soul_power_after) = if let Some(
             learned,
@@ -15113,6 +15117,12 @@ fn compatibility_effect_kind(
         && value > 0
     {
         "heal".to_string()
+    } else if operation == "control"
+        && attribute_key == "skill_usage"
+        && value_mode == "absolute"
+        && value == FORBID_SKILL_VALUE
+    {
+        "skill_forbidden".to_string()
     } else if operation == "select_target"
         && attribute_key == "battle_target"
         && value_mode == "absolute"
@@ -15686,6 +15696,9 @@ enum SupportedSkillEffect {
     CurrentBattleBeastTarget {
         stack_policy: EffectStackPolicy,
     },
+    PlayerSkillForbidden {
+        stack_policy: EffectStackPolicy,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15807,6 +15820,22 @@ fn parse_supported_skill_effect(
         });
     }
     if trigger_kind == "on_release"
+        && target_kind == "self"
+        && operation == "control"
+        && attribute_key == "skill_usage"
+        && value_mode == "absolute"
+        && value == FORBID_SKILL_VALUE
+        && chance_percent == 100
+    {
+        if !is_forbid_skill_v1_parameters(&parameters) {
+            return Err("forbid-skill-v1 参数必须固定声明规则版本、结算时机和阻断动作".to_string());
+        }
+        if stack_policy != EffectStackPolicy::Refresh {
+            return Err("forbid-skill-v1 只支持 refresh 叠加策略".to_string());
+        }
+        return Ok(SupportedSkillEffect::PlayerSkillForbidden { stack_policy });
+    }
+    if trigger_kind == "on_release"
         && target_kind == "beast"
         && operation == "select_target"
         && attribute_key == "battle_target"
@@ -15815,7 +15844,7 @@ fn parse_supported_skill_effect(
         && chance_percent == 100
     {
         if !is_target_v1_parameters(&parameters) {
-            return Err("target-v1 参数必须固定声明选择器、快照来源和缺失行为".to_string());
+            return Err("target-v1 参数必须固定声明当前战斗魂兽选择器".to_string());
         }
         if stack_policy != EffectStackPolicy::Replace {
             return Err("target-v1 只支持 replace 叠加策略".to_string());
@@ -15955,6 +15984,30 @@ fn beast_is_stunned_after_skill_effects(
         }
     }
     Ok(stunned)
+}
+
+/// 在扣除魂力前检查当前玩家是否处于禁技区间。
+fn player_skill_is_forbidden(active_effects: &[BattleSkillEffectRecord]) -> Result<bool, String> {
+    let mut forbidden = false;
+    for effect in active_effects {
+        if matches!(
+            parse_supported_skill_effect(
+                &effect.trigger_kind,
+                &effect.target_kind,
+                &effect.operation,
+                &effect.attribute_key,
+                &effect.value_mode,
+                effect.value,
+                effect.chance_percent,
+                &effect.stack_policy,
+                &effect.parameters_json,
+            )?,
+            SupportedSkillEffect::PlayerSkillForbidden { .. }
+        ) {
+            forbidden = true;
+        }
+    }
+    Ok(forbidden)
 }
 
 /// 判断当前玩家攻击或魂技动作是否有护盾吸收魂兽反击。
@@ -24378,6 +24431,23 @@ fn validate_v22_schema(connection: &Connection) -> Result<(), String> {
                            AND (SELECT COUNT(*) FROM json_each(parameters_json)) = 3
                        ) OR (
                            trigger_kind = 'on_release'
+                           AND target_kind = 'self'
+                           AND operation = 'control'
+                           AND attribute_key = 'skill_usage'
+                           AND value_mode = 'absolute'
+                           AND value = 1
+                           AND duration_rounds BETWEEN 2 AND 10
+                           AND chance_percent = 100
+                           AND stack_policy = 'refresh'
+                           AND json_type(parameters_json, '$.rule_version') = 'text'
+                           AND json_extract(parameters_json, '$.rule_version') = 'forbid-skill-v1'
+                           AND json_type(parameters_json, '$.apply_phase') = 'text'
+                           AND json_extract(parameters_json, '$.apply_phase') = 'before_player_action'
+                           AND json_type(parameters_json, '$.blocked_action') = 'text'
+                           AND json_extract(parameters_json, '$.blocked_action') = 'release_skill'
+                           AND (SELECT COUNT(*) FROM json_each(parameters_json)) = 3
+                       ) OR (
+                           trigger_kind = 'on_release'
                            AND target_kind = 'beast'
                            AND operation = 'select_target'
                            AND attribute_key = 'battle_target'
@@ -28448,8 +28518,9 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use crate::content::{
-        EffectPackageEntry, SkillPackageEntry, SoulBeastPackageEntry, SoulRingPackageEntry,
-        WuhunPackageEntry, WuhunStatsPackageEntry,
+        EffectPackageEntry, FORBID_SKILL_APPLY_PHASE, FORBID_SKILL_BLOCKED_ACTION,
+        FORBID_SKILL_RULE_VERSION, MIN_FORBID_SKILL_DURATION_ROUNDS, SkillPackageEntry,
+        SoulBeastPackageEntry, SoulRingPackageEntry, WuhunPackageEntry, WuhunStatsPackageEntry,
     };
     use tempfile::tempdir;
 
@@ -28710,6 +28781,110 @@ mod tests {
             stack_policy: "replace".to_string(),
             parameters_json: serde_json::to_string(&target_v1_parameters())
                 .expect("应序列化目标选择参数"),
+        }
+    }
+
+    fn forbid_skill_v1_parameters() -> BTreeMap<String, serde_json::Value> {
+        BTreeMap::from([
+            (
+                "rule_version".to_string(),
+                serde_json::Value::String(FORBID_SKILL_RULE_VERSION.to_string()),
+            ),
+            (
+                "apply_phase".to_string(),
+                serde_json::Value::String(FORBID_SKILL_APPLY_PHASE.to_string()),
+            ),
+            (
+                "blocked_action".to_string(),
+                serde_json::Value::String(FORBID_SKILL_BLOCKED_ACTION.to_string()),
+            ),
+        ])
+    }
+
+    fn forbid_skill_effect_record(effect_key: &str) -> SkillEffectRecord {
+        SkillEffectRecord {
+            effect_key: effect_key.to_string(),
+            effect_kind: "skill_forbidden".to_string(),
+            target_kind: "self".to_string(),
+            magnitude_percent: FORBID_SKILL_VALUE,
+            duration_rounds: MIN_FORBID_SKILL_DURATION_ROUNDS,
+            description: "test forbid-skill-v1 effect".to_string(),
+            trigger_kind: "on_release".to_string(),
+            operation: "control".to_string(),
+            attribute_key: "skill_usage".to_string(),
+            value_mode: "absolute".to_string(),
+            value: FORBID_SKILL_VALUE,
+            chance_percent: 100,
+            stack_policy: "refresh".to_string(),
+            parameters_json: serde_json::to_string(&forbid_skill_v1_parameters())
+                .expect("应序列化禁技参数"),
+        }
+    }
+
+    fn forbid_skill_battle_effect_record(id: i64, effect_key: &str) -> BattleSkillEffectRecord {
+        let effect = forbid_skill_effect_record(effect_key);
+        BattleSkillEffectRecord {
+            id,
+            battle_skill_event_id: id,
+            effect_key: effect.effect_key,
+            skill_key: "entangle".to_string(),
+            skill_name: "缠绕".to_string(),
+            effect_kind: effect.effect_kind,
+            target_kind: effect.target_kind,
+            magnitude_percent: effect.magnitude_percent,
+            duration_rounds: effect.duration_rounds,
+            started_sequence: id,
+            expires_after_sequence: id + effect.duration_rounds - 1,
+            rule_version: "effect-v2".to_string(),
+            description: effect.description,
+            trigger_kind: effect.trigger_kind,
+            operation: effect.operation,
+            attribute_key: effect.attribute_key,
+            value_mode: effect.value_mode,
+            value: effect.value,
+            chance_percent: effect.chance_percent,
+            stack_policy: effect.stack_policy,
+            parameters_json: effect.parameters_json,
+        }
+    }
+
+    fn forbid_skill_effect_package(
+        package_key: &str,
+        effect_key: &str,
+        skill_key: &str,
+        duration_rounds: i64,
+    ) -> LoadedContentPackage {
+        let package = ContentPackage {
+            package_key: package_key.to_string(),
+            revision: 1,
+            author: "test".to_string(),
+            minimum_runtime: String::new(),
+            wuhun: Vec::new(),
+            skills: Vec::new(),
+            effects: vec![EffectPackageEntry {
+                effect_key: effect_key.to_string(),
+                skill_key: skill_key.to_string(),
+                trigger_kind: "on_release".to_string(),
+                target_kind: "self".to_string(),
+                operation: "control".to_string(),
+                attribute_key: "skill_usage".to_string(),
+                value_mode: "absolute".to_string(),
+                value: FORBID_SKILL_VALUE,
+                duration_rounds,
+                chance_percent: 100,
+                stack_policy: "refresh".to_string(),
+                parameters: forbid_skill_v1_parameters(),
+                description: "test forbid-skill-v1 effect".to_string(),
+                enabled: true,
+            }],
+            soul_beasts: Vec::new(),
+            soul_rings: Vec::new(),
+            transitions: Vec::new(),
+        };
+        LoadedContentPackage {
+            content_hash: content_hash(&package).expect("应计算禁技内容包哈希"),
+            package,
+            source_format: "json".to_string(),
         }
     }
 
@@ -35176,6 +35351,47 @@ mod tests {
     }
 
     #[test]
+    fn forbid_skill_v1_parser_is_strict_and_checks_active_effects() {
+        let effect = forbid_skill_effect_record("forbid-parser");
+        assert!(matches!(
+            parse_supported_skill_effect(
+                &effect.trigger_kind,
+                &effect.target_kind,
+                &effect.operation,
+                &effect.attribute_key,
+                &effect.value_mode,
+                effect.value,
+                effect.chance_percent,
+                &effect.stack_policy,
+                &effect.parameters_json,
+            ),
+            Ok(SupportedSkillEffect::PlayerSkillForbidden { .. })
+        ));
+        assert!(
+            player_skill_is_forbidden(&[forbid_skill_battle_effect_record(1, "forbid-active")])
+                .expect("应解析 active 禁技效果")
+        );
+        assert!(!player_skill_is_forbidden(&[]).expect("空效果不应禁技"));
+
+        let mut invalid = effect;
+        invalid.stack_policy = "replace".to_string();
+        assert!(
+            parse_supported_skill_effect(
+                &invalid.trigger_kind,
+                &invalid.target_kind,
+                &invalid.operation,
+                &invalid.attribute_key,
+                &invalid.value_mode,
+                invalid.value,
+                invalid.chance_percent,
+                &invalid.stack_policy,
+                &invalid.parameters_json,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn v21_entangle_effect_catalog_is_exposed_with_the_skill() {
         let (_directory, store) = test_store();
         register_awakened_pair(&store);
@@ -35394,6 +35610,132 @@ mod tests {
         );
         assert_eq!(first.event.sequence, 1);
         assert_eq!(first.event.beast_hp_before, first.battle.beast.max_hp);
+    }
+
+    #[test]
+    fn forbid_skill_v1_blocks_release_before_mutation_and_expires() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        let forbid = forbid_skill_effect_package(
+            "forbid-skill-v1-test",
+            "entangle-forbid-skill-test",
+            "entangle",
+            2,
+        );
+        store
+            .stage_content_package(&forbid)
+            .expect("禁技内容包应暂存");
+        let validation = store
+            .validate_content_draft("forbid-skill-v1-test", 1)
+            .expect("禁技内容包应校验");
+        assert!(validation.errors.is_empty(), "{validation:?}");
+        store
+            .publish_content_draft("forbid-skill-v1-test", 1)
+            .expect("禁技内容包应发布");
+        absorb_test_soul_ring(&store, &identity(), "forbid-skill-v1-source");
+
+        let player_id = player_id_for(&store, &identity());
+        let connection = store.open().expect("应打开禁技战斗数据库");
+        connection
+            .execute(
+                "UPDATE player SET level = 10, hp = 1000, max_hp = 1000, soul_power = 1000, max_soul_power = 1000, strength = 1, endurance = 1000, perception = 0, luck = 0, updated_at = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置禁技战斗属性");
+        drop(connection);
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "哥布林",
+                &transfer_operation("挑战", "forbid-skill-v1-challenge"),
+            )
+            .expect("应创建禁技测试战斗");
+
+        let first = store
+            .use_skill_battle_with_operation(
+                &identity(),
+                "缠绕",
+                &transfer_operation("释放技能", "forbid-skill-v1-first"),
+            )
+            .expect("首次魂技应正常释放并施加禁技");
+        assert_eq!(first.event.sequence, 1);
+        assert!(
+            first
+                .skill
+                .as_ref()
+                .expect("首次应有魂技回执")
+                .effects
+                .iter()
+                .any(|effect| effect.effect_key == "entangle-forbid-skill-test")
+        );
+        let power_after_first = first
+            .skill
+            .as_ref()
+            .expect("首次应保存魂力回执")
+            .soul_power_after;
+
+        let blocked = store
+            .use_skill_battle_with_operation(
+                &identity(),
+                "缠绕",
+                &transfer_operation("释放技能", "forbid-skill-v1-blocked"),
+            )
+            .expect_err("禁技期间释放魂技应失败");
+        assert!(blocked.contains("禁技"));
+        let connection = store.open().expect("应读取禁技阻断后的状态");
+        let (action_count, soul_power, blocked_events) = connection
+            .query_row(
+                "SELECT battle.action_count, player.soul_power, (SELECT COUNT(*) FROM battle_event WHERE source_message_id = ?1) FROM battle JOIN player ON player.id = battle.player_id WHERE battle.player_id = ?2 AND battle.status = 'active'",
+                params!["forbid-skill-v1-blocked", player_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("应读取禁技阻断状态");
+        assert_eq!(action_count, 1);
+        assert_eq!(soul_power, power_after_first);
+        assert_eq!(blocked_events, 0);
+
+        let second = store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "forbid-skill-v1-wait-1"),
+            )
+            .expect("普通攻击不应被禁技阻断");
+        assert_eq!(second.event.sequence, 2);
+        assert!(
+            second
+                .expired_effects
+                .iter()
+                .any(|effect| effect.effect_key == "entangle-forbid-skill-test")
+        );
+        let third = store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "forbid-skill-v1-wait-2"),
+            )
+            .expect("禁技到期后仍应允许普通攻击");
+        assert_eq!(third.event.sequence, 3);
+        assert!(
+            !third
+                .battle
+                .active_effects
+                .iter()
+                .any(|effect| effect.effect_key == "entangle-forbid-skill-test")
+        );
+
+        let fourth = store
+            .use_skill_battle_with_operation(
+                &identity(),
+                "缠绕",
+                &transfer_operation("释放技能", "forbid-skill-v1-after-expiry"),
+            )
+            .expect("禁技到期且冷却结束后应允许再次释放魂技");
+        assert_eq!(fourth.event.sequence, 4);
     }
 
     #[test]

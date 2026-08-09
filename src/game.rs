@@ -2970,6 +2970,9 @@ fn skill_effect_label(effect: &SkillEffectRecord) -> String {
         ("stun", "beast") => format!("眩晕 · {} 回合", effect.duration_rounds),
         ("shield", "self") => format!("护盾吸收魂兽反击 · {} 回合", effect.duration_rounds),
         ("heal", "self") => format!("治疗恢复 {} 点生命", effect.value),
+        ("skill_forbidden", "self") => {
+            format!("禁技阻止魂技释放 · {} 回合", effect.duration_rounds)
+        }
         ("target_selection", "beast") => "选择当前魂兽目标".to_string(),
         _ => effect.description.clone(),
     }
@@ -2984,6 +2987,7 @@ fn battle_skill_effect_short_label(effect: &BattleSkillEffectRecord) -> String {
         ("stun", "beast") => "眩晕跳过魂兽反击".to_string(),
         ("shield", "self") => "护盾吸收魂兽反击".to_string(),
         ("heal", "self") => format!("治疗恢复 {} 点生命", effect.value),
+        ("skill_forbidden", "self") => "禁技：暂不能释放魂技".to_string(),
         ("target_selection", "beast") => "目标：当前魂兽".to_string(),
         _ => effect.description.clone(),
     }
