@@ -5243,6 +5243,58 @@ BEGIN
 END;
 "#;
 
+const MIGRATION_V31: &str = r#"
+CREATE TABLE content_admin_rollback_operation (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_role TEXT NOT NULL CHECK(actor_role = 'content_admin'),
+    actor_fingerprint TEXT NOT NULL CHECK(
+        length(actor_fingerprint) = 64
+        AND actor_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
+    activation_id INTEGER NOT NULL REFERENCES content_revision_activation(id) ON DELETE RESTRICT,
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    UNIQUE(activation_id)
+) STRICT;
+
+-- 回滚审计必须绑定本事务刚追加的 rollback activation，禁止伪造或脱离内容事务的记录。
+CREATE TRIGGER content_admin_rollback_operation_state_guard
+BEFORE INSERT ON content_admin_rollback_operation
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM content_revision_activation activation
+      JOIN content_revision revision ON revision.id = activation.revision_id
+     WHERE activation.id = NEW.activation_id
+       AND activation.revision_id = NEW.revision_id
+       AND revision.id = NEW.revision_id
+       AND activation.reason = 'rollback'
+       AND activation.created_at = NEW.created_at
+       AND activation.id = (SELECT MAX(id) FROM content_revision_activation)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'content admin rollback audit must match the rollback activation');
+END;
+
+CREATE TRIGGER content_admin_rollback_operation_no_update
+BEFORE UPDATE ON content_admin_rollback_operation
+BEGIN
+    SELECT RAISE(ABORT, 'content admin rollback audit is append-only');
+END;
+
+CREATE TRIGGER content_admin_rollback_operation_no_delete
+BEFORE DELETE ON content_admin_rollback_operation
+BEGIN
+    SELECT RAISE(ABORT, 'content admin rollback audit is append-only');
+END;
+
+CREATE TRIGGER content_admin_rollback_operation_no_reinsert
+BEFORE INSERT ON content_admin_rollback_operation
+WHEN EXISTS(SELECT 1 FROM content_admin_rollback_operation WHERE id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'content admin rollback audit id cannot be reused');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -5383,6 +5435,31 @@ pub struct ContentAdminOperationRecord {
 pub struct ContentAdminOperationPage {
     pub entries: Vec<ContentAdminOperationRecord>,
     pub next_after_id: Option<i64>,
+}
+
+/// 管理员显式回滚内容时的不可变审计记录，不包含会话明文。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentAdminRollbackOperationRecord {
+    pub id: i64,
+    pub actor_role: String,
+    pub actor_fingerprint: String,
+    pub revision_id: i64,
+    pub activation_id: i64,
+    pub created_at: i64,
+}
+
+/// 管理员回滚审计的受限游标分页结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentAdminRollbackOperationPage {
+    pub entries: Vec<ContentAdminRollbackOperationRecord>,
+    pub next_after_id: Option<i64>,
+}
+
+/// 显式回滚完成后返回的目标 revision 与新 activation 标识。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentRollbackReceipt {
+    pub revision: ContentRevisionRecord,
+    pub activation_id: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6461,6 +6538,19 @@ fn content_admin_operation_record_from_row(
     })
 }
 
+fn content_admin_rollback_operation_record_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ContentAdminRollbackOperationRecord> {
+    Ok(ContentAdminRollbackOperationRecord {
+        id: row.get(0)?,
+        actor_role: row.get(1)?,
+        actor_fingerprint: row.get(2)?,
+        revision_id: row.get(3)?,
+        activation_id: row.get(4)?,
+        created_at: row.get(5)?,
+    })
+}
+
 fn content_revision_record_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<ContentRevisionRecord> {
@@ -6603,6 +6693,34 @@ fn record_content_admin_operation(
             ],
         )
         .map_err(|error| format!("写入内容管理员审计失败：{error}"))?;
+    Ok(())
+}
+
+/// 将管理员回滚审计与同一事务内追加的 activation 绑定，失败时由事务整体回滚。
+fn record_content_admin_rollback_operation(
+    transaction: &Transaction<'_>,
+    actor: ContentAdminAuditActor<'_>,
+    revision_id: i64,
+    activation_id: i64,
+    timestamp: i64,
+) -> Result<(), String> {
+    validate_content_admin_actor(actor)?;
+    transaction
+        .execute(
+            r#"
+            INSERT INTO content_admin_rollback_operation(
+                actor_role, actor_fingerprint, revision_id, activation_id, created_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                actor.role,
+                actor.session_fingerprint,
+                revision_id,
+                activation_id,
+                timestamp,
+            ],
+        )
+        .map_err(|error| format!("写入内容管理员回滚审计失败：{error}"))?;
     Ok(())
 }
 
@@ -7975,6 +8093,44 @@ impl Store {
         })
     }
 
+    /// 按稳定自增 ID 游标读取管理员回滚审计，不返回会话明文。
+    pub fn list_content_admin_rollback_operations(
+        &self,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> Result<ContentAdminRollbackOperationPage, String> {
+        let (after_id, fetch_limit) = content_cursor_page_args(after_id, limit)?;
+        let connection = self.open()?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT id, actor_role, actor_fingerprint, revision_id, activation_id, created_at
+                  FROM content_admin_rollback_operation
+                 WHERE id > ?1
+                 ORDER BY id ASC
+                 LIMIT ?2
+                "#,
+            )
+            .map_err(|error| format!("准备内容管理员回滚审计分页查询失败：{error}"))?;
+        let mut entries = statement
+            .query_map(
+                params![after_id, fetch_limit],
+                content_admin_rollback_operation_record_from_row,
+            )
+            .map_err(|error| format!("查询内容管理员回滚审计分页失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析内容管理员回滚审计分页失败：{error}"))?;
+        let has_more = entries.len() > limit;
+        entries.truncate(limit);
+        let next_after_id = has_more
+            .then(|| entries.last().map(|entry| entry.id))
+            .flatten();
+        Ok(ContentAdminRollbackOperationPage {
+            entries,
+            next_after_id,
+        })
+    }
+
     /// 读取最后一条 activation 所指向的当前内容 revision。
     #[allow(dead_code)]
     pub fn active_content_revision(&self) -> Result<ContentRevisionRecord, String> {
@@ -7990,20 +8146,53 @@ impl Store {
         &self,
         revision_id: i64,
     ) -> Result<ContentRevisionRecord, String> {
+        self.rollback_content_revision_with_actor(revision_id, None)
+            .map(|receipt| receipt.revision)
+    }
+
+    /// 以已认证管理员身份回滚到既有 revision，并将 activation 与审计原子提交。
+    pub fn rollback_content_revision_as_admin(
+        &self,
+        revision_id: i64,
+        actor: ContentAdminAuditActor<'_>,
+    ) -> Result<ContentRollbackReceipt, String> {
+        validate_content_admin_actor(actor)?;
+        self.rollback_content_revision_with_actor(revision_id, Some(actor))
+    }
+
+    fn rollback_content_revision_with_actor(
+        &self,
+        revision_id: i64,
+        actor: Option<ContentAdminAuditActor<'_>>,
+    ) -> Result<ContentRollbackReceipt, String> {
         let mut connection = self.open()?;
         let transaction = self.begin_immediate(&mut connection, "开始内容回滚事务失败")?;
         let revision = load_content_revision_by_id(&transaction, revision_id)?
             .ok_or_else(|| "目标内容 revision 不存在".to_string())?;
+        let timestamp = now_timestamp()?;
         transaction
             .execute(
                 "INSERT INTO content_revision_activation(revision_id, reason, created_at) VALUES(?1, 'rollback', ?2)",
-                params![revision_id, now_timestamp()?],
+                params![revision_id, timestamp],
             )
             .map_err(|error| format!("回滚激活内容 revision 失败：{error}"))?;
+        let activation_id = transaction.last_insert_rowid();
+        if let Some(actor) = actor {
+            record_content_admin_rollback_operation(
+                &transaction,
+                actor,
+                revision_id,
+                activation_id,
+                timestamp,
+            )?;
+        }
         transaction
             .commit()
             .map_err(|error| format!("提交内容回滚事务失败：{error}"))?;
-        Ok(revision)
+        Ok(ContentRollbackReceipt {
+            revision,
+            activation_id,
+        })
     }
 
     fn open(&self) -> Result<Connection, String> {
@@ -8079,7 +8268,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
                     format!(
-                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30 失败：{error}"
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31 失败：{error}"
                     )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
@@ -8543,10 +8732,25 @@ impl Store {
                 validate_v30_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 31)? {
+                transaction
+                    .execute_batch(MIGRATION_V31)
+                    .map_err(|error| format!("执行数据库迁移 v31 失败：{error}"))?;
+                validate_v31_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(31, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v31 失败：{error}"))?;
+            } else {
+                validate_v31_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31 失败：{error}"
                 )
             })?;
             Ok(())
@@ -8583,6 +8787,7 @@ impl Store {
                 validate_v28_schema(connection)?;
                 validate_v29_schema(connection)?;
                 validate_v30_schema(connection)?;
+                validate_v31_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -24226,7 +24431,9 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
                     | "soul_ring_drop_scope_guard"
             )
             || (name == "content_admin_operation_state_guard"
-                && table == "content_admin_operation");
+                && table == "content_admin_operation")
+            || (name == "content_admin_rollback_operation_state_guard"
+                && table == "content_admin_rollback_operation");
         let touches_v23 = matches!(
             table.as_str(),
             "content_revision"
@@ -25479,6 +25686,162 @@ fn validate_v30_schema(connection: &Connection) -> Result<(), String> {
         {
             return Err(format!(
                 "v30 触发器 {name} 未声明却引用内容管理员审计结构 {table}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 校验管理员回滚审计与 rollback activation 的原子关联，损坏时拒绝启动。
+fn validate_v31_schema(connection: &Connection) -> Result<(), String> {
+    validate_v30_schema(connection)?;
+
+    let actual = table_columns_with_type(connection, "content_admin_rollback_operation")?;
+    let expected = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("actor_role", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("actor_fingerprint", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("revision_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("activation_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+    ];
+    if actual != expected {
+        return Err(format!(
+            "v31 表 content_admin_rollback_operation 字段不匹配：{actual:?}"
+        ));
+    }
+
+    validate_v10_table_sql(
+        connection,
+        "content_admin_rollback_operation",
+        &[
+            ") STRICT",
+            "ACTOR_ROLE = 'CONTENT_ADMIN'",
+            "REFERENCES CONTENT_REVISION(ID) ON DELETE RESTRICT",
+            "REFERENCES CONTENT_REVISION_ACTIVATION(ID) ON DELETE RESTRICT",
+            "UNIQUE(ACTIVATION_ID)",
+        ],
+    )
+    .map_err(|error| error.replace("v10", "v31"))?;
+    validate_v9_foreign_keys(
+        connection,
+        "content_admin_rollback_operation",
+        &[
+            (
+                "content_revision",
+                "revision_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            (
+                "content_revision_activation",
+                "activation_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+        ],
+    )
+    .map_err(|error| error.replace("v9", "v31"))?;
+    validate_v10_custom_index_set(connection, "content_admin_rollback_operation", &[])
+        .map_err(|error| error.replace("v10", "v31"))?;
+
+    let expected_triggers = [
+        (
+            "content_admin_rollback_operation_state_guard",
+            "content_admin_rollback_operation",
+            &[
+                "BEFORE INSERT",
+                "JOIN CONTENT_REVISION",
+                "ACTIVATION.REASON = 'ROLLBACK'",
+                "ACTIVATION.ID = (SELECT MAX(ID)",
+                "RAISE(ABORT",
+            ] as &[&str],
+        ),
+        (
+            "content_admin_rollback_operation_no_update",
+            "content_admin_rollback_operation",
+            &["BEFORE UPDATE", "RAISE(ABORT"],
+        ),
+        (
+            "content_admin_rollback_operation_no_delete",
+            "content_admin_rollback_operation",
+            &["BEFORE DELETE", "RAISE(ABORT"],
+        ),
+        (
+            "content_admin_rollback_operation_no_reinsert",
+            "content_admin_rollback_operation",
+            &["BEFORE INSERT", "RAISE(ABORT"],
+        ),
+    ];
+    for (name, table, markers) in expected_triggers {
+        let (actual_table, trigger_sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v31 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库缺少 v31 触发器 {name}"))?;
+        let trigger_sql = trigger_sql.to_ascii_uppercase();
+        if actual_table != table || markers.iter().any(|marker| !trigger_sql.contains(marker)) {
+            return Err(format!("v31 触发器 {name} 契约不匹配"));
+        }
+    }
+
+    let invalid_audit = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM content_admin_rollback_operation operation
+             LEFT JOIN content_revision revision ON revision.id = operation.revision_id
+             LEFT JOIN content_revision_activation activation ON activation.id = operation.activation_id
+                 WHERE revision.id IS NULL
+                    OR activation.id IS NULL
+                    OR activation.revision_id <> operation.revision_id
+                    OR activation.reason <> 'rollback'
+                    OR activation.created_at <> operation.created_at
+                    OR operation.actor_role <> 'content_admin'
+                    OR length(operation.actor_fingerprint) <> 64
+                    OR operation.actor_fingerprint GLOB '*[^0-9a-f]*'
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v31 内容管理员回滚审计失败：{error}"))?;
+    if invalid_audit {
+        return Err("v31 检测到与 rollback activation 不一致的管理员回滚审计".to_string());
+    }
+
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v31 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v31 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v31 全库触发器失败：{error}"))?;
+    for (name, table, trigger_sql) in triggers {
+        let declared = expected_triggers
+            .iter()
+            .any(|(expected_name, expected_table, _)| {
+                name == *expected_name && table == *expected_table
+            });
+        if (table == "content_admin_rollback_operation"
+            || sql_mentions_identifier(&trigger_sql, "content_admin_rollback_operation"))
+            && !declared
+        {
+            return Err(format!(
+                "v31 触发器 {name} 未声明却引用内容管理员回滚审计结构 {table}"
             ));
         }
     }
@@ -36360,6 +36723,146 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v31_content_admin_rollback_is_atomic_and_append_only() {
+        let (_directory, store) = test_store();
+        let actor = ContentAdminAuditActor {
+            role: "content_admin",
+            session_fingerprint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        };
+        let baseline = store
+            .active_content_revision()
+            .expect("应读取 v31 回滚基线 revision");
+        let target = content_effect_package("v31-target", "v31-target-effect", "entangle");
+        store
+            .stage_content_package(&target)
+            .expect("应写入 v31 回滚目标草稿");
+        assert!(
+            store
+                .validate_content_draft("v31-target", 1)
+                .expect("应校验 v31 回滚目标草稿")
+                .errors
+                .is_empty()
+        );
+        let published = store
+            .publish_content_draft("v31-target", 1)
+            .expect("应发布 v31 回滚目标 revision");
+
+        let rollback = store
+            .rollback_content_revision_as_admin(baseline.id, actor)
+            .expect("管理员应回滚到 v31 基线 revision");
+        assert_eq!(rollback.revision, baseline);
+        assert_eq!(
+            store
+                .active_content_revision()
+                .expect("应读取回滚后的 active revision")
+                .id,
+            baseline.id
+        );
+
+        let repeated = store
+            .rollback_content_revision_as_admin(baseline.id, actor)
+            .expect("显式重复回滚仍应追加 activation");
+        assert_ne!(repeated.activation_id, rollback.activation_id);
+        let audits = store
+            .list_content_admin_rollback_operations(None, 100)
+            .expect("应读取 v31 管理员回滚审计");
+        assert_eq!(audits.entries.len(), 2);
+        assert!(audits.entries.iter().all(|entry| {
+            entry.actor_role == "content_admin"
+                && entry.actor_fingerprint == actor.session_fingerprint
+                && entry.revision_id == baseline.id
+        }));
+        assert_eq!(audits.entries[0].activation_id, rollback.activation_id);
+        assert_eq!(audits.entries[1].activation_id, repeated.activation_id);
+
+        let invalid_actor = ContentAdminAuditActor {
+            role: "owner",
+            session_fingerprint: actor.session_fingerprint,
+        };
+        assert!(
+            store
+                .rollback_content_revision_as_admin(published.revision.id, invalid_actor)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .list_content_admin_rollback_operations(None, 100)
+                .expect("非法角色后审计应保持不变")
+                .entries
+                .len(),
+            2
+        );
+
+        let atomic = content_effect_package("v31-atomic", "v31-atomic-effect", "entangle");
+        store
+            .stage_content_package(&atomic)
+            .expect("应写入 v31 原子性草稿");
+        assert!(
+            store
+                .validate_content_draft("v31-atomic", 1)
+                .expect("应校验 v31 原子性草稿")
+                .errors
+                .is_empty()
+        );
+        let active_before_failure = store
+            .publish_content_draft("v31-atomic", 1)
+            .expect("应发布 v31 原子性 revision")
+            .revision;
+        let connection = store.open().expect("应打开 v31 原子性数据库");
+        let activation_count_before_failure = connection
+            .query_row(
+                "SELECT COUNT(*) FROM content_revision_activation",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("应统计回滚前 activation");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER content_admin_rollback_operation_test_failure
+                BEFORE INSERT ON content_admin_rollback_operation
+                BEGIN
+                    SELECT RAISE(ABORT, 'test rollback audit failure');
+                END;
+                "#,
+            )
+            .expect("应构造回滚审计写入失败");
+        drop(connection);
+
+        assert!(
+            store
+                .rollback_content_revision_as_admin(baseline.id, actor)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .active_content_revision()
+                .expect("审计失败后应保留原 active revision"),
+            active_before_failure
+        );
+        let connection = store.open().expect("应读取 v31 原子性数据库");
+        let activation_count_after_failure = connection
+            .query_row(
+                "SELECT COUNT(*) FROM content_revision_activation",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("应统计回滚失败后的 activation");
+        assert_eq!(
+            activation_count_after_failure,
+            activation_count_before_failure
+        );
+        assert_eq!(
+            store
+                .list_content_admin_rollback_operations(None, 100)
+                .expect("审计失败后不应追加回滚记录")
+                .entries
+                .len(),
+            2
+        );
+    }
+
     fn assert_v30_damage_fails_closed(mutation: &str) {
         let directory = tempdir().expect("应创建 v30 损坏测试目录");
         let store = Store::initialize(directory.path(), &DatabaseConfig::default())
@@ -36391,6 +36894,41 @@ mod tests {
             r#"
             CREATE TRIGGER content_admin_operation_shadow
             AFTER INSERT ON content_admin_operation
+            BEGIN SELECT 1; END;
+            "#,
+        );
+    }
+
+    fn assert_v31_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v31 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v31 迁移应成功");
+        let connection = store.open().expect("应打开 v31 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v31 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v31 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v31") || error.contains("content_admin_rollback_operation"),
+            "v31 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    #[test]
+    fn recorded_v31_with_damaged_schema_or_trigger_fails_closed() {
+        for mutation in [
+            "DROP TABLE content_admin_rollback_operation;",
+            "DROP TRIGGER content_admin_rollback_operation_state_guard;",
+        ] {
+            assert_v31_damage_fails_closed(mutation);
+        }
+        assert_v31_damage_fails_closed(
+            r#"
+            CREATE TRIGGER content_admin_rollback_operation_shadow
+            AFTER INSERT ON content_admin_rollback_operation
             BEGIN SELECT 1; END;
             "#,
         );

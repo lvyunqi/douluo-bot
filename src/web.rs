@@ -25,9 +25,9 @@ use crate::{
     config::WebConfig,
     content::is_content_key,
     store::{
-        ContentAdminAuditActor, ContentAdminOperationRecord, ContentDraftDiffMember,
-        ContentDraftRecord, ContentRevisionActivationRecord, ContentRevisionRecord,
-        ContentValidationReport, Store,
+        ContentAdminAuditActor, ContentAdminOperationRecord, ContentAdminRollbackOperationRecord,
+        ContentDraftDiffMember, ContentDraftRecord, ContentRevisionActivationRecord,
+        ContentRevisionRecord, ContentValidationReport, Store,
     },
 };
 
@@ -273,8 +273,16 @@ fn build_router(state: Arc<ManagementState>) -> Router {
             "/api/v1/content/drafts/{package_key}/{package_revision}/publish",
             post(publish_content_draft),
         )
+        .route(
+            "/api/v1/content/revisions/{revision_id}/rollback",
+            post(rollback_content_revision),
+        )
         .route("/api/v1/content/activations", get(content_activations))
         .route("/api/v1/content/operations", get(content_admin_operations))
+        .route(
+            "/api/v1/content/rollback-operations",
+            get(content_admin_rollback_operations),
+        )
         .layer(DefaultBodyLimit::max(MAX_API_BODY_BYTES))
         .with_state(state)
 }
@@ -392,6 +400,13 @@ struct ContentPublishResponse {
     replayed: bool,
 }
 
+#[derive(Serialize)]
+struct ContentRollbackResponse {
+    revision: ContentRevisionRecord,
+    active_revision_id: i64,
+    activation_id: i64,
+}
+
 /// 内容管理员审计 API 不返回会话指纹，避免把会话关联信息扩散到页面响应。
 #[derive(Serialize)]
 struct ContentAdminOperationListEntry {
@@ -403,6 +418,16 @@ struct ContentAdminOperationListEntry {
     content_hash: String,
     outcome: String,
     revision_id: Option<i64>,
+    created_at: i64,
+}
+
+/// 回滚审计列表不返回会话指纹，只暴露回滚目标与 activation 元数据。
+#[derive(Serialize)]
+struct ContentAdminRollbackOperationListEntry {
+    id: i64,
+    actor_role: String,
+    revision_id: i64,
+    activation_id: i64,
     created_at: i64,
 }
 
@@ -698,6 +723,44 @@ async fn publish_content_draft(
     }
 }
 
+/// 显式回滚到既有内容 revision；Store 只追加 rollback activation 与管理员审计。
+async fn rollback_content_revision(
+    State(state): State<Arc<ManagementState>>,
+    headers: HeaderMap,
+    Path(revision_id): Path<i64>,
+) -> Response {
+    let (session_id, session) =
+        match require_permission(&state, &headers, AdminPermission::ContentWrite) {
+            Ok(session) => session,
+            Err(error) => return error.into_response(),
+        };
+    if !csrf_matches(&session, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "csrf_required");
+    }
+    if revision_id <= 0 {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_revision_id");
+    }
+    let session_fingerprint = session_audit_fingerprint(&session_id);
+    let actor = ContentAdminAuditActor {
+        role: session.role.as_str(),
+        session_fingerprint: &session_fingerprint,
+    };
+    match state
+        .store
+        .rollback_content_revision_as_admin(revision_id, actor)
+    {
+        Ok(receipt) => json_response(
+            StatusCode::CREATED,
+            ContentRollbackResponse {
+                active_revision_id: receipt.revision.id,
+                revision: receipt.revision,
+                activation_id: receipt.activation_id,
+            },
+        ),
+        Err(error) => content_rollback_error(&error),
+    }
+}
+
 async fn content_activations(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
@@ -746,6 +809,37 @@ async fn content_admin_operations(
                     .entries
                     .into_iter()
                     .map(content_admin_operation_list_entry)
+                    .collect(),
+                next_after_id: page.next_after_id,
+            },
+        ),
+        Err(_) => api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    }
+}
+
+async fn content_admin_rollback_operations(
+    State(state): State<Arc<ManagementState>>,
+    headers: HeaderMap,
+    Query(query): Query<ContentPageQuery>,
+) -> Response {
+    if let Err(error) = require_permission(&state, &headers, AdminPermission::ContentRead) {
+        return error.into_response();
+    }
+    let (after_id, limit) = match content_page_params(query) {
+        Ok(params) => params,
+        Err(code) => return api_error(StatusCode::BAD_REQUEST, code),
+    };
+    match state
+        .store
+        .list_content_admin_rollback_operations(after_id, limit)
+    {
+        Ok(page) => json_response(
+            StatusCode::OK,
+            CursorPage {
+                entries: page
+                    .entries
+                    .into_iter()
+                    .map(content_admin_rollback_operation_list_entry)
                     .collect(),
                 next_after_id: page.next_after_id,
             },
@@ -830,6 +924,18 @@ fn content_admin_operation_list_entry(
     }
 }
 
+fn content_admin_rollback_operation_list_entry(
+    operation: ContentAdminRollbackOperationRecord,
+) -> ContentAdminRollbackOperationListEntry {
+    ContentAdminRollbackOperationListEntry {
+        id: operation.id,
+        actor_role: operation.actor_role,
+        revision_id: operation.revision_id,
+        activation_id: operation.activation_id,
+        created_at: operation.created_at,
+    }
+}
+
 fn valid_content_draft_identity(package_key: &str, package_revision: i64) -> bool {
     package_revision > 0 && is_content_key(package_key)
 }
@@ -844,6 +950,14 @@ fn content_write_error(error: &str) -> Response {
         _ if error.starts_with("内容草稿校验失败：") => {
             api_error(StatusCode::UNPROCESSABLE_ENTITY, "draft_rejected")
         }
+        _ => api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    }
+}
+
+/// 回滚路由只公开稳定错误类别，避免泄露 SQLite 或内容目录细节。
+fn content_rollback_error(error: &str) -> Response {
+    match error {
+        "目标内容 revision 不存在" => api_error(StatusCode::NOT_FOUND, "not_found"),
         _ => api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
     }
 }
@@ -1515,6 +1629,133 @@ mod tests {
             &app,
             Method::GET,
             "/api/v1/content/operations?limit=0",
+            &read_headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(response).await["error"], "invalid_pagination");
+    }
+
+    #[tokio::test]
+    async fn content_rollback_route_requires_csrf_and_appends_audit() {
+        let (_directory, state) = state();
+        let baseline = state
+            .store
+            .active_content_revision()
+            .expect("应读取 Web 回滚基线 revision");
+        let target = effect_package("web-rollback-target", "web-rollback-effect", "entangle");
+        state
+            .store
+            .stage_content_package(&target)
+            .expect("应写入 Web 回滚目标草稿");
+        assert!(
+            state
+                .store
+                .validate_content_draft("web-rollback-target", 1)
+                .expect("应校验 Web 回滚目标草稿")
+                .errors
+                .is_empty()
+        );
+        state
+            .store
+            .publish_content_draft("web-rollback-target", 1)
+            .expect("应发布 Web 回滚目标 revision");
+        let app = build_router(state.clone());
+        let rollback_path = format!("/api/v1/content/revisions/{}/rollback", baseline.id);
+
+        let response = request(&app, Method::POST, &rollback_path, &[], b"").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let (cookie, csrf_token) = login_for_test(&app).await;
+        let read_headers = [("cookie", cookie.as_str())];
+        let write_headers = [
+            ("cookie", cookie.as_str()),
+            ("x-csrf-token", csrf_token.as_str()),
+        ];
+        let response = request(&app, Method::POST, &rollback_path, &read_headers, b"").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = request(
+            &app,
+            Method::POST,
+            "/api/v1/content/revisions/0/rollback",
+            &write_headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["error"],
+            "invalid_revision_id"
+        );
+
+        let response = request(
+            &app,
+            Method::POST,
+            "/api/v1/content/revisions/999999/rollback",
+            &write_headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response_json(response).await["error"], "not_found");
+
+        let response = request(&app, Method::POST, &rollback_path, &write_headers, b"").await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let first = response_json(response).await;
+        assert_eq!(first["revision"]["id"], baseline.id);
+        assert_eq!(first["active_revision_id"], baseline.id);
+        let first_activation_id = first["activation_id"]
+            .as_i64()
+            .expect("回滚响应应返回 activation 标识");
+
+        let response = request(&app, Method::POST, &rollback_path, &write_headers, b"").await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let second = response_json(response).await;
+        assert_ne!(second["activation_id"], first_activation_id);
+        assert_eq!(
+            state
+                .store
+                .active_content_revision()
+                .expect("应读取 Web 回滚后的 active revision")
+                .id,
+            baseline.id
+        );
+
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/content/rollback-operations",
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/content/rollback-operations?limit=2",
+            &read_headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        let entries = payload["entries"].as_array().expect("应返回回滚审计列表");
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| {
+            entry["actor_role"] == "content_admin"
+                && entry["revision_id"] == baseline.id
+                && entry.get("actor_fingerprint").is_none()
+        }));
+        assert_eq!(entries[0]["activation_id"], first_activation_id);
+        assert_eq!(entries[1]["activation_id"], second["activation_id"]);
+
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/content/rollback-operations?limit=0",
             &read_headers,
             b"",
         )
