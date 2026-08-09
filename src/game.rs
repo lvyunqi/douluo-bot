@@ -1481,6 +1481,15 @@ impl GameService {
                     "等级伤害倍率",
                     skill_damage_modifier_label(&skill.damage_modifier),
                 );
+            if let Some(target) = &skill.target {
+                document = document.field(
+                    "目标",
+                    format!(
+                        "{}（{}，#{}）",
+                        target.target_name, target.target_key, target.target_id
+                    ),
+                );
+            }
             if let Some(progress) = &skill.progress {
                 document = document.field(
                     "魂技熟练度",
@@ -2970,6 +2979,7 @@ fn skill_effect_label(effect: &SkillEffectRecord) -> String {
         ("stun", "beast") => format!("眩晕 · {} 回合", effect.duration_rounds),
         ("shield", "self") => format!("护盾吸收魂兽反击 · {} 回合", effect.duration_rounds),
         ("heal", "self") => format!("治疗恢复 {} 点生命", effect.value),
+        ("target_selection", "beast") => "选择当前魂兽目标".to_string(),
         _ => effect.description.clone(),
     }
 }
@@ -2983,6 +2993,7 @@ fn battle_skill_effect_short_label(effect: &BattleSkillEffectRecord) -> String {
         ("stun", "beast") => "眩晕跳过魂兽反击".to_string(),
         ("shield", "self") => "护盾吸收魂兽反击".to_string(),
         ("heal", "self") => format!("治疗恢复 {} 点生命", effect.value),
+        ("target_selection", "beast") => "目标：当前魂兽".to_string(),
         _ => effect.description.clone(),
     }
 }
