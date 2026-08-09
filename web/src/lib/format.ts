@@ -24,3 +24,27 @@ export function shortHash(value: string): string {
 export function packageLabel(packageKey: string, revision: number): string {
   return `${packageKey} @ ${revision}`
 }
+
+export type StatusVariant = 'default' | 'destructive' | 'outline' | 'secondary'
+
+export function statusVariant(value: string): StatusVariant {
+  if (value === 'published' || value === 'validated' || value === 'staged') {
+    return 'secondary'
+  }
+  if (value === 'rejected') {
+    return 'destructive'
+  }
+  return 'outline'
+}
+
+export function statusLabel(value: string): string {
+  const labels: Record<string, string> = {
+    draft: '草稿',
+    published: '已发布',
+    rejected: '已拒绝',
+    replayed: '重放',
+    staged: '已暂存',
+    validated: '已校验',
+  }
+  return labels[value] ?? value
+}

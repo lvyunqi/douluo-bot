@@ -72,6 +72,37 @@ export type ContentStageOperation = {
   created_at: number
 }
 
+export type ContentValidation = {
+  package_key: string
+  package_revision: number
+  content_hash: string
+  valid: boolean
+  errors: string[]
+  wuhun_count: number
+  skill_count: number
+  effect_count: number
+  soul_beast_count: number
+  soul_ring_count: number
+}
+
+export type ContentStageResult = {
+  draft: ContentDraft
+  replayed: boolean
+}
+
+export type ContentPublishResult = {
+  revision: ContentRevision
+  active_revision_id: number
+  member_count: number
+  replayed: boolean
+}
+
+export type ContentRollbackResult = {
+  revision: ContentRevision
+  active_revision_id: number
+  activation_id: number
+}
+
 export type CursorPage<T> = {
   entries: T[]
   next_after_id: number | null
@@ -194,4 +225,52 @@ export function listStageOperations(afterId?: number): Promise<CursorPage<Conten
   return request<CursorPage<ContentStageOperation>>(
     cursorPath('/api/v1/content/stage-operations', afterId),
   )
+}
+
+// 写操作只复用后端 Store 事务，并把页面内存中的 CSRF token 交给同源请求。
+export function stageContentDraft(
+  packageFile: string,
+  csrfToken: string,
+): Promise<ContentStageResult> {
+  return request<ContentStageResult>('/api/v1/content/drafts/stage', {
+    body: JSON.stringify({ package_file: packageFile }),
+    headers: { 'x-csrf-token': csrfToken },
+    method: 'POST',
+  })
+}
+
+function draftActionPath(packageKey: string, packageRevision: number, action: 'validate' | 'publish') {
+  return `/api/v1/content/drafts/${encodeURIComponent(packageKey)}/${packageRevision}/${action}`
+}
+
+export function validateContentDraft(
+  packageKey: string,
+  packageRevision: number,
+  csrfToken: string,
+): Promise<ContentValidation> {
+  return request<ContentValidation>(draftActionPath(packageKey, packageRevision, 'validate'), {
+    headers: { 'x-csrf-token': csrfToken },
+    method: 'POST',
+  })
+}
+
+export function publishContentDraft(
+  packageKey: string,
+  packageRevision: number,
+  csrfToken: string,
+): Promise<ContentPublishResult> {
+  return request<ContentPublishResult>(draftActionPath(packageKey, packageRevision, 'publish'), {
+    headers: { 'x-csrf-token': csrfToken },
+    method: 'POST',
+  })
+}
+
+export function rollbackContentRevision(
+  revisionId: number,
+  csrfToken: string,
+): Promise<ContentRollbackResult> {
+  return request<ContentRollbackResult>(`/api/v1/content/revisions/${revisionId}/rollback`, {
+    headers: { 'x-csrf-token': csrfToken },
+    method: 'POST',
+  })
 }

@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ClipboardList,
   Database,
+  FileUp,
   History,
   LogOut,
   RefreshCw,
@@ -17,6 +18,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { ContentWritePanel, type WriteFeedback } from '@/components/management/content-write-panel'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -37,8 +39,12 @@ import {
   listRevisions,
   listRollbackOperations,
   listStageOperations,
-  logout,
   ManagementApiError,
+  publishContentDraft,
+  rollbackContentRevision,
+  stageContentDraft,
+  validateContentDraft,
+  logout,
   type ContentActivation,
   type ContentDraft,
   type ContentOperation,
@@ -49,9 +55,9 @@ import {
   type CursorPage,
   type Session,
 } from '@/lib/api'
-import { formatNumber, formatTimestamp, packageLabel, shortHash } from '@/lib/format'
+import { formatNumber, formatTimestamp, packageLabel, shortHash, statusLabel, statusVariant } from '@/lib/format'
 
-type TabValue = 'overview' | 'drafts' | 'revisions' | 'activations' | 'audits'
+type TabValue = 'overview' | 'operations' | 'drafts' | 'revisions' | 'activations' | 'audits'
 type PageValue =
   | ContentDraft
   | ContentRevisionSummary
@@ -92,6 +98,7 @@ type TableColumn<T> = {
 
 const tabs: Array<{ icon: typeof Activity; label: string; value: TabValue }> = [
   { icon: Activity, label: '概览', value: 'overview' },
+  { icon: FileUp, label: '写入', value: 'operations' },
   { icon: ClipboardList, label: '草稿', value: 'drafts' },
   { icon: BookOpenCheck, label: '版本', value: 'revisions' },
   { icon: History, label: '激活', value: 'activations' },
@@ -114,26 +121,31 @@ function requestMessage(error: unknown): string {
   return '无法读取内容管理数据。'
 }
 
-function statusVariant(value: string): 'default' | 'destructive' | 'outline' | 'secondary' {
-  if (value === 'published' || value === 'validated' || value === 'staged') {
-    return 'secondary'
+function writeErrorMessage(error: unknown): string {
+  if (error instanceof ManagementApiError) {
+    if (error.status === 401) {
+      return '管理会话已失效。'
+    }
+    if (error.status === 403 && error.code === 'csrf_required') {
+      return '会话校验已失效，请重新登录。'
+    }
+    if (error.code === 'published_draft_conflict') {
+      return '该草稿身份已发布但内容哈希不同，请提高内容 revision 后重新暂存。'
+    }
+    if (error.code === 'draft_not_validated') {
+      return '草稿状态已变化，请重新校验后再发布。'
+    }
+    if (error.code === 'draft_rejected') {
+      return '校验已拒绝，请修正已部署的内容文件后重新暂存。'
+    }
+    if (error.code === 'invalid_package') {
+      return '内容包格式或结构校验失败。'
+    }
+    if (error.code === 'not_found') {
+      return '目标已不存在，请刷新后重新选择。'
+    }
   }
-  if (value === 'rejected') {
-    return 'destructive'
-  }
-  return 'outline'
-}
-
-function statusLabel(value: string): string {
-  const labels: Record<string, string> = {
-    draft: '草稿',
-    published: '已发布',
-    rejected: '已拒绝',
-    replayed: '重放',
-    staged: '已暂存',
-    validated: '已校验',
-  }
-  return labels[value] ?? value
+  return '操作未完成，请稍后重试。'
 }
 
 function DataTable<T>({
@@ -184,6 +196,7 @@ function DataTable<T>({
 function PagePanel<T>({
   columns,
   description,
+  disabled,
   emptyLabel,
   entries,
   isLoadingMore,
@@ -194,6 +207,7 @@ function PagePanel<T>({
 }: {
   columns: Array<TableColumn<T>>
   description: string
+  disabled: boolean
   emptyLabel: string
   entries: T[]
   isLoadingMore: boolean
@@ -218,7 +232,7 @@ function PagePanel<T>({
       </Card>
       {nextAfterId !== null ? (
         <div className="flex justify-center">
-          <Button disabled={isLoadingMore} onClick={onLoadMore} variant="outline">
+          <Button disabled={disabled || isLoadingMore} onClick={onLoadMore} variant="outline">
             <ChevronDown data-icon="inline-start" aria-hidden="true" />
             {isLoadingMore ? '读取中' : '加载更多'}
           </Button>
@@ -255,9 +269,11 @@ export function ManagementDashboard({
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState<PageKey | null>(null)
+  const [pendingAction, setPendingAction] = useState<string | null>(null)
   const [signingOut, setSigningOut] = useState(false)
+  const [writeFeedback, setWriteFeedback] = useState<WriteFeedback | null>(null)
 
-  const loadSnapshot = useCallback(async () => {
+  const loadSnapshot = useCallback(async (): Promise<boolean> => {
     setLoading(true)
     setError(null)
     try {
@@ -280,12 +296,14 @@ export function ManagementDashboard({
         rollbackOperations,
         stageOperations,
       })
+      return true
     } catch (requestError) {
       if (requestError instanceof ManagementApiError && requestError.status === 401) {
         onSessionExpired()
-        return
+        return false
       }
       setError(requestMessage(requestError))
+      return false
     } finally {
       setLoading(false)
     }
@@ -296,7 +314,7 @@ export function ManagementDashboard({
   }, [loadSnapshot])
 
   async function loadMore(key: PageKey) {
-    if (!snapshot || loadingMore) {
+    if (!snapshot || loadingMore || pendingAction || loading) {
       return
     }
     const page = snapshot[key] as CursorPage<PageValue>
@@ -329,6 +347,85 @@ export function ManagementDashboard({
     } finally {
       setLoadingMore(null)
     }
+  }
+
+  async function runContentWrite<T>(
+    actionKey: string,
+    operation: () => Promise<T>,
+    successDescription: (result: T) => string,
+  ): Promise<boolean> {
+    if (pendingAction || loadingMore || loading) {
+      return false
+    }
+    setPendingAction(actionKey)
+    setWriteFeedback(null)
+    setError(null)
+    try {
+      const result = await operation()
+      const refreshed = await loadSnapshot()
+      setWriteFeedback({
+        description: refreshed
+          ? successDescription(result)
+          : 'Store 已接受操作，但刷新管理快照失败，请手动刷新确认当前状态。',
+        kind: refreshed ? 'success' : 'error',
+        title: refreshed ? '操作完成' : '写入已提交',
+      })
+      return true
+    } catch (requestError) {
+      if (requestError instanceof ManagementApiError && requestError.status === 401) {
+        onSessionExpired()
+        return false
+      }
+      if (
+        requestError instanceof ManagementApiError &&
+        (requestError.status === 404 || requestError.status === 409)
+      ) {
+        await loadSnapshot()
+      }
+      setWriteFeedback({
+        description: writeErrorMessage(requestError),
+        kind: 'error',
+        title: '操作被拒绝',
+      })
+      return false
+    } finally {
+      setPendingAction(null)
+    }
+  }
+
+  function stageDraft(packageFile: string) {
+    return runContentWrite(
+      'stage',
+      () => stageContentDraft(packageFile, session.csrf_token),
+      (result) => (result.replayed ? '相同内容已幂等重放。' : `已暂存 ${packageLabel(result.draft.package_key, result.draft.package_revision)}。`),
+    )
+  }
+
+  function validateDraft(draft: ContentDraft) {
+    return runContentWrite(
+      `validate:${draft.id}`,
+      () => validateContentDraft(draft.package_key, draft.package_revision, session.csrf_token),
+      (result) => (result.valid ? '草稿校验通过，可以发布。' : `校验完成，发现 ${result.errors.length} 项错误。`),
+    )
+  }
+
+  function publishDraft(draft: ContentDraft) {
+    return runContentWrite(
+      `publish:${draft.id}`,
+      () => publishContentDraft(draft.package_key, draft.package_revision, session.csrf_token),
+      (result) =>
+        result.replayed
+          ? `已重新激活 revision #${result.active_revision_id}。`
+          : `已发布并激活 revision #${result.active_revision_id}。`,
+    )
+  }
+
+  function rollbackRevision(revision: ContentRevision) {
+    return runContentWrite(
+      `rollback:${revision.id}`,
+      () => rollbackContentRevision(revision.id, session.csrf_token),
+      (result) => `已追加回滚 activation #${result.activation_id}，当前 revision 为 #${result.active_revision_id}。`,
+    )
   }
 
   async function signOut() {
@@ -442,6 +539,8 @@ export function ManagementDashboard({
     [],
   )
 
+  const dashboardDisabled = loading || loadingMore !== null || pendingAction !== null
+
   if (loading && !snapshot) {
     return <DashboardSkeleton />
   }
@@ -512,7 +611,7 @@ export function ManagementDashboard({
           <div className="flex items-center gap-1.5">
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button aria-label="刷新内容数据" disabled={loading} onClick={() => void loadSnapshot()} size="icon" variant="ghost">
+                <Button aria-label="刷新内容数据" disabled={dashboardDisabled} onClick={() => void loadSnapshot()} size="icon" variant="ghost">
                   <RefreshCw className={loading ? 'size-4 animate-spin' : 'size-4'} aria-hidden="true" />
                 </Button>
               </TooltipTrigger>
@@ -520,7 +619,7 @@ export function ManagementDashboard({
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button aria-label="退出管理会话" disabled={signingOut} onClick={() => void signOut()} size="icon" variant="ghost">
+                <Button aria-label="退出管理会话" disabled={signingOut || pendingAction !== null} onClick={() => void signOut()} size="icon" variant="ghost">
                   <LogOut className="size-4" aria-hidden="true" />
                 </Button>
               </TooltipTrigger>
@@ -590,10 +689,26 @@ export function ManagementDashboard({
             </section>
           </TabsContent>
 
+          <TabsContent value="operations">
+            <ContentWritePanel
+              activeRevision={snapshot.active}
+              disabled={dashboardDisabled}
+              drafts={snapshot.drafts.entries}
+              feedback={writeFeedback}
+              onPublish={publishDraft}
+              onRollback={rollbackRevision}
+              onStage={stageDraft}
+              onValidate={validateDraft}
+              pendingAction={pendingAction}
+              revisions={snapshot.revisions.entries}
+            />
+          </TabsContent>
+
           <TabsContent value="drafts">
             <PagePanel
               columns={draftColumns}
               description="草稿元数据与校验摘要"
+              disabled={dashboardDisabled}
               emptyLabel="暂无草稿"
               entries={snapshot.drafts.entries}
               isLoadingMore={loadingMore === 'drafts'}
@@ -608,6 +723,7 @@ export function ManagementDashboard({
             <PagePanel
               columns={revisionColumns}
               description="已发布内容 revision 摘要"
+              disabled={dashboardDisabled}
               emptyLabel="暂无已发布 revision"
               entries={snapshot.revisions.entries}
               isLoadingMore={loadingMore === 'revisions'}
@@ -622,6 +738,7 @@ export function ManagementDashboard({
             <PagePanel
               columns={activationColumns}
               description="不可变 active revision 历史"
+              disabled={dashboardDisabled}
               emptyLabel="暂无激活记录"
               entries={snapshot.activations.entries}
               isLoadingMore={loadingMore === 'activations'}
@@ -637,6 +754,7 @@ export function ManagementDashboard({
               <PagePanel
                 columns={operationColumns}
                 description="校验与发布的追加式审计"
+                disabled={dashboardDisabled}
                 emptyLabel="暂无内容操作审计"
                 entries={snapshot.operations.entries}
                 isLoadingMore={loadingMore === 'operations'}
@@ -649,6 +767,7 @@ export function ManagementDashboard({
               <PagePanel
                 columns={rollbackColumns}
                 description="回滚 activation 的追加式审计"
+                disabled={dashboardDisabled}
                 emptyLabel="暂无回滚审计"
                 entries={snapshot.rollbackOperations.entries}
                 isLoadingMore={loadingMore === 'rollbackOperations'}
@@ -661,6 +780,7 @@ export function ManagementDashboard({
               <PagePanel
                 columns={stageColumns}
                 description="受限内容文件暂存的追加式审计"
+                disabled={dashboardDisabled}
                 emptyLabel="暂无暂存审计"
                 entries={snapshot.stageOperations.entries}
                 isLoadingMore={loadingMore === 'stageOperations'}
