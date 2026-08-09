@@ -72,12 +72,6 @@ pub const TARGET_RULE_VERSION: &str = "target-v1";
 /// 首版只选择当前战斗已经冻结的魂兽目标。
 pub const TARGET_SELECTOR: &str = "current_battle_beast";
 
-/// 首版目标身份沿用 battle 与 battle_skill_event 的既有快照关联。
-pub const TARGET_SNAPSHOT_SOURCE: &str = "battle";
-
-/// 首版目标缺失时整次释放必须失败。
-pub const TARGET_MISSING_BEHAVIOR: &str = "fail";
-
 /// 首版目标选择节点的标记值。
 pub const TARGET_SELECTION_VALUE: i64 = 1;
 
@@ -275,11 +269,9 @@ pub fn is_heal_v1_parameters(parameters: &BTreeMap<String, Value>) -> bool {
 
 /// 判断内容包参数是否精确声明首版当前战斗目标选择规则。
 pub fn is_target_v1_parameters(parameters: &BTreeMap<String, Value>) -> bool {
-    parameters.len() == 4
+    parameters.len() == 2
         && parameters.get("rule_version").and_then(Value::as_str) == Some(TARGET_RULE_VERSION)
         && parameters.get("selector").and_then(Value::as_str) == Some(TARGET_SELECTOR)
-        && parameters.get("snapshot").and_then(Value::as_str) == Some(TARGET_SNAPSHOT_SOURCE)
-        && parameters.get("missing").and_then(Value::as_str) == Some(TARGET_MISSING_BEHAVIOR)
 }
 
 /// 将内容包序列化为用于持久化和哈希的稳定 JSON 表示。
@@ -516,7 +508,6 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
     }
 
     keys.clear();
-    let mut target_selector_counts = BTreeMap::<String, usize>::new();
     for entry in &package.effects {
         if !keys.insert(format!("effect:{}", entry.effect_key)) {
             errors.push(format!("效果键重复：{}", entry.effect_key));
@@ -687,9 +678,6 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
             ));
         }
         if target_selection {
-            *target_selector_counts
-                .entry(entry.skill_key.clone())
-                .or_default() += 1;
             if entry.value != TARGET_SELECTION_VALUE {
                 errors.push(format!(
                     "效果 {} 的 target-v1 value 必须固定为 {}",
@@ -722,14 +710,6 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
             2000,
             true,
         );
-    }
-    for (skill_key, count) in target_selector_counts {
-        if count > 1 {
-            errors.push(format!(
-                "魂技 {} 最多只能声明一个 target-v1 目标选择节点",
-                skill_key
-            ));
-        }
     }
 
     keys.clear();
@@ -1228,8 +1208,6 @@ mod tests {
                 "selector".to_string(),
                 Value::String("current_battle_beast".to_string()),
             ),
-            ("snapshot".to_string(), Value::String("battle".to_string())),
-            ("missing".to_string(), Value::String("fail".to_string())),
         ]);
         assert!(validate_shape(&package).is_empty());
 
@@ -1241,19 +1219,6 @@ mod tests {
             validate_shape(&package)
                 .iter()
                 .any(|error| error.contains("target-v1 parameters"))
-        );
-
-        package.effects[0].parameters.insert(
-            "selector".to_string(),
-            Value::String("current_battle_beast".to_string()),
-        );
-        let mut duplicate = package.effects[0].clone();
-        duplicate.effect_key = "target-second".to_string();
-        package.effects.push(duplicate);
-        assert!(
-            validate_shape(&package)
-                .iter()
-                .any(|error| error.contains("最多只能声明一个 target-v1"))
         );
     }
 

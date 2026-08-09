@@ -1481,15 +1481,6 @@ impl GameService {
                     "等级伤害倍率",
                     skill_damage_modifier_label(&skill.damage_modifier),
                 );
-            if let Some(target) = &skill.target {
-                document = document.field(
-                    "目标",
-                    format!(
-                        "{}（{}，#{}）",
-                        target.target_name, target.target_key, target.target_id
-                    ),
-                );
-            }
             if let Some(progress) = &skill.progress {
                 document = document.field(
                     "魂技熟练度",

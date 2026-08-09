@@ -6060,16 +6060,6 @@ pub struct SkillPage {
     pub max_soul_power: i64,
 }
 
-/// 当前战斗动作解析出的稳定目标快照，不创建独立的可变目标表。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BattleTargetSnapshot {
-    pub battle_id: i64,
-    pub target_kind: String,
-    pub target_id: i64,
-    pub target_key: String,
-    pub target_name: String,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillUseRecord {
     pub skill: SkillRecord,
@@ -6077,7 +6067,6 @@ pub struct SkillUseRecord {
     pub soul_power_after: i64,
     pub damage_modifier: SkillDamageModifierRecord,
     pub progress: Option<SkillProgressRecord>,
-    pub target: Option<BattleTargetSnapshot>,
     pub effects: Vec<BattleSkillEffectRecord>,
 }
 
@@ -11773,16 +11762,9 @@ impl Store {
             .as_ref()
             .map(|skill| skill.effects.clone())
             .unwrap_or_default();
-        let selected_target = if matches!(action, "攻击" | "释放技能") {
-            resolve_target_selection(
-                &transaction,
-                &state,
-                &active_skill_effects,
-                &pending_skill_effects,
-            )?
-        } else {
-            None
-        };
+        if matches!(action, "攻击" | "释放技能") {
+            validate_target_selection(&state, &active_skill_effects, &pending_skill_effects)?;
+        }
         let timestamp = now_timestamp()?;
         let (player_skill_id, skill_use, soul_power_before, soul_power_after) = if let Some(
             learned,
@@ -11839,7 +11821,6 @@ impl Store {
                     soul_power_after,
                     damage_modifier,
                     progress,
-                    target: selected_target.clone(),
                     effects: Vec::new(),
                 }),
                 Some(soul_power_before),
@@ -16090,14 +16071,13 @@ fn collect_player_heal_effect(
     Ok(())
 }
 
-/// 在释放结算前解析 target-v1，并复用 battle 已冻结的魂兽身份与数值边界。
-fn resolve_target_selection(
-    connection: &Connection,
+/// 在释放结算前确认 target-v1 仍指向当前战斗的唯一魂兽。
+fn validate_target_selection(
     state: &BattleState,
     active_effects: &[BattleSkillEffectRecord],
     pending_effects: &[SkillEffectRecord],
-) -> Result<Option<BattleTargetSnapshot>, String> {
-    let mut selected = false;
+) -> Result<(), String> {
+    let mut has_target_selection = false;
     for effect in active_effects {
         if matches!(
             parse_supported_skill_effect(
@@ -16113,10 +16093,7 @@ fn resolve_target_selection(
             )?,
             SupportedSkillEffect::CurrentBattleBeastTarget { .. }
         ) {
-            if selected {
-                return Err("同一释放序列存在多个 target-v1 目标选择节点".to_string());
-            }
-            selected = true;
+            has_target_selection = true;
         }
     }
     for effect in pending_effects {
@@ -16134,38 +16111,17 @@ fn resolve_target_selection(
             )?,
             SupportedSkillEffect::CurrentBattleBeastTarget { .. }
         ) {
-            if selected {
-                return Err("同一释放序列存在多个 target-v1 目标选择节点".to_string());
-            }
-            selected = true;
+            has_target_selection = true;
         }
     }
-    if !selected {
-        return Ok(None);
-    }
-    if state.soul_beast_id <= 0 || state.beast_max_hp <= 0 || state.beast_hp > state.beast_max_hp {
-        return Err("target-v1 的战斗魂兽快照无效".to_string());
-    }
-    let beast = load_soul_beast_by_id(connection, state.soul_beast_id)?
-        .ok_or_else(|| "target-v1 的战斗魂兽定义不存在".to_string())?;
-    if beast.map_key != state.map_key
-        || beast.max_hp != state.beast_max_hp
-        || beast.attack != state.beast_attack
-        || beast.defense != state.beast_defense
-        || beast.speed != state.beast_speed
-        || beast.exp_reward != state.exp_reward
-        || beast.drop_item.item_key != state.drop_item_key
-        || beast.drop_quantity != state.drop_quantity
+    if has_target_selection
+        && (state.soul_beast_id <= 0
+            || state.beast_max_hp <= 0
+            || state.beast_hp > state.beast_max_hp)
     {
-        return Err("target-v1 目标与 battle 冻结快照不一致".to_string());
+        return Err("target-v1 的当前战斗魂兽目标无效".to_string());
     }
-    Ok(Some(BattleTargetSnapshot {
-        battle_id: state.id,
-        target_kind: "beast".to_string(),
-        target_id: state.soul_beast_id,
-        target_key: beast.beast_key,
-        target_name: beast.name,
-    }))
+    Ok(())
 }
 
 /// 汇总当前序列应结算的中毒伤害；pending 定义排在已冻结快照之后，保证 refresh/replace 当回合生效。
@@ -17001,7 +16957,6 @@ fn load_battle_skill_use_by_event(
                         rule_version: row.get(15)?,
                     },
                     progress,
-                    target: None,
                     effects: Vec::new(),
                 })
             },
@@ -17018,16 +16973,6 @@ fn load_battle_skill_use_by_event(
             .map_err(|error| format!("读取战斗魂技效果关联事件失败：{error}"))?;
         skill_use.effects =
             load_battle_skill_effects_by_skill_event(connection, battle_skill_event_id)?;
-        let battle_id = connection
-            .query_row(
-                "SELECT battle_id FROM battle_skill_event WHERE id = ?1",
-                [battle_skill_event_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|error| format!("读取目标选择战斗关联失败：{error}"))?;
-        let state = load_battle_state_by_id(connection, battle_id)?
-            .ok_or_else(|| "目标选择关联的战斗快照不存在".to_string())?;
-        skill_use.target = resolve_target_selection(connection, &state, &skill_use.effects, &[])?;
     }
     Ok(record)
 }
@@ -24445,11 +24390,7 @@ fn validate_v22_schema(connection: &Connection) -> Result<(), String> {
                            AND json_extract(parameters_json, '$.rule_version') = 'target-v1'
                            AND json_type(parameters_json, '$.selector') = 'text'
                            AND json_extract(parameters_json, '$.selector') = 'current_battle_beast'
-                           AND json_type(parameters_json, '$.snapshot') = 'text'
-                           AND json_extract(parameters_json, '$.snapshot') = 'battle'
-                           AND json_type(parameters_json, '$.missing') = 'text'
-                           AND json_extract(parameters_json, '$.missing') = 'fail'
-                           AND (SELECT COUNT(*) FROM json_each(parameters_json)) = 4
+                           AND (SELECT COUNT(*) FROM json_each(parameters_json)) = 2
                        )
                    )
             )
@@ -24460,29 +24401,6 @@ fn validate_v22_schema(connection: &Connection) -> Result<(), String> {
         .map_err(|error| format!("校验 v22 效果定义失败：{error}"))?;
     if invalid_definitions {
         return Err("v22 启用的效果定义包含当前解释器不支持的操作，已拒绝加载".to_string());
-    }
-
-    let duplicate_target_selectors = connection
-        .query_row(
-            r#"
-            SELECT EXISTS(
-                SELECT 1
-                  FROM effect_definition
-                 WHERE enabled = 1
-                   AND trigger_kind = 'on_release'
-                   AND target_kind = 'beast'
-                   AND operation = 'select_target'
-                   AND attribute_key = 'battle_target'
-                 GROUP BY skill_key
-                HAVING COUNT(*) > 1
-            )
-            "#,
-            [],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(|error| format!("校验 v22 目标选择节点失败：{error}"))?;
-    if duplicate_target_selectors {
-        return Err("v22 同一魂技包含多个 target-v1 目标选择节点，已拒绝加载".to_string());
     }
 
     let seed_matches = connection
@@ -28771,14 +28689,6 @@ mod tests {
             (
                 "selector".to_string(),
                 serde_json::Value::String("current_battle_beast".to_string()),
-            ),
-            (
-                "snapshot".to_string(),
-                serde_json::Value::String("battle".to_string()),
-            ),
-            (
-                "missing".to_string(),
-                serde_json::Value::String("fail".to_string()),
             ),
         ])
     }
@@ -35430,12 +35340,9 @@ mod tests {
     }
 
     #[test]
-    fn target_v1_freezes_current_battle_beast_and_replays_after_rollback() {
-        let (directory, store) = test_store();
+    fn target_v1_uses_the_current_battle_beast_without_extra_state() {
+        let (_directory, store) = test_store();
         register_awakened_pair(&store);
-        let baseline = store
-            .active_content_revision()
-            .expect("应读取目标选择测试的 baseline revision");
         let target = target_effect_package("target-v1-test", "entangle-target-test", "entangle");
         store
             .stage_content_package(&target)
@@ -35471,14 +35378,8 @@ mod tests {
                 "缠绕",
                 &transfer_operation("释放技能", "target-v1-use"),
             )
-            .expect("目标选择应在释放前解析当前魂兽");
+            .expect("目标选择应直接使用当前战斗魂兽");
         let first_skill = first.skill.as_ref().expect("应有目标选择魂技回执");
-        let first_target = first_skill.target.as_ref().expect("应返回目标快照");
-        assert_eq!(first_target.battle_id, first.battle.id);
-        assert_eq!(first_target.target_kind, "beast");
-        assert_eq!(first_target.target_id, first.battle.beast.id);
-        assert_eq!(first_target.target_key, first.battle.beast.beast_key);
-        assert_eq!(first_target.target_name, first.battle.beast.name);
         assert!(
             first_skill
                 .effects
@@ -35491,29 +35392,8 @@ mod tests {
                 .iter()
                 .any(|effect| effect.effect_key == "entangle-target-test")
         );
-
-        store
-            .rollback_content_revision(baseline.id)
-            .expect("回滚内容 revision 应成功");
-        drop(store);
-        let restored = Store::initialize(directory.path(), &DatabaseConfig::default())
-            .expect("目标选择数据库应可热重载");
-        let replay = restored
-            .use_skill_battle_with_operation(
-                &identity(),
-                "缠绕",
-                &transfer_operation("释放技能", "target-v1-use"),
-            )
-            .expect("回滚后应从原快照重放目标选择");
-        assert!(replay.replayed);
-        assert_eq!(replay.event.id, first.event.id);
-        assert_eq!(
-            replay
-                .skill
-                .as_ref()
-                .and_then(|skill| skill.target.as_ref()),
-            Some(first_target)
-        );
+        assert_eq!(first.event.sequence, 1);
+        assert_eq!(first.event.beast_hp_before, first.battle.beast.max_hp);
     }
 
     #[test]
