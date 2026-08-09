@@ -54,6 +54,18 @@ pub const SHIELD_VALUE: i64 = 1;
 /// 首版护盾的持续时间上限，避免内容包声明无法审计的超长保护。
 pub const MAX_SHIELD_DURATION_ROUNDS: i64 = 10;
 
+/// 首版即时治疗冻结到快照中的规则版本。
+pub const HEAL_RULE_VERSION: &str = "heal-v1";
+
+/// 首版治疗在玩家对魂兽造成直接伤害后、魂兽反击前结算。
+pub const HEAL_APPLY_PHASE: &str = "after_player_damage";
+
+/// 首版治疗溢出时只恢复到玩家最大生命。
+pub const HEAL_OVERFLOW_BEHAVIOR: &str = "cap_at_max_hp";
+
+/// 首版治疗的单次恢复量上限，与 effect_definition.value 的数据库边界一致。
+pub const MAX_HEAL_AMOUNT: i64 = 1_000_000;
+
 /// 可发布目录数据的文件格式。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -236,6 +248,14 @@ pub fn is_shield_v1_parameters(parameters: &BTreeMap<String, Value>) -> bool {
         && parameters.get("apply_phase").and_then(Value::as_str) == Some(SHIELD_APPLY_PHASE)
         && parameters.get("counterattack").and_then(Value::as_str)
             == Some(SHIELD_COUNTERATTACK_BEHAVIOR)
+}
+
+/// 判断内容包参数是否精确声明首版治疗规则，拒绝任意脚本或附加开关。
+pub fn is_heal_v1_parameters(parameters: &BTreeMap<String, Value>) -> bool {
+    parameters.len() == 3
+        && parameters.get("rule_version").and_then(Value::as_str) == Some(HEAL_RULE_VERSION)
+        && parameters.get("apply_phase").and_then(Value::as_str) == Some(HEAL_APPLY_PHASE)
+        && parameters.get("overflow").and_then(Value::as_str) == Some(HEAL_OVERFLOW_BEHAVIOR)
 }
 
 /// 将内容包序列化为用于持久化和哈希的稳定 JSON 表示。
@@ -502,9 +522,18 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
             && entry.operation == "absorb_damage"
             && entry.attribute_key == "beast_counterattack"
             && entry.value_mode == "absolute";
-        if !beast_attack_reduction && !poison_damage && !stun_control && !shield_protection {
+        let heal_restore = entry.target_kind == "self"
+            && entry.operation == "restore"
+            && entry.attribute_key == "player_hp"
+            && entry.value_mode == "absolute";
+        if !beast_attack_reduction
+            && !poison_damage
+            && !stun_control
+            && !shield_protection
+            && !heal_restore
+        {
             errors.push(format!(
-                "效果 {} 当前只支持减攻、poison-v1 中毒伤害、stun-v1 眩晕或 shield-v1 护盾节点",
+                "效果 {} 当前只支持减攻、poison-v1 中毒伤害、stun-v1 眩晕、shield-v1 护盾或 heal-v1 治疗节点",
                 entry.effect_key
             ));
         }
@@ -600,6 +629,30 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
         if shield_protection && !is_shield_v1_parameters(&entry.parameters) {
             errors.push(format!(
                 "效果 {} 的 shield-v1 parameters 必须固定声明规则版本、结算时机和反击行为",
+                entry.effect_key
+            ));
+        }
+        if heal_restore && !(1..=MAX_HEAL_AMOUNT).contains(&entry.value) {
+            errors.push(format!(
+                "效果 {} 的 heal-v1 value 必须在 1 到 {} 之间",
+                entry.effect_key, MAX_HEAL_AMOUNT
+            ));
+        }
+        if heal_restore && entry.duration_rounds != 1 {
+            errors.push(format!(
+                "效果 {} 的 heal-v1 duration_rounds 必须固定为 1",
+                entry.effect_key
+            ));
+        }
+        if heal_restore && entry.stack_policy != "add" {
+            errors.push(format!(
+                "效果 {} 的 heal-v1 stack_policy 必须是 add",
+                entry.effect_key
+            ));
+        }
+        if heal_restore && !is_heal_v1_parameters(&entry.parameters) {
+            errors.push(format!(
+                "效果 {} 的 heal-v1 parameters 必须固定声明规则版本、结算时机和溢出行为",
                 entry.effect_key
             ));
         }
@@ -1047,6 +1100,44 @@ mod tests {
             validate_shape(&package)
                 .iter()
                 .any(|error| error.contains("shield-v1 parameters"))
+        );
+    }
+
+    #[test]
+    fn accepts_only_the_controlled_heal_v1_node() {
+        let mut package = minimal_package();
+        let effect = &mut package.effects[0];
+        effect.target_kind = "self".to_string();
+        effect.operation = "restore".to_string();
+        effect.attribute_key = "player_hp".to_string();
+        effect.value_mode = "absolute".to_string();
+        effect.value = 30;
+        effect.duration_rounds = 1;
+        effect.stack_policy = "add".to_string();
+        effect.parameters = BTreeMap::from([
+            (
+                "rule_version".to_string(),
+                Value::String("heal-v1".to_string()),
+            ),
+            (
+                "apply_phase".to_string(),
+                Value::String("after_player_damage".to_string()),
+            ),
+            (
+                "overflow".to_string(),
+                Value::String("cap_at_max_hp".to_string()),
+            ),
+        ]);
+        assert!(validate_shape(&package).is_empty());
+
+        package.effects[0].parameters.insert(
+            "overflow".to_string(),
+            Value::String("overflow".to_string()),
+        );
+        assert!(
+            validate_shape(&package)
+                .iter()
+                .any(|error| error.contains("heal-v1 parameters"))
         );
     }
 

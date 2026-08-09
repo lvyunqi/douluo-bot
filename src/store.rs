@@ -11,9 +11,10 @@ use rusqlite::{
 
 use crate::config::DatabaseConfig;
 use crate::content::{
-    ContentPackage, ContentTransitionPackageEntry, LoadedContentPackage, MAX_POISON_TICK_DAMAGE,
-    SHIELD_VALUE, STUN_VALUE, canonical_json, content_hash, is_poison_v1_parameters,
-    is_shield_v1_parameters, is_stun_v1_parameters, validate_shape,
+    ContentPackage, ContentTransitionPackageEntry, LoadedContentPackage, MAX_HEAL_AMOUNT,
+    MAX_POISON_TICK_DAMAGE, SHIELD_VALUE, STUN_VALUE, canonical_json, content_hash,
+    is_heal_v1_parameters, is_poison_v1_parameters, is_shield_v1_parameters, is_stun_v1_parameters,
+    validate_shape,
 };
 use crate::message::Protocol;
 
@@ -11834,6 +11835,16 @@ impl Store {
             beast_is_stunned_after_skill_effects(&active_skill_effects, &pending_skill_effects)?;
         let beast_shielded =
             beast_is_shielded_after_skill_effects(&active_skill_effects, &pending_skill_effects)?;
+        let player_hp_after_healing = if matches!(action, "攻击" | "释放技能") {
+            player_hp_after_skill_effects(
+                state.player_hp,
+                state.player_max_hp,
+                &active_skill_effects,
+                &pending_skill_effects,
+            )?
+        } else {
+            state.player_hp
+        };
         let event_kind = action_event_kind(action);
         let (
             status_after,
@@ -11929,7 +11940,7 @@ impl Store {
                 transaction
                     .execute(
                         "UPDATE player SET hp = ?1, updated_at = ?2 WHERE id = ?3",
-                        params![state.player_hp, timestamp, state.player_id],
+                        params![player_hp_after_healing, timestamp, state.player_id],
                     )
                     .map_err(|error| format!("保存战斗胜利生命失败：{error}"))?;
                 let expires_at = timestamp
@@ -11957,12 +11968,12 @@ impl Store {
                 transaction
                     .execute(
                         "UPDATE battle SET status = 'won', player_hp = ?1, beast_hp = 0, action_count = ?2, updated_at = ?3, ended_at = ?3 WHERE id = ?4",
-                        params![state.player_hp, sequence, timestamp, state.id],
+                        params![player_hp_after_healing, sequence, timestamp, state.id],
                     )
                     .map_err(|error| format!("保存战斗胜利状态失败：{error}"))?;
                 (
                     "won",
-                    state.player_hp,
+                    player_hp_after_healing,
                     0,
                     player_damage,
                     0,
@@ -11974,16 +11985,24 @@ impl Store {
                     Some(exp),
                 )
             } else if beast_stunned || beast_shielded {
-                // 眩晕或护盾只处理当前攻击/魂技动作后的反击，不修改玩家状态或历史快照。
+                // 眩晕或护盾只处理当前攻击/魂技动作后的反击；治疗已在此之前结算。
+                if player_hp_after_healing != state.player_hp {
+                    transaction
+                        .execute(
+                            "UPDATE player SET hp = ?1, updated_at = ?2 WHERE id = ?3",
+                            params![player_hp_after_healing, timestamp, state.player_id],
+                        )
+                        .map_err(|error| format!("保存反击前治疗生命失败：{error}"))?;
+                }
                 transaction
                     .execute(
                         "UPDATE battle SET status = 'active', player_hp = ?1, beast_hp = ?2, action_count = ?3, updated_at = ?4, ended_at = NULL WHERE id = ?5",
-                        params![state.player_hp, beast_hp_after, sequence, timestamp, state.id],
+                        params![player_hp_after_healing, beast_hp_after, sequence, timestamp, state.id],
                     )
                     .map_err(|error| format!("保存眩晕战斗状态失败：{error}"))?;
                 (
                     "active",
-                    state.player_hp,
+                    player_hp_after_healing,
                     beast_hp_after,
                     player_damage,
                     0,
@@ -12010,8 +12029,8 @@ impl Store {
                 if beast_critical {
                     beast_damage = battle_critical_damage(beast_damage, 10)?;
                 }
-                let player_hp_after = state.player_hp.saturating_sub(beast_damage).max(1);
-                let status = if player_hp_after == 1 && beast_damage >= state.player_hp {
+                let player_hp_after = player_hp_after_healing.saturating_sub(beast_damage).max(1);
+                let status = if player_hp_after == 1 && beast_damage >= player_hp_after_healing {
                     "defeated"
                 } else {
                     "active"
@@ -15085,6 +15104,12 @@ fn compatibility_effect_kind(
         && value == SHIELD_VALUE
     {
         "shield".to_string()
+    } else if operation == "restore"
+        && attribute_key == "player_hp"
+        && value_mode == "absolute"
+        && value > 0
+    {
+        "heal".to_string()
     } else {
         operation.to_string()
     }
@@ -15645,6 +15670,10 @@ enum SupportedSkillEffect {
     BeastShield {
         stack_policy: EffectStackPolicy,
     },
+    PlayerHeal {
+        amount: i64,
+        stack_policy: EffectStackPolicy,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15745,6 +15774,25 @@ fn parse_supported_skill_effect(
             return Err("shield-v1 只支持 refresh 叠加策略".to_string());
         }
         return Ok(SupportedSkillEffect::BeastShield { stack_policy });
+    }
+    if trigger_kind == "on_release"
+        && target_kind == "self"
+        && operation == "restore"
+        && attribute_key == "player_hp"
+        && value_mode == "absolute"
+        && (1..=MAX_HEAL_AMOUNT).contains(&value)
+        && chance_percent == 100
+    {
+        if !is_heal_v1_parameters(&parameters) {
+            return Err("heal-v1 参数必须固定声明规则版本、结算时机和溢出行为".to_string());
+        }
+        if stack_policy != EffectStackPolicy::Add {
+            return Err("heal-v1 只支持 add 叠加策略".to_string());
+        }
+        return Ok(SupportedSkillEffect::PlayerHeal {
+            amount: value,
+            stack_policy,
+        });
     }
     Err(format!(
         "当前魂技效果解释器不支持 {trigger_kind}/{target_kind}/{operation}/{attribute_key}/{value_mode}/{value}/{chance_percent}"
@@ -15924,6 +15972,75 @@ fn beast_is_shielded_after_skill_effects(
         }
     }
     Ok(shielded)
+}
+
+/// 汇总当前攻击/魂技动作的即时治疗，并将结果封顶到玩家最大生命。
+fn player_hp_after_skill_effects(
+    player_hp: i64,
+    player_max_hp: i64,
+    active_effects: &[BattleSkillEffectRecord],
+    pending_effects: &[SkillEffectRecord],
+) -> Result<i64, String> {
+    if player_hp < 1 || player_max_hp < player_hp {
+        return Err("治疗结算前的玩家生命快照无效".to_string());
+    }
+    let mut healing = 0_i64;
+    for effect in active_effects {
+        collect_player_heal_effect(
+            &mut healing,
+            parse_supported_skill_effect(
+                &effect.trigger_kind,
+                &effect.target_kind,
+                &effect.operation,
+                &effect.attribute_key,
+                &effect.value_mode,
+                effect.value,
+                effect.chance_percent,
+                &effect.stack_policy,
+                &effect.parameters_json,
+            )?,
+        )?;
+    }
+    for effect in pending_effects {
+        collect_player_heal_effect(
+            &mut healing,
+            parse_supported_skill_effect(
+                &effect.trigger_kind,
+                &effect.target_kind,
+                &effect.operation,
+                &effect.attribute_key,
+                &effect.value_mode,
+                effect.value,
+                effect.chance_percent,
+                &effect.stack_policy,
+                &effect.parameters_json,
+            )?,
+        )?;
+    }
+    player_hp
+        .checked_add(healing)
+        .ok_or_else(|| "治疗数值叠加溢出".to_string())
+        .map(|healed| healed.min(player_max_hp))
+}
+
+fn collect_player_heal_effect(
+    healing: &mut i64,
+    effect: SupportedSkillEffect,
+) -> Result<(), String> {
+    let SupportedSkillEffect::PlayerHeal {
+        amount,
+        stack_policy,
+    } = effect
+    else {
+        return Ok(());
+    };
+    if stack_policy != EffectStackPolicy::Add {
+        return Err("heal-v1 只支持 add 叠加策略".to_string());
+    }
+    *healing = healing
+        .checked_add(amount)
+        .ok_or_else(|| "治疗数值叠加溢出".to_string())?;
+    Ok(())
 }
 
 /// 汇总当前序列应结算的中毒伤害；pending 定义排在已冻结快照之后，保证 refresh/replace 当回合生效。
@@ -24161,6 +24278,23 @@ fn validate_v22_schema(connection: &Connection) -> Result<(), String> {
                            AND json_type(parameters_json, '$.counterattack') = 'text'
                            AND json_extract(parameters_json, '$.counterattack') = 'absorb'
                            AND (SELECT COUNT(*) FROM json_each(parameters_json)) = 3
+                       ) OR (
+                           trigger_kind = 'on_release'
+                           AND target_kind = 'self'
+                           AND operation = 'restore'
+                           AND attribute_key = 'player_hp'
+                           AND value_mode = 'absolute'
+                           AND value BETWEEN 1 AND 1000000
+                           AND duration_rounds = 1
+                           AND chance_percent = 100
+                           AND stack_policy = 'add'
+                           AND json_type(parameters_json, '$.rule_version') = 'text'
+                           AND json_extract(parameters_json, '$.rule_version') = 'heal-v1'
+                           AND json_type(parameters_json, '$.apply_phase') = 'text'
+                           AND json_extract(parameters_json, '$.apply_phase') = 'after_player_damage'
+                           AND json_type(parameters_json, '$.overflow') = 'text'
+                           AND json_extract(parameters_json, '$.overflow') = 'cap_at_max_hp'
+                           AND (SELECT COUNT(*) FROM json_each(parameters_json)) = 3
                        )
                    )
             )
@@ -28413,6 +28547,43 @@ mod tests {
         }
     }
 
+    fn heal_v1_parameters() -> BTreeMap<String, serde_json::Value> {
+        BTreeMap::from([
+            (
+                "rule_version".to_string(),
+                serde_json::Value::String("heal-v1".to_string()),
+            ),
+            (
+                "apply_phase".to_string(),
+                serde_json::Value::String("after_player_damage".to_string()),
+            ),
+            (
+                "overflow".to_string(),
+                serde_json::Value::String("cap_at_max_hp".to_string()),
+            ),
+        ])
+    }
+
+    fn heal_skill_effect_record(effect_key: &str, amount: i64) -> SkillEffectRecord {
+        SkillEffectRecord {
+            effect_key: effect_key.to_string(),
+            effect_kind: "heal".to_string(),
+            target_kind: "self".to_string(),
+            magnitude_percent: amount,
+            duration_rounds: 1,
+            description: "test heal-v1 effect".to_string(),
+            trigger_kind: "on_release".to_string(),
+            operation: "restore".to_string(),
+            attribute_key: "player_hp".to_string(),
+            value_mode: "absolute".to_string(),
+            value: amount,
+            chance_percent: 100,
+            stack_policy: "add".to_string(),
+            parameters_json: serde_json::to_string(&heal_v1_parameters())
+                .expect("应序列化治疗参数"),
+        }
+    }
+
     fn poison_effect_package(
         package_key: &str,
         effect_key: &str,
@@ -28530,6 +28701,46 @@ mod tests {
         };
         LoadedContentPackage {
             content_hash: content_hash(&package).expect("应计算护盾内容包哈希"),
+            package,
+            source_format: "json".to_string(),
+        }
+    }
+
+    fn heal_effect_package(
+        package_key: &str,
+        effect_key: &str,
+        skill_key: &str,
+        amount: i64,
+    ) -> LoadedContentPackage {
+        let package = ContentPackage {
+            package_key: package_key.to_string(),
+            revision: 1,
+            author: "test".to_string(),
+            minimum_runtime: String::new(),
+            wuhun: Vec::new(),
+            skills: Vec::new(),
+            effects: vec![EffectPackageEntry {
+                effect_key: effect_key.to_string(),
+                skill_key: skill_key.to_string(),
+                trigger_kind: "on_release".to_string(),
+                target_kind: "self".to_string(),
+                operation: "restore".to_string(),
+                attribute_key: "player_hp".to_string(),
+                value_mode: "absolute".to_string(),
+                value: amount,
+                duration_rounds: 1,
+                chance_percent: 100,
+                stack_policy: "add".to_string(),
+                parameters: heal_v1_parameters(),
+                description: "test heal-v1 effect".to_string(),
+                enabled: true,
+            }],
+            soul_beasts: Vec::new(),
+            soul_rings: Vec::new(),
+            transitions: Vec::new(),
+        };
+        LoadedContentPackage {
+            content_hash: content_hash(&package).expect("应计算治疗内容包哈希"),
             package,
             source_format: "json".to_string(),
         }
@@ -34748,6 +34959,19 @@ mod tests {
     }
 
     #[test]
+    fn heal_v1_adds_and_caps_at_max_hp() {
+        let pending = vec![
+            heal_skill_effect_record("heal-first", 20),
+            heal_skill_effect_record("heal-second", 30),
+        ];
+        assert_eq!(
+            player_hp_after_skill_effects(60, 100, &[], &pending),
+            Ok(100)
+        );
+        assert_eq!(player_hp_after_skill_effects(60, 100, &[], &[]), Ok(60));
+    }
+
+    #[test]
     fn v21_entangle_effect_catalog_is_exposed_with_the_skill() {
         let (_directory, store) = test_store();
         register_awakened_pair(&store);
@@ -35096,6 +35320,115 @@ mod tests {
         drop(store);
         let _restored = Store::initialize(directory.path(), &DatabaseConfig::default())
             .expect("护盾战斗数据库应可热重载");
+    }
+
+    #[test]
+    fn heal_v1_restores_before_counterattack_and_expires() {
+        let (directory, store) = test_store();
+        register_awakened_pair(&store);
+        let mut heal = heal_effect_package("heal-v1-test", "entangle-heal-test", "entangle", 30);
+        heal.package.effects.push(EffectPackageEntry {
+            effect_key: "entangle-heal-shield-test".to_string(),
+            skill_key: "entangle".to_string(),
+            trigger_kind: "on_release".to_string(),
+            target_kind: "self".to_string(),
+            operation: "absorb_damage".to_string(),
+            attribute_key: "beast_counterattack".to_string(),
+            value_mode: "absolute".to_string(),
+            value: 1,
+            duration_rounds: 1,
+            chance_percent: 100,
+            stack_policy: "refresh".to_string(),
+            parameters: shield_v1_parameters(),
+            description: "test shield-v1 companion effect".to_string(),
+            enabled: true,
+        });
+        heal.content_hash = content_hash(&heal.package).expect("应重新计算组合内容包哈希");
+        store
+            .stage_content_package(&heal)
+            .expect("治疗内容包应暂存");
+        let validation = store
+            .validate_content_draft("heal-v1-test", 1)
+            .expect("治疗内容包应校验");
+        assert!(validation.errors.is_empty(), "{validation:?}");
+        store
+            .publish_content_draft("heal-v1-test", 1)
+            .expect("治疗内容包应发布");
+        absorb_test_soul_ring(&store, &identity(), "heal-v1-source");
+
+        let player_id = player_id_for(&store, &identity());
+        let connection = store.open().expect("应打开治疗战斗数据库");
+        connection
+            .execute(
+                "UPDATE player SET level = 10, hp = 10, max_hp = 1000, soul_power = 1000, max_soul_power = 1000, strength = 1, endurance = 1000, perception = 0, luck = 0, updated_at = 1 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置治疗战斗属性");
+        drop(connection);
+        store
+            .challenge_soul_beast_with_operation(
+                &identity(),
+                "哥布林",
+                &transfer_operation("挑战", "heal-v1-challenge"),
+            )
+            .expect("应创建治疗测试战斗");
+
+        let first = store
+            .use_skill_battle_with_operation(
+                &identity(),
+                "缠绕",
+                &transfer_operation("释放技能", "heal-v1-first"),
+            )
+            .expect("治疗魂技释放应成功");
+        assert_eq!(first.event.sequence, 1);
+        assert_eq!(
+            first.event.player_hp_after,
+            first.event.player_hp_before + 30 - first.event.beast_damage
+        );
+        assert_eq!(first.event.beast_damage, 0);
+        assert!(first.event.player_hp_after > first.event.player_hp_before);
+        assert!(
+            first
+                .skill
+                .as_ref()
+                .expect("应有治疗魂技回执")
+                .effects
+                .iter()
+                .any(|effect| effect.effect_key == "entangle-heal-test")
+        );
+        assert!(
+            first
+                .skill
+                .as_ref()
+                .unwrap()
+                .effects
+                .iter()
+                .any(|effect| effect.effect_key == "entangle-heal-shield-test")
+        );
+        assert!(
+            first
+                .expired_effects
+                .iter()
+                .any(|effect| effect.effect_key == "entangle-heal-test")
+        );
+        assert!(
+            !first
+                .battle
+                .active_effects
+                .iter()
+                .any(|effect| effect.effect_key == "entangle-heal-test")
+        );
+
+        let second = store
+            .attack_battle_with_operation(
+                &identity(),
+                &transfer_operation("攻击", "heal-v1-second"),
+            )
+            .expect("治疗到期后普通攻击应继续结算魂兽反击");
+        assert!(second.event.beast_damage > 0);
+        let restored = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("治疗战斗数据库应可热重载");
+        assert!(restored.active_battle(&identity()).unwrap().is_some());
     }
 
     #[test]
