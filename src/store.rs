@@ -6260,7 +6260,74 @@ SELECT revision.id, 'item', item.item_key, item.created_at
         WHERE member.revision_id = revision.id
           AND member.member_kind = 'item'
           AND member.member_key = item.item_key
-   );
+ );
+"#;
+
+// v38 将静态 NPC 目录纳入内容成员账本，并为既有 revision 补登记已有 NPC。
+const MIGRATION_V38: &str = r#"
+CREATE TABLE content_revision_member_v38_backup AS
+SELECT revision_id, member_kind, member_key, created_at
+  FROM content_revision_member;
+
+DROP TRIGGER content_revision_member_no_update;
+DROP TRIGGER content_revision_member_no_delete;
+DROP TRIGGER content_revision_member_no_reinsert;
+DROP INDEX content_revision_member_lookup;
+DROP TABLE content_revision_member;
+
+CREATE TABLE content_revision_member (
+    revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
+    member_kind TEXT NOT NULL CHECK(
+        member_kind IN ('wuhun', 'skill', 'starter-skill', 'effect', 'beast', 'ring', 'map', 'item', 'npc')
+    ),
+    member_key TEXT NOT NULL CHECK(
+        length(member_key) BETWEEN 1 AND 200
+        AND member_key = trim(member_key)
+        AND instr(member_key, char(0)) = 0
+    ),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    PRIMARY KEY(revision_id, member_kind, member_key)
+) STRICT, WITHOUT ROWID;
+
+INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+SELECT revision_id, member_kind, member_key, created_at
+  FROM content_revision_member_v38_backup;
+DROP TABLE content_revision_member_v38_backup;
+
+CREATE INDEX content_revision_member_lookup
+    ON content_revision_member(member_kind, member_key, revision_id);
+
+CREATE TRIGGER content_revision_member_no_update
+BEFORE UPDATE ON content_revision_member
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is immutable');
+END;
+CREATE TRIGGER content_revision_member_no_delete
+BEFORE DELETE ON content_revision_member
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is immutable');
+END;
+CREATE TRIGGER content_revision_member_no_reinsert
+BEFORE INSERT ON content_revision_member
+WHEN EXISTS(
+    SELECT 1 FROM content_revision_member
+     WHERE revision_id = NEW.revision_id
+       AND member_kind = NEW.member_kind
+       AND member_key = NEW.member_key
+)
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is append-only');
+END;
+
+INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+SELECT revision.id, 'npc', npc.npc_key, npc.created_at
+  FROM content_revision revision CROSS JOIN npc
+ WHERE NOT EXISTS(
+       SELECT 1 FROM content_revision_member member
+        WHERE member.revision_id = revision.id
+          AND member.member_kind = 'npc'
+          AND member.member_key = npc.npc_key
+ );
 "#;
 
 const LEGACY_CLAIM_REQUIRED: &str =
@@ -8002,6 +8069,9 @@ fn content_package_declared_member_set(package: &ContentPackage) -> BTreeSet<(St
     for entry in &package.items {
         members.insert(("item".to_string(), entry.item_key.clone()));
     }
+    for entry in &package.npcs {
+        members.insert(("npc".to_string(), entry.npc_key.clone()));
+    }
     for entry in &package.wuhun {
         members.insert(("wuhun".to_string(), entry.name.clone()));
     }
@@ -8124,6 +8194,13 @@ fn validate_content_package_against_database(
         .iter()
         .map(|entry| entry.item_key.as_str())
         .collect::<std::collections::BTreeSet<_>>();
+    let package_map_keys = package
+        .maps
+        .iter()
+        .map(|entry| entry.map_key.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let active_revision_id = current_content_revision_id(connection)?;
+    let active_members = load_content_revision_member_set(connection, active_revision_id)?;
 
     let mut names = std::collections::BTreeSet::new();
     let mut map_sort_orders = std::collections::BTreeSet::new();
@@ -8155,6 +8232,31 @@ fn validate_content_package_against_database(
             errors.push(format!(
                 "物品键或名称已存在：{} / {}",
                 entry.item_key, entry.name
+            ));
+        }
+    }
+    let mut npc_names = std::collections::BTreeSet::new();
+    for entry in &package.npcs {
+        if !npc_names.insert((entry.map_key.as_str(), entry.name.as_str())) {
+            errors.push(format!(
+                "内容包内地图 {} 的 NPC 名称重复：{}",
+                entry.map_key, entry.name
+            ));
+        }
+        if catalog_value_exists(connection, "npc", "npc_key", &entry.npc_key)?
+            || npc_map_name_exists(connection, &entry.map_key, &entry.name)?
+        {
+            errors.push(format!(
+                "NPC 键或地图内名称已存在：{} / {} / {}",
+                entry.npc_key, entry.map_key, entry.name
+            ));
+        }
+        if !package_map_keys.contains(entry.map_key.as_str())
+            && !active_members.contains(&("map".to_string(), entry.map_key.clone()))
+        {
+            errors.push(format!(
+                "NPC {} 引用了不存在或不在当前 active revision 的地图 {}",
+                entry.npc_key, entry.map_key
             ));
         }
     }
@@ -8290,8 +8392,6 @@ fn validate_content_package_against_database(
         }
     }
 
-    let active_revision_id = current_content_revision_id(connection)?;
-    let active_members = load_content_revision_member_set(connection, active_revision_id)?;
     let package_members = content_package_declared_member_set(package);
     for transition in &package.transitions {
         let source_member = (
@@ -8359,6 +8459,7 @@ fn catalog_value_exists(
         ("map", "name") => "SELECT EXISTS(SELECT 1 FROM map WHERE name = ?1)",
         ("item", "item_key") => "SELECT EXISTS(SELECT 1 FROM item WHERE item_key = ?1)",
         ("item", "name") => "SELECT EXISTS(SELECT 1 FROM item WHERE name = ?1)",
+        ("npc", "npc_key") => "SELECT EXISTS(SELECT 1 FROM npc WHERE npc_key = ?1)",
         _ => return Err(format!("未知内容目录查询：{table}.{column}")),
     };
     connection
@@ -8374,6 +8475,16 @@ fn map_sort_order_exists(connection: &Connection, sort_order: i64) -> Result<boo
             |row| row.get::<_, bool>(0),
         )
         .map_err(|error| format!("查询地图排序失败：{error}"))
+}
+
+fn npc_map_name_exists(connection: &Connection, map_key: &str, name: &str) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM npc WHERE map_key = ?1 AND name = ?2)",
+            params![map_key, name],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("查询 NPC 地图内名称失败：{error}"))
 }
 
 fn catalog_enabled_exists(
@@ -8474,6 +8585,30 @@ fn publish_content_package_rows(
             )
             .map_err(|error| format!("发布地图 {} 失败：{error}", entry.map_key))?;
         ensure_content_revision_member(connection, revision_id, "map", &entry.map_key, created_at)?;
+    }
+    for entry in &package.npcs {
+        connection
+            .execute(
+                r#"
+                INSERT INTO npc(
+                    npc_key, map_key, name, npc_kind, dialogue, description,
+                    enabled, sort_order, created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+                "#,
+                params![
+                    entry.npc_key,
+                    entry.map_key,
+                    entry.name,
+                    entry.npc_kind,
+                    entry.dialogue,
+                    entry.description,
+                    entry.enabled,
+                    entry.sort_order,
+                    created_at
+                ],
+            )
+            .map_err(|error| format!("发布 NPC {} 失败：{error}", entry.npc_key))?;
+        ensure_content_revision_member(connection, revision_id, "npc", &entry.npc_key, created_at)?;
     }
     for entry in &package.items {
         connection
@@ -9693,7 +9828,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
                     format!(
-                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36/v37 失败：{error}"
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36/v37/v38 失败：{error}"
                     )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
@@ -10262,10 +10397,25 @@ impl Store {
                 validate_v37_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 38)? {
+                transaction
+                    .execute_batch(MIGRATION_V38)
+                    .map_err(|error| format!("执行数据库迁移 v38 失败：{error}"))?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(38, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v38 失败：{error}"))?;
+                validate_v38_schema(&transaction)?;
+            } else {
+                validate_v38_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36/v37 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36/v37/v38 失败：{error}"
                 )
             })?;
             Ok(())
@@ -10307,7 +10457,7 @@ impl Store {
                 validate_v34_schema(connection)?;
                 validate_v35_schema(connection)?;
                 validate_v36_schema(connection)?;
-                validate_v37_schema(connection)?;
+                validate_v38_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -11380,6 +11530,7 @@ impl Store {
         ensure_no_legacy_identity(&transaction, key)?;
         reject_replayed_operation(&transaction, key, operation)?;
         let (player_id, _, map) = load_player_map_for_identity(&transaction, key)?;
+        let active_revision_id = current_content_revision_id(&transaction)?;
         let npc = transaction
             .query_row(
                 r#"
@@ -11389,13 +11540,16 @@ impl Store {
                            SELECT 1 FROM shop_item si
                             WHERE si.npc_key = n.npc_key AND si.enabled = 1
                        )
-                  FROM npc n
+                   FROM npc n
                   JOIN map m ON m.map_key = n.map_key
-                 WHERE n.map_key = ?1 AND n.enabled = 1
-                   AND (n.name = ?2 OR n.npc_key = ?2)
-                 LIMIT 1
+                  JOIN content_revision_visible_member member
+                    ON member.member_kind = 'npc' AND member.member_key = n.npc_key
+                  WHERE n.map_key = ?1 AND n.enabled = 1
+                    AND (n.name = ?2 OR n.npc_key = ?2)
+                    AND member.revision_id = ?3
+                  LIMIT 1
                 "#,
-                params![map.map_key, npc_name_or_key],
+                params![map.map_key, npc_name_or_key, active_revision_id],
                 |row| npc_record_from_row(row, 0),
             )
             .optional()
@@ -11426,6 +11580,7 @@ impl Store {
         let connection = self.open()?;
         ensure_no_legacy_identity(&connection, key)?;
         let (_, _, map) = load_player_map_for_identity(&connection, key)?;
+        let active_revision_id = current_content_revision_id(&connection)?;
         let mut statement = connection
             .prepare(
                 r#"
@@ -11435,15 +11590,20 @@ impl Store {
                            SELECT 1 FROM shop_item si
                             WHERE si.npc_key = n.npc_key AND si.enabled = 1
                        )
-                  FROM npc n
+                   FROM npc n
                   JOIN map m ON m.map_key = n.map_key
-                 WHERE n.map_key = ?1 AND n.enabled = 1
-                 ORDER BY n.sort_order, n.npc_key
+                  JOIN content_revision_visible_member member
+                    ON member.member_kind = 'npc' AND member.member_key = n.npc_key
+                  WHERE n.map_key = ?1 AND n.enabled = 1
+                    AND member.revision_id = ?2
+                  ORDER BY n.sort_order, n.npc_key
                 "#,
             )
             .map_err(|error| format!("准备当前地图 NPC 查询失败：{error}"))?;
         let entries = statement
-            .query_map([map.map_key.as_str()], |row| npc_record_from_row(row, 0))
+            .query_map(params![map.map_key, active_revision_id], |row| {
+                npc_record_from_row(row, 0)
+            })
             .map_err(|error| format!("查询当前地图 NPC 失败：{error}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("解析当前地图 NPC 失败：{error}"))?;
@@ -11468,16 +11628,26 @@ impl Store {
         let connection = self.open()?;
         ensure_no_legacy_identity(&connection, key)?;
         let (player_id, _, map) = load_player_map_for_identity(&connection, key)?;
-        let npc = load_bound_npc_for_player(&connection, player_id, &map.map_key, npc_name_or_key)?;
+        let active_revision_id = current_content_revision_id(&connection)?;
+        let npc = load_bound_npc_for_player(
+            &connection,
+            player_id,
+            &map.map_key,
+            active_revision_id,
+            npc_name_or_key,
+        )?;
         if npc.npc_kind != "merchant" || !npc.has_shop {
             return Err(format!("当前对话 NPC“{}”没有可用商店", npc.name));
         }
-        let active_revision_id = current_content_revision_id(&connection)?;
         let total = connection
             .query_row(
                 r#"
                 SELECT COUNT(*)
                   FROM shop_item si
+                  JOIN content_revision_visible_member npc_member
+                    ON npc_member.member_kind = 'npc'
+                   AND npc_member.member_key = si.npc_key
+                   AND npc_member.revision_id = ?2
                   JOIN content_revision_visible_member member
                     ON member.member_kind = 'item'
                    AND member.member_key = si.item_key
@@ -11510,6 +11680,10 @@ impl Store {
                        si.buy_price, si.stock
                   FROM shop_item si
                   JOIN npc n ON n.npc_key = si.npc_key
+                  JOIN content_revision_visible_member npc_member
+                    ON npc_member.member_kind = 'npc'
+                   AND npc_member.member_key = n.npc_key
+                   AND npc_member.revision_id = ?4
                   JOIN item i ON i.item_key = si.item_key
                   JOIN content_revision_visible_member member
                     ON member.member_kind = 'item'
@@ -14787,11 +14961,17 @@ impl Store {
         reject_replayed_operation(&transaction, key, operation)?;
         let (player_id, level, map) = load_player_map_for_identity(&transaction, key)?;
         ensure_player_alive_for_action(&transaction, player_id, "购买")?;
-        let bound_npc = load_bound_npc_for_player(&transaction, player_id, &map.map_key, None)?;
+        let active_revision_id = current_content_revision_id(&transaction)?;
+        let bound_npc = load_bound_npc_for_player(
+            &transaction,
+            player_id,
+            &map.map_key,
+            active_revision_id,
+            None,
+        )?;
         if bound_npc.npc_kind != "merchant" || !bound_npc.has_shop {
             return Err(format!("当前对话 NPC“{}”没有可用商店", bound_npc.name));
         }
-        let active_revision_id = current_content_revision_id(&transaction)?;
         let (npc_name, stock, unit_price, item) = transaction
             .query_row(
                 r#"
@@ -14802,6 +14982,10 @@ impl Store {
                        i.purchasable, i.sellable, i.usable, i.description
                   FROM npc n
                   JOIN shop_item si ON si.npc_key = n.npc_key
+                  JOIN content_revision_visible_member npc_member
+                    ON npc_member.member_kind = 'npc'
+                   AND npc_member.member_key = n.npc_key
+                   AND npc_member.revision_id = ?3
                   JOIN item i ON i.item_key = si.item_key
                   JOIN content_revision_visible_member member
                     ON member.member_kind = 'item'
@@ -14937,11 +15121,17 @@ impl Store {
         reject_replayed_operation(&transaction, key, operation)?;
         let (player_id, level, map) = load_player_map_for_identity(&transaction, key)?;
         ensure_player_alive_for_action(&transaction, player_id, "出售")?;
-        let bound_npc = load_bound_npc_for_player(&transaction, player_id, &map.map_key, None)?;
+        let active_revision_id = current_content_revision_id(&transaction)?;
+        let bound_npc = load_bound_npc_for_player(
+            &transaction,
+            player_id,
+            &map.map_key,
+            active_revision_id,
+            None,
+        )?;
         if bound_npc.npc_kind != "merchant" || !bound_npc.has_shop {
             return Err(format!("当前对话 NPC“{}”没有可用商店", bound_npc.name));
         }
-        let active_revision_id = current_content_revision_id(&transaction)?;
         let (npc_key, npc_name, stock, item) = transaction
             .query_row(
                 r#"
@@ -14952,6 +15142,10 @@ impl Store {
                        i.purchasable, i.sellable, i.usable, i.description
                   FROM npc n
                   JOIN shop_item si ON si.npc_key = n.npc_key
+                  JOIN content_revision_visible_member npc_member
+                    ON npc_member.member_kind = 'npc'
+                   AND npc_member.member_key = n.npc_key
+                   AND npc_member.revision_id = ?3
                   JOIN item i ON i.item_key = si.item_key
                   JOIN content_revision_visible_member member
                     ON member.member_kind = 'item'
@@ -17401,10 +17595,12 @@ fn validate_quest_operation(
     Ok(())
 }
 
+/// 只解析当前 active revision 可见的对话 NPC；失活绑定保留原行但拒绝继续使用。
 fn load_bound_npc_for_player(
     connection: &Connection,
     player_id: i64,
     map_key: &str,
+    active_revision_id: i64,
     requested_name_or_key: Option<&str>,
 ) -> Result<NpcRecord, String> {
     connection
@@ -17416,14 +17612,22 @@ fn load_bound_npc_for_player(
                        SELECT 1 FROM shop_item si
                         WHERE si.npc_key = n.npc_key AND si.enabled = 1
                    )
-              FROM player_npc pn
+               FROM player_npc pn
               JOIN npc n ON n.npc_key = pn.npc_key
               JOIN map m ON m.map_key = n.map_key
+              JOIN content_revision_visible_member member
+                ON member.member_kind = 'npc' AND member.member_key = n.npc_key
              WHERE pn.player_id = ?1 AND n.map_key = ?2 AND n.enabled = 1
-               AND (?3 IS NULL OR n.name = ?3 OR n.npc_key = ?3)
-             LIMIT 1
+               AND member.revision_id = ?3
+               AND (?4 IS NULL OR n.name = ?4 OR n.npc_key = ?4)
+              LIMIT 1
             "#,
-            params![player_id, map_key, requested_name_or_key],
+            params![
+                player_id,
+                map_key,
+                active_revision_id,
+                requested_name_or_key
+            ],
             |row| npc_record_from_row(row, 0),
         )
         .optional()
@@ -28254,6 +28458,7 @@ fn validate_v22_index(
 fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
     let tracks_maps = migration_applied(connection, 36)?;
     let tracks_items = migration_applied(connection, 37)?;
+    let tracks_npcs = migration_applied(connection, 38)?;
     let expected_tables = [
         (
             "content_revision",
@@ -28315,7 +28520,9 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
         }
     }
 
-    let member_kind_marker = if tracks_items {
+    let member_kind_marker = if tracks_npcs {
+        "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING', 'MAP', 'ITEM', 'NPC')"
+    } else if tracks_items {
         "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING', 'MAP', 'ITEM')"
     } else if tracks_maps {
         "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING', 'MAP')"
@@ -28472,9 +28679,12 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
                     OR (member.member_kind = 'map' AND NOT EXISTS(
                         SELECT 1 FROM map WHERE map_key = member.member_key
                     ))
-                    OR (member.member_kind = 'item' AND NOT EXISTS(
-                        SELECT 1 FROM item WHERE item_key = member.member_key
-                    ))
+                     OR (member.member_kind = 'item' AND NOT EXISTS(
+                         SELECT 1 FROM item WHERE item_key = member.member_key
+                     ))
+                     OR (member.member_kind = 'npc' AND NOT EXISTS(
+                         SELECT 1 FROM npc WHERE npc_key = member.member_key
+                     ))
             )
             "#,
             [],
@@ -28526,15 +28736,22 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
                      WHERE member.member_kind = 'map' AND member.member_key = map.map_key
                  )
             ))
-            OR (?2 AND EXISTS(
-                SELECT 1 FROM item item
-                 WHERE NOT EXISTS(
-                    SELECT 1 FROM content_revision_member member
-                     WHERE member.member_kind = 'item' AND member.member_key = item.item_key
-                 )
-            ))
-            "#,
-            [tracks_maps, tracks_items],
+             OR (?2 AND EXISTS(
+                 SELECT 1 FROM item item
+                  WHERE NOT EXISTS(
+                     SELECT 1 FROM content_revision_member member
+                      WHERE member.member_kind = 'item' AND member.member_key = item.item_key
+                  )
+             ))
+             OR (?3 AND EXISTS(
+                 SELECT 1 FROM npc npc
+                  WHERE NOT EXISTS(
+                     SELECT 1 FROM content_revision_member member
+                      WHERE member.member_kind = 'npc' AND member.member_key = npc.npc_key
+                  )
+             ))
+             "#,
+            [tracks_maps, tracks_items, tracks_npcs],
             |row| row.get::<_, bool>(0),
         )
         .map_err(|error| format!("校验 v23 未发布目录失败：{error}"))?;
@@ -31317,6 +31534,11 @@ fn validate_v37_schema(connection: &Connection) -> Result<(), String> {
     validate_v23_schema(connection)
 }
 
+/// 校验 v38 NPC 成员覆盖与内容成员表的完整结构；损坏时拒绝启动。
+fn validate_v38_schema(connection: &Connection) -> Result<(), String> {
+    validate_v37_schema(connection)
+}
+
 fn validate_v24_table_sql(
     connection: &Connection,
     table: &str,
@@ -33187,8 +33409,8 @@ mod tests {
     use crate::content::{
         EffectPackageEntry, FORBID_SKILL_APPLY_PHASE, FORBID_SKILL_BLOCKED_ACTION,
         FORBID_SKILL_RULE_VERSION, ItemPackageEntry, MIN_FORBID_SKILL_DURATION_ROUNDS,
-        MapPackageEntry, SkillPackageEntry, SoulBeastPackageEntry, SoulRingPackageEntry,
-        WuhunPackageEntry, WuhunStatsPackageEntry,
+        MapPackageEntry, NpcPackageEntry, SkillPackageEntry, SoulBeastPackageEntry,
+        SoulRingPackageEntry, WuhunPackageEntry, WuhunStatsPackageEntry,
     };
     use tempfile::tempdir;
 
@@ -33213,6 +33435,7 @@ mod tests {
             minimum_runtime: String::new(),
             maps: Vec::new(),
             items: Vec::new(),
+            npcs: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33264,6 +33487,7 @@ mod tests {
                 sort_order,
             }],
             items: Vec::new(),
+            npcs: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: Vec::new(),
@@ -33309,6 +33533,7 @@ mod tests {
                 usable: true,
                 description: "内容包新增测试物品".to_string(),
             }],
+            npcs: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: Vec::new(),
@@ -33318,6 +33543,44 @@ mod tests {
         };
         LoadedContentPackage {
             content_hash: content_hash(&package).expect("应计算物品内容包哈希"),
+            package,
+            source_format: "json".to_string(),
+        }
+    }
+
+    fn npc_content_package(
+        package_key: &str,
+        npc_key: &str,
+        map_key: &str,
+        name: &str,
+        npc_kind: &str,
+    ) -> LoadedContentPackage {
+        let package = ContentPackage {
+            package_key: package_key.to_string(),
+            revision: 1,
+            author: "npc-test".to_string(),
+            minimum_runtime: String::new(),
+            maps: Vec::new(),
+            items: Vec::new(),
+            npcs: vec![NpcPackageEntry {
+                npc_key: npc_key.to_string(),
+                map_key: map_key.to_string(),
+                name: name.to_string(),
+                npc_kind: npc_kind.to_string(),
+                dialogue: "内容包 NPC 测试对话".to_string(),
+                description: "静态 NPC 目录测试条目".to_string(),
+                enabled: true,
+                sort_order: 30,
+            }],
+            wuhun: Vec::new(),
+            skills: Vec::new(),
+            effects: Vec::new(),
+            soul_beasts: Vec::new(),
+            soul_rings: Vec::new(),
+            transitions: Vec::new(),
+        };
+        LoadedContentPackage {
+            content_hash: content_hash(&package).expect("应计算 NPC 内容包哈希"),
             package,
             source_format: "json".to_string(),
         }
@@ -33612,6 +33875,7 @@ mod tests {
             minimum_runtime: String::new(),
             maps: Vec::new(),
             items: Vec::new(),
+            npcs: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33653,6 +33917,7 @@ mod tests {
             minimum_runtime: String::new(),
             maps: Vec::new(),
             items: Vec::new(),
+            npcs: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33697,6 +33962,7 @@ mod tests {
             minimum_runtime: String::new(),
             maps: Vec::new(),
             items: Vec::new(),
+            npcs: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33739,6 +34005,7 @@ mod tests {
             minimum_runtime: String::new(),
             maps: Vec::new(),
             items: Vec::new(),
+            npcs: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33781,6 +34048,7 @@ mod tests {
             minimum_runtime: String::new(),
             maps: Vec::new(),
             items: Vec::new(),
+            npcs: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33823,6 +34091,7 @@ mod tests {
             minimum_runtime: String::new(),
             maps: Vec::new(),
             items: Vec::new(),
+            npcs: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33957,6 +34226,7 @@ mod tests {
             minimum_runtime: String::new(),
             maps: Vec::new(),
             items: Vec::new(),
+            npcs: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "preview-skill".to_string(),
@@ -34026,6 +34296,7 @@ mod tests {
             minimum_runtime: String::new(),
             maps: Vec::new(),
             items: Vec::new(),
+            npcs: Vec::new(),
             wuhun: vec![WuhunPackageEntry {
                 name: "transition wuhun".to_string(),
                 category: "控制系".to_string(),
@@ -36693,11 +36964,11 @@ mod tests {
         connection
             .execute_batch(
                 r#"
-                DELETE FROM schema_migration WHERE version = 37;
+                DELETE FROM schema_migration WHERE version IN (37, 38);
                 CREATE TABLE content_revision_member_v36_test_backup AS
                 SELECT revision_id, member_kind, member_key, created_at
                   FROM content_revision_member
-                 WHERE member_kind <> 'item';
+                 WHERE member_kind NOT IN ('item', 'npc');
                 DROP TRIGGER content_revision_member_no_update;
                 DROP TRIGGER content_revision_member_no_delete;
                 DROP TRIGGER content_revision_member_no_reinsert;
@@ -36770,6 +37041,336 @@ mod tests {
         assert_eq!(
             inventory_for(&migrated, &identity(), "small-healing-potion"),
             2
+        );
+    }
+
+    #[test]
+    fn v38_npc_package_follows_active_revision_without_rewriting_player_npc_binding() {
+        let (directory, store) = test_store();
+        store
+            .register_player(&identity(), "NPC 内容角色", "男")
+            .expect("应创建 NPC 内容测试角色");
+        let baseline = store
+            .active_content_revision()
+            .expect("应读取 NPC 内容基线 revision");
+        let package = npc_content_package(
+            "test-npc-content",
+            "content-npc-v38",
+            "holy-soul-village",
+            "内容商人",
+            "merchant",
+        );
+
+        store
+            .stage_content_package(&package)
+            .expect("应暂存 NPC 内容包");
+        let report = store
+            .validate_content_draft("test-npc-content", 1)
+            .expect("应校验 NPC 内容包");
+        assert!(report.errors.is_empty(), "{report:?}");
+        store
+            .publish_content_draft("test-npc-content", 1)
+            .expect("应发布 NPC 内容包");
+
+        let npcs = store
+            .npcs_at_current_map(&identity())
+            .expect("active revision 应暴露新增 NPC");
+        assert!(
+            npcs.entries
+                .iter()
+                .any(|entry| entry.npc_key == "content-npc-v38")
+        );
+        let connection = store.open().expect("应打开 NPC 内容数据库");
+        assert!(
+            active_content_member_exists(&connection, "npc", "content-npc-v38")
+                .expect("应读取新增 NPC 成员")
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM shop_item WHERE npc_key = 'content-npc-v38'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("应读取新增 NPC 的商店关联"),
+            0
+        );
+        drop(connection);
+
+        let talked = store
+            .talk_to_npc_with_operation(
+                &identity(),
+                "内容商人",
+                &map_operation("对话", "npc-v38-talk"),
+            )
+            .expect("active revision 应允许与新增 NPC 对话");
+        assert_eq!(talked.npc_key, "content-npc-v38");
+        assert!(!talked.has_shop);
+
+        let connection = store.open().expect("应读取新增 NPC 对话绑定");
+        assert_eq!(
+            connection
+                .query_row("SELECT npc_key FROM player_npc", [], |row| row
+                    .get::<_, String>(0))
+                .expect("应保留新增 NPC 的玩家绑定"),
+            "content-npc-v38"
+        );
+        drop(connection);
+
+        store
+            .rollback_content_revision(baseline.id)
+            .expect("应回滚 NPC 内容 revision");
+        let rolled_back = store
+            .npcs_at_current_map(&identity())
+            .expect("回滚后 NPC 列表仍应可读");
+        assert!(
+            !rolled_back
+                .entries
+                .iter()
+                .any(|entry| entry.npc_key == "content-npc-v38")
+        );
+        let connection = store.open().expect("应读取回滚后的 NPC 绑定");
+        assert_eq!(
+            connection
+                .query_row("SELECT npc_key FROM player_npc", [], |row| row
+                    .get::<_, String>(0))
+                .expect("回滚不应删除玩家 NPC 绑定"),
+            "content-npc-v38"
+        );
+        drop(connection);
+
+        assert!(
+            store
+                .shop_items_page(&identity(), None, 1, 10)
+                .expect_err("失活 NPC 不得继续打开商店")
+                .contains("请先与当前地图的商人对话")
+        );
+        assert!(
+            store
+                .buy_item_with_operation(
+                    &identity(),
+                    "小回复药",
+                    1,
+                    &map_operation("购买", "npc-v38-buy-after-rollback"),
+                )
+                .expect_err("失活 NPC 不得继续购买")
+                .contains("请先与当前地图的商人对话")
+        );
+        assert!(
+            store
+                .sell_item_with_operation(
+                    &identity(),
+                    "小回复药",
+                    1,
+                    &map_operation("出售", "npc-v38-sell-after-rollback"),
+                )
+                .expect_err("失活 NPC 不得继续出售")
+                .contains("请先与当前地图的商人对话")
+        );
+
+        store
+            .talk_to_npc_with_operation(
+                &identity(),
+                "杂货商人",
+                &map_operation("对话", "npc-v38-retalk"),
+            )
+            .expect("玩家应能与当前 active NPC 重新对话");
+        assert_eq!(
+            store
+                .shop_items_page(&identity(), None, 1, 10)
+                .expect("重新对话后应恢复当前商店")
+                .total,
+            3
+        );
+
+        drop(store);
+        let restarted = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("NPC 回滚后的数据库应可重启");
+        assert_eq!(
+            restarted
+                .npcs_at_current_map(&identity())
+                .expect("重启后 NPC 列表应可读")
+                .entries
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn v38_npc_package_requires_active_or_same_package_map() {
+        let (_directory, store) = test_store();
+        let invalid = npc_content_package(
+            "test-npc-missing-map",
+            "content-npc-missing-map",
+            "missing-v38-map",
+            "失效地图 NPC",
+            "elder",
+        );
+        store
+            .stage_content_package(&invalid)
+            .expect("应暂存地图引用测试草稿");
+        let invalid_report = store
+            .validate_content_draft("test-npc-missing-map", 1)
+            .expect("应校验失效地图引用");
+        assert!(
+            invalid_report.errors.iter().any(|error| {
+                error.contains("不存在或不在当前 active revision 的地图")
+            })
+        );
+
+        let mut package = npc_content_package(
+            "test-npc-new-map",
+            "content-npc-new-map",
+            "content-npc-map-v38",
+            "新地图 NPC",
+            "elder",
+        );
+        package.package.maps.push(MapPackageEntry {
+            map_key: "content-npc-map-v38".to_string(),
+            name: "NPC 内容地图".to_string(),
+            description: "与 NPC 同包新增的地图".to_string(),
+            level_required: 1,
+            safe: true,
+            pvp_enabled: false,
+            teleport_enabled: true,
+            sort_order: 10_000,
+        });
+        package.content_hash = content_hash(&package.package).expect("应更新组合内容包哈希");
+        store
+            .stage_content_package(&package)
+            .expect("同包地图与 NPC 应可暂存");
+        let report = store
+            .validate_content_draft("test-npc-new-map", 1)
+            .expect("应校验同包地图与 NPC");
+        assert!(report.errors.is_empty(), "{report:?}");
+        store
+            .publish_content_draft("test-npc-new-map", 1)
+            .expect("同包地图与 NPC 应可发布");
+        let connection = store.open().expect("应打开同包地图 NPC 数据库");
+        assert!(
+            active_content_member_exists(&connection, "map", "content-npc-map-v38")
+                .expect("应读取同包地图成员")
+        );
+        assert!(
+            active_content_member_exists(&connection, "npc", "content-npc-new-map")
+                .expect("应读取同包 NPC 成员")
+        );
+    }
+
+    #[test]
+    fn v38_migration_registers_existing_npcs_for_every_historical_revision() {
+        let (directory, store) = test_store();
+        store
+            .register_player(&identity(), "v38迁移角色", "男")
+            .expect("应创建 v38 迁移测试角色");
+        store
+            .talk_to_npc_with_operation(
+                &identity(),
+                "杂货商人",
+                &map_operation("对话", "npc-v38-migration-talk"),
+            )
+            .expect("应创建既有 NPC 玩家绑定");
+        let connection = store.open().expect("应打开 v38 迁移数据库");
+        let revision_ids = connection
+            .prepare("SELECT id FROM content_revision ORDER BY id")
+            .expect("应准备历史 revision 查询")
+            .query_map([], |row| row.get::<_, i64>(0))
+            .expect("应读取历史 revision")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("应解析历史 revision");
+        let npc_keys = connection
+            .prepare("SELECT npc_key FROM npc ORDER BY npc_key")
+            .expect("应准备既有 NPC 查询")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("应读取既有 NPC")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("应解析既有 NPC");
+        assert!(!revision_ids.is_empty(), "应存在历史 revision");
+        assert!(!npc_keys.is_empty(), "应存在既有 NPC 目录");
+
+        connection
+            .execute_batch(
+                r#"
+                DELETE FROM schema_migration WHERE version = 38;
+                CREATE TABLE content_revision_member_v37_test_backup AS
+                SELECT revision_id, member_kind, member_key, created_at
+                  FROM content_revision_member
+                 WHERE member_kind <> 'npc';
+                DROP TRIGGER content_revision_member_no_update;
+                DROP TRIGGER content_revision_member_no_delete;
+                DROP TRIGGER content_revision_member_no_reinsert;
+                DROP INDEX content_revision_member_lookup;
+                DROP TABLE content_revision_member;
+                CREATE TABLE content_revision_member (
+                    revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
+                    member_kind TEXT NOT NULL CHECK(
+                        member_kind IN ('wuhun', 'skill', 'starter-skill', 'effect', 'beast', 'ring', 'map', 'item')
+                    ),
+                    member_key TEXT NOT NULL CHECK(
+                        length(member_key) BETWEEN 1 AND 200
+                        AND member_key = trim(member_key)
+                        AND instr(member_key, char(0)) = 0
+                    ),
+                    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+                    PRIMARY KEY(revision_id, member_kind, member_key)
+                ) STRICT, WITHOUT ROWID;
+                INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+                SELECT revision_id, member_kind, member_key, created_at
+                  FROM content_revision_member_v37_test_backup;
+                DROP TABLE content_revision_member_v37_test_backup;
+                CREATE INDEX content_revision_member_lookup
+                    ON content_revision_member(member_kind, member_key, revision_id);
+                CREATE TRIGGER content_revision_member_no_update
+                BEFORE UPDATE ON content_revision_member
+                BEGIN
+                    SELECT RAISE(ABORT, 'content revision member is immutable');
+                END;
+                CREATE TRIGGER content_revision_member_no_delete
+                BEFORE DELETE ON content_revision_member
+                BEGIN
+                    SELECT RAISE(ABORT, 'content revision member is immutable');
+                END;
+                CREATE TRIGGER content_revision_member_no_reinsert
+                BEFORE INSERT ON content_revision_member
+                WHEN EXISTS(
+                    SELECT 1 FROM content_revision_member
+                     WHERE revision_id = NEW.revision_id
+                       AND member_kind = NEW.member_kind
+                       AND member_key = NEW.member_key
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'content revision member is append-only');
+                END;
+                "#,
+            )
+            .expect("应构造 v37 内容成员表");
+        drop(connection);
+        drop(store);
+
+        let migrated = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v37 数据库应成功升级到 v38");
+        let connection = migrated.open().expect("应打开升级后的 v38 数据库");
+        for revision_id in revision_ids {
+            let actual_npc_keys = connection
+                .prepare(
+                    "SELECT member_key FROM content_revision_member WHERE revision_id = ?1 AND member_kind = 'npc' ORDER BY member_key",
+                )
+                .expect("应准备 v38 NPC 成员查询")
+                .query_map([revision_id], |row| row.get::<_, String>(0))
+                .expect("应读取 v38 NPC 成员")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("应解析 v38 NPC 成员");
+            assert_eq!(
+                actual_npc_keys, npc_keys,
+                "revision {revision_id} 的 NPC 成员不完整"
+            );
+        }
+        assert_eq!(
+            connection
+                .query_row("SELECT npc_key FROM player_npc", [], |row| row
+                    .get::<_, String>(0))
+                .expect("玩家 NPC 绑定应保留"),
+            "holy-soul-village-grocer"
         );
     }
 
@@ -36968,17 +37569,22 @@ mod tests {
         store
             .publish_content_draft("v8-additional-item", 1)
             .expect("应发布新增物品内容包");
+        store
+            .stage_content_package(&npc_content_package(
+                "v8-additional-npc",
+                "holy-soul-village-apothecary",
+                "holy-soul-village",
+                "药师",
+                "merchant",
+            ))
+            .expect("应暂存新增 NPC 内容包");
+        store
+            .validate_content_draft("v8-additional-npc", 1)
+            .expect("应校验新增 NPC 内容包");
+        store
+            .publish_content_draft("v8-additional-npc", 1)
+            .expect("应发布新增 NPC 内容包");
         let connection = store.open().expect("应打开经济数据库");
-        connection
-            .execute(
-                r#"INSERT INTO npc(
-                    npc_key, map_key, name, npc_kind, dialogue, description,
-                    enabled, sort_order, created_at, updated_at
-                ) VALUES('holy-soul-village-apothecary', 'holy-soul-village', '药师',
-                         'merchant', '需要药剂吗？', '新增测试商人', 1, 30, 0, 0)"#,
-                [],
-            )
-            .expect("应允许新增 NPC");
         connection
             .execute(
                 "INSERT INTO shop_item(npc_key, item_key, buy_price, stock, enabled, created_at, updated_at) VALUES('holy-soul-village-apothecary', 'custom-healing', 100, -1, 1, 0, 0)",
@@ -41008,6 +41614,7 @@ mod tests {
             minimum_runtime: String::new(),
             maps: Vec::new(),
             items: Vec::new(),
+            npcs: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -42016,6 +42623,7 @@ mod tests {
             minimum_runtime: String::new(),
             maps: Vec::new(),
             items: Vec::new(),
+            npcs: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "test-starter".to_string(),
@@ -43032,6 +43640,7 @@ mod tests {
             minimum_runtime: String::new(),
             maps: Vec::new(),
             items: Vec::new(),
+            npcs: Vec::new(),
             wuhun: vec![WuhunPackageEntry {
                 name: "test catalog wuhun".to_string(),
                 category: "控制系".to_string(),
@@ -45675,6 +46284,47 @@ mod tests {
                 created_at, updated_at
             ) VALUES('untracked-v37-item', '未登记物品', 'consumable', 1, 1, 1,
                      1, 0, 1, 'restore_hp', 1, 0, 1, 1, 1, 'v37 损坏探针', 0, 0);
+            "#,
+        );
+    }
+
+    fn assert_v38_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v38 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v38 迁移应成功");
+        let connection = store.open().expect("应打开 v38 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v38 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v38 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v38")
+                || error.contains("v23")
+                || error.contains("content_revision_member")
+                || error.contains("NPC")
+                || error.contains("npc"),
+            "v38 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    #[test]
+    fn recorded_v38_npc_membership_damage_fails_closed() {
+        for mutation in [
+            "DROP INDEX content_revision_member_lookup;",
+            "DROP TRIGGER content_revision_member_no_reinsert;",
+        ] {
+            assert_v38_damage_fails_closed(mutation);
+        }
+        assert_v38_damage_fails_closed(
+            r#"
+            INSERT INTO npc(
+                npc_key, map_key, name, npc_kind, dialogue, description,
+                enabled, sort_order, created_at, updated_at
+            ) VALUES('untracked-v38-npc', 'holy-soul-village', '未登记 NPC', 'elder',
+                     'v38 损坏探针', 'v38 损坏探针', 1, 99_999, 0, 0);
             "#,
         );
     }

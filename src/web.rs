@@ -1467,6 +1467,7 @@ mod tests {
             minimum_runtime: String::new(),
             maps: Vec::new(),
             items: Vec::new(),
+            npcs: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -1723,6 +1724,7 @@ mod tests {
             minimum_runtime: String::new(),
             maps: Vec::new(),
             items: Vec::new(),
+            npcs: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {

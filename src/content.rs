@@ -106,6 +106,8 @@ pub struct ContentPackage {
     pub maps: Vec<MapPackageEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<ItemPackageEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub npcs: Vec<NpcPackageEntry>,
     #[serde(default)]
     pub wuhun: Vec<WuhunPackageEntry>,
     #[serde(default)]
@@ -166,6 +168,20 @@ pub struct ItemPackageEntry {
     pub sellable: bool,
     pub usable: bool,
     pub description: String,
+}
+
+/// 内容包中的静态 NPC 目录行；不承载商店库存或玩家对话绑定。
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NpcPackageEntry {
+    pub npc_key: String,
+    pub map_key: String,
+    pub name: String,
+    pub npc_kind: String,
+    pub dialogue: String,
+    pub description: String,
+    pub enabled: bool,
+    pub sort_order: i64,
 }
 
 /// 内容包中的武魂及其属性模板。
@@ -447,6 +463,7 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
     );
     let total = package.maps.len()
         + package.items.len()
+        + package.npcs.len()
         + package.wuhun.len()
         + package.skills.len()
         + package.effects.len()
@@ -596,6 +613,40 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
             2000,
             false,
         );
+    }
+
+    keys.clear();
+    let mut npc_names = BTreeSet::new();
+    for entry in &package.npcs {
+        if !keys.insert(format!("npc:{}", entry.npc_key)) {
+            errors.push(format!("NPC 键重复：{}", entry.npc_key));
+        }
+        if !npc_names.insert((entry.map_key.as_str(), entry.name.as_str())) {
+            errors.push(format!(
+                "地图 {} 的 NPC 名称重复：{}",
+                entry.map_key, entry.name
+            ));
+        }
+        validate_key(&mut errors, "npc.npc_key", &entry.npc_key);
+        validate_key(&mut errors, "npc.map_key", &entry.map_key);
+        text_field(&mut errors, "npc.name", &entry.name, 128, true);
+        if !matches!(entry.npc_kind.as_str(), "elder" | "merchant") {
+            errors.push(format!("NPC {} 的 npc_kind 不受支持", entry.npc_key));
+        }
+        text_field(&mut errors, "npc.dialogue", &entry.dialogue, 2000, false);
+        text_field(
+            &mut errors,
+            "npc.description",
+            &entry.description,
+            2000,
+            false,
+        );
+        if !entry.enabled {
+            errors.push(format!("当前发布切片不允许禁用新 NPC：{}", entry.npc_key));
+        }
+        if entry.sort_order < 0 {
+            errors.push(format!("NPC {} 的 sort_order 不能为负数", entry.npc_key));
+        }
     }
 
     keys.clear();
@@ -1227,6 +1278,7 @@ mod tests {
             minimum_runtime: String::new(),
             maps: Vec::new(),
             items: Vec::new(),
+            npcs: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "test-skill".to_string(),
@@ -1299,6 +1351,7 @@ mod tests {
         let legacy = canonical_json(&package).expect("旧内容包应可规范化");
         assert!(!legacy.contains("\"maps\""));
         assert!(!legacy.contains("\"items\""));
+        assert!(!legacy.contains("\"npcs\""));
 
         package.maps = vec![MapPackageEntry {
             map_key: "content-map".to_string(),
@@ -1379,6 +1432,61 @@ mod tests {
             errors
                 .iter()
                 .any(|error| error.contains("item.quality(content-potion)"))
+        );
+    }
+
+    #[test]
+    fn npcs_preserve_legacy_hash_and_enforce_static_shape() {
+        let mut package = minimal_package();
+        let legacy = canonical_json(&package).expect("旧内容包应可规范化");
+        assert!(!legacy.contains("\"npcs\""));
+
+        package.npcs = vec![NpcPackageEntry {
+            npc_key: "content-merchant".to_string(),
+            map_key: "content-map".to_string(),
+            name: "内容商人".to_string(),
+            npc_kind: "merchant".to_string(),
+            dialogue: "这里仅校验静态 NPC 目录。".to_string(),
+            description: "不承载商店商品或玩家对话绑定。".to_string(),
+            enabled: true,
+            sort_order: 10,
+        }];
+        assert!(validate_shape(&package).is_empty());
+
+        package.npcs.push(NpcPackageEntry {
+            npc_key: "content-merchant".to_string(),
+            map_key: "content-map".to_string(),
+            name: "内容商人".to_string(),
+            npc_kind: "elder".to_string(),
+            dialogue: String::new(),
+            description: String::new(),
+            enabled: true,
+            sort_order: 20,
+        });
+        let errors = validate_shape(&package);
+        assert!(errors.iter().any(|error| error.contains("NPC 键重复")));
+        assert!(errors.iter().any(|error| error.contains("NPC 名称重复")));
+
+        package.npcs[0].enabled = false;
+        package.npcs[1].npc_key = "content-elder".to_string();
+        package.npcs[1].name = "另一位内容 NPC".to_string();
+        package.npcs[1].npc_kind = "unknown".to_string();
+        package.npcs[1].sort_order = -1;
+        let errors = validate_shape(&package);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("不允许禁用新 NPC"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("npc_kind 不受支持"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("sort_order 不能为负数"))
         );
     }
 
