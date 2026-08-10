@@ -19,10 +19,10 @@ use crate::store::{
     BattleSkillEffectRecord, BattleSnapshot, DailyCheckinInput, DailyCheckinResult, GOLD_SOUL_COIN,
     IdentityKey, LegacyClaimActor, LegacyClaimResult, LegacyIdentityState, MAX_SKILL_LEVEL,
     MAX_SKILL_PROFICIENCY, MapExit, MapRecord, MapTravelReceipt, OperationLogInput, PlayerStatus,
-    QuestActionReceipt, QuestListEntry, REVIVE_WINDOW_SECONDS, SkillDamageModifierRecord,
-    SkillEffectRecord, SkillLoadoutReceipt, SkillPage, SoulBeastPage, SoulRingAbsorbReceipt,
-    SoulRingDetachmentReceipt, SoulRingPage, Store, WuhunToggleReceipt, experience_progress,
-    skill_damage_percent, skill_proficiency_threshold,
+    QuestActionReceipt, QuestListEntry, REVIVE_WINDOW_SECONDS, RevivalAbandonReceipt,
+    SkillDamageModifierRecord, SkillEffectRecord, SkillLoadoutReceipt, SkillPage, SoulBeastPage,
+    SoulRingAbsorbReceipt, SoulRingDetachmentReceipt, SoulRingPage, Store, WuhunToggleReceipt,
+    experience_progress, skill_damage_percent, skill_proficiency_threshold,
 };
 
 const MENU_PAGES: &[MenuPage] = &[
@@ -53,6 +53,10 @@ const MENU_PAGES: &[MenuPage] = &[
             MenuEntry {
                 command: "状态",
                 description: "查看角色属性、武魂和位置",
+            },
+            MenuEntry {
+                command: "放弃复活",
+                description: "复活窗口结束后放弃当前生命并进入下一世",
             },
             MenuEntry {
                 command: "技能",
@@ -1914,6 +1918,71 @@ impl GameService {
         Ok(document.command("背包").command("状态"))
     }
 
+    pub fn abandon_revival(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        if !req.args.as_str().trim().is_empty() {
+            return Err("用法：放弃复活".to_string());
+        }
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self
+            .store
+            .abandon_revival_with_operation(&key, &operation)?;
+        Ok(self.abandon_revival_document(receipt))
+    }
+
+    fn abandon_revival_document(&self, receipt: RevivalAbandonReceipt) -> GameDocument {
+        let mut document = GameDocument::new(if receipt.sealed {
+            "角色已封存"
+        } else if receipt.replayed {
+            "重生结算回执"
+        } else {
+            "重生完成"
+        })
+        .field("原世数", receipt.life_before.to_string())
+        .field("当前世数", receipt.life_after.to_string())
+        .field(
+            "状态",
+            if receipt.sealed {
+                "已封存"
+            } else {
+                "存活"
+            },
+        )
+        .field(
+            "生命",
+            format!("{}/{}", receipt.hp_after, receipt.max_hp_after),
+        )
+        .field(
+            "魂力",
+            format!(
+                "{}/{}",
+                receipt.soul_power_after, receipt.max_soul_power_after
+            ),
+        )
+        .field("重置等级", receipt.level_after.to_string())
+        .field(
+            "清空背包数量",
+            receipt.inventory_quantity_cleared.to_string(),
+        )
+        .field("位置", receipt.map_name_after);
+        if receipt.replayed {
+            document = document.notice("检测到相同消息的重复请求，已返回原结算后的角色状态");
+        } else if receipt.sealed {
+            document =
+                document.notice("三世已经耗尽，角色已永久封存；魂环、魂技和绑定历史保留为历史记录");
+        } else {
+            document =
+                document.notice("属性与背包已重置；魂环、魂技和绑定历史未切换、未迁移、未删除");
+        }
+        if receipt.sealed {
+            document.command("状态")
+        } else {
+            document.command("状态").command("开武魂")
+        }
+    }
+
     pub fn status(&self, req: &CommandRequest) -> Result<GameDocument, String> {
         let identity = resolve_identity(req, &self.config.identity)?;
         let key = self.identity_key(&identity, &identity.subject_id);
@@ -2308,6 +2377,12 @@ impl GameService {
             },
             None => "不可用".to_string(),
         };
+        let state_label = match player.state.as_str() {
+            "dead" => "死亡",
+            "deleted" => "已封存",
+            "alive" => "存活",
+            _ => player.state.as_str(),
+        };
         let mut document = GameDocument::new("角色状态")
             .field("角色", player.name)
             .field("性别", player.gender)
@@ -2322,7 +2397,7 @@ impl GameService {
             .field("武魂", wuhun)
             .field("位置", player.map_name)
             .field("转生", format!("第 {} 世", player.life_count))
-            .field("状态", player.state);
+            .field("状态", state_label);
         if let Some(seconds) = player.revive_window_seconds_remaining {
             document = document.field("复活窗口", format!("剩余 {} 秒", seconds));
         }
@@ -2333,6 +2408,13 @@ impl GameService {
             {
                 document = document.field("武魂稳定度", format!("{stability}/{max_stability}"));
             }
+        }
+        if player.state == "dead" {
+            document = if player.revive_window_seconds_remaining == Some(0) {
+                document.command("放弃复活")
+            } else {
+                document.command("使用 <复活物品>")
+            };
         }
         document.illustration_if(illustration)
     }

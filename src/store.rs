@@ -5634,6 +5634,37 @@ pub struct PlayerStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevivalAbandonReceipt {
+    pub life_before: i64,
+    pub life_after: i64,
+    pub state_before: String,
+    pub state_after: String,
+    pub level_after: i64,
+    pub exp_after: i64,
+    pub hp_after: i64,
+    pub max_hp_after: i64,
+    pub soul_power_after: i64,
+    pub max_soul_power_after: i64,
+    pub inventory_quantity_cleared: i64,
+    pub map_name_after: String,
+    pub sealed: bool,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RevivalSettlementPlayerStatus {
+    life_count: i64,
+    state: String,
+    level: i64,
+    exp: i64,
+    hp: i64,
+    max_hp: i64,
+    soul_power: i64,
+    max_soul_power: i64,
+    map_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MapRecord {
     pub map_key: String,
     pub name: String,
@@ -6381,6 +6412,16 @@ pub const MAX_SKILL_LEVEL: i64 = 10;
 pub const MAX_SKILL_PROFICIENCY: i64 = 4_500;
 /// 角色死亡后允许使用复活物品的固定窗口，窗口起点复用 player.updated_at。
 pub const REVIVE_WINDOW_SECONDS: i64 = 300;
+const MAX_LIFE_COUNT: i64 = 3;
+const INITIAL_PLAYER_LEVEL: i64 = 1;
+const INITIAL_PLAYER_MAX_HP: i64 = 100;
+const INITIAL_PLAYER_SOUL_POWER: i64 = 50;
+const INITIAL_PLAYER_STRENGTH: i64 = 10;
+const INITIAL_PLAYER_AGILITY: i64 = 10;
+const INITIAL_PLAYER_SPIRIT: i64 = 10;
+const INITIAL_PLAYER_ENDURANCE: i64 = 10;
+const INITIAL_PLAYER_PERCEPTION: i64 = 10;
+const INITIAL_PLAYER_LUCK: i64 = 10;
 pub const BASE_SKILL_DAMAGE_PERCENT: i64 = 100;
 pub const SKILL_DAMAGE_PERCENT_PER_LEVEL: i64 = 5;
 const SKILL_DAMAGE_RULE_LEVEL_V1: &str = "level-v1";
@@ -9317,6 +9358,220 @@ impl Store {
             None
         };
         Ok(Some(status))
+    }
+
+    /// 在复活窗口结束后结算当前生命；三世用尽时只封存角色，不删除魂环历史。
+    pub fn abandon_revival_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<RevivalAbandonReceipt, String> {
+        validate_identity_key(key)?;
+        validate_revival_abandon_operation(operation)?;
+        let mut connection = self.open()?;
+        let transaction = self.begin_immediate(&mut connection, "开始放弃复活事务失败")?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let (player_id, life_before, state_before, updated_at) = transaction
+            .query_row(
+                r#"
+                SELECT p.id, p.life_count, p.state, p.updated_at
+                  FROM identity i
+                  JOIN player p ON p.identity_id = i.id
+                 WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+                   AND i.subject_kind = ?4 AND i.subject_id = ?5
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind,
+                    key.subject_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("读取复活结算角色失败：{error}"))?
+            .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())?;
+        ensure_no_active_battle_for_player(&transaction, player_id)?;
+
+        if !operation.source_message_id.is_empty() {
+            let previous_command = transaction
+                .query_row(
+                    r#"
+                    SELECT command
+                      FROM operation_log
+                     WHERE protocol = ?1 AND account_id = ?2 AND namespace = ?3
+                       AND subject_kind = ?4 AND subject_id = ?5
+                       AND source_message_id = ?6 AND outcome = 'ok'
+                     ORDER BY id DESC LIMIT 1
+                    "#,
+                    params![
+                        key.protocol.as_str(),
+                        key.account_id,
+                        key.namespace,
+                        key.subject_kind,
+                        key.subject_id,
+                        operation.source_message_id
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| format!("检查放弃复活幂等键失败：{error}"))?;
+            if let Some(previous_command) = previous_command {
+                if previous_command != operation.command {
+                    return Err("该消息 ID 已用于不同的角色操作，拒绝重放".to_string());
+                }
+                let status = load_player_status_for_revival_settlement(&transaction, player_id)?;
+                transaction
+                    .commit()
+                    .map_err(|error| format!("提交放弃复活重放事务失败：{error}"))?;
+                let sealed = status.state == "deleted";
+                return Ok(RevivalAbandonReceipt {
+                    life_before: status.life_count,
+                    life_after: status.life_count,
+                    state_before: status.state.clone(),
+                    state_after: status.state.clone(),
+                    level_after: status.level,
+                    exp_after: status.exp,
+                    hp_after: status.hp,
+                    max_hp_after: status.max_hp,
+                    soul_power_after: status.soul_power,
+                    max_soul_power_after: status.max_soul_power,
+                    inventory_quantity_cleared: 0,
+                    map_name_after: status.map_name,
+                    sealed,
+                    replayed: true,
+                });
+            }
+        }
+
+        if state_before == "deleted" {
+            return Err("角色已封存，不能再次放弃复活".to_string());
+        }
+        if state_before != "dead" {
+            return Err("当前角色不在死亡状态，不能放弃复活".to_string());
+        }
+        let timestamp = now_timestamp()?;
+        if revive_window_seconds_remaining(updated_at, timestamp)? > 0 {
+            return Err("复活窗口尚未结束，请等待窗口结束或使用复活物品".to_string());
+        }
+        if !(1..=MAX_LIFE_COUNT).contains(&life_before) {
+            return Err("角色转生次数已损坏，拒绝结算".to_string());
+        }
+
+        let inventory_quantity_cleared = transaction
+            .query_row(
+                "SELECT COALESCE(SUM(quantity), 0) FROM inventory WHERE player_id = ?1",
+                [player_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("统计重生前背包失败：{error}"))?;
+        let sealed = life_before == MAX_LIFE_COUNT;
+        let life_after = if sealed {
+            life_before
+        } else {
+            life_before
+                .checked_add(1)
+                .ok_or_else(|| "下一世次数计算溢出".to_string())?
+        };
+        let state_after = if sealed { "deleted" } else { "alive" };
+        let hp_after = if sealed { 0 } else { INITIAL_PLAYER_MAX_HP };
+        let updated = transaction
+            .execute(
+                r#"
+                UPDATE player
+                   SET level = ?1,
+                       exp = 0,
+                       hp = ?2,
+                       max_hp = ?3,
+                       soul_power = ?4,
+                       max_soul_power = ?4,
+                       strength = ?5,
+                       agility = ?6,
+                       spirit = ?7,
+                       endurance = ?8,
+                       perception = ?9,
+                       luck = ?10,
+                       life_count = ?11,
+                       state = ?12,
+                       map_name = CASE WHEN ?12 = 'alive' THEN '圣魂村' ELSE map_name END,
+                       updated_at = ?13
+                 WHERE id = ?14 AND state = 'dead'
+                "#,
+                params![
+                    INITIAL_PLAYER_LEVEL,
+                    hp_after,
+                    INITIAL_PLAYER_MAX_HP,
+                    INITIAL_PLAYER_SOUL_POWER,
+                    INITIAL_PLAYER_STRENGTH,
+                    INITIAL_PLAYER_AGILITY,
+                    INITIAL_PLAYER_SPIRIT,
+                    INITIAL_PLAYER_ENDURANCE,
+                    INITIAL_PLAYER_PERCEPTION,
+                    INITIAL_PLAYER_LUCK,
+                    life_after,
+                    state_after,
+                    timestamp,
+                    player_id
+                ],
+            )
+            .map_err(|error| format!("保存三世结算角色状态失败：{error}"))?;
+        if updated != 1 {
+            return Err("三世结算时角色状态发生变化".to_string());
+        }
+        transaction
+            .execute("DELETE FROM inventory WHERE player_id = ?1", [player_id])
+            .map_err(|error| format!("清空重生背包失败：{error}"))?;
+        let map_name_after = if sealed {
+            transaction
+                .query_row(
+                    "SELECT map_name FROM player WHERE id = ?1",
+                    [player_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|error| format!("读取封存角色地图失败：{error}"))?
+        } else {
+            let map_updated = transaction
+                .execute(
+                    "UPDATE player_map SET map_key = 'holy-soul-village', updated_at = ?1 WHERE player_id = ?2",
+                    params![timestamp, player_id],
+                )
+                .map_err(|error| format!("重置重生角色地图失败：{error}"))?;
+            if map_updated != 1 {
+                return Err("重生角色缺少地图存档，拒绝完成结算".to_string());
+            }
+            transaction
+                .execute("DELETE FROM player_npc WHERE player_id = ?1", [player_id])
+                .map_err(|error| format!("清理重生角色 NPC 上下文失败：{error}"))?;
+            "圣魂村".to_string()
+        };
+        insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交放弃复活事务失败：{error}"))?;
+        Ok(RevivalAbandonReceipt {
+            life_before,
+            life_after,
+            state_before,
+            state_after: state_after.to_string(),
+            level_after: INITIAL_PLAYER_LEVEL,
+            exp_after: 0,
+            hp_after,
+            max_hp_after: INITIAL_PLAYER_MAX_HP,
+            soul_power_after: INITIAL_PLAYER_SOUL_POWER,
+            max_soul_power_after: INITIAL_PLAYER_SOUL_POWER,
+            inventory_quantity_cleared,
+            map_name_after,
+            sealed,
+            replayed: false,
+        })
     }
 
     pub fn current_map(&self, key: &IdentityKey<'_>) -> Result<Option<MapRecord>, String> {
@@ -28468,6 +28723,44 @@ fn validate_operation_input(operation: &OperationLogInput<'_>) -> Result<(), Str
     Ok(())
 }
 
+fn validate_revival_abandon_operation(operation: &OperationLogInput<'_>) -> Result<(), String> {
+    validate_operation_input(operation)?;
+    if operation.command != "放弃复活" || operation.outcome != "ok" {
+        return Err("放弃复活审计必须使用规范命令和 ok 结果".to_string());
+    }
+    Ok(())
+}
+
+fn load_player_status_for_revival_settlement(
+    connection: &Connection,
+    player_id: i64,
+) -> Result<RevivalSettlementPlayerStatus, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT life_count, state, level, exp, hp, max_hp,
+                   soul_power, max_soul_power, map_name
+              FROM player
+             WHERE id = ?1
+            "#,
+            [player_id],
+            |row| {
+                Ok(RevivalSettlementPlayerStatus {
+                    life_count: row.get(0)?,
+                    state: row.get(1)?,
+                    level: row.get(2)?,
+                    exp: row.get(3)?,
+                    hp: row.get(4)?,
+                    max_hp: row.get(5)?,
+                    soul_power: row.get(6)?,
+                    max_soul_power: row.get(7)?,
+                    map_name: row.get(8)?,
+                })
+            },
+        )
+        .map_err(|error| format!("读取重放后的角色状态失败：{error}"))
+}
+
 fn validate_context_fields(
     context_kind: &str,
     context_id: &str,
@@ -33840,6 +34133,135 @@ mod tests {
         assert_eq!(player.hp, 0);
         assert_eq!(player.wuhun_enabled, Some(false));
         assert_eq!(player.wuhun_stability, Some(0));
+    }
+
+    #[test]
+    fn p4_expired_revival_resets_each_life_preserves_ring_history_and_seals_after_third() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "三世测试角色", "男")
+            .expect("应创建三世测试角色");
+        store
+            .awaken_wuhun(&identity())
+            .expect("三世测试角色应完成武魂觉醒");
+        absorb_test_soul_ring(&store, &identity(), "p4-three-lives");
+        seed_inventory(&store, &identity(), "small-healing-potion", 2);
+        seed_inventory(&store, &identity(), "revival-grass", 1);
+        let player_id = player_id_for(&store, &identity());
+        let expired_at = now_timestamp().expect("应读取当前时间") - REVIVE_WINDOW_SECONDS - 1;
+        let connection = store.open().expect("应打开三世测试数据库");
+        connection
+            .execute(
+                "UPDATE player SET level = 17, exp = 1234, hp = 0, max_hp = 999, soul_power = 1, max_soul_power = 999, strength = 77, state = 'dead', updated_at = ?1 WHERE id = ?2",
+                params![expired_at, player_id],
+            )
+            .expect("应设置第一世过期死亡状态");
+        drop(connection);
+
+        let first = store
+            .abandon_revival_with_operation(
+                &identity(),
+                &transfer_operation("放弃复活", "p4-three-lives-1"),
+            )
+            .expect("第一世过期后应进入第二世");
+        assert_eq!(first.life_before, 1);
+        assert_eq!(first.life_after, 2);
+        assert_eq!(first.state_after, "alive");
+        assert!(!first.sealed);
+        assert_eq!(first.inventory_quantity_cleared, 3);
+        assert_eq!(
+            inventory_for(&store, &identity(), "small-healing-potion"),
+            0
+        );
+        assert_eq!(inventory_for(&store, &identity(), "revival-grass"), 0);
+        assert_eq!(
+            store.current_map(&identity()).unwrap().unwrap().map_key,
+            "holy-soul-village"
+        );
+        let reset = store.player_status(&identity()).unwrap().unwrap();
+        assert_eq!(reset.life_count, 2);
+        assert_eq!(reset.level, 1);
+        assert_eq!(reset.exp, 0);
+        assert_eq!(reset.hp, 100);
+        assert_eq!(reset.max_hp, 100);
+        assert_eq!(reset.soul_power, 50);
+        assert_eq!(reset.max_soul_power, 50);
+        assert_eq!(reset.state, "alive");
+        assert_eq!(
+            store
+                .open()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM player_soul_ring WHERE player_id = ?1",
+                    [player_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .open()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM player_skill WHERE player_id = ?1",
+                    [player_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let replay = store
+            .abandon_revival_with_operation(
+                &identity(),
+                &transfer_operation("放弃复活", "p4-three-lives-1"),
+            )
+            .expect("相同重生消息应返回幂等回执");
+        assert!(replay.replayed);
+        assert_eq!(replay.life_after, 2);
+
+        for (life, message_id) in [(2_i64, "p4-three-lives-2"), (3_i64, "p4-three-lives-3")] {
+            let connection = store.open().expect("应打开下一世过期测试数据库");
+            connection
+                .execute(
+                    "UPDATE player SET hp = 0, state = 'dead', updated_at = ?1 WHERE id = ?2 AND life_count = ?3",
+                    params![expired_at, player_id, life],
+                )
+                .expect("应设置下一世过期死亡状态");
+            drop(connection);
+            let receipt = store
+                .abandon_revival_with_operation(
+                    &identity(),
+                    &transfer_operation("放弃复活", message_id),
+                )
+                .expect("下一世过期后应完成结算");
+            if life == 3 {
+                assert!(receipt.sealed);
+                assert_eq!(receipt.state_after, "deleted");
+                assert_eq!(receipt.life_after, 3);
+            } else {
+                assert!(!receipt.sealed);
+                assert_eq!(receipt.state_after, "alive");
+                assert_eq!(receipt.life_after, 3);
+            }
+        }
+        let sealed = store.player_status(&identity()).unwrap().unwrap();
+        assert_eq!(sealed.life_count, 3);
+        assert_eq!(sealed.state, "deleted");
+        assert_eq!(sealed.hp, 0);
+        assert_eq!(
+            inventory_for(&store, &identity(), "small-healing-potion"),
+            0
+        );
+        assert_eq!(inventory_for(&store, &identity(), "revival-grass"), 0);
+        let sealed_replay = store
+            .abandon_revival_with_operation(
+                &identity(),
+                &transfer_operation("放弃复活", "p4-three-lives-3"),
+            )
+            .expect("封存结算消息重放应返回原状态");
+        assert!(sealed_replay.replayed);
+        assert!(sealed_replay.sealed);
     }
 
     #[test]

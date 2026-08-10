@@ -370,6 +370,9 @@ fn dispatch_player_alias_command(request: &CommandRequest) -> CommandResponse {
         "武魂觉醒" => with_service(request, false, true, |service| service.awaken(request)),
         "开武魂" => with_service(request, false, true, |service| service.open_wuhun(request)),
         "关武魂" => with_service(request, false, true, |service| service.close_wuhun(request)),
+        "放弃复活" => with_service(request, false, true, |service| {
+            service.abandon_revival(request)
+        }),
         "技能" => with_service(request, true, true, |service| service.skills(request)),
         "技能详情" => {
             with_service(request, true, true, |service| service.skill_detail(request))
@@ -542,6 +545,17 @@ mod plugin {
     )]
     fn close_wuhun(req: &CommandRequest) -> CommandResponse {
         with_service(req, false, true, |service| service.close_wuhun(req))
+    }
+
+    #[command(
+        name = "放弃复活",
+        description = "复活窗口结束后放弃当前生命并进入下一世",
+        aliases = "放弃重生,重生",
+        category = "斗罗大陆·角色",
+        scope = "all"
+    )]
+    fn abandon_revival(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.abandon_revival(req))
     }
 
     #[command(
