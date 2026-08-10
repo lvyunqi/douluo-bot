@@ -6193,6 +6193,73 @@ SELECT revision.id, 'map', map.map_key, 0
         WHERE member.revision_id = revision.id
           AND member.member_kind = 'map'
           AND member.member_key = map.map_key
+ );
+"#;
+
+// v37 将静态物品目录纳入内容成员账本，并为既有 revision 补登记已有物品。
+const MIGRATION_V37: &str = r#"
+CREATE TABLE content_revision_member_v37_backup AS
+SELECT revision_id, member_kind, member_key, created_at
+  FROM content_revision_member;
+
+DROP TRIGGER content_revision_member_no_update;
+DROP TRIGGER content_revision_member_no_delete;
+DROP TRIGGER content_revision_member_no_reinsert;
+DROP INDEX content_revision_member_lookup;
+DROP TABLE content_revision_member;
+
+CREATE TABLE content_revision_member (
+    revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
+    member_kind TEXT NOT NULL CHECK(
+        member_kind IN ('wuhun', 'skill', 'starter-skill', 'effect', 'beast', 'ring', 'map', 'item')
+    ),
+    member_key TEXT NOT NULL CHECK(
+        length(member_key) BETWEEN 1 AND 200
+        AND member_key = trim(member_key)
+        AND instr(member_key, char(0)) = 0
+    ),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    PRIMARY KEY(revision_id, member_kind, member_key)
+) STRICT, WITHOUT ROWID;
+
+INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+SELECT revision_id, member_kind, member_key, created_at
+  FROM content_revision_member_v37_backup;
+DROP TABLE content_revision_member_v37_backup;
+
+CREATE INDEX content_revision_member_lookup
+    ON content_revision_member(member_kind, member_key, revision_id);
+
+CREATE TRIGGER content_revision_member_no_update
+BEFORE UPDATE ON content_revision_member
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is immutable');
+END;
+CREATE TRIGGER content_revision_member_no_delete
+BEFORE DELETE ON content_revision_member
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is immutable');
+END;
+CREATE TRIGGER content_revision_member_no_reinsert
+BEFORE INSERT ON content_revision_member
+WHEN EXISTS(
+    SELECT 1 FROM content_revision_member
+     WHERE revision_id = NEW.revision_id
+       AND member_kind = NEW.member_kind
+       AND member_key = NEW.member_key
+)
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is append-only');
+END;
+
+INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+SELECT revision.id, 'item', item.item_key, item.created_at
+  FROM content_revision revision CROSS JOIN item
+ WHERE NOT EXISTS(
+       SELECT 1 FROM content_revision_member member
+        WHERE member.revision_id = revision.id
+          AND member.member_kind = 'item'
+          AND member.member_key = item.item_key
    );
 "#;
 
@@ -6226,6 +6293,7 @@ pub struct ContentValidationReport {
     pub package_revision: i64,
     pub content_hash: String,
     pub errors: Vec<String>,
+    pub item_count: usize,
     pub wuhun_count: usize,
     pub skill_count: usize,
     pub effect_count: usize,
@@ -7931,6 +7999,9 @@ fn content_package_declared_member_set(package: &ContentPackage) -> BTreeSet<(St
     for entry in &package.maps {
         members.insert(("map".to_string(), entry.map_key.clone()));
     }
+    for entry in &package.items {
+        members.insert(("item".to_string(), entry.item_key.clone()));
+    }
     for entry in &package.wuhun {
         members.insert(("wuhun".to_string(), entry.name.clone()));
     }
@@ -8010,6 +8081,7 @@ fn content_validation_report(
         package_revision: package.revision,
         content_hash,
         errors,
+        item_count: package.items.len(),
         wuhun_count: package.wuhun.len(),
         skill_count: package.skills.len(),
         effect_count: package.effects.len(),
@@ -8047,6 +8119,11 @@ fn validate_content_package_against_database(
         .iter()
         .map(|entry| entry.beast_key.as_str())
         .collect::<std::collections::BTreeSet<_>>();
+    let package_item_keys = package
+        .items
+        .iter()
+        .map(|entry| entry.item_key.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
 
     let mut names = std::collections::BTreeSet::new();
     let mut map_sort_orders = std::collections::BTreeSet::new();
@@ -8064,6 +8141,20 @@ fn validate_content_package_against_database(
             errors.push(format!(
                 "地图键、名称或排序已存在：{} / {} / {}",
                 entry.map_key, entry.name, entry.sort_order
+            ));
+        }
+    }
+    names.clear();
+    for entry in &package.items {
+        if !names.insert(entry.name.as_str()) {
+            errors.push(format!("内容包内物品名称重复：{}", entry.name));
+        }
+        if catalog_value_exists(connection, "item", "item_key", &entry.item_key)?
+            || catalog_value_exists(connection, "item", "name", &entry.name)?
+        {
+            errors.push(format!(
+                "物品键或名称已存在：{} / {}",
+                entry.item_key, entry.name
             ));
         }
     }
@@ -8139,7 +8230,9 @@ fn validate_content_package_against_database(
                 entry.beast_key, entry.map_key
             ));
         }
-        if !catalog_value_exists(connection, "item", "item_key", &entry.drop_item_key)? {
+        if !package_item_keys.contains(entry.drop_item_key.as_str())
+            && !catalog_value_exists(connection, "item", "item_key", &entry.drop_item_key)?
+        {
             errors.push(format!(
                 "魂兽 {} 引用了不存在的掉落物品 {}",
                 entry.beast_key, entry.drop_item_key
@@ -8265,6 +8358,7 @@ fn catalog_value_exists(
         ("map", "map_key") => "SELECT EXISTS(SELECT 1 FROM map WHERE map_key = ?1)",
         ("map", "name") => "SELECT EXISTS(SELECT 1 FROM map WHERE name = ?1)",
         ("item", "item_key") => "SELECT EXISTS(SELECT 1 FROM item WHERE item_key = ?1)",
+        ("item", "name") => "SELECT EXISTS(SELECT 1 FROM item WHERE name = ?1)",
         _ => return Err(format!("未知内容目录查询：{table}.{column}")),
     };
     connection
@@ -8380,6 +8474,46 @@ fn publish_content_package_rows(
             )
             .map_err(|error| format!("发布地图 {} 失败：{error}", entry.map_key))?;
         ensure_content_revision_member(connection, revision_id, "map", &entry.map_key, created_at)?;
+    }
+    for entry in &package.items {
+        connection
+            .execute(
+                r#"
+                INSERT INTO item(
+                    item_key, name, category, quality, stackable, max_stack,
+                    buy_price, sell_price, level_required, effect_kind, effect_amount,
+                    revive_hp_percent, purchasable, sellable, usable, description,
+                    created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)
+                "#,
+                params![
+                    entry.item_key,
+                    entry.name,
+                    entry.category,
+                    entry.quality,
+                    entry.stackable,
+                    entry.max_stack,
+                    entry.buy_price,
+                    entry.sell_price,
+                    entry.level_required,
+                    entry.effect_kind,
+                    entry.effect_amount,
+                    entry.revive_hp_percent,
+                    entry.purchasable,
+                    entry.sellable,
+                    entry.usable,
+                    entry.description,
+                    created_at
+                ],
+            )
+            .map_err(|error| format!("发布物品 {} 失败：{error}", entry.item_key))?;
+        ensure_content_revision_member(
+            connection,
+            revision_id,
+            "item",
+            &entry.item_key,
+            created_at,
+        )?;
     }
     for entry in &package.wuhun {
         connection
@@ -9559,7 +9693,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
                     format!(
-                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35 失败：{error}"
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36/v37 失败：{error}"
                     )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
@@ -10113,10 +10247,25 @@ impl Store {
                 validate_v36_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 37)? {
+                transaction
+                    .execute_batch(MIGRATION_V37)
+                    .map_err(|error| format!("执行数据库迁移 v37 失败：{error}"))?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(37, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v37 失败：{error}"))?;
+                validate_v37_schema(&transaction)?;
+            } else {
+                validate_v37_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36/v37 失败：{error}"
                 )
             })?;
             Ok(())
@@ -10158,6 +10307,7 @@ impl Store {
                 validate_v34_schema(connection)?;
                 validate_v35_schema(connection)?;
                 validate_v36_schema(connection)?;
+                validate_v37_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -11322,10 +11472,19 @@ impl Store {
         if npc.npc_kind != "merchant" || !npc.has_shop {
             return Err(format!("当前对话 NPC“{}”没有可用商店", npc.name));
         }
+        let active_revision_id = current_content_revision_id(&connection)?;
         let total = connection
             .query_row(
-                "SELECT COUNT(*) FROM shop_item WHERE npc_key = ?1 AND enabled = 1",
-                [npc.npc_key.as_str()],
+                r#"
+                SELECT COUNT(*)
+                  FROM shop_item si
+                  JOIN content_revision_visible_member member
+                    ON member.member_kind = 'item'
+                   AND member.member_key = si.item_key
+                   AND member.revision_id = ?2
+                 WHERE si.npc_key = ?1 AND si.enabled = 1
+                "#,
+                params![npc.npc_key, active_revision_id],
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|error| format!("统计商店商品失败：{error}"))?;
@@ -11352,23 +11511,30 @@ impl Store {
                   FROM shop_item si
                   JOIN npc n ON n.npc_key = si.npc_key
                   JOIN item i ON i.item_key = si.item_key
+                  JOIN content_revision_visible_member member
+                    ON member.member_kind = 'item'
+                   AND member.member_key = si.item_key
                  WHERE si.npc_key = ?1 AND si.enabled = 1
+                   AND member.revision_id = ?4
                  ORDER BY i.level_required, i.name, i.item_key
                  LIMIT ?2 OFFSET ?3
                 "#,
             )
             .map_err(|error| format!("准备商店商品分页失败：{error}"))?;
         let entries = statement
-            .query_map(params![npc.npc_key, fetch_limit, offset], |row| {
-                let stock = row.get::<_, i64>(19)?;
-                Ok(ShopItemEntry {
-                    npc_key: row.get(0)?,
-                    npc_name: row.get(1)?,
-                    item: item_record_from_row(row, 2)?,
-                    price: row.get(18)?,
-                    stock: (stock >= 0).then_some(stock),
-                })
-            })
+            .query_map(
+                params![npc.npc_key, fetch_limit, offset, active_revision_id],
+                |row| {
+                    let stock = row.get::<_, i64>(19)?;
+                    Ok(ShopItemEntry {
+                        npc_key: row.get(0)?,
+                        npc_name: row.get(1)?,
+                        item: item_record_from_row(row, 2)?,
+                        price: row.get(18)?,
+                        stock: (stock >= 0).then_some(stock),
+                    })
+                },
+            )
             .map_err(|error| format!("查询商店商品分页失败：{error}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("解析商店商品分页失败：{error}"))?;
@@ -14625,6 +14791,7 @@ impl Store {
         if bound_npc.npc_kind != "merchant" || !bound_npc.has_shop {
             return Err(format!("当前对话 NPC“{}”没有可用商店", bound_npc.name));
         }
+        let active_revision_id = current_content_revision_id(&transaction)?;
         let (npc_name, stock, unit_price, item) = transaction
             .query_row(
                 r#"
@@ -14636,11 +14803,15 @@ impl Store {
                   FROM npc n
                   JOIN shop_item si ON si.npc_key = n.npc_key
                   JOIN item i ON i.item_key = si.item_key
+                  JOIN content_revision_visible_member member
+                    ON member.member_kind = 'item'
+                   AND member.member_key = i.item_key
                  WHERE n.npc_key = ?1 AND n.enabled = 1 AND n.npc_kind = 'merchant'
                    AND si.enabled = 1 AND (i.name = ?2 OR i.item_key = ?2)
+                   AND member.revision_id = ?3
                  LIMIT 1
                 "#,
-                params![bound_npc.npc_key, item_name_or_key],
+                params![bound_npc.npc_key, item_name_or_key, active_revision_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -14770,6 +14941,7 @@ impl Store {
         if bound_npc.npc_kind != "merchant" || !bound_npc.has_shop {
             return Err(format!("当前对话 NPC“{}”没有可用商店", bound_npc.name));
         }
+        let active_revision_id = current_content_revision_id(&transaction)?;
         let (npc_key, npc_name, stock, item) = transaction
             .query_row(
                 r#"
@@ -14781,11 +14953,15 @@ impl Store {
                   FROM npc n
                   JOIN shop_item si ON si.npc_key = n.npc_key
                   JOIN item i ON i.item_key = si.item_key
+                  JOIN content_revision_visible_member member
+                    ON member.member_kind = 'item'
+                   AND member.member_key = i.item_key
                  WHERE n.npc_key = ?1 AND n.enabled = 1 AND n.npc_kind = 'merchant'
                    AND si.enabled = 1 AND (i.name = ?2 OR i.item_key = ?2)
+                   AND member.revision_id = ?3
                  LIMIT 1
                 "#,
-                params![bound_npc.npc_key, item_name_or_key],
+                params![bound_npc.npc_key, item_name_or_key, active_revision_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -28077,6 +28253,7 @@ fn validate_v22_index(
 
 fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
     let tracks_maps = migration_applied(connection, 36)?;
+    let tracks_items = migration_applied(connection, 37)?;
     let expected_tables = [
         (
             "content_revision",
@@ -28138,19 +28315,18 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
         }
     }
 
-    let member_markers = if tracks_maps {
-        vec![
-            ") STRICT, WITHOUT ROWID",
-            "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING', 'MAP')",
-            "PRIMARY KEY(REVISION_ID, MEMBER_KIND, MEMBER_KEY)",
-        ]
+    let member_kind_marker = if tracks_items {
+        "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING', 'MAP', 'ITEM')"
+    } else if tracks_maps {
+        "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING', 'MAP')"
     } else {
-        vec![
-            ") STRICT, WITHOUT ROWID",
-            "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING')",
-            "PRIMARY KEY(REVISION_ID, MEMBER_KIND, MEMBER_KEY)",
-        ]
+        "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING')"
     };
+    let member_markers = vec![
+        ") STRICT, WITHOUT ROWID",
+        member_kind_marker,
+        "PRIMARY KEY(REVISION_ID, MEMBER_KIND, MEMBER_KEY)",
+    ];
     for (table, markers) in [
         (
             "content_revision",
@@ -28296,6 +28472,9 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
                     OR (member.member_kind = 'map' AND NOT EXISTS(
                         SELECT 1 FROM map WHERE map_key = member.member_key
                     ))
+                    OR (member.member_kind = 'item' AND NOT EXISTS(
+                        SELECT 1 FROM item WHERE item_key = member.member_key
+                    ))
             )
             "#,
             [],
@@ -28347,8 +28526,15 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
                      WHERE member.member_kind = 'map' AND member.member_key = map.map_key
                  )
             ))
+            OR (?2 AND EXISTS(
+                SELECT 1 FROM item item
+                 WHERE NOT EXISTS(
+                    SELECT 1 FROM content_revision_member member
+                     WHERE member.member_kind = 'item' AND member.member_key = item.item_key
+                 )
+            ))
             "#,
-            [tracks_maps],
+            [tracks_maps, tracks_items],
             |row| row.get::<_, bool>(0),
         )
         .map_err(|error| format!("校验 v23 未发布目录失败：{error}"))?;
@@ -31125,6 +31311,12 @@ fn validate_v36_schema(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// 校验 v37 物品成员覆盖与内容成员表的完整结构；损坏时拒绝启动。
+fn validate_v37_schema(connection: &Connection) -> Result<(), String> {
+    validate_v36_schema(connection)?;
+    validate_v23_schema(connection)
+}
+
 fn validate_v24_table_sql(
     connection: &Connection,
     table: &str,
@@ -32994,9 +33186,9 @@ mod tests {
 
     use crate::content::{
         EffectPackageEntry, FORBID_SKILL_APPLY_PHASE, FORBID_SKILL_BLOCKED_ACTION,
-        FORBID_SKILL_RULE_VERSION, MIN_FORBID_SKILL_DURATION_ROUNDS, MapPackageEntry,
-        SkillPackageEntry, SoulBeastPackageEntry, SoulRingPackageEntry, WuhunPackageEntry,
-        WuhunStatsPackageEntry,
+        FORBID_SKILL_RULE_VERSION, ItemPackageEntry, MIN_FORBID_SKILL_DURATION_ROUNDS,
+        MapPackageEntry, SkillPackageEntry, SoulBeastPackageEntry, SoulRingPackageEntry,
+        WuhunPackageEntry, WuhunStatsPackageEntry,
     };
     use tempfile::tempdir;
 
@@ -33020,6 +33212,7 @@ mod tests {
             author: "test".to_string(),
             minimum_runtime: String::new(),
             maps: Vec::new(),
+            items: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33070,6 +33263,7 @@ mod tests {
                 teleport_enabled: true,
                 sort_order,
             }],
+            items: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: Vec::new(),
@@ -33079,6 +33273,51 @@ mod tests {
         };
         LoadedContentPackage {
             content_hash: content_hash(&package).expect("应计算地图内容包哈希"),
+            package,
+            source_format: "json".to_string(),
+        }
+    }
+
+    fn item_content_package(
+        package_key: &str,
+        item_key: &str,
+        name: &str,
+        buy_price: i64,
+        sell_price: i64,
+    ) -> LoadedContentPackage {
+        let package = ContentPackage {
+            package_key: package_key.to_string(),
+            revision: 1,
+            author: "item-test".to_string(),
+            minimum_runtime: String::new(),
+            maps: Vec::new(),
+            items: vec![ItemPackageEntry {
+                item_key: item_key.to_string(),
+                name: name.to_string(),
+                category: "consumable".to_string(),
+                quality: 2,
+                stackable: true,
+                max_stack: 99,
+                buy_price,
+                sell_price,
+                level_required: 1,
+                effect_kind: "restore_hp".to_string(),
+                effect_amount: 100,
+                revive_hp_percent: 0,
+                purchasable: true,
+                sellable: true,
+                usable: true,
+                description: "内容包新增测试物品".to_string(),
+            }],
+            wuhun: Vec::new(),
+            skills: Vec::new(),
+            effects: Vec::new(),
+            soul_beasts: Vec::new(),
+            soul_rings: Vec::new(),
+            transitions: Vec::new(),
+        };
+        LoadedContentPackage {
+            content_hash: content_hash(&package).expect("应计算物品内容包哈希"),
             package,
             source_format: "json".to_string(),
         }
@@ -33372,6 +33611,7 @@ mod tests {
             author: "test".to_string(),
             minimum_runtime: String::new(),
             maps: Vec::new(),
+            items: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33412,6 +33652,7 @@ mod tests {
             author: "test".to_string(),
             minimum_runtime: String::new(),
             maps: Vec::new(),
+            items: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33455,6 +33696,7 @@ mod tests {
             author: "test".to_string(),
             minimum_runtime: String::new(),
             maps: Vec::new(),
+            items: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33496,6 +33738,7 @@ mod tests {
             author: "test".to_string(),
             minimum_runtime: String::new(),
             maps: Vec::new(),
+            items: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33537,6 +33780,7 @@ mod tests {
             author: "test".to_string(),
             minimum_runtime: String::new(),
             maps: Vec::new(),
+            items: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33578,6 +33822,7 @@ mod tests {
             author: "test".to_string(),
             minimum_runtime: String::new(),
             maps: Vec::new(),
+            items: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33711,6 +33956,7 @@ mod tests {
             author: "test".to_string(),
             minimum_runtime: String::new(),
             maps: Vec::new(),
+            items: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "preview-skill".to_string(),
@@ -33779,6 +34025,7 @@ mod tests {
             author: "test".to_string(),
             minimum_runtime: String::new(),
             maps: Vec::new(),
+            items: Vec::new(),
             wuhun: vec![WuhunPackageEntry {
                 name: "transition wuhun".to_string(),
                 category: "控制系".to_string(),
@@ -36253,6 +36500,280 @@ mod tests {
     }
 
     #[test]
+    fn v37_item_package_follows_active_revision_without_moving_inventory_history() {
+        let (directory, store) = test_store();
+        store
+            .register_player(&identity(), "物品内容角色", "男")
+            .expect("应创建物品内容测试角色");
+        store
+            .talk_to_npc_with_operation(
+                &identity(),
+                "杂货商人",
+                &map_operation("对话", "item-v37-talk"),
+            )
+            .expect("应绑定物品测试商人");
+        seed_wallet(&store, &identity(), 1_000);
+        let baseline = store
+            .active_content_revision()
+            .expect("应读取物品内容基线 revision");
+        let package = item_content_package(
+            "test-item-content",
+            "content-potion-v37",
+            "内容测试药",
+            30,
+            10,
+        );
+
+        store
+            .stage_content_package(&package)
+            .expect("应暂存物品内容包");
+        let report = store
+            .validate_content_draft("test-item-content", 1)
+            .expect("应校验物品内容包");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.item_count, 1);
+        store
+            .publish_content_draft("test-item-content", 1)
+            .expect("应发布物品内容包");
+
+        let connection = store.open().expect("应打开物品内容数据库");
+        connection
+            .execute(
+                "INSERT INTO shop_item(npc_key, item_key, buy_price, stock, enabled, created_at, updated_at) VALUES('holy-soul-village-grocer', 'content-potion-v37', 30, -1, 1, 0, 0)",
+                [],
+            )
+            .expect("应允许为新增物品挂接商店商品");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM item WHERE item_key = 'content-potion-v37'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("应读取新增物品行"),
+            1
+        );
+        assert!(
+            active_content_member_exists(&connection, "item", "content-potion-v37")
+                .expect("应读取新增物品成员")
+        );
+        drop(connection);
+
+        let shop = store
+            .shop_items_page(&identity(), None, 1, 20)
+            .expect("active revision 应暴露新增商店商品");
+        assert_eq!(shop.total, 4);
+        assert!(
+            shop.entries
+                .iter()
+                .any(|entry| entry.item.item_key == "content-potion-v37")
+        );
+        let bought = store
+            .buy_item_with_operation(
+                &identity(),
+                "content-potion-v37",
+                2,
+                &map_operation("购买", "item-v37-buy"),
+            )
+            .expect("active revision 应允许购买新增物品");
+        assert_eq!((bought.total_price, bought.inventory_after), (60, 2));
+        let sold = store
+            .sell_item_with_operation(
+                &identity(),
+                "content-potion-v37",
+                1,
+                &map_operation("出售", "item-v37-sell"),
+            )
+            .expect("active revision 应允许出售新增物品");
+        assert_eq!((sold.total_price, sold.inventory_after), (10, 1));
+
+        store
+            .rollback_content_revision(baseline.id)
+            .expect("应回滚物品内容 revision");
+        let rolled_back_shop = store
+            .shop_items_page(&identity(), None, 1, 20)
+            .expect("回滚后商店分页仍应可读");
+        assert_eq!(rolled_back_shop.total, 3);
+        assert!(
+            !rolled_back_shop
+                .entries
+                .iter()
+                .any(|entry| entry.item.item_key == "content-potion-v37")
+        );
+        assert!(
+            !active_content_member_exists(
+                &store.open().expect("应打开回滚后的物品数据库"),
+                "item",
+                "content-potion-v37"
+            )
+            .expect("应读取回滚后的物品成员")
+        );
+        assert_eq!(inventory_for(&store, &identity(), "content-potion-v37"), 1);
+        assert!(
+            store
+                .buy_item_with_operation(
+                    &identity(),
+                    "content-potion-v37",
+                    1,
+                    &map_operation("购买", "item-v37-buy-after-rollback"),
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .sell_item_with_operation(
+                    &identity(),
+                    "content-potion-v37",
+                    1,
+                    &map_operation("出售", "item-v37-sell-after-rollback"),
+                )
+                .is_err()
+        );
+
+        drop(store);
+        let restarted = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("回滚后的物品数据库应可重启");
+        let connection = restarted.open().expect("应打开重启后的物品数据库");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM item WHERE item_key = 'content-potion-v37'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("物品目录行应保留"),
+            1
+        );
+        assert_eq!(
+            inventory_for(&restarted, &identity(), "content-potion-v37"),
+            1
+        );
+    }
+
+    #[test]
+    fn v37_migration_registers_existing_items_for_every_historical_revision() {
+        let (directory, store) = test_store();
+        store
+            .register_player(&identity(), "v37迁移角色", "男")
+            .expect("应创建 v37 迁移测试角色");
+        seed_inventory(&store, &identity(), "small-healing-potion", 2);
+        store
+            .stage_content_package(&map_content_package(
+                "v37-migration-map",
+                "v37-migration-map",
+                "v37迁移地图",
+                90,
+            ))
+            .expect("应暂存历史 revision 测试包");
+        store
+            .validate_content_draft("v37-migration-map", 1)
+            .expect("应校验历史 revision 测试包");
+        store
+            .publish_content_draft("v37-migration-map", 1)
+            .expect("应发布历史 revision 测试包");
+
+        let connection = store.open().expect("应打开 v37 迁移测试数据库");
+        let revision_ids = connection
+            .prepare("SELECT id FROM content_revision ORDER BY id")
+            .expect("应准备历史 revision 查询")
+            .query_map([], |row| row.get::<_, i64>(0))
+            .expect("应读取历史 revision")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("应解析历史 revision");
+        let item_keys = connection
+            .prepare("SELECT item_key FROM item ORDER BY item_key")
+            .expect("应准备既有物品查询")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("应读取既有物品")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("应解析既有物品");
+        assert!(revision_ids.len() >= 2, "应存在多个历史 revision");
+        assert!(!item_keys.is_empty(), "应存在既有物品目录");
+
+        connection
+            .execute_batch(
+                r#"
+                DELETE FROM schema_migration WHERE version = 37;
+                CREATE TABLE content_revision_member_v36_test_backup AS
+                SELECT revision_id, member_kind, member_key, created_at
+                  FROM content_revision_member
+                 WHERE member_kind <> 'item';
+                DROP TRIGGER content_revision_member_no_update;
+                DROP TRIGGER content_revision_member_no_delete;
+                DROP TRIGGER content_revision_member_no_reinsert;
+                DROP INDEX content_revision_member_lookup;
+                DROP TABLE content_revision_member;
+                CREATE TABLE content_revision_member (
+                    revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
+                    member_kind TEXT NOT NULL CHECK(
+                        member_kind IN ('wuhun', 'skill', 'starter-skill', 'effect', 'beast', 'ring', 'map')
+                    ),
+                    member_key TEXT NOT NULL CHECK(
+                        length(member_key) BETWEEN 1 AND 200
+                        AND member_key = trim(member_key)
+                        AND instr(member_key, char(0)) = 0
+                    ),
+                    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+                    PRIMARY KEY(revision_id, member_kind, member_key)
+                ) STRICT, WITHOUT ROWID;
+                INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+                SELECT revision_id, member_kind, member_key, created_at
+                  FROM content_revision_member_v36_test_backup;
+                DROP TABLE content_revision_member_v36_test_backup;
+                CREATE INDEX content_revision_member_lookup
+                    ON content_revision_member(member_kind, member_key, revision_id);
+                CREATE TRIGGER content_revision_member_no_update
+                BEFORE UPDATE ON content_revision_member
+                BEGIN
+                    SELECT RAISE(ABORT, 'content revision member is immutable');
+                END;
+                CREATE TRIGGER content_revision_member_no_delete
+                BEFORE DELETE ON content_revision_member
+                BEGIN
+                    SELECT RAISE(ABORT, 'content revision member is immutable');
+                END;
+                CREATE TRIGGER content_revision_member_no_reinsert
+                BEFORE INSERT ON content_revision_member
+                WHEN EXISTS(
+                    SELECT 1 FROM content_revision_member
+                     WHERE revision_id = NEW.revision_id
+                       AND member_kind = NEW.member_kind
+                       AND member_key = NEW.member_key
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'content revision member is append-only');
+                END;
+                "#,
+            )
+            .expect("应构造 v36 内容成员表");
+        drop(connection);
+        drop(store);
+
+        let migrated = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v36 数据库应成功升级到 v37");
+        let connection = migrated.open().expect("应打开升级后的 v37 数据库");
+        for revision_id in revision_ids {
+            let actual_item_keys = connection
+                .prepare(
+                    "SELECT member_key FROM content_revision_member WHERE revision_id = ?1 AND member_kind = 'item' ORDER BY member_key",
+                )
+                .expect("应准备 v37 物品成员查询")
+                .query_map([revision_id], |row| row.get::<_, String>(0))
+                .expect("应读取 v37 物品成员")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("应解析 v37 物品成员");
+            assert_eq!(
+                actual_item_keys, item_keys,
+                "revision {revision_id} 的物品成员不完整"
+            );
+        }
+        assert_eq!(
+            inventory_for(&migrated, &identity(), "small-healing-potion"),
+            2
+        );
+    }
+
+    #[test]
     fn movement_and_teleport_are_atomic_and_respect_edge_requirements() {
         let (_directory, store) = test_store();
         store
@@ -36432,19 +36953,22 @@ mod tests {
     #[test]
     fn v8_allows_additional_catalog_rows_without_relaxing_schema_contract() {
         let (directory, store) = test_store();
+        store
+            .stage_content_package(&item_content_package(
+                "v8-additional-item",
+                "custom-healing",
+                "自定义恢复药",
+                100,
+                20,
+            ))
+            .expect("应暂存新增物品内容包");
+        store
+            .validate_content_draft("v8-additional-item", 1)
+            .expect("应校验新增物品内容包");
+        store
+            .publish_content_draft("v8-additional-item", 1)
+            .expect("应发布新增物品内容包");
         let connection = store.open().expect("应打开经济数据库");
-        connection
-            .execute(
-                r#"INSERT INTO item(
-                    item_key, name, category, quality, stackable, max_stack,
-                    buy_price, sell_price, level_required, effect_kind, effect_amount,
-                    revive_hp_percent, purchasable, sellable, usable, description,
-                    created_at, updated_at
-                ) VALUES('custom-healing', '自定义恢复药', 'consumable', 3, 1, 20,
-                         100, 20, 1, 'restore_hp', 300, 0, 1, 1, 1, '测试商品', 0, 0)"#,
-                [],
-            )
-            .expect("应允许新增物品种子");
         connection
             .execute(
                 r#"INSERT INTO npc(
@@ -40483,6 +41007,7 @@ mod tests {
             author: "test".to_string(),
             minimum_runtime: String::new(),
             maps: Vec::new(),
+            items: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -41490,6 +42015,7 @@ mod tests {
             author: "test".to_string(),
             minimum_runtime: String::new(),
             maps: Vec::new(),
+            items: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "test-starter".to_string(),
@@ -42505,6 +43031,7 @@ mod tests {
             author: "test".to_string(),
             minimum_runtime: String::new(),
             maps: Vec::new(),
+            items: Vec::new(),
             wuhun: vec![WuhunPackageEntry {
                 name: "test catalog wuhun".to_string(),
                 category: "控制系".to_string(),
@@ -45105,6 +45632,49 @@ mod tests {
                 map_key, name, description, level_required, safe, pvp_enabled,
                 teleport_enabled, sort_order, created_at, updated_at
             ) VALUES('untracked-v36-map', '未登记地图', 'v36 损坏探针', 1, 1, 0, 1, 99999, 0, 0);
+            "#,
+        );
+    }
+
+    fn assert_v37_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v37 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v37 迁移应成功");
+        let connection = store.open().expect("应打开 v37 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v37 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v37 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v37")
+                || error.contains("v23")
+                || error.contains("content_revision_member")
+                || error.contains("物品")
+                || error.contains("item"),
+            "v37 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    #[test]
+    fn recorded_v37_item_membership_damage_fails_closed() {
+        for mutation in [
+            "DROP INDEX content_revision_member_lookup;",
+            "DROP TRIGGER content_revision_member_no_reinsert;",
+        ] {
+            assert_v37_damage_fails_closed(mutation);
+        }
+        assert_v37_damage_fails_closed(
+            r#"
+            INSERT INTO item(
+                item_key, name, category, quality, stackable, max_stack,
+                buy_price, sell_price, level_required, effect_kind, effect_amount,
+                revive_hp_percent, purchasable, sellable, usable, description,
+                created_at, updated_at
+            ) VALUES('untracked-v37-item', '未登记物品', 'consumable', 1, 1, 1,
+                     1, 0, 1, 'restore_hp', 1, 0, 1, 1, 1, 'v37 损坏探针', 0, 0);
             "#,
         );
     }

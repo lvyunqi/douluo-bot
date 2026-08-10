@@ -451,6 +451,7 @@ struct ContentValidationResponse {
     content_hash: String,
     valid: bool,
     errors: Vec<String>,
+    item_count: usize,
     wuhun_count: usize,
     skill_count: usize,
     effect_count: usize,
@@ -1084,6 +1085,7 @@ fn content_validation_response(report: ContentValidationReport) -> ContentValida
         content_hash: report.content_hash,
         valid,
         errors: report.errors,
+        item_count: report.item_count,
         wuhun_count: report.wuhun_count,
         skill_count: report.skill_count,
         effect_count: report.effect_count,
@@ -1464,6 +1466,7 @@ mod tests {
             author: "web-test".to_string(),
             minimum_runtime: String::new(),
             maps: Vec::new(),
+            items: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -1719,6 +1722,7 @@ mod tests {
             author: "web-test".to_string(),
             minimum_runtime: String::new(),
             maps: Vec::new(),
+            items: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {

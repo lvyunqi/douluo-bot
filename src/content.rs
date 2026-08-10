@@ -104,6 +104,8 @@ pub struct ContentPackage {
     pub minimum_runtime: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub maps: Vec<MapPackageEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<ItemPackageEntry>,
     #[serde(default)]
     pub wuhun: Vec<WuhunPackageEntry>,
     #[serde(default)]
@@ -142,6 +144,28 @@ pub struct MapPackageEntry {
     pub pvp_enabled: bool,
     pub teleport_enabled: bool,
     pub sort_order: i64,
+}
+
+/// 内容包中的静态物品目录行；只允许追加新键，不承载玩家背包数量。
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ItemPackageEntry {
+    pub item_key: String,
+    pub name: String,
+    pub category: String,
+    pub quality: i64,
+    pub stackable: bool,
+    pub max_stack: i64,
+    pub buy_price: i64,
+    pub sell_price: i64,
+    pub level_required: i64,
+    pub effect_kind: String,
+    pub effect_amount: i64,
+    pub revive_hp_percent: i64,
+    pub purchasable: bool,
+    pub sellable: bool,
+    pub usable: bool,
+    pub description: String,
 }
 
 /// 内容包中的武魂及其属性模板。
@@ -422,6 +446,7 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
         false,
     );
     let total = package.maps.len()
+        + package.items.len()
         + package.wuhun.len()
         + package.skills.len()
         + package.effects.len()
@@ -468,6 +493,109 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
         if entry.sort_order < 0 {
             errors.push(format!("地图 {} 的 sort_order 不能为负数", entry.map_key));
         }
+    }
+
+    keys.clear();
+    let mut item_names = BTreeSet::new();
+    for entry in &package.items {
+        if !keys.insert(format!("item:{}", entry.item_key)) {
+            errors.push(format!("物品键重复：{}", entry.item_key));
+        }
+        if !item_names.insert(entry.name.as_str()) {
+            errors.push(format!("物品名称重复：{}", entry.name));
+        }
+        validate_key(&mut errors, "item.item_key", &entry.item_key);
+        text_field(&mut errors, "item.name", &entry.name, 128, true);
+        if !matches!(entry.category.as_str(), "revival" | "consumable") {
+            errors.push(format!("物品 {} 的 category 不受支持", entry.item_key));
+        }
+        range_field(
+            &mut errors,
+            "item.quality",
+            &entry.item_key,
+            entry.quality,
+            1,
+            5,
+        );
+        range_field(
+            &mut errors,
+            "item.max_stack",
+            &entry.item_key,
+            entry.max_stack,
+            1,
+            9999,
+        );
+        if !entry.stackable && entry.max_stack != 1 {
+            errors.push(format!(
+                "物品 {} 不可堆叠时 max_stack 必须为 1",
+                entry.item_key
+            ));
+        }
+        if entry.buy_price < 0 {
+            errors.push(format!("物品 {} 的 buy_price 不能为负数", entry.item_key));
+        }
+        if entry.sell_price < 0 || entry.sell_price > entry.buy_price {
+            errors.push(format!(
+                "物品 {} 的 sell_price 必须在 0 到 buy_price 之间",
+                entry.item_key
+            ));
+        }
+        range_field(
+            &mut errors,
+            "item.level_required",
+            &entry.item_key,
+            entry.level_required,
+            1,
+            120,
+        );
+        if !matches!(
+            entry.effect_kind.as_str(),
+            "revive" | "restore_hp" | "restore_soul"
+        ) {
+            errors.push(format!("物品 {} 的 effect_kind 不受支持", entry.item_key));
+        }
+        match entry.effect_kind.as_str() {
+            "revive" => {
+                if entry.effect_amount != 0 {
+                    errors.push(format!(
+                        "复活物品 {} 的 effect_amount 必须为 0",
+                        entry.item_key
+                    ));
+                }
+                range_field(
+                    &mut errors,
+                    "item.revive_hp_percent",
+                    &entry.item_key,
+                    entry.revive_hp_percent,
+                    1,
+                    100,
+                );
+            }
+            "restore_hp" | "restore_soul" => {
+                range_field(
+                    &mut errors,
+                    "item.effect_amount",
+                    &entry.item_key,
+                    entry.effect_amount,
+                    1,
+                    1_000_000,
+                );
+                if entry.revive_hp_percent != 0 {
+                    errors.push(format!(
+                        "恢复物品 {} 的 revive_hp_percent 必须为 0",
+                        entry.item_key
+                    ));
+                }
+            }
+            _ => {}
+        }
+        text_field(
+            &mut errors,
+            "item.description",
+            &entry.description,
+            2000,
+            false,
+        );
     }
 
     keys.clear();
@@ -1098,6 +1226,7 @@ mod tests {
             author: "test".to_string(),
             minimum_runtime: String::new(),
             maps: Vec::new(),
+            items: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "test-skill".to_string(),
@@ -1169,6 +1298,7 @@ mod tests {
         let mut package = minimal_package();
         let legacy = canonical_json(&package).expect("旧内容包应可规范化");
         assert!(!legacy.contains("\"maps\""));
+        assert!(!legacy.contains("\"items\""));
 
         package.maps = vec![MapPackageEntry {
             map_key: "content-map".to_string(),
@@ -1195,6 +1325,61 @@ mod tests {
         let errors = validate_shape(&package);
         assert!(errors.iter().any(|error| error.contains("地图名称重复")));
         assert!(errors.iter().any(|error| error.contains("地图排序重复")));
+    }
+
+    #[test]
+    fn items_preserve_legacy_hash_and_enforce_static_shape() {
+        let mut package = minimal_package();
+        package.items = vec![ItemPackageEntry {
+            item_key: "content-potion".to_string(),
+            name: "内容测试药".to_string(),
+            category: "consumable".to_string(),
+            quality: 2,
+            stackable: true,
+            max_stack: 99,
+            buy_price: 50,
+            sell_price: 10,
+            level_required: 1,
+            effect_kind: "restore_hp".to_string(),
+            effect_amount: 100,
+            revive_hp_percent: 0,
+            purchasable: true,
+            sellable: true,
+            usable: true,
+            description: "恢复100点生命值".to_string(),
+        }];
+        assert!(validate_shape(&package).is_empty());
+
+        package.items.push(ItemPackageEntry {
+            item_key: "content-potion".to_string(),
+            name: "内容测试药".to_string(),
+            category: "consumable".to_string(),
+            quality: 2,
+            stackable: true,
+            max_stack: 99,
+            buy_price: 50,
+            sell_price: 10,
+            level_required: 1,
+            effect_kind: "restore_hp".to_string(),
+            effect_amount: 100,
+            revive_hp_percent: 0,
+            purchasable: true,
+            sellable: true,
+            usable: true,
+            description: "重复名称".to_string(),
+        });
+        let errors = validate_shape(&package);
+        assert!(errors.iter().any(|error| error.contains("物品键重复")));
+        assert!(errors.iter().any(|error| error.contains("物品名称重复")));
+
+        package.items[0].quality = 6;
+        package.items[1].name = "另一种测试药".to_string();
+        let errors = validate_shape(&package);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("item.quality(content-potion)"))
+        );
     }
 
     #[test]

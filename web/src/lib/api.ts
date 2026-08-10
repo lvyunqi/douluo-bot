@@ -88,6 +88,7 @@ export type ContentValidation = {
   content_hash: string
   valid: boolean
   errors: string[]
+  item_count: number
   wuhun_count: number
   skill_count: number
   effect_count: number
