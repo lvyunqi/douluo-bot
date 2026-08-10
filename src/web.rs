@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use tokio::{net::TcpListener, runtime::Builder as RuntimeBuilder, sync::oneshot};
 
 use crate::{
+    catalog,
     config::{WebConfig, is_safe_data_relative_path},
     content::{is_content_key, load_package_file},
     embedded_web::ManagementWebAssets,
@@ -274,6 +275,7 @@ fn build_router(state: Arc<ManagementState>) -> Router {
             "/api/v1/session",
             get(current_session).post(login).delete(logout),
         )
+        .route("/api/v1/illustrations", get(illustration_bindings))
         .route("/api/v1/content/active", get(active_content_revision))
         .route("/api/v1/content/revisions", get(content_revisions))
         .route("/api/v1/content/drafts", get(content_drafts))
@@ -357,6 +359,23 @@ struct SessionResponse {
     role: &'static str,
     csrf_token: String,
     expires_in_seconds: u64,
+}
+
+/// 只读插图目录刻意不暴露直连地址、本地路径或媒体服务内部元数据。
+#[derive(Serialize)]
+struct IllustrationBindingListEntry {
+    entity_type: String,
+    entity_key: String,
+    media_role: String,
+    asset_key: String,
+    alt: String,
+    width: u16,
+    height: u16,
+}
+
+#[derive(Serialize)]
+struct IllustrationBindingsResponse {
+    entries: Vec<IllustrationBindingListEntry>,
 }
 
 /// 管理列表统一使用受限的自增 ID 游标，避免无界 offset 查询。
@@ -605,6 +624,33 @@ async fn active_content_revision(
         Ok(revision) => json_response(StatusCode::OK, json!({ "revision": revision })),
         Err(_) => api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
     }
+}
+
+/// 返回编译期 manifest 中的脱敏绑定，供管理员核对实体与稳定资源键。
+async fn illustration_bindings(
+    State(state): State<Arc<ManagementState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(error) = require_permission(&state, &headers, AdminPermission::ContentRead) {
+        return error.into_response();
+    }
+    let bindings = match catalog::bindings() {
+        Ok(bindings) => bindings,
+        Err(_) => return api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    };
+    let entries = bindings
+        .iter()
+        .map(|binding| IllustrationBindingListEntry {
+            entity_type: binding.entity_type.clone(),
+            entity_key: binding.entity_key.clone(),
+            media_role: binding.media_role.clone(),
+            asset_key: binding.asset_key.clone(),
+            alt: binding.alt.clone(),
+            width: binding.display.width,
+            height: binding.display.height,
+        })
+        .collect();
+    json_response(StatusCode::OK, IllustrationBindingsResponse { entries })
 }
 
 async fn content_revisions(
@@ -1618,6 +1664,49 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn illustration_directory_requires_session_and_redacts_binding_sources() {
+        let (_directory, state) = state();
+        let app = build_router(state);
+
+        let response = request(&app, Method::GET, "/api/v1/illustrations", &[], b"").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let (cookie, _csrf_token) = login_for_test(&app).await;
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/illustrations",
+            &[("cookie", &cookie)],
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let payload = response_json(response).await;
+        let entries = payload["entries"].as_array().expect("应返回插图目录");
+        assert_eq!(entries.len(), 19);
+        let holy_soul = entries
+            .iter()
+            .find(|entry| entry["asset_key"] == "maps/holy-soul-village/cover.webp")
+            .expect("应返回圣魂村绑定");
+        assert_eq!(holy_soul["entity_type"], "map");
+        assert_eq!(holy_soul["entity_key"], "圣魂村");
+        assert_eq!(holy_soul["media_role"], "cover");
+        assert_eq!(holy_soul["alt"], "圣魂村地图");
+        assert_eq!(holy_soul["width"], 640);
+        assert_eq!(holy_soul["height"], 360);
+        for entry in entries {
+            assert!(entry.get("direct_url").is_none());
+            assert!(entry.get("local_path").is_none());
+            assert!(entry.get("storage_key").is_none());
+            assert!(entry.get("sha256").is_none());
+        }
     }
 
     #[tokio::test]

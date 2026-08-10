@@ -8,6 +8,7 @@ import {
   Database,
   FileUp,
   History,
+  Image,
   LogOut,
   RefreshCw,
   ScrollText,
@@ -33,6 +34,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   getActiveRevision,
+  listIllustrations,
   listActivations,
   listDrafts,
   listOperations,
@@ -53,11 +55,12 @@ import {
   type ContentRollbackOperation,
   type ContentStageOperation,
   type CursorPage,
+  type IllustrationBinding,
   type Session,
 } from '@/lib/api'
 import { formatNumber, formatTimestamp, packageLabel, shortHash, statusLabel, statusVariant } from '@/lib/format'
 
-type TabValue = 'overview' | 'operations' | 'drafts' | 'revisions' | 'activations' | 'audits'
+type TabValue = 'overview' | 'illustrations' | 'operations' | 'drafts' | 'revisions' | 'activations' | 'audits'
 type PageValue =
   | ContentDraft
   | ContentRevisionSummary
@@ -76,6 +79,7 @@ type PageKey =
 
 type DashboardSnapshot = {
   active: ContentRevision
+  illustrations: IllustrationBinding[]
   drafts: CursorPage<ContentDraft>
   revisions: CursorPage<ContentRevisionSummary>
   activations: CursorPage<ContentActivation>
@@ -98,6 +102,7 @@ type TableColumn<T> = {
 
 const tabs: Array<{ icon: typeof Activity; label: string; value: TabValue }> = [
   { icon: Activity, label: '概览', value: 'overview' },
+  { icon: Image, label: '插图', value: 'illustrations' },
   { icon: FileUp, label: '写入', value: 'operations' },
   { icon: ClipboardList, label: '草稿', value: 'drafts' },
   { icon: BookOpenCheck, label: '版本', value: 'revisions' },
@@ -160,36 +165,38 @@ function DataTable<T>({
   rowKey: (item: T) => string | number
 }) {
   return (
-    <Table>
-      <TableHeader>
-        <TableRow>
-          {columns.map((column) => (
-            <TableHead className={column.className} key={column.header}>
-              {column.header}
-            </TableHead>
-          ))}
-        </TableRow>
-      </TableHeader>
-      <TableBody>
-        {entries.length ? (
-          entries.map((entry) => (
-            <TableRow key={rowKey(entry)}>
-              {columns.map((column) => (
-                <TableCell className={column.className} key={column.header}>
-                  {column.render(entry)}
-                </TableCell>
-              ))}
-            </TableRow>
-          ))
-        ) : (
+    <div className="overflow-x-auto">
+      <Table>
+        <TableHeader>
           <TableRow>
-            <TableCell className="h-28 text-center text-muted-foreground" colSpan={columns.length}>
-              {emptyLabel}
-            </TableCell>
+            {columns.map((column) => (
+              <TableHead className={column.className} key={column.header}>
+                {column.header}
+              </TableHead>
+            ))}
           </TableRow>
-        )}
-      </TableBody>
-    </Table>
+        </TableHeader>
+        <TableBody>
+          {entries.length ? (
+            entries.map((entry) => (
+              <TableRow key={rowKey(entry)}>
+                {columns.map((column) => (
+                  <TableCell className={column.className} key={column.header}>
+                    {column.render(entry)}
+                  </TableCell>
+                ))}
+              </TableRow>
+            ))
+          ) : (
+            <TableRow>
+              <TableCell className="h-28 text-center text-muted-foreground" colSpan={columns.length}>
+                {emptyLabel}
+              </TableCell>
+            </TableRow>
+          )}
+        </TableBody>
+      </Table>
+    </div>
   )
 }
 
@@ -277,9 +284,10 @@ export function ManagementDashboard({
     setLoading(true)
     setError(null)
     try {
-      const [active, drafts, revisions, activations, operations, rollbackOperations, stageOperations] =
+      const [active, illustrations, drafts, revisions, activations, operations, rollbackOperations, stageOperations] =
         await Promise.all([
           getActiveRevision(),
+          listIllustrations(),
           listDrafts(),
           listRevisions(),
           listActivations(),
@@ -291,6 +299,7 @@ export function ManagementDashboard({
         active: active.revision,
         activations,
         drafts,
+        illustrations: illustrations.entries,
         operations,
         revisions,
         rollbackOperations,
@@ -468,6 +477,29 @@ export function ManagementDashboard({
         render: (draft) => (draft.validation_errors.length ? `${draft.validation_errors.length} 项` : '无错误'),
       },
       { header: '更新时间', render: (draft) => formatTimestamp(draft.updated_at) },
+    ],
+    [],
+  )
+
+  const illustrationColumns = useMemo<Array<TableColumn<IllustrationBinding>>>(
+    () => [
+      {
+        header: '实体',
+        render: (binding) => (
+          <div className="space-y-0.5">
+            <p className="font-medium">{binding.entity_key}</p>
+            <p className="text-xs text-muted-foreground">{binding.entity_type}</p>
+          </div>
+        ),
+      },
+      { header: '用途', render: (binding) => <Badge variant="outline">{binding.media_role}</Badge> },
+      {
+        className: 'max-w-72 font-mono text-xs',
+        header: '资源键',
+        render: (binding) => <span className="block truncate">{binding.asset_key}</span>,
+      },
+      { className: 'max-w-48', header: '说明', render: (binding) => <span className="block truncate">{binding.alt}</span> },
+      { header: '尺寸', render: (binding) => `${binding.width} × ${binding.height}` },
     ],
     [],
   )
@@ -687,6 +719,21 @@ export function ManagementDashboard({
                 </CardContent>
               </Card>
             </section>
+          </TabsContent>
+
+          <TabsContent value="illustrations">
+            <PagePanel
+              columns={illustrationColumns}
+              description="当前编译期 manifest 中的实体插图绑定"
+              disabled={dashboardDisabled}
+              emptyLabel="暂无插图绑定"
+              entries={snapshot.illustrations}
+              isLoadingMore={false}
+              nextAfterId={null}
+              onLoadMore={() => undefined}
+              rowKey={(binding) => `${binding.entity_type}:${binding.entity_key}:${binding.media_role}`}
+              title="插图绑定"
+            />
           </TabsContent>
 
           <TabsContent value="operations">

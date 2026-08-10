@@ -72,6 +72,16 @@ export type ContentStageOperation = {
   created_at: number
 }
 
+export type IllustrationBinding = {
+  entity_type: string
+  entity_key: string
+  media_role: string
+  asset_key: string
+  alt: string
+  width: number
+  height: number
+}
+
 export type ContentValidation = {
   package_key: string
   package_revision: number
@@ -195,6 +205,10 @@ export function logout(csrfToken: string): Promise<void> {
 
 export function getActiveRevision(): Promise<{ revision: ContentRevision }> {
   return request<{ revision: ContentRevision }>('/api/v1/content/active')
+}
+
+export function listIllustrations(): Promise<{ entries: IllustrationBinding[] }> {
+  return request<{ entries: IllustrationBinding[] }>('/api/v1/illustrations')
 }
 
 export function listDrafts(afterId?: number): Promise<CursorPage<ContentDraft>> {

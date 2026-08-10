@@ -87,6 +87,14 @@ pub(crate) fn binding(
     })
 }
 
+/// 返回已经过启动校验的只读插图绑定；调用方必须自行限制可返回的字段。
+pub(crate) fn bindings() -> Result<&'static [IllustrationBinding], String> {
+    manifest()
+        .as_ref()
+        .map(|manifest| manifest.bindings.as_slice())
+        .map_err(Clone::clone)
+}
+
 pub(crate) fn asset_keys() -> impl Iterator<Item = &'static str> {
     manifest().as_ref().ok().into_iter().flat_map(|manifest| {
         manifest
