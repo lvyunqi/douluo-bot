@@ -46,6 +46,8 @@ const HASH_LENGTH: usize = 64;
 const HASH_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 const ALIAS_CACHE_CONTROL: &str = "public, max-age=60, must-revalidate";
 const MAX_CONCURRENT_RESPONSES: usize = 4;
+const VARIANT_DIRECTORY: &str = "__variants";
+const MAX_STORAGE_KEY_LENGTH: usize = 1024;
 
 /// Maximum file size accepted by the initial read-only service.
 pub const MAX_ASSET_SIZE: u64 = 20 * 1024 * 1024;
@@ -111,7 +113,6 @@ impl MediaConfig {
             Some(path) => PathBuf::from(path),
             None => root.join("catalog.sqlite"),
         };
-
         Ok(Self::with_catalog(bind, root, catalog))
     }
 }
@@ -148,6 +149,35 @@ impl fmt::Display for MediaError {
 }
 
 impl std::error::Error for MediaError {}
+
+/// 当前允许的派生图用途；未知用途不能进入公开 URL 或 catalog。
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum MediaVariant {
+    Chat,
+    Thumb,
+    Large,
+}
+
+impl MediaVariant {
+    /// 从目录键或 URL 段解析固定变体。
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "chat" => Some(Self::Chat),
+            "thumb" => Some(Self::Thumb),
+            "large" => Some(Self::Large),
+            _ => None,
+        }
+    }
+
+    /// 返回稳定的目录键。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Thumb => "thumb",
+            Self::Large => "large",
+        }
+    }
+}
 
 /// Metadata captured for one indexed image.
 #[derive(Clone, Debug)]
@@ -193,12 +223,83 @@ impl AssetMeta {
     }
 }
 
+/// Metadata captured for one generated image variant.
+#[derive(Clone, Debug)]
+pub struct VariantMeta {
+    asset_key: String,
+    variant: MediaVariant,
+    path: PathBuf,
+    sha256: String,
+    mime: &'static str,
+    extension: String,
+    size: u64,
+    modified: SystemTime,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+impl VariantMeta {
+    /// 返回被派生的逻辑资源键。
+    pub fn asset_key(&self) -> &str {
+        &self.asset_key
+    }
+
+    /// 返回派生图用途。
+    pub const fn variant(&self) -> MediaVariant {
+        self.variant
+    }
+
+    /// 返回内容哈希。
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// 返回响应 MIME。
+    pub fn mime(&self) -> &str {
+        self.mime
+    }
+
+    /// 返回 URL 使用的扩展名。
+    pub fn extension(&self) -> &str {
+        &self.extension
+    }
+
+    /// 返回文件大小。
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// 返回启动索引时的修改时间。
+    pub fn modified(&self) -> SystemTime {
+        self.modified
+    }
+
+    /// 返回派生图宽度；无法从安全头部读取时为空。
+    pub fn width(&self) -> Option<u32> {
+        self.width
+    }
+
+    /// 返回派生图高度；无法从安全头部读取时为空。
+    pub fn height(&self) -> Option<u32> {
+        self.height
+    }
+
+    fn storage_key(&self) -> String {
+        format!(
+            "{VARIANT_DIRECTORY}/{}/{}",
+            self.variant.as_str(),
+            self.asset_key
+        )
+    }
+}
+
 /// Immutable startup index.
 #[derive(Clone, Debug)]
 pub struct MediaIndex {
     root: PathBuf,
     by_key: HashMap<String, Arc<AssetMeta>>,
     by_hash_extension: HashMap<(String, String), Arc<AssetMeta>>,
+    by_variant: HashMap<(String, MediaVariant), Arc<VariantMeta>>,
 }
 
 impl MediaIndex {
@@ -214,9 +315,11 @@ impl MediaIndex {
             root,
             by_key: HashMap::new(),
             by_hash_extension: HashMap::new(),
+            by_variant: HashMap::new(),
         };
         let mut visited_directories = HashSet::new();
         index.walk_directory(index.root.clone(), &mut visited_directories)?;
+        index.index_variants()?;
         Ok(index)
     }
 
@@ -229,6 +332,13 @@ impl MediaIndex {
     pub fn get_by_hash(&self, sha256: &str, extension: &str) -> Option<&AssetMeta> {
         self.by_hash_extension
             .get(&(sha256.to_ascii_lowercase(), extension.to_ascii_lowercase()))
+            .map(Arc::as_ref)
+    }
+
+    /// 查找指定逻辑资源的派生图。
+    pub fn get_variant(&self, asset_key: &str, variant: MediaVariant) -> Option<&VariantMeta> {
+        self.by_variant
+            .get(&(asset_key.to_owned(), variant))
             .map(Arc::as_ref)
     }
 
@@ -247,6 +357,30 @@ impl MediaIndex {
         let mut assets = self.by_key.values().map(Arc::as_ref).collect::<Vec<_>>();
         assets.sort_by(|left, right| left.asset_key.cmp(&right.asset_key));
         assets
+    }
+
+    /// 按稳定键和用途排序返回所有变体，供 catalog 发布和校验使用。
+    pub(crate) fn variants(&self) -> Vec<&VariantMeta> {
+        let mut variants = self
+            .by_variant
+            .values()
+            .map(Arc::as_ref)
+            .collect::<Vec<_>>();
+        variants.sort_by(|left, right| {
+            (left.asset_key(), left.variant()).cmp(&(right.asset_key(), right.variant()))
+        });
+        variants
+    }
+
+    /// 返回指定逻辑资源下的全部变体。
+    pub(crate) fn variants_for(&self, asset_key: &str) -> Vec<&VariantMeta> {
+        let mut variants = self
+            .by_variant
+            .iter()
+            .filter_map(|((key, _), variant)| (key == asset_key).then_some(variant.as_ref()))
+            .collect::<Vec<_>>();
+        variants.sort_by_key(|variant| variant.variant());
+        variants
     }
 
     fn walk_directory(
@@ -271,6 +405,11 @@ impl MediaIndex {
 
         for entry in entries {
             let path = entry.path();
+            if directory == self.root
+                && path.file_name().and_then(|name| name.to_str()) == Some(VARIANT_DIRECTORY)
+            {
+                continue;
+            }
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(_) => continue,
@@ -335,6 +474,144 @@ impl MediaIndex {
         Ok(())
     }
 
+    fn index_variants(&mut self) -> Result<(), MediaError> {
+        let directory = self.root.join(VARIANT_DIRECTORY);
+        if !directory.exists() {
+            return Ok(());
+        }
+        let canonical_directory = fs::canonicalize(&directory)
+            .map_err(|_| MediaError::IndexUnavailable)?;
+        if !is_within_root(&self.root, &canonical_directory)
+            || !fs::metadata(&canonical_directory)
+                .map_err(|_| MediaError::IndexUnavailable)?
+                .is_dir()
+        {
+            return Err(MediaError::IndexUnavailable);
+        }
+
+        let mut entries = fs::read_dir(&directory)
+            .map_err(|_| MediaError::IndexUnavailable)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| MediaError::IndexUnavailable)?;
+        entries.sort_by_key(|entry| entry.file_name());
+        let mut visited_directories = HashSet::new();
+        for entry in entries {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return Err(MediaError::IndexUnavailable);
+            };
+            let Some(variant) = MediaVariant::parse(&name) else {
+                return Err(MediaError::IndexUnavailable);
+            };
+            let path = entry.path();
+            let canonical_variant_directory = fs::canonicalize(&path)
+                .map_err(|_| MediaError::IndexUnavailable)?;
+            if !is_within_root(&self.root, &canonical_variant_directory)
+                || !fs::metadata(&canonical_variant_directory)
+                    .map_err(|_| MediaError::IndexUnavailable)?
+                    .is_dir()
+            {
+                return Err(MediaError::IndexUnavailable);
+            }
+            self.walk_variant_directory(
+                variant,
+                path,
+                canonical_variant_directory,
+                &mut visited_directories,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn walk_variant_directory(
+        &mut self,
+        variant: MediaVariant,
+        directory: PathBuf,
+        variants_root: PathBuf,
+        visited_directories: &mut HashSet<PathBuf>,
+    ) -> Result<(), MediaError> {
+        let canonical_directory = match fs::canonicalize(&directory) {
+            Ok(path) if is_within_root(&self.root, &path) => path,
+            _ => return Ok(()),
+        };
+        if !visited_directories.insert(canonical_directory) {
+            return Ok(());
+        }
+
+        let mut entries = fs::read_dir(&directory)
+            .map_err(|_| MediaError::IndexUnavailable)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| MediaError::IndexUnavailable)?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            let canonical_path = match fs::canonicalize(&path) {
+                Ok(path) if is_within_root(&self.root, &path) => path,
+                _ => continue,
+            };
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if metadata.is_dir() {
+                self.walk_variant_directory(
+                    variant,
+                    path,
+                    variants_root.clone(),
+                    visited_directories,
+                )?;
+                continue;
+            }
+            if !metadata.is_file() || (!file_type.is_file() && !file_type.is_symlink()) {
+                continue;
+            }
+            if metadata.len() > MAX_ASSET_SIZE {
+                continue;
+            }
+            let Some(asset_key) = relative_asset_key(&variants_root, &path) else {
+                return Err(MediaError::IndexUnavailable);
+            };
+            let Some(extension) = allowed_extension(&path) else {
+                continue;
+            };
+            let Some(mime) = detect_image_mime(&canonical_path).ok().flatten() else {
+                continue;
+            };
+            if mime_for_extension(&extension) != Some(mime) {
+                continue;
+            }
+            let (sha256, size) = match hash_file(&canonical_path, &metadata) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+            let (width, height) = image_dimensions(&canonical_path, mime);
+            let variant_meta = Arc::new(VariantMeta {
+                asset_key: asset_key.clone(),
+                variant,
+                path: canonical_path,
+                sha256,
+                mime,
+                extension,
+                size,
+                modified,
+                width,
+                height,
+            });
+            if self
+                .by_variant
+                .insert((asset_key, variant), variant_meta)
+                .is_some()
+            {
+                return Err(MediaError::IndexUnavailable);
+            }
+        }
+        Ok(())
+    }
+
     fn root(&self) -> &Path {
         &self.root
     }
@@ -351,11 +628,7 @@ pub struct MediaState {
 impl MediaState {
     /// 仅按媒体 root 建立状态，供不使用 catalog 的嵌入测试保留。
     pub fn from_root(root: impl AsRef<Path>) -> Result<Self, MediaError> {
-        Ok(Self {
-            index: Arc::new(MediaIndex::build(root)?),
-            ready: true,
-            read_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_RESPONSES)),
-        })
+        Ok(Self::from_index(MediaIndex::build(root)?))
     }
 
     /// 从只读 catalog 与发布根建立状态；任何键或文件元数据不一致都会拒绝启动。
@@ -394,8 +667,10 @@ pub fn build_router(state: Arc<MediaState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz).head(healthz))
         .route("/readyz", get(readyz).head(readyz))
-        // Keep the hash route before the alias wildcard for readability. Axum
-        // chooses the more specific route regardless of declaration order.
+        .route(
+            "/media/variants/{variant}/{*asset_key}",
+            get(variant_get).head(variant_head),
+        )
         .route("/media/sha256/{*hash_asset}", get(hash_get).head(hash_head))
         .route("/media/{*asset_key}", get(alias_get).head(alias_head))
         .with_state(state)
@@ -506,6 +781,30 @@ async fn alias_head(
     serve_key(state, asset_key, headers, true).await
 }
 
+async fn variant_get(
+    State(state): State<Arc<MediaState>>,
+    AxumPath((variant, asset_key)): AxumPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    if !is_safe_raw_media_path(uri.path()) {
+        return HttpError::InvalidAssetKey.into_response();
+    }
+    serve_variant(state, variant, asset_key, headers, false).await
+}
+
+async fn variant_head(
+    State(state): State<Arc<MediaState>>,
+    AxumPath((variant, asset_key)): AxumPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    if !is_safe_raw_media_path(uri.path()) {
+        return HttpError::InvalidAssetKey.into_response();
+    }
+    serve_variant(state, variant, asset_key, headers, true).await
+}
+
 async fn hash_get(
     State(state): State<Arc<MediaState>>,
     AxumPath(hash_asset): AxumPath<String>,
@@ -539,10 +838,38 @@ async fn serve_key(
     if !is_safe_asset_key(&asset_key) {
         return HttpError::InvalidAssetKey.into_response();
     }
-    let Some(asset) = state.index.get(&asset_key) else {
+    let resource = state
+        .index
+        .get_variant(&asset_key, MediaVariant::Chat)
+        .map(SelectedResource::Variant)
+        .or_else(|| state.index.get(&asset_key).map(SelectedResource::Asset));
+    let Some(resource) = resource else {
         return HttpError::NotFound.into_response();
     };
-    serve_asset(&state, asset, headers, head, false).await
+    serve_selected(&state, resource, headers, head, false).await
+}
+
+async fn serve_variant(
+    state: Arc<MediaState>,
+    variant: String,
+    asset_key: String,
+    headers: HeaderMap,
+    head: bool,
+) -> Response {
+    let Some(variant) = MediaVariant::parse(&variant) else {
+        return HttpError::NotFound.into_response();
+    };
+    if !is_safe_asset_key(&asset_key) {
+        return HttpError::InvalidAssetKey.into_response();
+    }
+    let resource = state
+        .index
+        .get_variant(&asset_key, variant)
+        .map(SelectedResource::Variant);
+    let Some(resource) = resource else {
+        return HttpError::NotFound.into_response();
+    };
+    serve_selected(&state, resource, headers, head, false).await
 }
 
 async fn serve_hash(
@@ -554,20 +881,46 @@ async fn serve_hash(
     let Some((digest, extension)) = parse_hash_path(&hash_asset) else {
         return HttpError::NotFound.into_response();
     };
-    let Some(asset) = state.index.get_by_hash(&digest, &extension) else {
+    let resource = state
+        .index
+        .get_by_hash(&digest, &extension)
+        .map(SelectedResource::Asset);
+    let Some(resource) = resource else {
         return HttpError::NotFound.into_response();
     };
-    serve_asset(&state, asset, headers, head, true).await
+    serve_selected(&state, resource, headers, head, true).await
 }
 
-async fn serve_asset(
+enum SelectedResource<'a> {
+    Asset(&'a AssetMeta),
+    Variant(&'a VariantMeta),
+}
+
+async fn serve_selected(
     state: &MediaState,
-    asset: &AssetMeta,
+    resource: SelectedResource<'_>,
     request_headers: HeaderMap,
     head: bool,
     content_addressed: bool,
 ) -> Response {
-    let (mut bytes, permit) = match read_verified_asset(state, asset).await {
+    match resource {
+        SelectedResource::Asset(asset) => {
+            serve_indexed_resource(state, asset, request_headers, head, content_addressed).await
+        }
+        SelectedResource::Variant(variant) => {
+            serve_indexed_resource(state, variant, request_headers, head, content_addressed).await
+        }
+    }
+}
+
+async fn serve_indexed_resource<R: IndexedResource + ?Sized>(
+    state: &MediaState,
+    asset: &R,
+    request_headers: HeaderMap,
+    head: bool,
+    content_addressed: bool,
+) -> Response {
+    let (mut bytes, permit) = match read_verified_resource(state, asset).await {
         Ok(value) => value,
         Err(ReadAssetError::Busy) => return HttpError::Busy.into_response(),
         Err(ReadAssetError::Unavailable) => return HttpError::NotFound.into_response(),
@@ -575,18 +928,18 @@ async fn serve_asset(
 
     let mut response_headers = asset_headers(asset, content_addressed);
     let has_if_none_match = request_headers.get(header::IF_NONE_MATCH).is_some();
-    if if_none_match_matches(request_headers.get(header::IF_NONE_MATCH), &asset.sha256)
+    if if_none_match_matches(request_headers.get(header::IF_NONE_MATCH), asset.sha256())
         || (!has_if_none_match
             && if_modified_since_matches(
                 request_headers.get(header::IF_MODIFIED_SINCE),
-                asset.modified,
+                asset.modified(),
             ))
     {
         // RFC 9110 permits Content-Length on 304 when it describes the selected
         // 200 representation. Setting it also prevents Axum from inserting 0.
         response_headers.insert(
             header::CONTENT_LENGTH,
-            header_value(&asset.size.to_string()),
+            header_value(&asset.size().to_string()),
         );
         return response_from_parts(StatusCode::NOT_MODIFIED, response_headers, Body::empty());
     }
@@ -600,11 +953,11 @@ async fn serve_asset(
         value
             .to_str()
             .map_err(|_| RangeError::Invalid)
-            .and_then(|value| parse_range(value, asset.size))
+            .and_then(|value| parse_range(value, asset.size()))
     }) {
         Some(Ok(range)) => range,
         Some(Err(_)) => {
-            return range_not_satisfiable(asset.size, head);
+            return range_not_satisfiable(asset.size(), head);
         }
         None => None,
     };
@@ -615,17 +968,19 @@ async fn serve_asset(
                 header::CONTENT_RANGE,
                 header_value(&format!(
                     "bytes {}-{}/{}",
-                    range.start, range.end, asset.size
+                    range.start,
+                    range.end,
+                    asset.size()
                 )),
             );
             (StatusCode::PARTIAL_CONTENT, range.start, range.end)
         }
         None => {
-            let end = asset.size.saturating_sub(1);
+            let end = asset.size().saturating_sub(1);
             (StatusCode::OK, 0, end)
         }
     };
-    let content_length = if asset.size == 0 {
+    let content_length = if asset.size() == 0 {
         0
     } else {
         end.saturating_sub(start).saturating_add(1)
@@ -664,9 +1019,61 @@ enum ReadAssetError {
     Unavailable,
 }
 
-async fn read_verified_asset(
+trait IndexedResource {
+    fn path(&self) -> &Path;
+    fn sha256(&self) -> &str;
+    fn mime(&self) -> &str;
+    fn size(&self) -> u64;
+    fn modified(&self) -> SystemTime;
+}
+
+impl IndexedResource for AssetMeta {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    fn mime(&self) -> &str {
+        self.mime
+    }
+
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn modified(&self) -> SystemTime {
+        self.modified
+    }
+}
+
+impl IndexedResource for VariantMeta {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    fn mime(&self) -> &str {
+        self.mime
+    }
+
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn modified(&self) -> SystemTime {
+        self.modified
+    }
+}
+
+async fn read_verified_resource<R: IndexedResource + ?Sized>(
     state: &MediaState,
-    asset: &AssetMeta,
+    asset: &R,
 ) -> Result<(Vec<u8>, OwnedSemaphorePermit), ReadAssetError> {
     let permit = Arc::clone(&state.read_permits)
         .try_acquire_owned()
@@ -675,7 +1082,7 @@ async fn read_verified_asset(
     let mut file = TokioFile::open(path)
         .await
         .map_err(|_| ReadAssetError::Unavailable)?;
-    let mut bytes = Vec::with_capacity(asset.size as usize);
+    let mut bytes = Vec::with_capacity(asset.size() as usize);
     (&mut file)
         .take(MAX_ASSET_SIZE + 1)
         .read_to_end(&mut bytes)
@@ -686,10 +1093,10 @@ async fn read_verified_asset(
         .await
         .map_err(|_| ReadAssetError::Unavailable)?;
     if !metadata.is_file()
-        || bytes.len() as u64 != asset.size
-        || metadata.len() != asset.size
-        || metadata.modified().unwrap_or(UNIX_EPOCH) != asset.modified
-        || sha256_hex(&bytes) != asset.sha256
+        || bytes.len() as u64 != asset.size()
+        || metadata.len() != asset.size()
+        || metadata.modified().unwrap_or(UNIX_EPOCH) != asset.modified()
+        || sha256_hex(&bytes) != asset.sha256()
     {
         return Err(ReadAssetError::Unavailable);
     }
@@ -746,13 +1153,16 @@ fn range_not_satisfiable(size: u64, head: bool) -> Response {
     )
 }
 
-fn asset_headers(asset: &AssetMeta, content_addressed: bool) -> HeaderMap {
+fn asset_headers<R: IndexedResource + ?Sized>(asset: &R, content_addressed: bool) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, header_value(asset.mime));
-    headers.insert(header::ETAG, header_value(&format!("\"{}\"", asset.sha256)));
+    headers.insert(header::CONTENT_TYPE, header_value(asset.mime()));
+    headers.insert(
+        header::ETAG,
+        header_value(&format!("\"{}\"", asset.sha256())),
+    );
     headers.insert(
         header::LAST_MODIFIED,
-        header_value(&httpdate::fmt_http_date(asset.modified)),
+        header_value(&httpdate::fmt_http_date(asset.modified())),
     );
     headers.insert(
         HeaderName::from_static("x-content-type-options"),
@@ -786,19 +1196,22 @@ fn if_none_match_matches(value: Option<&HeaderValue>, digest: &str) -> bool {
     })
 }
 
-fn if_range_matches(value: Option<&HeaderValue>, asset: &AssetMeta) -> bool {
+fn if_range_matches<R: IndexedResource + ?Sized>(
+    value: Option<&HeaderValue>,
+    asset: &R,
+) -> bool {
     let Some(value) = value.and_then(|value| value.to_str().ok()) else {
         return value.is_none();
     };
     let value = value.trim();
     if value.starts_with('"') {
-        return value == format!("\"{}\"", asset.sha256);
+        return value == format!("\"{}\"", asset.sha256());
     }
     if value.starts_with("W/") {
         return false;
     }
     httpdate::parse_http_date(value)
-        .map(|date| truncate_to_http_second(asset.modified) <= date)
+        .map(|date| truncate_to_http_second(asset.modified()) <= date)
         .unwrap_or(false)
 }
 
@@ -837,7 +1250,7 @@ pub fn is_safe_asset_key(value: &str) -> bool {
         return false;
     };
     // Reserved by `/media/sha256/{digest}.{ext}`.
-    if first == "sha256" {
+    if first == "sha256" || first == VARIANT_DIRECTORY {
         return false;
     }
     for segment in std::iter::once(first).chain(segments) {
@@ -874,7 +1287,7 @@ fn allowed_extension(path: &Path) -> Option<String> {
         .then_some(extension)
 }
 
-fn mime_for_extension(extension: &str) -> Option<&'static str> {
+pub(crate) fn mime_for_extension(extension: &str) -> Option<&'static str> {
     Some(match extension {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -909,6 +1322,86 @@ fn detect_image_mime_bytes(header: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// 仅从有限长度的图片头读取尺寸，不执行完整解码或转码。
+fn image_dimensions(path: &Path, mime: &str) -> (Option<u32>, Option<u32>) {
+    let Ok(bytes) = read_file_prefix(path, 128 * 1024) else {
+        return (None, None);
+    };
+    let dimensions = match mime {
+        "image/png" if bytes.len() >= 24 => match (
+            be_u32(&bytes[16..20]),
+            be_u32(&bytes[20..24]),
+        ) {
+            (Some(width), Some(height)) => Some((width, height)),
+            _ => None,
+        },
+        "image/gif" if bytes.len() >= 10 => Some((
+            u16::from_le_bytes(bytes[6..8].try_into().ok().unwrap_or([0; 2])) as u32,
+            u16::from_le_bytes(bytes[8..10].try_into().ok().unwrap_or([0; 2])) as u32,
+        )),
+        "image/bmp" if bytes.len() >= 26 => {
+            let width = i32::from_le_bytes(
+                bytes[18..22].try_into().ok().unwrap_or([0; 4]),
+            )
+            .unsigned_abs();
+            let height = i32::from_le_bytes(
+                bytes[22..26].try_into().ok().unwrap_or([0; 4]),
+            )
+            .unsigned_abs();
+            Some((width, height))
+        }
+        "image/jpeg" => jpeg_dimensions(&bytes),
+        _ => None,
+    };
+    match dimensions.filter(|(width, height)| *width > 0 && *height > 0) {
+        Some((width, height)) => (Some(width), Some(height)),
+        None => (None, None),
+    }
+}
+
+fn be_u32(bytes: &[u8]) -> Option<u32> {
+    Some(u32::from_be_bytes(bytes.try_into().ok()?))
+}
+
+fn read_file_prefix(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    let mut bytes = Vec::new();
+    file.by_ref().take(limit).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 4 || bytes[..2] != [0xff, 0xd8] {
+        return None;
+    }
+    let mut offset = 2;
+    while offset + 3 < bytes.len() {
+        if bytes[offset] != 0xff {
+            offset += 1;
+            continue;
+        }
+        while offset < bytes.len() && bytes[offset] == 0xff {
+            offset += 1;
+        }
+        let marker = *bytes.get(offset)?;
+        offset += 1;
+        if marker == 0xd9 || marker == 0xda {
+            return None;
+        }
+        let length = u16::from_be_bytes(bytes.get(offset..offset + 2)?.try_into().ok()?) as usize;
+        if length < 2 || offset + length > bytes.len() {
+            return None;
+        }
+        if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) {
+            let height = u16::from_be_bytes(bytes.get(offset + 3..offset + 5)?.try_into().ok()?);
+            let width = u16::from_be_bytes(bytes.get(offset + 5..offset + 7)?.try_into().ok()?);
+            return Some((u32::from(width), u32::from(height)));
+        }
+        offset += length;
+    }
+    None
 }
 
 fn hash_file(path: &Path, metadata: &Metadata) -> io::Result<(String, u64)> {
@@ -953,15 +1446,41 @@ fn is_within_root(root: &Path, candidate: &Path) -> bool {
     candidate == root || candidate.starts_with(root)
 }
 
-fn safe_indexed_path(index: &MediaIndex, asset: &AssetMeta) -> Option<PathBuf> {
-    let canonical = fs::canonicalize(&asset.path).ok()?;
+/// 限制 catalog 本地存储键为安全的 ASCII 相对路径。
+pub(crate) fn is_safe_storage_key(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > MAX_STORAGE_KEY_LENGTH
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.contains("//")
+        || value.contains('\\')
+        || value.contains('%')
+        || value.contains('\0')
+    {
+        return false;
+    }
+    value.split('/').all(|segment| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    })
+}
+
+fn safe_indexed_path<R: IndexedResource + ?Sized>(
+    index: &MediaIndex,
+    asset: &R,
+) -> Option<PathBuf> {
+    let canonical = fs::canonicalize(asset.path()).ok()?;
     if !is_within_root(index.root(), &canonical) {
         return None;
     }
     let metadata = fs::metadata(&canonical).ok()?;
     (metadata.is_file()
-        && metadata.len() == asset.size
-        && metadata.modified().unwrap_or(UNIX_EPOCH) == asset.modified)
+        && metadata.len() == asset.size()
+        && metadata.modified().unwrap_or(UNIX_EPOCH) == asset.modified())
         .then_some(canonical)
 }
 
@@ -1151,6 +1670,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prefers_chat_variant_and_serves_explicit_variants() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let original = directory.path().join("maps/village.png");
+        let chat = directory
+            .path()
+            .join("__variants/chat/maps/village.png");
+        let large = directory
+            .path()
+            .join("__variants/large/maps/village.png");
+        fs::create_dir_all(original.parent().expect("parent")).expect("mkdir");
+        fs::create_dir_all(chat.parent().expect("parent")).expect("mkdir");
+        fs::create_dir_all(large.parent().expect("parent")).expect("mkdir");
+        fs::write(&original, b"\x89PNG\r\n\x1a\noriginal").expect("original");
+        fs::write(&chat, b"\x89PNG\r\n\x1a\nchat").expect("chat");
+        fs::write(&large, b"\x89PNG\r\n\x1a\nlarge").expect("large");
+
+        let state = Arc::new(MediaState::from_index(
+            MediaIndex::build(directory.path()).expect("index"),
+        ));
+        let app = build_router(state);
+
+        let (status, _headers, body) =
+            request(&app, Method::GET, "/media/maps/village.png", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"\x89PNG\r\n\x1a\nchat");
+
+        let (status, _headers, body) = request(
+            &app,
+            Method::GET,
+            "/media/variants/large/maps/village.png",
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"\x89PNG\r\n\x1a\nlarge");
+
+        let (status, _headers, _body) = request(
+            &app,
+            Method::GET,
+            "/media/variants/thumb/maps/village.png",
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn head_has_get_headers_without_body() {
         let (_directory, state, _digest) = fixture();
         let app = build_router(state);
@@ -1280,6 +1846,29 @@ mod tests {
         assert!(MediaState::from_catalog(directory.path(), &catalog).is_ok());
 
         fs::write(&image, b"\x89PNG\r\n\x1a\nrelease-two").expect("replace fixture");
+        assert!(matches!(
+            MediaState::from_catalog(directory.path(), &catalog),
+            Err(MediaError::CatalogUnavailable)
+        ));
+    }
+
+    #[test]
+    fn catalog_backed_state_refuses_variant_changed_outside_publish_command() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let image = directory.path().join("maps/village.png");
+        let variant = directory
+            .path()
+            .join("__variants/chat/maps/village.png");
+        fs::create_dir_all(image.parent().expect("parent")).expect("mkdir");
+        fs::create_dir_all(variant.parent().expect("parent")).expect("mkdir");
+        fs::write(&image, b"\x89PNG\r\n\x1a\nrelease").expect("image");
+        fs::write(&variant, b"\x89PNG\r\n\x1a\nchat-one").expect("variant");
+        let catalog = directory.path().join("catalog.sqlite");
+
+        publish_catalog(directory.path(), &catalog).expect("publish catalog");
+        assert!(MediaState::from_catalog(directory.path(), &catalog).is_ok());
+
+        fs::write(&variant, b"\x89PNG\r\n\x1a\nchat-two").expect("replace variant");
         assert!(matches!(
             MediaState::from_catalog(directory.path(), &catalog),
             Err(MediaError::CatalogUnavailable)
