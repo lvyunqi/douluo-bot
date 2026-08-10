@@ -1379,7 +1379,10 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
-    use crate::content::{ContentPackage, EffectPackageEntry, LoadedContentPackage, content_hash};
+    use crate::content::{
+        ContentPackage, EffectPackageEntry, LoadedContentPackage, SoulBeastPackageEntry,
+        SoulBeastSkillPoolPackageEntry, StatePackageEntry, content_hash,
+    };
     use axum::{
         body::{Body, to_bytes},
         http::{Method, Request},
@@ -1470,6 +1473,7 @@ mod tests {
             npcs: Vec::new(),
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -1489,11 +1493,71 @@ mod tests {
                 enabled: true,
             }],
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         };
         LoadedContentPackage {
             content_hash: content_hash(&package).expect("应计算 web 写入内容包哈希"),
+            package,
+            source_format: "json".to_string(),
+        }
+    }
+
+    fn state_and_beast_skill_pool_package(package_key: &str) -> LoadedContentPackage {
+        let package = ContentPackage {
+            package_key: package_key.to_string(),
+            revision: 1,
+            author: "web-v41-test".to_string(),
+            minimum_runtime: String::new(),
+            maps: Vec::new(),
+            items: Vec::new(),
+            npcs: Vec::new(),
+            quests: Vec::new(),
+            numeric_curves: Vec::new(),
+            states: vec![StatePackageEntry {
+                state_key: "web-v41-action-lock".to_string(),
+                name: "Web v41 行动锁".to_string(),
+                state_kind: "action_lock".to_string(),
+                target_kind: "beast".to_string(),
+                settlement_phase: "before_player_action".to_string(),
+                duration_rounds: 2,
+                stack_policy: "refresh".to_string(),
+                max_stacks: 1,
+                dispellable: false,
+                immunity_kind: "none".to_string(),
+                description: "仅用于验证管理端状态目录差异。".to_string(),
+            }],
+            wuhun: Vec::new(),
+            skills: Vec::new(),
+            effects: Vec::new(),
+            soul_beasts: vec![SoulBeastPackageEntry {
+                beast_key: "web-v41-pool-beast".to_string(),
+                name: "Web v41 技能池魂兽".to_string(),
+                description: "仅用于验证管理端魂兽技能池差异。".to_string(),
+                map_key: "sunset-forest".to_string(),
+                age: 30,
+                level_required: 1,
+                max_hp: 30,
+                attack: 4,
+                defense: 1,
+                speed: 9,
+                exp_reward: 30,
+                drop_item_key: "small-healing-potion".to_string(),
+                drop_quantity: 1,
+                enabled: true,
+            }],
+            soul_beast_skill_pools: vec![SoulBeastSkillPoolPackageEntry {
+                beast_key: "web-v41-pool-beast".to_string(),
+                skill_key: "entangle".to_string(),
+                weight: 100,
+                sort_order: 0,
+            }],
+            soul_rings: Vec::new(),
+            transitions: Vec::new(),
+        };
+        LoadedContentPackage {
+            content_hash: content_hash(&package).expect("应计算 v41 web 测试内容包哈希"),
             package,
             source_format: "json".to_string(),
         }
@@ -1729,6 +1793,7 @@ mod tests {
             npcs: Vec::new(),
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -1748,6 +1813,7 @@ mod tests {
                 enabled: true,
             }],
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         };
@@ -1765,7 +1831,7 @@ mod tests {
             .validate_content_draft("web-list-draft", 1)
             .expect("应校验 web 测试草稿");
 
-        let app = build_router(state);
+        let app = build_router(state.clone());
         for path in [
             "/api/v1/content/revisions",
             "/api/v1/content/drafts",
@@ -1855,6 +1921,44 @@ mod tests {
                 .iter()
                 .any(|member| member["member_key"] == "web-list-effect")
         );
+        assert!(payload.get("package_json").is_none());
+        assert!(payload["draft"].get("package_json").is_none());
+
+        let v41_package = state_and_beast_skill_pool_package("web-v41-diff-draft");
+        state
+            .store
+            .stage_content_package(&v41_package)
+            .expect("应写入 v41 web 测试草稿");
+        state
+            .store
+            .validate_content_draft("web-v41-diff-draft", 1)
+            .expect("应校验 v41 web 测试草稿");
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/content/drafts/web-v41-diff-draft/1/diff",
+            &headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["draft"]["package_key"], "web-v41-diff-draft");
+        for (member_kind, member_key) in [
+            ("state", "web-v41-action-lock"),
+            ("beast-skill", "web-v41-pool-beast:entangle"),
+        ] {
+            assert!(
+                payload["added_members"]
+                    .as_array()
+                    .expect("差异响应应包含成员数组")
+                    .iter()
+                    .any(|member| {
+                        member["member_kind"] == member_kind && member["member_key"] == member_key
+                    }),
+                "v41 差异响应缺少成员 {member_kind} / {member_key}"
+            );
+        }
         assert!(payload.get("package_json").is_none());
         assert!(payload["draft"].get("package_json").is_none());
 

@@ -12,11 +12,11 @@ use rusqlite::{
 use crate::config::DatabaseConfig;
 use crate::content::{
     ContentPackage, ContentTransitionPackageEntry, FORBID_SKILL_VALUE, LoadedContentPackage,
-    MAX_HEAL_AMOUNT, MAX_POISON_TICK_DAMAGE, PLAYER_LEVEL_EXP_CURVE_REFERENCE, SHIELD_VALUE,
-    SKILL_DAMAGE_PERCENT_CURVE_REFERENCE, SKILL_PROFICIENCY_CURVE_REFERENCE, STUN_VALUE,
-    TARGET_SELECTION_VALUE, canonical_json, content_hash, is_forbid_skill_v1_parameters,
-    is_heal_v1_parameters, is_poison_v1_parameters, is_shield_v1_parameters, is_stun_v1_parameters,
-    is_target_v1_parameters, validate_shape,
+    MAX_HEAL_AMOUNT, MAX_POISON_TICK_DAMAGE, MAX_SOUL_BEAST_SKILL_POOL_WEIGHT,
+    PLAYER_LEVEL_EXP_CURVE_REFERENCE, SHIELD_VALUE, SKILL_DAMAGE_PERCENT_CURVE_REFERENCE,
+    SKILL_PROFICIENCY_CURVE_REFERENCE, STUN_VALUE, TARGET_SELECTION_VALUE, canonical_json,
+    content_hash, is_forbid_skill_v1_parameters, is_heal_v1_parameters, is_poison_v1_parameters,
+    is_shield_v1_parameters, is_stun_v1_parameters, is_target_v1_parameters, validate_shape,
 };
 use crate::message::Protocol;
 
@@ -6497,6 +6497,168 @@ BEGIN
 END;
 "#;
 
+// v41 只追加类型化状态和魂兽技能池目录；它不创建玩家状态，也不改变既有战斗结算。
+const MIGRATION_V41: &str = r#"
+CREATE TABLE state_definition (
+    revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
+    state_key TEXT PRIMARY KEY CHECK(
+        length(state_key) BETWEEN 1 AND 96
+        AND state_key = trim(state_key)
+        AND state_key GLOB '[a-z0-9][a-z0-9._-]*'
+        AND state_key NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 128),
+    state_kind TEXT NOT NULL CHECK(state_kind IN (
+        'damage_over_time', 'heal_over_time', 'action_lock'
+    )),
+    target_kind TEXT NOT NULL CHECK(target_kind IN ('self', 'beast')),
+    settlement_phase TEXT NOT NULL CHECK(settlement_phase IN (
+        'after_player_damage', 'before_player_action'
+    )),
+    duration_rounds INTEGER NOT NULL CHECK(duration_rounds BETWEEN 1 AND 10),
+    stack_policy TEXT NOT NULL CHECK(stack_policy IN ('add', 'strongest', 'refresh', 'replace')),
+    max_stacks INTEGER NOT NULL CHECK(
+        max_stacks BETWEEN 1 AND 10
+        AND (stack_policy = 'add' OR max_stacks = 1)
+    ),
+    dispellable INTEGER NOT NULL CHECK(dispellable IN (0, 1) AND dispellable = 0),
+    immunity_kind TEXT NOT NULL CHECK(immunity_kind = 'none'),
+    description TEXT NOT NULL CHECK(length(description) BETWEEN 1 AND 2000),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    CHECK(
+        (state_kind = 'damage_over_time'
+            AND target_kind = 'beast'
+            AND settlement_phase = 'after_player_damage')
+        OR (state_kind = 'heal_over_time'
+            AND target_kind = 'self'
+            AND settlement_phase = 'after_player_damage')
+        OR (state_kind = 'action_lock'
+            AND target_kind IN ('self', 'beast')
+            AND settlement_phase = 'before_player_action')
+    )
+) STRICT;
+
+CREATE UNIQUE INDEX state_definition_name_unique ON state_definition(name);
+CREATE INDEX state_definition_revision ON state_definition(revision_id, state_key);
+
+CREATE TRIGGER state_definition_no_update
+BEFORE UPDATE ON state_definition
+BEGIN
+    SELECT RAISE(ABORT, 'state definition catalog is immutable');
+END;
+CREATE TRIGGER state_definition_no_delete
+BEFORE DELETE ON state_definition
+BEGIN
+    SELECT RAISE(ABORT, 'state definition catalog is immutable');
+END;
+CREATE TRIGGER state_definition_no_reinsert
+BEFORE INSERT ON state_definition
+WHEN EXISTS(SELECT 1 FROM state_definition WHERE state_key = NEW.state_key)
+BEGIN
+    SELECT RAISE(ABORT, 'state definition catalog is append-only');
+END;
+
+CREATE TABLE soul_beast_skill_pool (
+    revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
+    soul_beast_id INTEGER NOT NULL REFERENCES soul_beast(id) ON DELETE RESTRICT,
+    skill_key TEXT NOT NULL REFERENCES skill(skill_key) ON DELETE RESTRICT,
+    weight INTEGER NOT NULL CHECK(weight BETWEEN 1 AND 1000000),
+    sort_order INTEGER NOT NULL CHECK(sort_order >= 0),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    PRIMARY KEY(revision_id, soul_beast_id, skill_key),
+    UNIQUE(soul_beast_id, skill_key),
+    UNIQUE(soul_beast_id, sort_order)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX soul_beast_skill_pool_skill ON soul_beast_skill_pool(skill_key, soul_beast_id);
+
+CREATE TRIGGER soul_beast_skill_pool_no_update
+BEFORE UPDATE ON soul_beast_skill_pool
+BEGIN
+    SELECT RAISE(ABORT, 'soul beast skill pool is immutable');
+END;
+CREATE TRIGGER soul_beast_skill_pool_no_delete
+BEFORE DELETE ON soul_beast_skill_pool
+BEGIN
+    SELECT RAISE(ABORT, 'soul beast skill pool is immutable');
+END;
+CREATE TRIGGER soul_beast_skill_pool_no_reinsert
+BEFORE INSERT ON soul_beast_skill_pool
+WHEN EXISTS(
+    SELECT 1 FROM soul_beast_skill_pool
+     WHERE soul_beast_id = NEW.soul_beast_id AND skill_key = NEW.skill_key
+)
+BEGIN
+    SELECT RAISE(ABORT, 'soul beast skill pool is append-only');
+END;
+CREATE TRIGGER soul_beast_skill_pool_weight_guard
+BEFORE INSERT ON soul_beast_skill_pool
+WHEN NEW.weight + COALESCE((
+    SELECT SUM(weight) FROM soul_beast_skill_pool
+     WHERE soul_beast_id = NEW.soul_beast_id
+), 0) > 1000000
+BEGIN
+    SELECT RAISE(ABORT, 'soul beast skill pool total weight exceeds limit');
+END;
+
+CREATE TABLE content_revision_member_v41_backup AS
+SELECT revision_id, member_kind, member_key, created_at
+  FROM content_revision_member;
+
+DROP TRIGGER content_revision_member_no_update;
+DROP TRIGGER content_revision_member_no_delete;
+DROP TRIGGER content_revision_member_no_reinsert;
+DROP INDEX content_revision_member_lookup;
+DROP TABLE content_revision_member;
+
+CREATE TABLE content_revision_member (
+    revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
+    member_kind TEXT NOT NULL CHECK(
+        member_kind IN (
+            'wuhun', 'skill', 'starter-skill', 'effect', 'beast', 'ring', 'map', 'item', 'npc',
+            'quest', 'curve', 'state', 'beast-skill'
+        )
+    ),
+    member_key TEXT NOT NULL CHECK(
+        length(member_key) BETWEEN 1 AND 200
+        AND member_key = trim(member_key)
+        AND instr(member_key, char(0)) = 0
+    ),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    PRIMARY KEY(revision_id, member_kind, member_key)
+) STRICT, WITHOUT ROWID;
+
+INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+SELECT revision_id, member_kind, member_key, created_at
+  FROM content_revision_member_v41_backup;
+DROP TABLE content_revision_member_v41_backup;
+
+CREATE INDEX content_revision_member_lookup
+    ON content_revision_member(member_kind, member_key, revision_id);
+
+CREATE TRIGGER content_revision_member_no_update
+BEFORE UPDATE ON content_revision_member
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is immutable');
+END;
+CREATE TRIGGER content_revision_member_no_delete
+BEFORE DELETE ON content_revision_member
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is immutable');
+END;
+CREATE TRIGGER content_revision_member_no_reinsert
+BEFORE INSERT ON content_revision_member
+WHEN EXISTS(
+    SELECT 1 FROM content_revision_member
+     WHERE revision_id = NEW.revision_id
+       AND member_kind = NEW.member_kind
+       AND member_key = NEW.member_key
+)
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is append-only');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -8249,6 +8411,11 @@ fn content_package_member_set(package: &ContentPackage) -> BTreeSet<(String, Str
     members
 }
 
+/// 生成魂兽技能池成员的稳定复合键；内容键不允许冒号，因此无需解析歧义。
+fn soul_beast_skill_pool_member_key(beast_key: &str, skill_key: &str) -> String {
+    format!("{beast_key}:{skill_key}")
+}
+
 /// 仅收集内容包直接创建的目录成员，不能把依赖引用当作 replacement target。
 fn content_package_declared_member_set(package: &ContentPackage) -> BTreeSet<(String, String)> {
     let mut members = BTreeSet::new();
@@ -8267,6 +8434,9 @@ fn content_package_declared_member_set(package: &ContentPackage) -> BTreeSet<(St
     for entry in &package.numeric_curves {
         members.insert(("curve".to_string(), entry.curve_key.clone()));
     }
+    for entry in &package.states {
+        members.insert(("state".to_string(), entry.state_key.clone()));
+    }
     for entry in &package.wuhun {
         members.insert(("wuhun".to_string(), entry.name.clone()));
     }
@@ -8278,6 +8448,12 @@ fn content_package_declared_member_set(package: &ContentPackage) -> BTreeSet<(St
     }
     for entry in &package.soul_beasts {
         members.insert(("beast".to_string(), entry.beast_key.clone()));
+    }
+    for entry in &package.soul_beast_skill_pools {
+        members.insert((
+            "beast-skill".to_string(),
+            soul_beast_skill_pool_member_key(&entry.beast_key, &entry.skill_key),
+        ));
     }
     for entry in &package.soul_rings {
         members.insert(("ring".to_string(), entry.ring_key.clone()));
@@ -8413,6 +8589,24 @@ fn validate_content_package_against_database(
             errors.push(format!(
                 "地图键、名称或排序已存在：{} / {} / {}",
                 entry.map_key, entry.name, entry.sort_order
+            ));
+        }
+    }
+    let mut state_names = BTreeSet::new();
+    for entry in &package.states {
+        if !state_names.insert(entry.name.as_str()) {
+            errors.push(format!("内容包内状态名称重复：{}", entry.name));
+        }
+        if catalog_value_exists(
+            connection,
+            "state_definition",
+            "state_key",
+            &entry.state_key,
+        )? || catalog_value_exists(connection, "state_definition", "name", &entry.name)?
+        {
+            errors.push(format!(
+                "状态键或名称已存在：{} / {}",
+                entry.state_key, entry.name
             ));
         }
     }
@@ -8630,6 +8824,22 @@ fn validate_content_package_against_database(
             ));
         }
     }
+    for entry in &package.soul_beast_skill_pools {
+        if !package_beast_keys.contains(entry.beast_key.as_str()) {
+            errors.push(format!(
+                "魂兽技能池 {} 只能归属本包新增魂兽",
+                entry.beast_key
+            ));
+        }
+        if !package_skill_keys.contains(entry.skill_key.as_str())
+            && !active_content_member_exists(connection, "skill", &entry.skill_key)?
+        {
+            errors.push(format!(
+                "魂兽 {} 的技能池引用了不存在或不在当前 active revision 的魂技 {}",
+                entry.beast_key, entry.skill_key
+            ));
+        }
+    }
     names.clear();
     let mut ring_beasts = std::collections::BTreeSet::new();
     for entry in &package.soul_rings {
@@ -8755,6 +8965,12 @@ fn catalog_value_exists(
             "SELECT EXISTS(SELECT 1 FROM numeric_curve WHERE curve_key = ?1)"
         }
         ("numeric_curve", "name") => "SELECT EXISTS(SELECT 1 FROM numeric_curve WHERE name = ?1)",
+        ("state_definition", "state_key") => {
+            "SELECT EXISTS(SELECT 1 FROM state_definition WHERE state_key = ?1)"
+        }
+        ("state_definition", "name") => {
+            "SELECT EXISTS(SELECT 1 FROM state_definition WHERE name = ?1)"
+        }
         _ => return Err(format!("未知内容目录查询：{table}.{column}")),
     };
     connection
@@ -9083,6 +9299,41 @@ fn publish_content_package_rows(
             created_at,
         )?;
     }
+    for entry in &package.states {
+        connection
+            .execute(
+                r#"
+                INSERT INTO state_definition(
+                    revision_id, state_key, name, state_kind, target_kind,
+                    settlement_phase, duration_rounds, stack_policy, max_stacks,
+                    dispellable, immunity_kind, description, created_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                "#,
+                params![
+                    revision_id,
+                    entry.state_key,
+                    entry.name,
+                    entry.state_kind,
+                    entry.target_kind,
+                    entry.settlement_phase,
+                    entry.duration_rounds,
+                    entry.stack_policy,
+                    entry.max_stacks,
+                    entry.dispellable,
+                    entry.immunity_kind,
+                    entry.description,
+                    created_at,
+                ],
+            )
+            .map_err(|error| format!("发布状态 {} 失败：{error}", entry.state_key))?;
+        ensure_content_revision_member(
+            connection,
+            revision_id,
+            "state",
+            &entry.state_key,
+            created_at,
+        )?;
+    }
     for entry in &package.wuhun {
         connection
             .execute(
@@ -9254,6 +9505,44 @@ fn publish_content_package_rows(
             revision_id,
             "beast",
             &entry.beast_key,
+            created_at,
+        )?;
+    }
+    for entry in &package.soul_beast_skill_pools {
+        let beast_id = connection
+            .query_row(
+                "SELECT id FROM soul_beast WHERE beast_key = ?1",
+                [&entry.beast_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("发布魂兽技能池时找不到魂兽 {}：{error}", entry.beast_key))?;
+        connection
+            .execute(
+                r#"
+                INSERT INTO soul_beast_skill_pool(
+                    revision_id, soul_beast_id, skill_key, weight, sort_order, created_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                params![
+                    revision_id,
+                    beast_id,
+                    entry.skill_key,
+                    entry.weight,
+                    entry.sort_order,
+                    created_at,
+                ],
+            )
+            .map_err(|error| {
+                format!(
+                    "发布魂兽 {} 的技能池 {} 失败：{error}",
+                    entry.beast_key, entry.skill_key
+                )
+            })?;
+        ensure_content_revision_member(
+            connection,
+            revision_id,
+            "beast-skill",
+            &soul_beast_skill_pool_member_key(&entry.beast_key, &entry.skill_key),
             created_at,
         )?;
     }
@@ -10875,10 +11164,25 @@ impl Store {
                 validate_v40_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 41)? {
+                transaction
+                    .execute_batch(MIGRATION_V41)
+                    .map_err(|error| format!("执行数据库迁移 v41 失败：{error}"))?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(41, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v41 失败：{error}"))?;
+                validate_v41_schema(&transaction)?;
+            } else {
+                validate_v41_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36/v37/v38/v39/v40 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36/v37/v38/v39/v40/v41 失败：{error}"
                 )
             })?;
             Ok(())
@@ -10921,6 +11225,7 @@ impl Store {
                 validate_v35_schema(connection)?;
                 validate_v36_schema(connection)?;
                 validate_v40_schema(connection)?;
+                validate_v41_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -26642,6 +26947,7 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
     }
 
     let legacy_v26_present = migration_applied(connection, 26)?;
+    let v41_applied = migration_applied(connection, 41)?;
     let expected_triggers = if v28_applied {
         vec![
             ("skill_no_update", "skill"),
@@ -26809,6 +27115,7 @@ fn validate_v16_schema(connection: &Connection) -> Result<(), String> {
                 table.as_str(),
                 "soul_ring" | "soul_ring_drop" | "player_soul_ring" | "soul_ring_event"
             )
+            || (v41_applied && table == "soul_beast_skill_pool")
             || [
                 "soul_ring",
                 "soul_ring_drop",
@@ -29058,6 +29365,7 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
     let tracks_npcs = migration_applied(connection, 38)?;
     let tracks_quests = migration_applied(connection, 39)?;
     let tracks_curves = migration_applied(connection, 40)?;
+    let tracks_states = migration_applied(connection, 41)?;
     let expected_tables = [
         (
             "content_revision",
@@ -29119,7 +29427,9 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
         }
     }
 
-    let member_kind_marker = if tracks_curves {
+    let member_kind_marker = if tracks_states {
+        "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING', 'MAP', 'ITEM', 'NPC', 'QUEST', 'CURVE', 'STATE', 'BEAST-SKILL')"
+    } else if tracks_curves {
         "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING', 'MAP', 'ITEM', 'NPC', 'QUEST', 'CURVE')"
     } else if tracks_quests {
         "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING', 'MAP', 'ITEM', 'NPC', 'QUEST')"
@@ -32408,6 +32718,281 @@ fn validate_v40_schema(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// 校验 v41 类型化状态和魂兽技能池目录；目录损坏必须在启动前拒绝继续运行。
+fn validate_v41_schema(connection: &Connection) -> Result<(), String> {
+    validate_v40_schema(connection)?;
+    validate_column_names_and_types(
+        "state_definition",
+        &table_columns_with_type(connection, "state_definition")?,
+        &[
+            ("revision_id", "INTEGER"),
+            ("state_key", "TEXT"),
+            ("name", "TEXT"),
+            ("state_kind", "TEXT"),
+            ("target_kind", "TEXT"),
+            ("settlement_phase", "TEXT"),
+            ("duration_rounds", "INTEGER"),
+            ("stack_policy", "TEXT"),
+            ("max_stacks", "INTEGER"),
+            ("dispellable", "INTEGER"),
+            ("immunity_kind", "TEXT"),
+            ("description", "TEXT"),
+            ("created_at", "INTEGER"),
+        ],
+    )?;
+    validate_column_names_and_types(
+        "soul_beast_skill_pool",
+        &table_columns_with_type(connection, "soul_beast_skill_pool")?,
+        &[
+            ("revision_id", "INTEGER"),
+            ("soul_beast_id", "INTEGER"),
+            ("skill_key", "TEXT"),
+            ("weight", "INTEGER"),
+            ("sort_order", "INTEGER"),
+            ("created_at", "INTEGER"),
+        ],
+    )?;
+    validate_v10_table_sql(
+        connection,
+        "state_definition",
+        &[
+            ") STRICT",
+            "REVISION_ID INTEGER NOT NULL REFERENCES CONTENT_REVISION(ID) ON DELETE RESTRICT",
+            "STATE_KEY TEXT PRIMARY KEY",
+            "STATE_KIND TEXT NOT NULL CHECK(STATE_KIND IN",
+            "'DAMAGE_OVER_TIME'",
+            "'HEAL_OVER_TIME'",
+            "'ACTION_LOCK'",
+            "TARGET_KIND TEXT NOT NULL CHECK(TARGET_KIND IN ('SELF', 'BEAST'))",
+            "SETTLEMENT_PHASE TEXT NOT NULL CHECK(SETTLEMENT_PHASE IN",
+            "DURATION_ROUNDS BETWEEN 1 AND 10",
+            "STACK_POLICY TEXT NOT NULL CHECK(STACK_POLICY IN",
+            "MAX_STACKS BETWEEN 1 AND 10",
+            "DISPELLABLE INTEGER NOT NULL CHECK(DISPELLABLE IN (0, 1) AND DISPELLABLE = 0)",
+            "IMMUNITY_KIND TEXT NOT NULL CHECK(IMMUNITY_KIND = 'NONE')",
+        ],
+    )
+    .map_err(|error| error.replace("v10", "v41"))?;
+    validate_v10_table_sql(
+        connection,
+        "soul_beast_skill_pool",
+        &[
+            ") STRICT, WITHOUT ROWID",
+            "REVISION_ID INTEGER NOT NULL REFERENCES CONTENT_REVISION(ID) ON DELETE RESTRICT",
+            "SOUL_BEAST_ID INTEGER NOT NULL REFERENCES SOUL_BEAST(ID) ON DELETE RESTRICT",
+            "SKILL_KEY TEXT NOT NULL REFERENCES SKILL(SKILL_KEY) ON DELETE RESTRICT",
+            "WEIGHT INTEGER NOT NULL CHECK(WEIGHT BETWEEN 1 AND 1000000)",
+            "SORT_ORDER INTEGER NOT NULL CHECK(SORT_ORDER >= 0)",
+            "UNIQUE(SOUL_BEAST_ID, SKILL_KEY)",
+            "UNIQUE(SOUL_BEAST_ID, SORT_ORDER)",
+        ],
+    )
+    .map_err(|error| error.replace("v10", "v41"))?;
+    validate_v10_table_sql(
+        connection,
+        "content_revision_member",
+        &[") STRICT, WITHOUT ROWID", "'STATE'", "'BEAST-SKILL'"],
+    )
+    .map_err(|error| error.replace("v10", "v41"))?;
+    validate_v9_foreign_keys(
+        connection,
+        "state_definition",
+        &[(
+            "content_revision",
+            "revision_id",
+            "id",
+            "NO ACTION",
+            "RESTRICT",
+        )],
+    )
+    .map_err(|error| error.replace("v9", "v41"))?;
+    validate_v9_foreign_keys(
+        connection,
+        "soul_beast_skill_pool",
+        &[
+            (
+                "content_revision",
+                "revision_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("skill", "skill_key", "skill_key", "NO ACTION", "RESTRICT"),
+            ("soul_beast", "soul_beast_id", "id", "NO ACTION", "RESTRICT"),
+        ],
+    )
+    .map_err(|error| error.replace("v9", "v41"))?;
+    validate_v7_index(
+        connection,
+        "state_definition_name_unique",
+        true,
+        &["name"],
+        false,
+    )
+    .map_err(|error| error.replace("v7", "v41"))?;
+    validate_v7_index(
+        connection,
+        "state_definition_revision",
+        false,
+        &["revision_id", "state_key"],
+        false,
+    )
+    .map_err(|error| error.replace("v7", "v41"))?;
+    validate_v7_index(
+        connection,
+        "soul_beast_skill_pool_skill",
+        false,
+        &["skill_key", "soul_beast_id"],
+        false,
+    )
+    .map_err(|error| error.replace("v7", "v41"))?;
+    validate_v10_custom_index_set(
+        connection,
+        "state_definition",
+        &["state_definition_name_unique", "state_definition_revision"],
+    )
+    .map_err(|error| error.replace("v10", "v41"))?;
+    validate_v10_custom_index_set(
+        connection,
+        "soul_beast_skill_pool",
+        &["soul_beast_skill_pool_skill"],
+    )
+    .map_err(|error| error.replace("v10", "v41"))?;
+
+    let expected_triggers = [
+        (
+            "state_definition_no_update",
+            "state_definition",
+            &["BEFORE UPDATE ON STATE_DEFINITION", "RAISE(ABORT"] as &[&str],
+        ),
+        (
+            "state_definition_no_delete",
+            "state_definition",
+            &["BEFORE DELETE ON STATE_DEFINITION", "RAISE(ABORT"] as &[&str],
+        ),
+        (
+            "state_definition_no_reinsert",
+            "state_definition",
+            &["BEFORE INSERT ON STATE_DEFINITION", "APPEND-ONLY"] as &[&str],
+        ),
+        (
+            "soul_beast_skill_pool_no_update",
+            "soul_beast_skill_pool",
+            &["BEFORE UPDATE ON SOUL_BEAST_SKILL_POOL", "RAISE(ABORT"] as &[&str],
+        ),
+        (
+            "soul_beast_skill_pool_no_delete",
+            "soul_beast_skill_pool",
+            &["BEFORE DELETE ON SOUL_BEAST_SKILL_POOL", "RAISE(ABORT"] as &[&str],
+        ),
+        (
+            "soul_beast_skill_pool_no_reinsert",
+            "soul_beast_skill_pool",
+            &[
+                "BEFORE INSERT ON SOUL_BEAST_SKILL_POOL",
+                "SOUL BEAST SKILL POOL IS APPEND-ONLY",
+            ] as &[&str],
+        ),
+        (
+            "soul_beast_skill_pool_weight_guard",
+            "soul_beast_skill_pool",
+            &[
+                "BEFORE INSERT ON SOUL_BEAST_SKILL_POOL",
+                "TOTAL WEIGHT EXCEEDS LIMIT",
+            ] as &[&str],
+        ),
+    ];
+    for &(name, table, markers) in &expected_triggers {
+        let (actual_table, sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v41 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库缺少 v41 触发器 {name}"))?;
+        let normalized = sql.to_ascii_uppercase();
+        if actual_table != table || markers.iter().any(|marker| !normalized.contains(marker)) {
+            return Err(format!("v41 触发器 {name} 契约不匹配"));
+        }
+    }
+
+    let invalid_rows = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM state_definition state
+                 WHERE NOT EXISTS(
+                    SELECT 1 FROM content_revision_member member
+                     WHERE member.revision_id = state.revision_id
+                       AND member.member_kind = 'state'
+                       AND member.member_key = state.state_key
+                 )
+            ) OR EXISTS(
+                SELECT 1
+                  FROM content_revision_member member
+                  LEFT JOIN state_definition state ON state.state_key = member.member_key
+                 WHERE member.member_kind = 'state' AND state.state_key IS NULL
+            ) OR EXISTS(
+                SELECT 1
+                  FROM soul_beast_skill_pool pool
+                  JOIN soul_beast beast ON beast.id = pool.soul_beast_id
+                  JOIN skill ON skill.skill_key = pool.skill_key
+                  JOIN content_revision revision ON revision.id = pool.revision_id
+                 WHERE NOT EXISTS(
+                    SELECT 1 FROM content_revision_member member
+                     WHERE member.revision_id = pool.revision_id
+                       AND member.member_kind = 'beast-skill'
+                       AND member.member_key = beast.beast_key || ':' || pool.skill_key
+                 )
+                    OR NOT EXISTS(
+                    SELECT 1 FROM content_revision_member member
+                     WHERE member.revision_id = pool.revision_id
+                       AND member.member_kind = 'beast'
+                       AND member.member_key = beast.beast_key
+                 )
+                    OR EXISTS(
+                    SELECT 1 FROM content_revision_member parent
+                     WHERE parent.revision_id = revision.parent_revision_id
+                       AND parent.member_kind = 'beast'
+                       AND parent.member_key = beast.beast_key
+                 )
+                    OR NOT EXISTS(
+                    SELECT 1 FROM content_revision_visible_member member
+                     WHERE member.revision_id = pool.revision_id
+                       AND member.member_kind = 'skill'
+                       AND member.member_key = pool.skill_key
+                 )
+            ) OR EXISTS(
+                SELECT 1
+                  FROM content_revision_member member
+                 WHERE member.member_kind = 'beast-skill'
+                   AND NOT EXISTS(
+                    SELECT 1
+                      FROM soul_beast_skill_pool pool
+                      JOIN soul_beast beast ON beast.id = pool.soul_beast_id
+                      JOIN skill ON skill.skill_key = pool.skill_key
+                     WHERE beast.beast_key || ':' || pool.skill_key = member.member_key
+                   )
+            ) OR EXISTS(
+                SELECT 1
+                  FROM soul_beast_skill_pool
+                 GROUP BY soul_beast_id
+                HAVING SUM(weight) > ?1
+            )
+            "#,
+            [MAX_SOUL_BEAST_SKILL_POOL_WEIGHT],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v41 状态与魂兽技能池目录边界失败：{error}"))?;
+    if invalid_rows {
+        return Err("v41 检测到越界、孤立或未登记的状态/魂兽技能池目录成员".to_string());
+    }
+    Ok(())
+}
+
 fn validate_v24_table_sql(
     connection: &Connection,
     table: &str,
@@ -32628,13 +33213,41 @@ fn validate_v12_index(
 }
 
 fn validate_v12_seeds(connection: &Connection) -> Result<(), String> {
+    let allows_catalog_extensions = migration_applied(connection, 23)?;
     let count = connection
         .query_row("SELECT COUNT(*) FROM soul_beast", [], |row| {
             row.get::<_, i64>(0)
         })
         .map_err(|error| format!("统计 v12 魂兽种子失败：{error}"))?;
-    if count != 2 {
+    let untracked_extensions = if allows_catalog_extensions {
+        connection
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1
+                      FROM soul_beast beast
+                     WHERE beast.beast_key NOT IN ('goblin', 'slime')
+                       AND NOT EXISTS(
+                            SELECT 1
+                              FROM content_revision_member member
+                             WHERE member.member_kind = 'beast'
+                               AND member.member_key = beast.beast_key
+                       )
+                )
+                "#,
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("检查 v12 新增魂兽成员失败：{error}"))?
+    } else {
+        false
+    };
+    // v23 之后的新增魂兽必须仍由内容成员账本登记，v12 继续守住不可替换的基础种子。
+    if (!allows_catalog_extensions && count != 2) || (allows_catalog_extensions && count < 2) {
         return Err(format!("v12 魂兽种子数量不匹配：{count}"));
+    }
+    if untracked_extensions {
+        return Err("v12 检测到未登记到内容 revision 的新增魂兽目录".to_string());
     }
     for (
         beast_key,
@@ -32831,9 +33444,17 @@ fn validate_v10_table_sql(
         .optional()
         .map_err(|error| format!("读取 v10 表 {table} 建表语句失败：{error}"))?
         .ok_or_else(|| format!("数据库已标记迁移 v10，但缺少表 {table}"))?
-        .to_ascii_uppercase();
+        .to_ascii_uppercase()
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>();
     for marker in markers {
-        if !sql.contains(marker) {
+        let normalized_marker = marker
+            .to_ascii_uppercase()
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect::<String>();
+        if !sql.contains(&normalized_marker) {
             return Err(format!(
                 "数据库已标记迁移 v10，但表 {table} 缺少约束：{marker}"
             ));
@@ -34280,7 +34901,8 @@ mod tests {
         FORBID_SKILL_RULE_VERSION, ItemPackageEntry, MIN_FORBID_SKILL_DURATION_ROUNDS,
         MapPackageEntry, NpcPackageEntry, NumericCurvePackageEntry, QuestPackageEntry,
         QuestRequirementPackageEntry, QuestRewardPackageEntry, SkillPackageEntry,
-        SoulBeastPackageEntry, SoulRingPackageEntry, WuhunPackageEntry, WuhunStatsPackageEntry,
+        SoulBeastPackageEntry, SoulBeastSkillPoolPackageEntry, SoulRingPackageEntry,
+        StatePackageEntry, WuhunPackageEntry, WuhunStatsPackageEntry,
     };
     use tempfile::tempdir;
 
@@ -34308,6 +34930,7 @@ mod tests {
             npcs: Vec::new(),
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -34327,6 +34950,7 @@ mod tests {
                 enabled: true,
             }],
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         };
@@ -34362,10 +34986,12 @@ mod tests {
             npcs: Vec::new(),
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: Vec::new(),
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         };
@@ -34410,10 +35036,12 @@ mod tests {
             npcs: Vec::new(),
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: Vec::new(),
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         };
@@ -34450,10 +35078,12 @@ mod tests {
             }],
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: Vec::new(),
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         };
@@ -34538,10 +35168,12 @@ mod tests {
                 ],
             }],
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: Vec::new(),
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         };
@@ -34580,15 +35212,76 @@ mod tests {
                 description: "只展示既有编译期数值规则的输入范围。".to_string(),
                 sort_order,
             }],
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: Vec::new(),
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         };
         LoadedContentPackage {
             content_hash: content_hash(&package).expect("应计算数值曲线内容包哈希"),
+            package,
+            source_format: "json".to_string(),
+        }
+    }
+
+    fn state_and_beast_skill_pool_content_package(package_key: &str) -> LoadedContentPackage {
+        let package = ContentPackage {
+            package_key: package_key.to_string(),
+            revision: 1,
+            author: "v41-test".to_string(),
+            minimum_runtime: String::new(),
+            maps: Vec::new(),
+            items: Vec::new(),
+            npcs: Vec::new(),
+            quests: Vec::new(),
+            numeric_curves: Vec::new(),
+            states: vec![StatePackageEntry {
+                state_key: "v41-action-lock".to_string(),
+                name: "v41 行动锁".to_string(),
+                state_kind: "action_lock".to_string(),
+                target_kind: "beast".to_string(),
+                settlement_phase: "before_player_action".to_string(),
+                duration_rounds: 2,
+                stack_policy: "refresh".to_string(),
+                max_stacks: 1,
+                dispellable: false,
+                immunity_kind: "none".to_string(),
+                description: "仅用于验证类型化状态目录，不进入战斗结算。".to_string(),
+            }],
+            wuhun: Vec::new(),
+            skills: Vec::new(),
+            effects: Vec::new(),
+            soul_beasts: vec![SoulBeastPackageEntry {
+                beast_key: "v41-pool-beast".to_string(),
+                name: "v41 技能池魂兽".to_string(),
+                description: "仅用于验证结构化魂兽技能池。".to_string(),
+                map_key: "sunset-forest".to_string(),
+                age: 30,
+                level_required: 1,
+                max_hp: 30,
+                attack: 4,
+                defense: 1,
+                speed: 9,
+                exp_reward: 30,
+                drop_item_key: "small-healing-potion".to_string(),
+                drop_quantity: 1,
+                enabled: true,
+            }],
+            soul_beast_skill_pools: vec![SoulBeastSkillPoolPackageEntry {
+                beast_key: "v41-pool-beast".to_string(),
+                skill_key: "entangle".to_string(),
+                weight: 100,
+                sort_order: 0,
+            }],
+            soul_rings: Vec::new(),
+            transitions: Vec::new(),
+        };
+        LoadedContentPackage {
+            content_hash: content_hash(&package).expect("应计算 v41 内容包哈希"),
             package,
             source_format: "json".to_string(),
         }
@@ -34886,6 +35579,7 @@ mod tests {
             npcs: Vec::new(),
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -34905,6 +35599,7 @@ mod tests {
                 enabled: true,
             }],
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         };
@@ -34930,6 +35625,7 @@ mod tests {
             npcs: Vec::new(),
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -34949,6 +35645,7 @@ mod tests {
                 enabled: true,
             }],
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         };
@@ -34977,6 +35674,7 @@ mod tests {
             npcs: Vec::new(),
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -34996,6 +35694,7 @@ mod tests {
                 enabled: true,
             }],
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         };
@@ -35022,6 +35721,7 @@ mod tests {
             npcs: Vec::new(),
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -35041,6 +35741,7 @@ mod tests {
                 enabled: true,
             }],
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         };
@@ -35067,6 +35768,7 @@ mod tests {
             npcs: Vec::new(),
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -35086,6 +35788,7 @@ mod tests {
                 enabled: true,
             }],
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         };
@@ -35112,6 +35815,7 @@ mod tests {
             npcs: Vec::new(),
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -35131,6 +35835,7 @@ mod tests {
                 enabled: true,
             }],
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         };
@@ -35249,6 +35954,7 @@ mod tests {
             npcs: Vec::new(),
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "preview-skill".to_string(),
@@ -35300,6 +36006,7 @@ mod tests {
                 },
             ],
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         };
@@ -35321,6 +36028,7 @@ mod tests {
             npcs: Vec::new(),
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: vec![WuhunPackageEntry {
                 name: "transition wuhun".to_string(),
                 category: "控制系".to_string(),
@@ -35385,6 +36093,7 @@ mod tests {
                 drop_quantity: 1,
                 enabled: true,
             }],
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: vec![SoulRingPackageEntry {
                 ring_key: "transition-ring".to_string(),
                 name: "transition ring".to_string(),
@@ -37988,7 +38697,9 @@ mod tests {
         connection
             .execute_batch(
                 r#"
-                DELETE FROM schema_migration WHERE version IN (37, 38, 39, 40);
+                DELETE FROM schema_migration WHERE version IN (37, 38, 39, 40, 41);
+                DROP TABLE soul_beast_skill_pool;
+                DROP TABLE state_definition;
                 DROP TABLE numeric_curve;
                 CREATE TABLE content_revision_member_v36_test_backup AS
                 SELECT revision_id, member_kind, member_key, created_at
@@ -38316,7 +39027,9 @@ mod tests {
         connection
             .execute_batch(
                 r#"
-                DELETE FROM schema_migration WHERE version IN (38, 39, 40);
+                DELETE FROM schema_migration WHERE version IN (38, 39, 40, 41);
+                DROP TABLE soul_beast_skill_pool;
+                DROP TABLE state_definition;
                 DROP TABLE numeric_curve;
                 CREATE TABLE content_revision_member_v37_test_backup AS
                 SELECT revision_id, member_kind, member_key, created_at
@@ -38668,6 +39381,301 @@ mod tests {
     }
 
     #[test]
+    fn v41_state_and_beast_skill_pool_follow_active_revision_without_rewriting_player_state() {
+        let (directory, store) = test_store();
+        register_awakened_pair(&store);
+        let baseline = store
+            .active_content_revision()
+            .expect("应读取 v41 内容目录基线 revision");
+        let before_player = store
+            .player_status(&identity())
+            .expect("应读取发布前角色状态")
+            .expect("应存在测试角色");
+        let connection = store.open().expect("应打开 v41 内容目录测试数据库");
+        let player_rows_before = connection
+            .query_row(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM player),
+                    (SELECT COUNT(*) FROM player_skill),
+                    (SELECT COUNT(*) FROM player_soul_ring),
+                    (SELECT COUNT(*) FROM player_soul_ring_detachment),
+                    (SELECT COUNT(*) FROM battle),
+                    (SELECT COUNT(*) FROM battle_event)
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .expect("应读取发布前玩家与战斗行数");
+        drop(connection);
+
+        let package = state_and_beast_skill_pool_content_package("test-v41-catalog");
+        store
+            .stage_content_package(&package)
+            .expect("应暂存 v41 内容包");
+        let preview = store
+            .preview_content_draft("test-v41-catalog", 1)
+            .expect("应预览 v41 内容包差异")
+            .expect("已暂存的 v41 内容包应存在");
+        assert_eq!(preview.active_revision.id, baseline.id);
+        assert_eq!(
+            preview.projected_member_count,
+            preview.active_member_count + 3
+        );
+        for member in [
+            ("beast", "v41-pool-beast"),
+            ("beast-skill", "v41-pool-beast:entangle"),
+            ("state", "v41-action-lock"),
+        ] {
+            assert!(
+                preview
+                    .added_members
+                    .iter()
+                    .any(|entry| entry.member_kind == member.0 && entry.member_key == member.1),
+                "差异预览缺少成员 {} / {}",
+                member.0,
+                member.1
+            );
+        }
+        let report = store
+            .validate_content_draft("test-v41-catalog", 1)
+            .expect("应校验 v41 内容包");
+        assert!(report.errors.is_empty(), "{report:?}");
+        let receipt = store
+            .publish_content_draft("test-v41-catalog", 1)
+            .expect("应发布 v41 内容包");
+        assert_eq!(receipt.active_revision_id, receipt.revision.id);
+        assert_eq!(receipt.member_count, preview.projected_member_count);
+
+        let connection = store.open().expect("应读取已发布 v41 目录");
+        for member in [
+            ("beast", "v41-pool-beast"),
+            ("beast-skill", "v41-pool-beast:entangle"),
+            ("state", "v41-action-lock"),
+        ] {
+            assert!(
+                active_content_member_exists(&connection, member.0, member.1)
+                    .expect("应读取 v41 active 内容成员"),
+                "发布后应显示成员 {} / {}",
+                member.0,
+                member.1
+            );
+        }
+        let member_rows = connection
+            .prepare(
+                r#"
+                SELECT member_kind, member_key
+                  FROM content_revision_member
+                 WHERE revision_id = ?1
+                   AND (
+                        (member_kind = 'beast' AND member_key = 'v41-pool-beast')
+                     OR (member_kind = 'beast-skill' AND member_key = 'v41-pool-beast:entangle')
+                     OR (member_kind = 'state' AND member_key = 'v41-action-lock')
+                   )
+                 ORDER BY member_kind, member_key
+                "#,
+            )
+            .expect("应准备 v41 成员查询")
+            .query_map([receipt.revision.id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("应读取 v41 成员")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("应解析 v41 成员");
+        assert_eq!(
+            member_rows,
+            vec![
+                ("beast".to_string(), "v41-pool-beast".to_string()),
+                (
+                    "beast-skill".to_string(),
+                    "v41-pool-beast:entangle".to_string(),
+                ),
+                ("state".to_string(), "v41-action-lock".to_string()),
+            ]
+        );
+        let state = connection
+            .query_row(
+                r#"
+                SELECT revision_id, state_key, state_kind, target_kind, settlement_phase,
+                       duration_rounds, stack_policy, max_stacks, dispellable, immunity_kind
+                  FROM state_definition
+                 WHERE state_key = 'v41-action-lock'
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                },
+            )
+            .expect("应读取已发布状态目录行");
+        assert_eq!(
+            state,
+            (
+                receipt.revision.id,
+                "v41-action-lock".to_string(),
+                "action_lock".to_string(),
+                "beast".to_string(),
+                "before_player_action".to_string(),
+                2,
+                "refresh".to_string(),
+                1,
+                0,
+                "none".to_string(),
+            )
+        );
+        let pool = connection
+            .query_row(
+                r#"
+                SELECT pool.revision_id, beast.beast_key, skill.skill_key, pool.weight, pool.sort_order
+                  FROM soul_beast_skill_pool pool
+                  JOIN soul_beast beast ON beast.id = pool.soul_beast_id
+                  JOIN skill ON skill.skill_key = pool.skill_key
+                 WHERE beast.beast_key = 'v41-pool-beast'
+                   AND skill.skill_key = 'entangle'
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .expect("应读取已发布魂兽技能池目录行");
+        assert_eq!(
+            pool,
+            (
+                receipt.revision.id,
+                "v41-pool-beast".to_string(),
+                "entangle".to_string(),
+                100,
+                0,
+            )
+        );
+        drop(connection);
+        assert_eq!(
+            store
+                .player_status(&identity())
+                .expect("应读取发布后角色状态"),
+            Some(before_player.clone())
+        );
+
+        store
+            .rollback_content_revision(baseline.id)
+            .expect("应回滚 v41 内容 revision");
+        let connection = store.open().expect("应读取回滚后的 v41 目录");
+        for member in [
+            ("beast", "v41-pool-beast"),
+            ("beast-skill", "v41-pool-beast:entangle"),
+            ("state", "v41-action-lock"),
+        ] {
+            assert!(
+                !active_content_member_exists(&connection, member.0, member.1)
+                    .expect("应读取回滚后的 active 内容成员"),
+                "回滚后不应显示成员 {} / {}",
+                member.0,
+                member.1
+            );
+        }
+        let catalog_counts = connection
+            .query_row(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM state_definition WHERE state_key = 'v41-action-lock'),
+                    (SELECT COUNT(*) FROM soul_beast_skill_pool pool
+                      JOIN soul_beast beast ON beast.id = pool.soul_beast_id
+                      JOIN skill ON skill.skill_key = pool.skill_key
+                     WHERE beast.beast_key = 'v41-pool-beast' AND skill.skill_key = 'entangle'),
+                    (SELECT COUNT(*) FROM player),
+                    (SELECT COUNT(*) FROM player_skill),
+                    (SELECT COUNT(*) FROM player_soul_ring),
+                    (SELECT COUNT(*) FROM player_soul_ring_detachment),
+                    (SELECT COUNT(*) FROM battle),
+                    (SELECT COUNT(*) FROM battle_event)
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .expect("应统计回滚后的 v41 目录与玩家数据");
+        assert_eq!(catalog_counts.0, 1);
+        assert_eq!(catalog_counts.1, 1);
+        assert_eq!(
+            (
+                catalog_counts.2,
+                catalog_counts.3,
+                catalog_counts.4,
+                catalog_counts.5,
+                catalog_counts.6,
+                catalog_counts.7,
+            ),
+            player_rows_before
+        );
+        drop(connection);
+        assert_eq!(
+            store
+                .player_status(&identity())
+                .expect("应读取回滚后角色状态"),
+            Some(before_player)
+        );
+
+        drop(store);
+        let restarted = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v41 回滚后的数据库应可重启");
+        let connection = restarted.open().expect("应读取重启后的 v41 目录");
+        assert!(
+            !active_content_member_exists(&connection, "state", "v41-action-lock")
+                .expect("重启后应读取状态成员")
+        );
+        assert!(
+            !active_content_member_exists(&connection, "beast-skill", "v41-pool-beast:entangle")
+                .expect("重启后应读取魂兽技能池成员")
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM state_definition WHERE state_key = 'v41-action-lock'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("重启后状态目录行应保留"),
+            1
+        );
+    }
+
+    #[test]
     fn v40_upgrade_from_v39_preserves_existing_members_and_player_state() {
         let (directory, store) = test_store();
         store
@@ -38690,7 +39698,9 @@ mod tests {
         connection
             .execute_batch(
                 r#"
-                DELETE FROM schema_migration WHERE version = 40;
+                DELETE FROM schema_migration WHERE version IN (40, 41);
+                DROP TABLE soul_beast_skill_pool;
+                DROP TABLE state_definition;
                 DROP TABLE numeric_curve;
                 CREATE TABLE content_revision_member_v39_test_backup AS
                 SELECT revision_id, member_kind, member_key, created_at
@@ -38988,7 +39998,9 @@ mod tests {
         connection
             .execute_batch(
                 r#"
-                DELETE FROM schema_migration WHERE version IN (39, 40);
+                DELETE FROM schema_migration WHERE version IN (39, 40, 41);
+                DROP TABLE soul_beast_skill_pool;
+                DROP TABLE state_definition;
                 DROP TABLE numeric_curve;
                 CREATE TABLE content_revision_member_v38_test_backup AS
                 SELECT revision_id, member_kind, member_key, created_at
@@ -41279,6 +42291,15 @@ mod tests {
             "DROP INDEX battle_player_active;",
             "DROP TRIGGER battle_event_scope_guard;",
             "DROP TRIGGER soul_beast_no_update; UPDATE soul_beast SET exp_reward = 1 WHERE beast_key = 'slime';",
+            r#"
+            INSERT INTO soul_beast(
+                beast_key, name, description, map_key, age, level_required, max_hp, attack, defense,
+                speed, exp_reward, drop_item_key, drop_quantity, enabled, created_at, updated_at
+            ) VALUES(
+                'untracked-disabled-v12', '未登记魂兽', 'v12 损坏探针', 'sunset-forest', 1, 1, 1, 1, 0,
+                0, 1, 'small-healing-potion', 1, 0, 0, 0
+            );
+            "#,
         ] {
             assert_v12_damage_fails_closed(mutation);
         }
@@ -43331,6 +44352,7 @@ mod tests {
             npcs: Vec::new(),
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -43350,6 +44372,7 @@ mod tests {
                 enabled: true,
             }],
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         };
@@ -44342,6 +45365,7 @@ mod tests {
             npcs: Vec::new(),
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "test-starter".to_string(),
@@ -44360,6 +45384,7 @@ mod tests {
             }],
             effects: Vec::new(),
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         };
@@ -45361,6 +46386,7 @@ mod tests {
             npcs: Vec::new(),
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: vec![WuhunPackageEntry {
                 name: "test catalog wuhun".to_string(),
                 category: "控制系".to_string(),
@@ -45425,6 +46451,7 @@ mod tests {
                 drop_quantity: 1,
                 enabled: true,
             }],
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: vec![SoulRingPackageEntry {
                 ring_key: "test-catalog-ring".to_string(),
                 name: "test catalog ring".to_string(),
@@ -48132,6 +49159,53 @@ mod tests {
             );
             INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
             SELECT revision_id, 'curve', 'invalid-v40-curve', 0
+              FROM content_revision_activation
+             ORDER BY id DESC
+             LIMIT 1;
+            "#,
+        );
+    }
+
+    fn assert_v41_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v41 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v41 迁移应成功");
+        let connection = store.open().expect("应打开 v41 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v41 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v41 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v41")
+                || error.contains("state_definition")
+                || error.contains("soul_beast_skill_pool")
+                || error.contains("状态")
+                || error.contains("魂兽技能池"),
+            "v41 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    #[test]
+    fn recorded_v41_state_and_beast_skill_pool_damage_fails_closed() {
+        for mutation in [
+            "DROP INDEX state_definition_revision;",
+            "DROP TRIGGER state_definition_no_update;",
+            "DROP TRIGGER soul_beast_skill_pool_weight_guard;",
+        ] {
+            assert_v41_damage_fails_closed(mutation);
+        }
+        assert_v41_damage_fails_closed(
+            r#"
+            INSERT INTO state_definition(
+                revision_id, state_key, name, state_kind, target_kind,
+                settlement_phase, duration_rounds, stack_policy, max_stacks,
+                dispellable, immunity_kind, description, created_at
+            )
+            SELECT revision_id, 'untracked-v41-state', '未登记 v41 状态', 'action_lock', 'beast',
+                   'before_player_action', 1, 'refresh', 1, 0, 'none', 'v41 损坏探针', 0
               FROM content_revision_activation
              ORDER BY id DESC
              LIMIT 1;

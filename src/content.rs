@@ -102,6 +102,15 @@ pub const SKILL_PROFICIENCY_CURVE_REFERENCE: &str = "skill-proficiency-v1";
 /// 魂技等级伤害倍率规则的只读展示引用。
 pub const SKILL_DAMAGE_PERCENT_CURVE_REFERENCE: &str = "skill-damage-percent-v1";
 
+/// 类型化状态声明允许的最长结算序列，避免未来规则出现无法审计的持续状态。
+pub const MAX_STATE_DURATION_ROUNDS: i64 = 10;
+
+/// 类型化状态声明允许的最大叠加层数。
+pub const MAX_STATE_STACKS: i64 = 10;
+
+/// 单个魂兽技能池条目及其总权重的目录上限。
+pub const MAX_SOUL_BEAST_SKILL_POOL_WEIGHT: i64 = 1_000_000;
+
 /// 可发布目录数据的文件格式。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -121,6 +130,8 @@ pub struct ContentPackage {
     pub quests: Vec<QuestPackageEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub numeric_curves: Vec<NumericCurvePackageEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub states: Vec<StatePackageEntry>,
     #[serde(default)]
     pub wuhun: Vec<WuhunPackageEntry>,
     #[serde(default)]
@@ -129,6 +140,8 @@ pub struct ContentPackage {
     pub effects: Vec<EffectPackageEntry>,
     #[serde(default)]
     pub soul_beasts: Vec<SoulBeastPackageEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub soul_beast_skill_pools: Vec<SoulBeastSkillPoolPackageEntry>,
     #[serde(default)]
     pub soul_rings: Vec<SoulRingPackageEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -254,6 +267,23 @@ pub struct NumericCurvePackageEntry {
     pub sort_order: i64,
 }
 
+/// 内容包中的类型化状态声明；首片只记录固定生命周期策略，不直接创建战斗状态实例。
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StatePackageEntry {
+    pub state_key: String,
+    pub name: String,
+    pub state_kind: String,
+    pub target_kind: String,
+    pub settlement_phase: String,
+    pub duration_rounds: i64,
+    pub stack_policy: String,
+    pub max_stacks: i64,
+    pub dispellable: bool,
+    pub immunity_kind: String,
+    pub description: String,
+}
+
 /// 内容包中的武魂及其属性模板。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -343,6 +373,16 @@ pub struct SoulBeastPackageEntry {
     pub drop_quantity: i64,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+}
+
+/// 新魂兽可用技能的结构化权重候选；运行时选择留给后续独立战斗切片。
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SoulBeastSkillPoolPackageEntry {
+    pub beast_key: String,
+    pub skill_key: String,
+    pub weight: i64,
+    pub sort_order: i64,
 }
 
 /// 内容包中的魂环目录行。
@@ -536,10 +576,12 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
         + package.npcs.len()
         + package.quests.len()
         + package.numeric_curves.len()
+        + package.states.len()
         + package.wuhun.len()
         + package.skills.len()
         + package.effects.len()
         + package.soul_beasts.len()
+        + package.soul_beast_skill_pools.len()
         + package.soul_rings.len()
         + package.transitions.len();
     if total == 0 {
@@ -948,6 +990,89 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
         text_field(
             &mut errors,
             "numeric_curve.description",
+            &entry.description,
+            2000,
+            true,
+        );
+    }
+
+    keys.clear();
+    let mut state_names = BTreeSet::new();
+    for entry in &package.states {
+        if !keys.insert(format!("state:{}", entry.state_key)) {
+            errors.push(format!("状态键重复：{}", entry.state_key));
+        }
+        if !state_names.insert(entry.name.as_str()) {
+            errors.push(format!("状态名称重复：{}", entry.name));
+        }
+        validate_key(&mut errors, "state.state_key", &entry.state_key);
+        text_field(&mut errors, "state.name", &entry.name, 128, true);
+        validate_key(&mut errors, "state.state_kind", &entry.state_kind);
+        validate_key(&mut errors, "state.target_kind", &entry.target_kind);
+        validate_key(
+            &mut errors,
+            "state.settlement_phase",
+            &entry.settlement_phase,
+        );
+        let supported_shape = match entry.state_kind.as_str() {
+            "damage_over_time" => {
+                entry.target_kind == "beast" && entry.settlement_phase == "after_player_damage"
+            }
+            "heal_over_time" => {
+                entry.target_kind == "self" && entry.settlement_phase == "after_player_damage"
+            }
+            "action_lock" => {
+                matches!(entry.target_kind.as_str(), "self" | "beast")
+                    && entry.settlement_phase == "before_player_action"
+            }
+            _ => false,
+        };
+        if !supported_shape {
+            errors.push(format!(
+                "状态 {} 的类型、目标或结算时机组合不受支持",
+                entry.state_key
+            ));
+        }
+        range_field(
+            &mut errors,
+            "state.duration_rounds",
+            &entry.state_key,
+            entry.duration_rounds,
+            1,
+            MAX_STATE_DURATION_ROUNDS,
+        );
+        if !matches!(
+            entry.stack_policy.as_str(),
+            "add" | "strongest" | "refresh" | "replace"
+        ) {
+            errors.push(format!("状态 {} 的 stack_policy 不受支持", entry.state_key));
+        }
+        range_field(
+            &mut errors,
+            "state.max_stacks",
+            &entry.state_key,
+            entry.max_stacks,
+            1,
+            MAX_STATE_STACKS,
+        );
+        if entry.stack_policy != "add" && entry.max_stacks != 1 {
+            errors.push(format!(
+                "状态 {} 的非 add 叠加策略必须将 max_stacks 设为 1",
+                entry.state_key
+            ));
+        }
+        if entry.dispellable {
+            errors.push(format!("状态 {} 当前不允许声明可驱散", entry.state_key));
+        }
+        if entry.immunity_kind != "none" {
+            errors.push(format!(
+                "状态 {} 的 immunity_kind 当前必须为 none",
+                entry.state_key
+            ));
+        }
+        text_field(
+            &mut errors,
+            "state.description",
             &entry.description,
             2000,
             true,
@@ -1395,6 +1520,70 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
         );
     }
 
+    let package_beast_keys = package
+        .soul_beasts
+        .iter()
+        .map(|entry| entry.beast_key.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut pool_skill_keys = BTreeSet::new();
+    let mut pool_sort_orders = BTreeSet::new();
+    let mut pool_total_weights = BTreeMap::<&str, i64>::new();
+    for entry in &package.soul_beast_skill_pools {
+        if !pool_skill_keys.insert((entry.beast_key.as_str(), entry.skill_key.as_str())) {
+            errors.push(format!(
+                "魂兽 {} 的技能池重复引用魂技 {}",
+                entry.beast_key, entry.skill_key
+            ));
+        }
+        if !pool_sort_orders.insert((entry.beast_key.as_str(), entry.sort_order)) {
+            errors.push(format!(
+                "魂兽 {} 的技能池排序重复：{}",
+                entry.beast_key, entry.sort_order
+            ));
+        }
+        validate_key(
+            &mut errors,
+            "soul_beast_skill_pool.beast_key",
+            &entry.beast_key,
+        );
+        validate_key(
+            &mut errors,
+            "soul_beast_skill_pool.skill_key",
+            &entry.skill_key,
+        );
+        if !package_beast_keys.contains(entry.beast_key.as_str()) {
+            errors.push(format!(
+                "魂兽技能池 {} 只能归属本包新增魂兽",
+                entry.beast_key
+            ));
+        }
+        range_field(
+            &mut errors,
+            "soul_beast_skill_pool.weight",
+            &entry.beast_key,
+            entry.weight,
+            1,
+            MAX_SOUL_BEAST_SKILL_POOL_WEIGHT,
+        );
+        if entry.sort_order < 0 {
+            errors.push(format!(
+                "魂兽 {} 的技能池 sort_order 不能为负数",
+                entry.beast_key
+            ));
+        }
+        let total_weight = pool_total_weights
+            .entry(entry.beast_key.as_str())
+            .or_default();
+        match total_weight.checked_add(entry.weight) {
+            Some(total) if total <= MAX_SOUL_BEAST_SKILL_POOL_WEIGHT => *total_weight = total,
+            Some(_) => errors.push(format!(
+                "魂兽 {} 的技能池总权重不能超过 {}",
+                entry.beast_key, MAX_SOUL_BEAST_SKILL_POOL_WEIGHT
+            )),
+            None => errors.push(format!("魂兽 {} 的技能池总权重溢出", entry.beast_key)),
+        }
+    }
+
     keys.clear();
     for entry in &package.soul_rings {
         if !keys.insert(format!("ring:{}", entry.ring_key)) {
@@ -1586,6 +1775,7 @@ mod tests {
             npcs: Vec::new(),
             quests: Vec::new(),
             numeric_curves: Vec::new(),
+            states: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "test-skill".to_string(),
@@ -1619,6 +1809,7 @@ mod tests {
                 enabled: true,
             }],
             soul_beasts: Vec::new(),
+            soul_beast_skill_pools: Vec::new(),
             soul_rings: Vec::new(),
             transitions: Vec::new(),
         }
@@ -1661,6 +1852,8 @@ mod tests {
         assert!(!legacy.contains("\"npcs\""));
         assert!(!legacy.contains("\"quests\""));
         assert!(!legacy.contains("\"numeric_curves\""));
+        assert!(!legacy.contains("\"states\""));
+        assert!(!legacy.contains("\"soul_beast_skill_pools\""));
 
         package.maps = vec![MapPackageEntry {
             map_key: "content-map".to_string(),
@@ -1948,6 +2141,82 @@ mod tests {
             errors
                 .iter()
                 .any(|error| error.contains("range_max 不能小于 range_min"))
+        );
+    }
+
+    #[test]
+    fn states_and_beast_skill_pools_preserve_legacy_hash_and_enforce_typed_shape() {
+        let mut package = minimal_package();
+        let legacy = canonical_json(&package).expect("旧内容包应可规范化");
+        assert!(!legacy.contains("\"states\""));
+        assert!(!legacy.contains("\"soul_beast_skill_pools\""));
+
+        package.states = vec![StatePackageEntry {
+            state_key: "test-action-lock".to_string(),
+            name: "测试行动锁".to_string(),
+            state_kind: "action_lock".to_string(),
+            target_kind: "beast".to_string(),
+            settlement_phase: "before_player_action".to_string(),
+            duration_rounds: 2,
+            stack_policy: "refresh".to_string(),
+            max_stacks: 1,
+            dispellable: false,
+            immunity_kind: "none".to_string(),
+            description: "仅用于校验类型化状态声明。".to_string(),
+        }];
+        package.soul_beasts = vec![SoulBeastPackageEntry {
+            beast_key: "test-pool-beast".to_string(),
+            name: "测试技能池魂兽".to_string(),
+            description: "仅用于校验结构化魂兽技能池。".to_string(),
+            map_key: "holy-soul-village".to_string(),
+            age: 10,
+            level_required: 1,
+            max_hp: 20,
+            attack: 3,
+            defense: 1,
+            speed: 8,
+            exp_reward: 25,
+            drop_item_key: "small-healing-potion".to_string(),
+            drop_quantity: 1,
+            enabled: true,
+        }];
+        package.soul_beast_skill_pools = vec![SoulBeastSkillPoolPackageEntry {
+            beast_key: "test-pool-beast".to_string(),
+            skill_key: "test-skill".to_string(),
+            weight: 100,
+            sort_order: 0,
+        }];
+        assert!(validate_shape(&package).is_empty());
+
+        package.states[0].dispellable = true;
+        package.states[0].immunity_kind = "all".to_string();
+        package.states[0].max_stacks = 2;
+        package
+            .soul_beast_skill_pools
+            .push(SoulBeastSkillPoolPackageEntry {
+                beast_key: "test-pool-beast".to_string(),
+                skill_key: "test-skill".to_string(),
+                weight: MAX_SOUL_BEAST_SKILL_POOL_WEIGHT,
+                sort_order: 0,
+            });
+        let errors = validate_shape(&package);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("当前不允许声明可驱散"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("immunity_kind 当前必须为 none"))
+        );
+        assert!(errors.iter().any(|error| error.contains("非 add 叠加策略")));
+        assert!(errors.iter().any(|error| error.contains("重复引用魂技")));
+        assert!(errors.iter().any(|error| error.contains("技能池排序重复")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("技能池总权重不能超过"))
         );
     }
 

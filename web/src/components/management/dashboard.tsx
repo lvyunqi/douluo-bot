@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ClipboardList,
   Database,
+  Eye,
   FileUp,
   History,
   Image,
@@ -20,6 +21,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { ContentWritePanel, type WriteFeedback } from '@/components/management/content-write-panel'
+import { ContentDraftDiffPreviewPanel } from '@/components/management/content-draft-diff-preview'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -34,6 +36,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   getActiveRevision,
+  getContentDraftDiff,
   listIllustrations,
   listActivations,
   listDrafts,
@@ -49,6 +52,7 @@ import {
   logout,
   type ContentActivation,
   type ContentDraft,
+  type ContentDraftDiffPreview,
   type ContentOperation,
   type ContentRevision,
   type ContentRevisionSummary,
@@ -279,6 +283,10 @@ export function ManagementDashboard({
   const [pendingAction, setPendingAction] = useState<string | null>(null)
   const [signingOut, setSigningOut] = useState(false)
   const [writeFeedback, setWriteFeedback] = useState<WriteFeedback | null>(null)
+  const [draftDiffPreview, setDraftDiffPreview] = useState<ContentDraftDiffPreview | null>(null)
+  const [draftDiffDraft, setDraftDiffDraft] = useState<ContentDraft | null>(null)
+  const [draftDiffLoadingId, setDraftDiffLoadingId] = useState<number | null>(null)
+  const [draftDiffError, setDraftDiffError] = useState<string | null>(null)
 
   const loadSnapshot = useCallback(async (): Promise<boolean> => {
     setLoading(true)
@@ -363,11 +371,14 @@ export function ManagementDashboard({
     operation: () => Promise<T>,
     successDescription: (result: T) => string,
   ): Promise<boolean> {
-    if (pendingAction || loadingMore || loading) {
+    if (pendingAction || loadingMore || loading || draftDiffLoadingId !== null) {
       return false
     }
     setPendingAction(actionKey)
     setWriteFeedback(null)
+    setDraftDiffPreview(null)
+    setDraftDiffDraft(null)
+    setDraftDiffError(null)
     setError(null)
     try {
       const result = await operation()
@@ -401,6 +412,36 @@ export function ManagementDashboard({
       setPendingAction(null)
     }
   }
+
+  // 差异预览只读取已暂存草稿，不改变校验、发布或激活状态。
+  const previewDraft = useCallback(
+    async (draft: ContentDraft) => {
+      if (loading || loadingMore || pendingAction || draftDiffLoadingId !== null) {
+        return
+      }
+      setDraftDiffDraft(draft)
+      setDraftDiffPreview(null)
+      setDraftDiffError(null)
+      setDraftDiffLoadingId(draft.id)
+      try {
+        const preview = await getContentDraftDiff(draft.package_key, draft.package_revision)
+        setDraftDiffPreview(preview)
+      } catch (requestError) {
+        if (requestError instanceof ManagementApiError && requestError.status === 401) {
+          onSessionExpired()
+          return
+        }
+        if (requestError instanceof ManagementApiError && requestError.status === 404) {
+          setDraftDiffError('草稿已不存在，请刷新内容列表后重试。')
+          return
+        }
+        setDraftDiffError('无法读取草稿差异。')
+      } finally {
+        setDraftDiffLoadingId(null)
+      }
+    },
+    [draftDiffLoadingId, loading, loadingMore, onSessionExpired, pendingAction],
+  )
 
   function stageDraft(packageFile: string) {
     return runContentWrite(
@@ -456,6 +497,9 @@ export function ManagementDashboard({
     }
   }
 
+  const dashboardDisabled =
+    loading || loadingMore !== null || pendingAction !== null || draftDiffLoadingId !== null
+
   const draftColumns = useMemo<Array<TableColumn<ContentDraft>>>(
     () => [
       {
@@ -477,8 +521,31 @@ export function ManagementDashboard({
         render: (draft) => (draft.validation_errors.length ? `${draft.validation_errors.length} 项` : '无错误'),
       },
       { header: '更新时间', render: (draft) => formatTimestamp(draft.updated_at) },
+      {
+        className: 'w-12 text-right',
+        header: '预览',
+        render: (draft) => (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                aria-label={`预览 ${packageLabel(draft.package_key, draft.package_revision)} 的草稿差异`}
+                disabled={dashboardDisabled || draftDiffLoadingId !== null}
+                onClick={() => void previewDraft(draft)}
+                size="icon"
+                variant="ghost"
+              >
+                <Eye
+                  aria-hidden="true"
+                  className={draftDiffLoadingId === draft.id ? 'size-4 animate-pulse' : 'size-4'}
+                />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{draftDiffLoadingId === draft.id ? '正在加载差异' : '预览差异'}</TooltipContent>
+          </Tooltip>
+        ),
+      },
     ],
-    [],
+    [dashboardDisabled, draftDiffLoadingId, previewDraft],
   )
 
   const illustrationColumns = useMemo<Array<TableColumn<IllustrationBinding>>>(
@@ -571,8 +638,6 @@ export function ManagementDashboard({
     [],
   )
 
-  const dashboardDisabled = loading || loadingMore !== null || pendingAction !== null
-
   if (loading && !snapshot) {
     return <DashboardSkeleton />
   }
@@ -651,7 +716,7 @@ export function ManagementDashboard({
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button aria-label="退出管理会话" disabled={signingOut || pendingAction !== null} onClick={() => void signOut()} size="icon" variant="ghost">
+                <Button aria-label="退出管理会话" disabled={signingOut || pendingAction !== null || draftDiffLoadingId !== null} onClick={() => void signOut()} size="icon" variant="ghost">
                   <LogOut className="size-4" aria-hidden="true" />
                 </Button>
               </TooltipTrigger>
@@ -752,18 +817,26 @@ export function ManagementDashboard({
           </TabsContent>
 
           <TabsContent value="drafts">
-            <PagePanel
-              columns={draftColumns}
-              description="草稿元数据与校验摘要"
-              disabled={dashboardDisabled}
-              emptyLabel="暂无草稿"
-              entries={snapshot.drafts.entries}
-              isLoadingMore={loadingMore === 'drafts'}
-              nextAfterId={snapshot.drafts.next_after_id}
-              onLoadMore={() => void loadMore('drafts')}
-              rowKey={(draft) => draft.id}
-              title="内容草稿"
-            />
+            <section className="space-y-8">
+              <PagePanel
+                columns={draftColumns}
+                description="草稿元数据与校验摘要"
+                disabled={dashboardDisabled}
+                emptyLabel="暂无草稿"
+                entries={snapshot.drafts.entries}
+                isLoadingMore={loadingMore === 'drafts'}
+                nextAfterId={snapshot.drafts.next_after_id}
+                onLoadMore={() => void loadMore('drafts')}
+                rowKey={(draft) => draft.id}
+                title="内容草稿"
+              />
+              <ContentDraftDiffPreviewPanel
+                draft={draftDiffDraft}
+                error={draftDiffError}
+                loading={draftDiffLoadingId !== null}
+                preview={draftDiffPreview}
+              />
+            </section>
           </TabsContent>
 
           <TabsContent value="revisions">

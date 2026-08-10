@@ -96,6 +96,19 @@ export type ContentValidation = {
   soul_ring_count: number
 }
 
+export type ContentDraftDiffMember = {
+  member_kind: string
+  member_key: string
+}
+
+export type ContentDraftDiffPreview = {
+  draft: ContentDraft
+  active_revision: ContentRevision
+  active_member_count: number
+  added_members: ContentDraftDiffMember[]
+  projected_member_count: number
+}
+
 export type ContentStageResult = {
   draft: ContentDraft
   replayed: boolean
@@ -256,6 +269,15 @@ export function stageContentDraft(
 
 function draftActionPath(packageKey: string, packageRevision: number, action: 'validate' | 'publish') {
   return `/api/v1/content/drafts/${encodeURIComponent(packageKey)}/${packageRevision}/${action}`
+}
+
+export function getContentDraftDiff(
+  packageKey: string,
+  packageRevision: number,
+): Promise<ContentDraftDiffPreview> {
+  return request<ContentDraftDiffPreview>(
+    `/api/v1/content/drafts/${encodeURIComponent(packageKey)}/${packageRevision}/diff`,
+  )
 }
 
 export function validateContentDraft(
