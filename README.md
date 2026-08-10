@@ -46,6 +46,9 @@ cargo build --release --locked
 cargo build --manifest-path services/douluo-media/Cargo.toml --release --locked
 ```
 
+生产只读卷、Caddy HTTPS/base-path 配置、资源更新重启边界和插件 `remote` 模式冒烟见
+[douluo-media 部署说明](deploy/douluo-media/README.md)。
+
 ## Load In QimenBot
 
 1. 将当前平台的动态库复制到 QimenBot `plugin_bin_dir`。

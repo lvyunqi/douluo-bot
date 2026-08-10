@@ -1,0 +1,32 @@
+[Unit]
+Description=Douluo read-only media service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=douluo-media
+Group=douluo-media
+ExecStart=/usr/local/bin/douluo-media
+Environment=DOULUO_MEDIA_BIND=127.0.0.1:18182
+Environment=DOULUO_MEDIA_ROOT=/srv/douluo-media/published
+Restart=on-failure
+RestartSec=2s
+UMask=027
+
+# 服务只读取启动索引和图片，不需要任何持久写权限。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/srv/douluo-media/published
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

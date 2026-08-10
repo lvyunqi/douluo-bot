@@ -1,0 +1,32 @@
+{
+	# 冒烟使用 tls internal 并由 curl 显式跳过校验，无需每次安装临时 CA 到系统信任库。
+	skip_install_trust
+
+	storage file_system {
+		root "{$CADDY_STORAGE_ROOT}"
+	}
+}
+
+{$MEDIA_HOST} {
+	# 生产环境留空时由 Caddy 自动申请公网证书；本地冒烟设置为 tls internal。
+	{$MEDIA_TLS}
+
+	header {
+		-Server
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		X-Frame-Options "DENY"
+	}
+
+	# 只把公开前缀后的读取请求转发到服务固定的 /media/* 根路由。
+	handle_path {$MEDIA_BASE_PATH}/* {
+		reverse_proxy {$MEDIA_UPSTREAM} {
+			transport http {
+				read_timeout 10s
+				write_timeout 10s
+			}
+		}
+	}
+
+	respond 404
+}
