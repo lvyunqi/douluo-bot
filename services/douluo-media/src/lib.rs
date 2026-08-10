@@ -5,6 +5,8 @@
 //! `asset_key`) and a content-addressed URL.  There is no directory listing and no
 //! request-controlled filesystem path.
 
+mod catalog;
+
 use std::{
     collections::{HashMap, HashSet},
     env, fmt,
@@ -35,6 +37,8 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
 };
 
+pub use catalog::CatalogError;
+
 const DEFAULT_BIND: &str = "127.0.0.1:18182";
 // Keep this in sync with the plugin's stable remote-asset-key contract.
 const MAX_ASSET_KEY_LENGTH: usize = 200;
@@ -50,28 +54,44 @@ pub const MAX_ASSET_SIZE: u64 = 20 * 1024 * 1024;
 const ALLOWED_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp"];
 const IMAGE_MAGIC_HEADER_BYTES: u64 = 12;
 
-/// Runtime configuration loaded from the environment by [`MediaConfig::from_env`].
+/// 由 [`MediaConfig::from_env`] 读取的运行期配置。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaConfig {
-    /// Address on which the service listens.
+    /// 服务监听地址。
     pub bind: SocketAddr,
-    /// Directory containing published media files.
+    /// 包含已发布媒体文件的目录。
     pub root: PathBuf,
+    /// 只读发布 catalog；默认位于 published root 的 `catalog.sqlite`。
+    pub catalog: PathBuf,
 }
 
 impl MediaConfig {
-    /// Construct a configuration explicitly.
+    /// 显式构造默认使用 root 内 catalog 的配置。
     pub fn new(bind: SocketAddr, root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
         Self {
             bind,
-            root: root.into(),
+            catalog: root.join("catalog.sqlite"),
+            root,
         }
     }
 
-    /// Read `DOULUO_MEDIA_BIND` and `DOULUO_MEDIA_ROOT`.
+    /// 构造指定 catalog 路径的运行配置，供部署和集成测试使用。
+    pub fn with_catalog(
+        bind: SocketAddr,
+        root: impl Into<PathBuf>,
+        catalog: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            bind,
+            root: root.into(),
+            catalog: catalog.into(),
+        }
+    }
+
+    /// 读取 `DOULUO_MEDIA_BIND`、`DOULUO_MEDIA_ROOT` 和可选 catalog 路径。
     ///
-    /// The bind address defaults to `127.0.0.1:18182`.  A root is intentionally
-    /// required: serving an accidental current directory is an unsafe default.
+    /// 监听地址默认是 `127.0.0.1:18182`。root 必须显式配置，避免意外公开当前目录。
     pub fn from_env() -> Result<Self, MediaError> {
         let bind = match env::var("DOULUO_MEDIA_BIND") {
             Ok(value) if !value.trim().is_empty() => value,
@@ -85,8 +105,14 @@ impl MediaConfig {
         if root.is_empty() {
             return Err(MediaError::MissingRoot);
         }
+        let root = PathBuf::from(root);
+        let catalog = match env::var_os("DOULUO_MEDIA_CATALOG") {
+            Some(path) if path.is_empty() => return Err(MediaError::InvalidCatalog),
+            Some(path) => PathBuf::from(path),
+            None => root.join("catalog.sqlite"),
+        };
 
-        Ok(Self::new(bind, PathBuf::from(root)))
+        Ok(Self::with_catalog(bind, root, catalog))
     }
 }
 
@@ -98,6 +124,8 @@ pub enum MediaError {
     RootUnavailable,
     RootNotDirectory,
     IndexUnavailable,
+    InvalidCatalog,
+    CatalogUnavailable,
     BindUnavailable,
     ServerUnavailable,
 }
@@ -110,6 +138,8 @@ impl fmt::Display for MediaError {
             Self::RootUnavailable => "media root is unavailable",
             Self::RootNotDirectory => "media root is not a directory",
             Self::IndexUnavailable => "media index could not be built",
+            Self::InvalidCatalog => "DOULUO_MEDIA_CATALOG must not be empty",
+            Self::CatalogUnavailable => "media catalog is unavailable or inconsistent",
             Self::BindUnavailable => "media listener could not bind",
             Self::ServerUnavailable => "media server stopped unexpectedly",
         };
@@ -212,6 +242,13 @@ impl MediaIndex {
         self.by_key.is_empty()
     }
 
+    /// 按稳定资源键排序返回启动索引中的全部资源，供 catalog 发布和校验使用。
+    pub(crate) fn assets(&self) -> Vec<&AssetMeta> {
+        let mut assets = self.by_key.values().map(Arc::as_ref).collect::<Vec<_>>();
+        assets.sort_by(|left, right| left.asset_key.cmp(&right.asset_key));
+        assets
+    }
+
     fn walk_directory(
         &mut self,
         directory: PathBuf,
@@ -312,7 +349,7 @@ pub struct MediaState {
 }
 
 impl MediaState {
-    /// Build state by indexing a media root.
+    /// 仅按媒体 root 建立状态，供不使用 catalog 的嵌入测试保留。
     pub fn from_root(root: impl AsRef<Path>) -> Result<Self, MediaError> {
         Ok(Self {
             index: Arc::new(MediaIndex::build(root)?),
@@ -321,7 +358,18 @@ impl MediaState {
         })
     }
 
-    /// Build state from a pre-built index. Useful for embedding and tests.
+    /// 从只读 catalog 与发布根建立状态；任何键或文件元数据不一致都会拒绝启动。
+    pub fn from_catalog(
+        root: impl AsRef<Path>,
+        catalog_path: impl AsRef<Path>,
+    ) -> Result<Self, MediaError> {
+        let index = MediaIndex::build(root)?;
+        catalog::validate_published_catalog(&index, catalog_path)
+            .map_err(|_| MediaError::CatalogUnavailable)?;
+        Ok(Self::from_index(index))
+    }
+
+    /// 由预先构建的索引建立状态，供嵌入和测试使用。
     pub fn from_index(index: MediaIndex) -> Self {
         Self {
             index: Arc::new(index),
@@ -330,18 +378,18 @@ impl MediaState {
         }
     }
 
-    /// Access the immutable index.
+    /// 访问不可变启动索引。
     pub fn index(&self) -> &MediaIndex {
         &self.index
     }
 
-    /// Whether startup indexing completed successfully.
+    /// 启动索引是否已完成。
     pub fn is_ready(&self) -> bool {
         self.ready
     }
 }
 
-/// Construct the read-only media router.
+/// 构造只读媒体路由。
 pub fn build_router(state: Arc<MediaState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz).head(healthz))
@@ -353,20 +401,20 @@ pub fn build_router(state: Arc<MediaState>) -> Router {
         .with_state(state)
 }
 
-/// Alias retained as a concise embedding API.
+/// 保留简短的嵌入式路由别名。
 pub fn router(state: Arc<MediaState>) -> Router {
     build_router(state)
 }
 
-/// Start the service using environment configuration.
+/// 使用环境变量启动服务。
 pub async fn run_from_env() -> Result<(), MediaError> {
     let config = MediaConfig::from_env()?;
     run(config).await
 }
 
-/// Start the service with an explicit configuration.
+/// 使用显式配置启动服务。
 pub async fn run(config: MediaConfig) -> Result<(), MediaError> {
-    let state = Arc::new(MediaState::from_root(&config.root)?);
+    let state = Arc::new(MediaState::from_catalog(&config.root, &config.catalog)?);
     let listener = TcpListener::bind(config.bind)
         .await
         .map_err(|_| MediaError::BindUnavailable)?;
@@ -374,6 +422,15 @@ pub async fn run(config: MediaConfig) -> Result<(), MediaError> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|_| MediaError::ServerUnavailable)
+}
+
+/// 发布前把当前 published root 写入 SQLite catalog；运行期不调用此函数。
+pub fn publish_catalog(
+    root: impl AsRef<Path>,
+    catalog_path: impl AsRef<Path>,
+) -> Result<(), MediaError> {
+    let index = MediaIndex::build(root)?;
+    catalog::publish_catalog(&index, catalog_path).map_err(|_| MediaError::CatalogUnavailable)
 }
 
 async fn shutdown_signal() {
@@ -1209,6 +1266,24 @@ mod tests {
         let text = String::from_utf8(body).expect("utf8");
         assert!(!text.contains("douluo"));
         assert!(!text.contains("\\"));
+    }
+
+    #[test]
+    fn catalog_backed_state_refuses_files_changed_outside_publish_command() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let image = directory.path().join("maps").join("village.png");
+        fs::create_dir_all(image.parent().expect("parent")).expect("mkdir");
+        fs::write(&image, b"\x89PNG\r\n\x1a\nrelease-one").expect("fixture");
+        let catalog = directory.path().join("catalog.sqlite");
+
+        publish_catalog(directory.path(), &catalog).expect("publish catalog");
+        assert!(MediaState::from_catalog(directory.path(), &catalog).is_ok());
+
+        fs::write(&image, b"\x89PNG\r\n\x1a\nrelease-two").expect("replace fixture");
+        assert!(matches!(
+            MediaState::from_catalog(directory.path(), &catalog),
+            Err(MediaError::CatalogUnavailable)
+        ));
     }
 
     #[tokio::test]

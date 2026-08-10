@@ -10,6 +10,7 @@ repository = "https://github.com/lvyunqi/douluo-bot"
 [dependencies]
 axum = "0.8.8"
 httpdate = "1.0.3"
+rusqlite = { version = "=0.34.0", features = ["bundled"] }
 sha2 = "0.11.0"
 tokio = { version = "1.50", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
 

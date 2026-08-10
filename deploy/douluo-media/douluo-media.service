@@ -10,11 +10,12 @@ Group=douluo-media
 ExecStart=/usr/local/bin/douluo-media
 Environment=DOULUO_MEDIA_BIND=127.0.0.1:18182
 Environment=DOULUO_MEDIA_ROOT=/srv/douluo-media/published
+Environment=DOULUO_MEDIA_CATALOG=/srv/douluo-media/published/catalog.sqlite
 Restart=on-failure
 RestartSec=2s
 UMask=027
 
-# 服务只读取启动索引和图片，不需要任何持久写权限。
+# 服务只读取启动索引、catalog 和图片，不需要任何持久写权限。
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true

@@ -405,6 +405,11 @@ $fixtureWebp = [Convert]::FromBase64String(
     "UklGRkAAAABXRUJQVlA4WAoAAAAQAAAAAAAAAAAAQUxQSAIAAAAAAFZQOCAYAAAAMAEAnQEqAQABAAIANCWkAANwAP77/VAA"
 )
 [IO.File]::WriteAllBytes($assetPath, $fixtureWebp)
+$catalogPath = Join-Path $published "catalog.sqlite"
+# catalog 只能在发布前生成；后续 published root 快照会同时保护图片和 SQLite 元数据。
+$catalogPublishOutput = & $MediaBinary catalog publish --root $published 2>&1
+Assert-Condition ($LASTEXITCODE -eq 0) "media catalog publish failed: $catalogPublishOutput"
+Assert-Condition (Test-Path -LiteralPath $catalogPath) "media catalog was not created"
 $beforePublished = Get-TreeSnapshot $published
 
 $mediaConfig = Join-Path $root "Caddyfile"
@@ -429,6 +434,7 @@ try {
         -Environment @{
             DOULUO_MEDIA_BIND = "127.0.0.1:$MediaPort"
             DOULUO_MEDIA_ROOT = $published
+            DOULUO_MEDIA_CATALOG = $catalogPath
         } `
         -StdoutPath $mediaLog `
         -StderrPath $mediaErrorLog
