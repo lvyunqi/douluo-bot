@@ -102,6 +102,8 @@ pub struct ContentPackage {
     pub author: String,
     #[serde(default)]
     pub minimum_runtime: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub maps: Vec<MapPackageEntry>,
     #[serde(default)]
     pub wuhun: Vec<WuhunPackageEntry>,
     #[serde(default)]
@@ -126,6 +128,20 @@ pub struct ContentTransitionPackageEntry {
     pub target_key: Option<String>,
     pub transition_kind: String,
     pub reason: String,
+}
+
+/// 内容包中的静态地图目录行，不承载出口或玩家位置。
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MapPackageEntry {
+    pub map_key: String,
+    pub name: String,
+    pub description: String,
+    pub level_required: i64,
+    pub safe: bool,
+    pub pvp_enabled: bool,
+    pub teleport_enabled: bool,
+    pub sort_order: i64,
 }
 
 /// 内容包中的武魂及其属性模板。
@@ -405,7 +421,8 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
         64,
         false,
     );
-    let total = package.wuhun.len()
+    let total = package.maps.len()
+        + package.wuhun.len()
         + package.skills.len()
         + package.effects.len()
         + package.soul_beasts.len()
@@ -419,6 +436,41 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
     }
 
     let mut keys = BTreeSet::new();
+    let mut map_names = BTreeSet::new();
+    let mut map_sort_orders = BTreeSet::new();
+    for entry in &package.maps {
+        if !keys.insert(format!("map:{}", entry.map_key)) {
+            errors.push(format!("地图键重复：{}", entry.map_key));
+        }
+        if !map_names.insert(entry.name.as_str()) {
+            errors.push(format!("地图名称重复：{}", entry.name));
+        }
+        if !map_sort_orders.insert(entry.sort_order) {
+            errors.push(format!("地图排序重复：{}", entry.sort_order));
+        }
+        validate_key(&mut errors, "map.map_key", &entry.map_key);
+        text_field(&mut errors, "map.name", &entry.name, 128, true);
+        text_field(
+            &mut errors,
+            "map.description",
+            &entry.description,
+            2000,
+            true,
+        );
+        range_field(
+            &mut errors,
+            "map.level_required",
+            &entry.map_key,
+            entry.level_required,
+            1,
+            120,
+        );
+        if entry.sort_order < 0 {
+            errors.push(format!("地图 {} 的 sort_order 不能为负数", entry.map_key));
+        }
+    }
+
+    keys.clear();
     for entry in &package.wuhun {
         if !keys.insert(format!("wuhun:{}", entry.name)) {
             errors.push(format!("武魂名称重复：{}", entry.name));
@@ -1045,6 +1097,7 @@ mod tests {
             revision: 1,
             author: "test".to_string(),
             minimum_runtime: String::new(),
+            maps: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "test-skill".to_string(),
@@ -1109,6 +1162,39 @@ mod tests {
         let toml_loaded = parse_package_text(&toml, "toml").expect("TOML 应可解析");
         assert_eq!(json_loaded.package, toml_loaded.package);
         assert_eq!(json_loaded.content_hash, toml_loaded.content_hash);
+    }
+
+    #[test]
+    fn maps_preserve_legacy_hash_and_enforce_static_shape() {
+        let mut package = minimal_package();
+        let legacy = canonical_json(&package).expect("旧内容包应可规范化");
+        assert!(!legacy.contains("\"maps\""));
+
+        package.maps = vec![MapPackageEntry {
+            map_key: "content-map".to_string(),
+            name: "内容测试地图".to_string(),
+            description: "仅用于校验静态地图目录。".to_string(),
+            level_required: 1,
+            safe: true,
+            pvp_enabled: false,
+            teleport_enabled: true,
+            sort_order: 80,
+        }];
+        assert!(validate_shape(&package).is_empty());
+
+        package.maps.push(MapPackageEntry {
+            map_key: "content-map-second".to_string(),
+            name: "内容测试地图".to_string(),
+            description: "重复名称和排序必须拒绝。".to_string(),
+            level_required: 1,
+            safe: false,
+            pvp_enabled: true,
+            teleport_enabled: false,
+            sort_order: 80,
+        });
+        let errors = validate_shape(&package);
+        assert!(errors.iter().any(|error| error.contains("地图名称重复")));
+        assert!(errors.iter().any(|error| error.contains("地图排序重复")));
     }
 
     #[test]

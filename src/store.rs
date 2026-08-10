@@ -6129,6 +6129,73 @@ BEGIN
 END;
 "#;
 
+// v36 只扩展内容成员种类，并为既有 revision 登记当前地图目录。
+const MIGRATION_V36: &str = r#"
+CREATE TABLE content_revision_member_v36_backup AS
+SELECT revision_id, member_kind, member_key, created_at
+  FROM content_revision_member;
+
+DROP TRIGGER content_revision_member_no_update;
+DROP TRIGGER content_revision_member_no_delete;
+DROP TRIGGER content_revision_member_no_reinsert;
+DROP INDEX content_revision_member_lookup;
+DROP TABLE content_revision_member;
+
+CREATE TABLE content_revision_member (
+    revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
+    member_kind TEXT NOT NULL CHECK(
+        member_kind IN ('wuhun', 'skill', 'starter-skill', 'effect', 'beast', 'ring', 'map')
+    ),
+    member_key TEXT NOT NULL CHECK(
+        length(member_key) BETWEEN 1 AND 200
+        AND member_key = trim(member_key)
+        AND instr(member_key, char(0)) = 0
+    ),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    PRIMARY KEY(revision_id, member_kind, member_key)
+) STRICT, WITHOUT ROWID;
+
+INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+SELECT revision_id, member_kind, member_key, created_at
+  FROM content_revision_member_v36_backup;
+DROP TABLE content_revision_member_v36_backup;
+
+CREATE INDEX content_revision_member_lookup
+    ON content_revision_member(member_kind, member_key, revision_id);
+
+CREATE TRIGGER content_revision_member_no_update
+BEFORE UPDATE ON content_revision_member
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is immutable');
+END;
+CREATE TRIGGER content_revision_member_no_delete
+BEFORE DELETE ON content_revision_member
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is immutable');
+END;
+CREATE TRIGGER content_revision_member_no_reinsert
+BEFORE INSERT ON content_revision_member
+WHEN EXISTS(
+    SELECT 1 FROM content_revision_member
+     WHERE revision_id = NEW.revision_id
+       AND member_kind = NEW.member_kind
+       AND member_key = NEW.member_key
+)
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is append-only');
+END;
+
+INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+SELECT revision.id, 'map', map.map_key, 0
+  FROM content_revision revision CROSS JOIN map
+ WHERE NOT EXISTS(
+       SELECT 1 FROM content_revision_member member
+        WHERE member.revision_id = revision.id
+          AND member.member_kind = 'map'
+          AND member.member_key = map.map_key
+   );
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -7861,6 +7928,9 @@ fn content_package_member_set(package: &ContentPackage) -> BTreeSet<(String, Str
 /// 仅收集内容包直接创建的目录成员，不能把依赖引用当作 replacement target。
 fn content_package_declared_member_set(package: &ContentPackage) -> BTreeSet<(String, String)> {
     let mut members = BTreeSet::new();
+    for entry in &package.maps {
+        members.insert(("map".to_string(), entry.map_key.clone()));
+    }
     for entry in &package.wuhun {
         members.insert(("wuhun".to_string(), entry.name.clone()));
     }
@@ -7979,6 +8049,25 @@ fn validate_content_package_against_database(
         .collect::<std::collections::BTreeSet<_>>();
 
     let mut names = std::collections::BTreeSet::new();
+    let mut map_sort_orders = std::collections::BTreeSet::new();
+    for entry in &package.maps {
+        if !names.insert(entry.name.as_str()) {
+            errors.push(format!("内容包内地图名称重复：{}", entry.name));
+        }
+        if !map_sort_orders.insert(entry.sort_order) {
+            errors.push(format!("内容包内地图排序重复：{}", entry.sort_order));
+        }
+        if catalog_value_exists(connection, "map", "map_key", &entry.map_key)?
+            || catalog_value_exists(connection, "map", "name", &entry.name)?
+            || map_sort_order_exists(connection, entry.sort_order)?
+        {
+            errors.push(format!(
+                "地图键、名称或排序已存在：{} / {} / {}",
+                entry.map_key, entry.name, entry.sort_order
+            ));
+        }
+    }
+    names.clear();
     for entry in &package.wuhun {
         if !names.insert(entry.name.as_str()) {
             errors.push(format!("内容包内武魂名称重复：{}", entry.name));
@@ -8174,12 +8263,23 @@ fn catalog_value_exists(
         ("soul_ring", "ring_key") => "SELECT EXISTS(SELECT 1 FROM soul_ring WHERE ring_key = ?1)",
         ("soul_ring", "name") => "SELECT EXISTS(SELECT 1 FROM soul_ring WHERE name = ?1)",
         ("map", "map_key") => "SELECT EXISTS(SELECT 1 FROM map WHERE map_key = ?1)",
+        ("map", "name") => "SELECT EXISTS(SELECT 1 FROM map WHERE name = ?1)",
         ("item", "item_key") => "SELECT EXISTS(SELECT 1 FROM item WHERE item_key = ?1)",
         _ => return Err(format!("未知内容目录查询：{table}.{column}")),
     };
     connection
         .query_row(sql, [value], |row| row.get::<_, bool>(0))
         .map_err(|error| format!("查询内容目录 {table}.{column} 失败：{error}"))
+}
+
+fn map_sort_order_exists(connection: &Connection, sort_order: i64) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM map WHERE sort_order = ?1)",
+            [sort_order],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("查询地图排序失败：{error}"))
 }
 
 fn catalog_enabled_exists(
@@ -8257,6 +8357,30 @@ fn publish_content_package_rows(
     package: &ContentPackage,
     created_at: i64,
 ) -> Result<(), String> {
+    for entry in &package.maps {
+        connection
+            .execute(
+                r#"
+                INSERT INTO map(
+                    map_key, name, description, level_required, safe, pvp_enabled,
+                    teleport_enabled, sort_order, created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+                "#,
+                params![
+                    entry.map_key,
+                    entry.name,
+                    entry.description,
+                    entry.level_required,
+                    entry.safe,
+                    entry.pvp_enabled,
+                    entry.teleport_enabled,
+                    entry.sort_order,
+                    created_at
+                ],
+            )
+            .map_err(|error| format!("发布地图 {} 失败：{error}", entry.map_key))?;
+        ensure_content_revision_member(connection, revision_id, "map", &entry.map_key, created_at)?;
+    }
     for entry in &package.wuhun {
         connection
             .execute(
@@ -9974,10 +10098,25 @@ impl Store {
                 validate_v35_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 36)? {
+                transaction
+                    .execute_batch(MIGRATION_V36)
+                    .map_err(|error| format!("执行数据库迁移 v36 失败：{error}"))?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(36, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v36 失败：{error}"))?;
+                validate_v36_schema(&transaction)?;
+            } else {
+                validate_v36_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36 失败：{error}"
                 )
             })?;
             Ok(())
@@ -10018,6 +10157,7 @@ impl Store {
                 validate_v32_schema(connection)?;
                 validate_v34_schema(connection)?;
                 validate_v35_schema(connection)?;
+                validate_v36_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -10599,8 +10739,19 @@ impl Store {
     pub fn list_maps_page(&self, page: usize, limit: usize) -> Result<MapPage, String> {
         validate_map_page(page, limit)?;
         let connection = self.open()?;
+        let active_revision_id = current_content_revision_id(&connection)?;
         let total = connection
-            .query_row("SELECT COUNT(*) FROM map", [], |row| row.get::<_, i64>(0))
+            .query_row(
+                r#"
+                SELECT COUNT(*)
+                  FROM map
+                  JOIN content_revision_member member
+                    ON member.member_kind = 'map' AND member.member_key = map.map_key
+                 WHERE member.revision_id = ?1
+                "#,
+                [active_revision_id],
+                |row| row.get::<_, i64>(0),
+            )
             .map_err(|error| format!("统计地图数量失败：{error}"))?;
         let total = usize::try_from(total).map_err(|_| "地图数量超出可分页范围".to_string())?;
         let page_count = total.div_ceil(limit).max(1);
@@ -10619,13 +10770,19 @@ impl Store {
                 SELECT map_key, name, description, level_required,
                        safe, pvp_enabled, teleport_enabled, sort_order
                   FROM map
+                  JOIN content_revision_member member
+                    ON member.member_kind = 'map' AND member.member_key = map.map_key
+                 WHERE member.revision_id = ?3
                  ORDER BY sort_order, map_key
                  LIMIT ?1 OFFSET ?2
                 "#,
             )
             .map_err(|error| format!("准备地图分页查询失败：{error}"))?;
         let entries = statement
-            .query_map(params![fetch_limit, offset], map_record_from_row)
+            .query_map(
+                params![fetch_limit, offset, active_revision_id],
+                map_record_from_row,
+            )
             .map_err(|error| format!("查询地图分页失败：{error}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("解析地图分页失败：{error}"))?;
@@ -27919,6 +28076,7 @@ fn validate_v22_index(
 }
 
 fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
+    let tracks_maps = migration_applied(connection, 36)?;
     let expected_tables = [
         (
             "content_revision",
@@ -27980,6 +28138,19 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
         }
     }
 
+    let member_markers = if tracks_maps {
+        vec![
+            ") STRICT, WITHOUT ROWID",
+            "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING', 'MAP')",
+            "PRIMARY KEY(REVISION_ID, MEMBER_KIND, MEMBER_KEY)",
+        ]
+    } else {
+        vec![
+            ") STRICT, WITHOUT ROWID",
+            "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING')",
+            "PRIMARY KEY(REVISION_ID, MEMBER_KIND, MEMBER_KEY)",
+        ]
+    };
     for (table, markers) in [
         (
             "content_revision",
@@ -27998,14 +28169,7 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
                 "STATUS IN ('DRAFT', 'VALIDATED', 'REJECTED', 'PUBLISHED')",
             ][..],
         ),
-        (
-            "content_revision_member",
-            &[
-                ") STRICT, WITHOUT ROWID",
-                "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING')",
-                "PRIMARY KEY(REVISION_ID, MEMBER_KIND, MEMBER_KEY)",
-            ][..],
-        ),
+        ("content_revision_member", member_markers.as_slice()),
         (
             "content_revision_activation",
             &[
@@ -28129,6 +28293,9 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
                     OR (member.member_kind = 'ring' AND NOT EXISTS(
                         SELECT 1 FROM soul_ring WHERE ring_key = member.member_key AND enabled = 1
                     ))
+                    OR (member.member_kind = 'map' AND NOT EXISTS(
+                        SELECT 1 FROM map WHERE map_key = member.member_key
+                    ))
             )
             "#,
             [],
@@ -28173,8 +28340,15 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
                      WHERE member.member_kind = 'ring' AND member.member_key = ring.ring_key
                  )
             )
+            OR (?1 AND EXISTS(
+                SELECT 1 FROM map map
+                 WHERE NOT EXISTS(
+                    SELECT 1 FROM content_revision_member member
+                     WHERE member.member_kind = 'map' AND member.member_key = map.map_key
+                 )
+            ))
             "#,
-            [],
+            [tracks_maps],
             |row| row.get::<_, bool>(0),
         )
         .map_err(|error| format!("校验 v23 未发布目录失败：{error}"))?;
@@ -30926,6 +31100,31 @@ fn validate_v35_schema(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// 校验 v36 地图成员覆盖；未被任何 revision 登记的地图拒绝启动。
+fn validate_v36_schema(connection: &Connection) -> Result<(), String> {
+    validate_v35_schema(connection)?;
+    let untracked_maps = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM map
+                 WHERE NOT EXISTS(
+                    SELECT 1 FROM content_revision_member member
+                     WHERE member.member_kind = 'map'
+                       AND member.member_key = map.map_key
+                 )
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v36 地图成员覆盖失败：{error}"))?;
+    if untracked_maps {
+        return Err("v36 存在未被任何 revision 登记的地图目录成员".to_string());
+    }
+    Ok(())
+}
+
 fn validate_v24_table_sql(
     connection: &Connection,
     table: &str,
@@ -32795,8 +32994,9 @@ mod tests {
 
     use crate::content::{
         EffectPackageEntry, FORBID_SKILL_APPLY_PHASE, FORBID_SKILL_BLOCKED_ACTION,
-        FORBID_SKILL_RULE_VERSION, MIN_FORBID_SKILL_DURATION_ROUNDS, SkillPackageEntry,
-        SoulBeastPackageEntry, SoulRingPackageEntry, WuhunPackageEntry, WuhunStatsPackageEntry,
+        FORBID_SKILL_RULE_VERSION, MIN_FORBID_SKILL_DURATION_ROUNDS, MapPackageEntry,
+        SkillPackageEntry, SoulBeastPackageEntry, SoulRingPackageEntry, WuhunPackageEntry,
+        WuhunStatsPackageEntry,
     };
     use tempfile::tempdir;
 
@@ -32819,6 +33019,7 @@ mod tests {
             revision: 1,
             author: "test".to_string(),
             minimum_runtime: String::new(),
+            maps: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -32843,6 +33044,41 @@ mod tests {
         };
         LoadedContentPackage {
             content_hash: content_hash(&package).expect("应计算测试内容包哈希"),
+            package,
+            source_format: "json".to_string(),
+        }
+    }
+
+    fn map_content_package(
+        package_key: &str,
+        map_key: &str,
+        name: &str,
+        sort_order: i64,
+    ) -> LoadedContentPackage {
+        let package = ContentPackage {
+            package_key: package_key.to_string(),
+            revision: 1,
+            author: "map-test".to_string(),
+            minimum_runtime: String::new(),
+            maps: vec![MapPackageEntry {
+                map_key: map_key.to_string(),
+                name: name.to_string(),
+                description: "内容包地图测试条目".to_string(),
+                level_required: 1,
+                safe: true,
+                pvp_enabled: false,
+                teleport_enabled: true,
+                sort_order,
+            }],
+            wuhun: Vec::new(),
+            skills: Vec::new(),
+            effects: Vec::new(),
+            soul_beasts: Vec::new(),
+            soul_rings: Vec::new(),
+            transitions: Vec::new(),
+        };
+        LoadedContentPackage {
+            content_hash: content_hash(&package).expect("应计算地图内容包哈希"),
             package,
             source_format: "json".to_string(),
         }
@@ -33135,6 +33371,7 @@ mod tests {
             revision: 1,
             author: "test".to_string(),
             minimum_runtime: String::new(),
+            maps: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33174,6 +33411,7 @@ mod tests {
             revision: 1,
             author: "test".to_string(),
             minimum_runtime: String::new(),
+            maps: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33216,6 +33454,7 @@ mod tests {
             revision: 1,
             author: "test".to_string(),
             minimum_runtime: String::new(),
+            maps: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33256,6 +33495,7 @@ mod tests {
             revision: 1,
             author: "test".to_string(),
             minimum_runtime: String::new(),
+            maps: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33296,6 +33536,7 @@ mod tests {
             revision: 1,
             author: "test".to_string(),
             minimum_runtime: String::new(),
+            maps: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33336,6 +33577,7 @@ mod tests {
             revision: 1,
             author: "test".to_string(),
             minimum_runtime: String::new(),
+            maps: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33468,6 +33710,7 @@ mod tests {
             revision: 1,
             author: "test".to_string(),
             minimum_runtime: String::new(),
+            maps: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "preview-skill".to_string(),
@@ -33535,6 +33778,7 @@ mod tests {
             revision: 1,
             author: "test".to_string(),
             minimum_runtime: String::new(),
+            maps: Vec::new(),
             wuhun: vec![WuhunPackageEntry {
                 name: "transition wuhun".to_string(),
                 category: "控制系".to_string(),
@@ -35907,6 +36151,105 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    #[test]
+    fn v36_map_package_follows_active_revision_without_moving_players() {
+        let (directory, store) = test_store();
+        store
+            .register_player(&identity(), "地图内容角色", "男")
+            .expect("应创建地图内容测试角色");
+        let before = store
+            .current_map(&identity())
+            .expect("应读取发布前位置")
+            .expect("发布前应有位置");
+        let baseline = store
+            .active_content_revision()
+            .expect("应读取地图内容基线 revision");
+        let package = map_content_package(
+            "test-map-content",
+            "content-map-v36",
+            "内容测试地图",
+            10_000,
+        );
+
+        store
+            .stage_content_package(&package)
+            .expect("应暂存地图内容包");
+        assert!(
+            store
+                .validate_content_draft("test-map-content", 1)
+                .expect("应校验地图内容包")
+                .errors
+                .is_empty()
+        );
+        store
+            .publish_content_draft("test-map-content", 1)
+            .expect("应发布地图内容包");
+
+        drop(store);
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("新地图发布后应可重启");
+        let published = store.list_maps_page(1, 50).expect("应读取发布后的地图目录");
+        assert_eq!(published.total, 8);
+        assert!(
+            published
+                .entries
+                .iter()
+                .any(|entry| entry.map_key == "content-map-v36")
+        );
+        assert!(
+            active_content_member_exists(
+                &store.open().expect("应打开发布后的地图数据库"),
+                "map",
+                "content-map-v36"
+            )
+            .expect("应读取发布后的地图成员")
+        );
+        assert_eq!(store.current_map(&identity()).unwrap().unwrap(), before);
+
+        let conflict = map_content_package(
+            "test-map-content-conflict",
+            "content-map-v36",
+            "另一张内容测试地图",
+            10_001,
+        );
+        store
+            .stage_content_package(&conflict)
+            .expect("应暂存地图唯一性测试草稿");
+        let conflict_report = store
+            .validate_content_draft("test-map-content-conflict", 1)
+            .expect("应校验地图唯一性测试草稿");
+        assert!(
+            conflict_report
+                .errors
+                .iter()
+                .any(|error| error.contains("地图键、名称或排序已存在"))
+        );
+
+        store
+            .rollback_content_revision(baseline.id)
+            .expect("应回到地图内容基线 revision");
+        drop(store);
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("回到旧地图 revision 后应可重启");
+        let rolled_back = store.list_maps_page(1, 50).expect("应读取回滚后的地图目录");
+        assert_eq!(rolled_back.total, 7);
+        assert!(
+            !rolled_back
+                .entries
+                .iter()
+                .any(|entry| entry.map_key == "content-map-v36")
+        );
+        assert!(
+            !active_content_member_exists(
+                &store.open().expect("应打开回滚后的地图数据库"),
+                "map",
+                "content-map-v36"
+            )
+            .expect("应读取回滚后的地图成员")
+        );
+        assert_eq!(store.current_map(&identity()).unwrap().unwrap(), before);
     }
 
     #[test]
@@ -40139,6 +40482,7 @@ mod tests {
             revision: 1,
             author: "test".to_string(),
             minimum_runtime: String::new(),
+            maps: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -41145,6 +41489,7 @@ mod tests {
             revision: 1,
             author: "test".to_string(),
             minimum_runtime: String::new(),
+            maps: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "test-starter".to_string(),
@@ -42159,6 +42504,7 @@ mod tests {
             revision: 1,
             author: "test".to_string(),
             minimum_runtime: String::new(),
+            maps: Vec::new(),
             wuhun: vec![WuhunPackageEntry {
                 name: "test catalog wuhun".to_string(),
                 category: "控制系".to_string(),
@@ -44720,6 +45066,45 @@ mod tests {
             BEGIN
                 SELECT 1;
             END;
+            "#,
+        );
+    }
+
+    fn assert_v36_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v36 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v36 迁移应成功");
+        let connection = store.open().expect("应打开 v36 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v36 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v36 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v36")
+                || error.contains("v23")
+                || error.contains("content_revision_member")
+                || error.contains("地图"),
+            "v36 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    #[test]
+    fn recorded_v36_map_membership_damage_fails_closed() {
+        for mutation in [
+            "DROP INDEX content_revision_member_lookup;",
+            "DROP TRIGGER content_revision_member_no_reinsert;",
+        ] {
+            assert_v36_damage_fails_closed(mutation);
+        }
+        assert_v36_damage_fails_closed(
+            r#"
+            INSERT INTO map(
+                map_key, name, description, level_required, safe, pvp_enabled,
+                teleport_enabled, sort_order, created_at, updated_at
+            ) VALUES('untracked-v36-map', '未登记地图', 'v36 损坏探针', 1, 1, 0, 1, 99999, 0, 0);
             "#,
         );
     }

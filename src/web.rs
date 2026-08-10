@@ -1463,6 +1463,7 @@ mod tests {
             revision: 1,
             author: "web-test".to_string(),
             minimum_runtime: String::new(),
+            maps: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -1717,6 +1718,7 @@ mod tests {
             revision: 1,
             author: "web-test".to_string(),
             minimum_runtime: String::new(),
+            maps: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
