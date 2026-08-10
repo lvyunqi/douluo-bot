@@ -10,6 +10,7 @@ mod embedded_web;
 mod game;
 mod identity;
 pub mod message;
+pub mod public_seed;
 mod store;
 mod web;
 

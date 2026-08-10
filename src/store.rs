@@ -34904,6 +34904,7 @@ mod tests {
         SoulBeastPackageEntry, SoulBeastSkillPoolPackageEntry, SoulRingPackageEntry,
         StatePackageEntry, WuhunPackageEntry, WuhunStatsPackageEntry,
     };
+    use crate::public_seed::{PublicSeedPackageMetadata, import_public_seed_sqlite};
     use tempfile::tempdir;
 
     use super::*;
@@ -39671,6 +39672,191 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .expect("重启后状态目录行应保留"),
+            1
+        );
+    }
+
+    #[test]
+    fn public_seed_importer_builds_a_package_for_content_revision_without_player_writes() {
+        let source_directory = tempdir().expect("应创建公共种子源目录");
+        let source_path = source_directory.path().join("public-seed.sqlite");
+        let source = rusqlite::Connection::open(&source_path).expect("应创建公共种子源库");
+        source
+            .execute_batch(
+                r#"
+                CREATE TABLE map(
+                    map_key TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL,
+                    level_required INTEGER NOT NULL, safe INTEGER NOT NULL,
+                    pvp_enabled INTEGER NOT NULL, teleport_enabled INTEGER NOT NULL,
+                    sort_order INTEGER NOT NULL
+                );
+                CREATE TABLE item(
+                    item_key TEXT NOT NULL, name TEXT NOT NULL, category TEXT NOT NULL,
+                    quality INTEGER NOT NULL, stackable INTEGER NOT NULL, max_stack INTEGER NOT NULL,
+                    buy_price INTEGER NOT NULL, sell_price INTEGER NOT NULL,
+                    level_required INTEGER NOT NULL, effect_kind TEXT NOT NULL,
+                    effect_amount INTEGER NOT NULL, revive_hp_percent INTEGER NOT NULL,
+                    purchasable INTEGER NOT NULL, sellable INTEGER NOT NULL, usable INTEGER NOT NULL,
+                    description TEXT NOT NULL
+                );
+                CREATE TABLE npc(
+                    npc_key TEXT NOT NULL, map_key TEXT NOT NULL, name TEXT NOT NULL,
+                    npc_kind TEXT NOT NULL, dialogue TEXT NOT NULL, description TEXT NOT NULL,
+                    enabled INTEGER NOT NULL, sort_order INTEGER NOT NULL
+                );
+                CREATE TABLE quest(
+                    id INTEGER PRIMARY KEY, quest_key TEXT NOT NULL, name TEXT NOT NULL,
+                    description TEXT NOT NULL, category TEXT NOT NULL, map_key TEXT,
+                    level_required INTEGER NOT NULL, repeatable INTEGER NOT NULL, enabled INTEGER NOT NULL
+                );
+                CREATE TABLE quest_requirement(
+                    id INTEGER PRIMARY KEY, quest_id INTEGER NOT NULL, requirement_kind TEXT NOT NULL,
+                    target_key TEXT NOT NULL, required_quantity INTEGER NOT NULL,
+                    sort_order INTEGER NOT NULL, description TEXT NOT NULL
+                );
+                CREATE TABLE quest_reward(
+                    id INTEGER PRIMARY KEY, quest_id INTEGER NOT NULL, reward_kind TEXT NOT NULL,
+                    currency_code TEXT, item_key TEXT, amount INTEGER NOT NULL,
+                    sort_order INTEGER NOT NULL, description TEXT NOT NULL
+                );
+                CREATE TABLE numeric_curve(
+                    curve_key TEXT NOT NULL, name TEXT NOT NULL, unit TEXT NOT NULL,
+                    range_min INTEGER NOT NULL, range_max INTEGER NOT NULL,
+                    reference_key TEXT NOT NULL, description TEXT NOT NULL, sort_order INTEGER NOT NULL
+                );
+                INSERT INTO map(
+                    map_key, name, description, level_required, safe, pvp_enabled, teleport_enabled,
+                    sort_order
+                ) VALUES(
+                    'public-seed-grove', '公共种子林地', '用于验证公共目录导入。',
+                    1, 1, 0, 1, 9000
+                );
+                INSERT INTO item(
+                    item_key, name, category, quality, stackable, max_stack,
+                    buy_price, sell_price, level_required, effect_kind, effect_amount,
+                    revive_hp_percent, purchasable, sellable, usable, description
+                ) VALUES(
+                    'public-seed-tonic', '公共种子药剂', 'consumable', 1, 1, 99,
+                    10, 2, 1, 'restore_hp', 25, 0, 1, 1, 1, '公共种子物品。'
+                );
+                INSERT INTO npc(
+                    npc_key, map_key, name, npc_kind, dialogue, description,
+                    enabled, sort_order
+                ) VALUES(
+                    'public-seed-guide', 'public-seed-grove', '公共种子向导', 'elder',
+                    '欢迎来到公共种子林地。', '用于验证 NPC 目录导入。', 1, 0
+                );
+                INSERT INTO quest(
+                    quest_key, name, description, category, map_key, level_required,
+                    repeatable, enabled
+                ) VALUES(
+                    'public-seed-quest', '公共种子任务', '用于验证任务目录导入。', 'side',
+                    'public-seed-grove', 1, 0, 1
+                );
+                INSERT INTO quest_requirement(
+                    quest_id, requirement_kind, target_key, required_quantity,
+                    sort_order, description
+                ) VALUES(1, 'item', 'public-seed-tonic', 1, 0, '携带公共种子药剂。');
+                INSERT INTO quest_reward(
+                    quest_id, reward_kind, currency_code, item_key, amount,
+                    sort_order, description
+                ) VALUES(1, 'item', NULL, 'public-seed-tonic', 1, 0, '获得公共种子药剂。');
+                INSERT INTO numeric_curve(
+                    curve_key, name, unit, range_min, range_max, reference_key,
+                    description, sort_order
+                ) VALUES(
+                    'public-seed-level-curve', '公共种子等级曲线', '级', 1, 120,
+                    'player-level-exp-v1', '用于验证数值曲线目录导入。', 9000
+                );
+                "#,
+            )
+            .expect("应准备公共种子源目录");
+        drop(source);
+
+        let metadata = PublicSeedPackageMetadata {
+            package_key: "public-seed-import".to_string(),
+            revision: 1,
+            author: "seed-import-test".to_string(),
+            minimum_runtime: "0.1.20".to_string(),
+        };
+        let loaded =
+            import_public_seed_sqlite(&source_path, &metadata).expect("应只读导入完整公共种子目录");
+        assert_eq!(loaded.package.maps.len(), 1);
+        assert_eq!(loaded.package.items.len(), 1);
+        assert_eq!(loaded.package.npcs.len(), 1);
+        assert_eq!(loaded.package.quests.len(), 1);
+        assert_eq!(loaded.package.quests[0].requirements.len(), 1);
+        assert_eq!(loaded.package.quests[0].rewards.len(), 1);
+        assert_eq!(loaded.package.numeric_curves.len(), 1);
+        let source = rusqlite::Connection::open(&source_path).expect("应重新打开公共种子源库");
+        assert!(
+            !source
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'player')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .expect("应检查公共种子源不存在玩家表"),
+            "公共种子源不应包含玩家表"
+        );
+        drop(source);
+
+        let (_target_directory, target_store) = test_store();
+        target_store
+            .register_player(&identity(), "公共种子目标角色", "男")
+            .expect("应创建公共种子目标角色");
+        let before_player = target_store
+            .player_status(&identity())
+            .expect("应读取公共种子发布前角色状态");
+        target_store
+            .stage_content_package(&loaded)
+            .expect("公共种子内容包应能进入既有暂存流程");
+        let report = target_store
+            .validate_content_draft("public-seed-import", 1)
+            .expect("应校验公共种子内容包");
+        assert!(
+            report.errors.is_empty(),
+            "公共种子内容包不应产生数据库校验错误：{:?}",
+            report.errors
+        );
+        let receipt = target_store
+            .publish_content_draft("public-seed-import", 1)
+            .expect("公共种子内容包应通过既有发布流程");
+        assert_eq!(
+            target_store
+                .active_content_revision()
+                .expect("应读取发布后的 active revision")
+                .id,
+            receipt.revision.id
+        );
+        assert_eq!(
+            target_store
+                .player_status(&identity())
+                .expect("应读取公共种子发布后角色状态"),
+            before_player
+        );
+
+        let target = target_store.open().expect("应读取公共种子发布目录");
+        for member in [
+            ("map", "public-seed-grove"),
+            ("item", "public-seed-tonic"),
+            ("npc", "public-seed-guide"),
+            ("quest", "public-seed-quest"),
+            ("curve", "public-seed-level-curve"),
+        ] {
+            assert!(
+                active_content_member_exists(&target, member.0, member.1)
+                    .expect("应读取公共种子 active 成员"),
+                "发布后应存在公共种子成员 {} / {}",
+                member.0,
+                member.1
+            );
+        }
+        assert_eq!(
+            target
+                .query_row("SELECT COUNT(*) FROM player", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("应统计公共种子发布后的角色"),
             1
         );
     }
