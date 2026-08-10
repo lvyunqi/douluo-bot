@@ -12,9 +12,10 @@ use rusqlite::{
 use crate::config::DatabaseConfig;
 use crate::content::{
     ContentPackage, ContentTransitionPackageEntry, FORBID_SKILL_VALUE, LoadedContentPackage,
-    MAX_HEAL_AMOUNT, MAX_POISON_TICK_DAMAGE, SHIELD_VALUE, STUN_VALUE, TARGET_SELECTION_VALUE,
-    canonical_json, content_hash, is_forbid_skill_v1_parameters, is_heal_v1_parameters,
-    is_poison_v1_parameters, is_shield_v1_parameters, is_stun_v1_parameters,
+    MAX_HEAL_AMOUNT, MAX_POISON_TICK_DAMAGE, PLAYER_LEVEL_EXP_CURVE_REFERENCE, SHIELD_VALUE,
+    SKILL_DAMAGE_PERCENT_CURVE_REFERENCE, SKILL_PROFICIENCY_CURVE_REFERENCE, STUN_VALUE,
+    TARGET_SELECTION_VALUE, canonical_json, content_hash, is_forbid_skill_v1_parameters,
+    is_heal_v1_parameters, is_poison_v1_parameters, is_shield_v1_parameters, is_stun_v1_parameters,
     is_target_v1_parameters, validate_shape,
 };
 use crate::message::Protocol;
@@ -6397,6 +6398,105 @@ SELECT revision.id, 'quest', quest.quest_key, quest.created_at
  );
 "#;
 
+// v40 新增只读数值曲线展示目录；它不保存或驱动任何玩家数值计算。
+const MIGRATION_V40: &str = r#"
+CREATE TABLE numeric_curve (
+    curve_key TEXT PRIMARY KEY CHECK(
+        length(curve_key) BETWEEN 1 AND 96
+        AND curve_key = trim(curve_key)
+        AND curve_key GLOB '[a-z0-9][a-z0-9._-]*'
+        AND curve_key NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 128),
+    unit TEXT NOT NULL CHECK(length(unit) BETWEEN 1 AND 32),
+    range_min INTEGER NOT NULL CHECK(range_min >= 1),
+    range_max INTEGER NOT NULL CHECK(range_max >= range_min),
+    reference_key TEXT NOT NULL CHECK(reference_key IN (
+        'player-level-exp-v1', 'skill-proficiency-v1', 'skill-damage-percent-v1'
+    )),
+    description TEXT NOT NULL CHECK(length(description) BETWEEN 1 AND 2000),
+    sort_order INTEGER NOT NULL CHECK(sort_order >= 0),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0)
+) STRICT;
+
+CREATE UNIQUE INDEX numeric_curve_name_unique ON numeric_curve(name);
+CREATE UNIQUE INDEX numeric_curve_sort_order_unique ON numeric_curve(sort_order);
+CREATE INDEX numeric_curve_page ON numeric_curve(sort_order, curve_key);
+
+CREATE TRIGGER numeric_curve_no_update
+BEFORE UPDATE ON numeric_curve
+BEGIN
+    SELECT RAISE(ABORT, 'numeric curve catalog is immutable');
+END;
+CREATE TRIGGER numeric_curve_no_delete
+BEFORE DELETE ON numeric_curve
+BEGIN
+    SELECT RAISE(ABORT, 'numeric curve catalog is immutable');
+END;
+CREATE TRIGGER numeric_curve_no_reinsert
+BEFORE INSERT ON numeric_curve
+WHEN EXISTS(
+    SELECT 1 FROM numeric_curve WHERE curve_key = NEW.curve_key
+)
+BEGIN
+    SELECT RAISE(ABORT, 'numeric curve catalog is append-only');
+END;
+
+CREATE TABLE content_revision_member_v40_backup AS
+SELECT revision_id, member_kind, member_key, created_at
+  FROM content_revision_member;
+
+DROP TRIGGER content_revision_member_no_update;
+DROP TRIGGER content_revision_member_no_delete;
+DROP TRIGGER content_revision_member_no_reinsert;
+DROP INDEX content_revision_member_lookup;
+DROP TABLE content_revision_member;
+
+CREATE TABLE content_revision_member (
+    revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
+    member_kind TEXT NOT NULL CHECK(
+        member_kind IN ('wuhun', 'skill', 'starter-skill', 'effect', 'beast', 'ring', 'map', 'item', 'npc', 'quest', 'curve')
+    ),
+    member_key TEXT NOT NULL CHECK(
+        length(member_key) BETWEEN 1 AND 200
+        AND member_key = trim(member_key)
+        AND instr(member_key, char(0)) = 0
+    ),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    PRIMARY KEY(revision_id, member_kind, member_key)
+) STRICT, WITHOUT ROWID;
+
+INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+SELECT revision_id, member_kind, member_key, created_at
+  FROM content_revision_member_v40_backup;
+DROP TABLE content_revision_member_v40_backup;
+
+CREATE INDEX content_revision_member_lookup
+    ON content_revision_member(member_kind, member_key, revision_id);
+
+CREATE TRIGGER content_revision_member_no_update
+BEFORE UPDATE ON content_revision_member
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is immutable');
+END;
+CREATE TRIGGER content_revision_member_no_delete
+BEFORE DELETE ON content_revision_member
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is immutable');
+END;
+CREATE TRIGGER content_revision_member_no_reinsert
+BEFORE INSERT ON content_revision_member
+WHEN EXISTS(
+    SELECT 1 FROM content_revision_member
+     WHERE revision_id = NEW.revision_id
+       AND member_kind = NEW.member_kind
+       AND member_key = NEW.member_key
+)
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is append-only');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -6721,6 +6821,28 @@ pub struct MapPage {
     pub page_count: usize,
     pub total: usize,
     pub next_after_key: Option<String>,
+}
+
+/// 已发布数值曲线的纯展示记录；范围和引用不参与运行时数值结算。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NumericCurveRecord {
+    pub curve_key: String,
+    pub name: String,
+    pub unit: String,
+    pub range_min: i64,
+    pub range_max: i64,
+    pub reference_key: String,
+    pub description: String,
+    pub sort_order: i64,
+}
+
+/// 当前 active content revision 下可见的数值曲线分页目录。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NumericCurvePage {
+    pub entries: Vec<NumericCurveRecord>,
+    pub page: usize,
+    pub page_count: usize,
+    pub total: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8142,6 +8264,9 @@ fn content_package_declared_member_set(package: &ContentPackage) -> BTreeSet<(St
     for entry in &package.quests {
         members.insert(("quest".to_string(), entry.quest_key.clone()));
     }
+    for entry in &package.numeric_curves {
+        members.insert(("curve".to_string(), entry.curve_key.clone()));
+    }
     for entry in &package.wuhun {
         members.insert(("wuhun".to_string(), entry.name.clone()));
     }
@@ -8390,6 +8515,40 @@ fn validate_content_package_against_database(
             }
         }
     }
+    let mut curve_names = std::collections::BTreeSet::new();
+    let mut curve_sort_orders = std::collections::BTreeSet::new();
+    for entry in &package.numeric_curves {
+        if !curve_names.insert(entry.name.as_str()) {
+            errors.push(format!("内容包内数值曲线名称重复：{}", entry.name));
+        }
+        if !curve_sort_orders.insert(entry.sort_order) {
+            errors.push(format!("内容包内数值曲线排序重复：{}", entry.sort_order));
+        }
+        if catalog_value_exists(connection, "numeric_curve", "curve_key", &entry.curve_key)?
+            || catalog_value_exists(connection, "numeric_curve", "name", &entry.name)?
+            || numeric_curve_sort_order_exists(connection, entry.sort_order)?
+        {
+            errors.push(format!(
+                "数值曲线键、名称或排序已存在：{} / {} / {}",
+                entry.curve_key, entry.name, entry.sort_order
+            ));
+        }
+        match numeric_curve_reference_range(&entry.reference_key) {
+            Some((range_min, range_max))
+                if (entry.range_min, entry.range_max) != (range_min, range_max) =>
+            {
+                errors.push(format!(
+                    "数值曲线 {} 的引用 {} 必须使用输入范围 {} 到 {}",
+                    entry.curve_key, entry.reference_key, range_min, range_max
+                ));
+            }
+            Some(_) => {}
+            None => errors.push(format!(
+                "数值曲线 {} 的 reference_key 不受支持：{}",
+                entry.curve_key, entry.reference_key
+            )),
+        }
+    }
     names.clear();
     for entry in &package.wuhun {
         if !names.insert(entry.name.as_str()) {
@@ -8592,6 +8751,10 @@ fn catalog_value_exists(
         ("npc", "npc_key") => "SELECT EXISTS(SELECT 1 FROM npc WHERE npc_key = ?1)",
         ("quest", "quest_key") => "SELECT EXISTS(SELECT 1 FROM quest WHERE quest_key = ?1)",
         ("quest", "name") => "SELECT EXISTS(SELECT 1 FROM quest WHERE name = ?1)",
+        ("numeric_curve", "curve_key") => {
+            "SELECT EXISTS(SELECT 1 FROM numeric_curve WHERE curve_key = ?1)"
+        }
+        ("numeric_curve", "name") => "SELECT EXISTS(SELECT 1 FROM numeric_curve WHERE name = ?1)",
         _ => return Err(format!("未知内容目录查询：{table}.{column}")),
     };
     connection
@@ -8607,6 +8770,30 @@ fn map_sort_order_exists(connection: &Connection, sort_order: i64) -> Result<boo
             |row| row.get::<_, bool>(0),
         )
         .map_err(|error| format!("查询地图排序失败：{error}"))
+}
+
+fn numeric_curve_sort_order_exists(
+    connection: &Connection,
+    sort_order: i64,
+) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM numeric_curve WHERE sort_order = ?1)",
+            [sort_order],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("查询数值曲线排序失败：{error}"))
+}
+
+/// 返回受控展示引用的固定输入范围，避免内容包伪造可执行数值规则。
+fn numeric_curve_reference_range(reference_key: &str) -> Option<(i64, i64)> {
+    match reference_key {
+        PLAYER_LEVEL_EXP_CURVE_REFERENCE => Some((1, MAX_PLAYER_LEVEL)),
+        SKILL_PROFICIENCY_CURVE_REFERENCE | SKILL_DAMAGE_PERCENT_CURVE_REFERENCE => {
+            Some((1, MAX_SKILL_LEVEL))
+        }
+        _ => None,
+    }
 }
 
 fn npc_map_name_exists(connection: &Connection, map_key: &str, name: &str) -> Result<bool, String> {
@@ -8863,6 +9050,36 @@ fn publish_content_package_rows(
             revision_id,
             "quest",
             &entry.quest_key,
+            created_at,
+        )?;
+    }
+    for entry in &package.numeric_curves {
+        connection
+            .execute(
+                r#"
+                INSERT INTO numeric_curve(
+                    curve_key, name, unit, range_min, range_max, reference_key,
+                    description, sort_order, created_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+                params![
+                    entry.curve_key,
+                    entry.name,
+                    entry.unit,
+                    entry.range_min,
+                    entry.range_max,
+                    entry.reference_key,
+                    entry.description,
+                    entry.sort_order,
+                    created_at,
+                ],
+            )
+            .map_err(|error| format!("发布数值曲线 {} 失败：{error}", entry.curve_key))?;
+        ensure_content_revision_member(
+            connection,
+            revision_id,
+            "curve",
+            &entry.curve_key,
             created_at,
         )?;
     }
@@ -10643,10 +10860,25 @@ impl Store {
                 validate_v39_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 40)? {
+                transaction
+                    .execute_batch(MIGRATION_V40)
+                    .map_err(|error| format!("执行数据库迁移 v40 失败：{error}"))?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(40, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v40 失败：{error}"))?;
+                validate_v40_schema(&transaction)?;
+            } else {
+                validate_v40_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36/v37/v38/v39 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36/v37/v38/v39/v40 失败：{error}"
                 )
             })?;
             Ok(())
@@ -10688,7 +10920,7 @@ impl Store {
                 validate_v34_schema(connection)?;
                 validate_v35_schema(connection)?;
                 validate_v36_schema(connection)?;
-                validate_v39_schema(connection)?;
+                validate_v40_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -11326,6 +11558,70 @@ impl Store {
             page_count,
             total,
             next_after_key,
+        })
+    }
+
+    /// 分页读取当前 active revision 可见的数值曲线展示目录。
+    pub fn numeric_curves_page(
+        &self,
+        page: usize,
+        limit: usize,
+    ) -> Result<NumericCurvePage, String> {
+        validate_catalog_page(page, limit, "数值曲线")?;
+        let connection = self.open()?;
+        let active_revision_id = current_content_revision_id(&connection)?;
+        let total = connection
+            .query_row(
+                r#"
+                SELECT COUNT(*)
+                  FROM numeric_curve curve
+                  JOIN content_revision_member member
+                    ON member.member_kind = 'curve' AND member.member_key = curve.curve_key
+                 WHERE member.revision_id = ?1
+                "#,
+                [active_revision_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("统计数值曲线数量失败：{error}"))?;
+        let total = usize::try_from(total).map_err(|_| "数值曲线数量超出可分页范围".to_string())?;
+        let page_count = total.div_ceil(limit).max(1);
+        if page > page_count {
+            return Err(format!("数值曲线页码必须在 1 到 {page_count} 之间"));
+        }
+        let offset = page
+            .checked_sub(1)
+            .and_then(|page| page.checked_mul(limit))
+            .ok_or_else(|| "数值曲线分页偏移量溢出".to_string())?;
+        let fetch_limit =
+            i64::try_from(limit).map_err(|_| "数值曲线分页数量无法转换".to_string())?;
+        let offset = i64::try_from(offset).map_err(|_| "数值曲线分页偏移量无法转换".to_string())?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT curve_key, name, unit, range_min, range_max, reference_key,
+                       description, sort_order
+                  FROM numeric_curve curve
+                  JOIN content_revision_member member
+                    ON member.member_kind = 'curve' AND member.member_key = curve.curve_key
+                 WHERE member.revision_id = ?3
+                 ORDER BY sort_order, curve_key
+                 LIMIT ?1 OFFSET ?2
+                "#,
+            )
+            .map_err(|error| format!("准备数值曲线分页查询失败：{error}"))?;
+        let entries = statement
+            .query_map(
+                params![fetch_limit, offset, active_revision_id],
+                numeric_curve_record_from_row,
+            )
+            .map_err(|error| format!("查询数值曲线分页失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析数值曲线分页失败：{error}"))?;
+        Ok(NumericCurvePage {
+            entries,
+            page,
+            page_count,
+            total,
         })
     }
 
@@ -16660,6 +16956,19 @@ fn map_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MapRecord> {
         safe: row.get(4)?,
         pvp_enabled: row.get(5)?,
         teleport_enabled: row.get(6)?,
+        sort_order: row.get(7)?,
+    })
+}
+
+fn numeric_curve_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NumericCurveRecord> {
+    Ok(NumericCurveRecord {
+        curve_key: row.get(0)?,
+        name: row.get(1)?,
+        unit: row.get(2)?,
+        range_min: row.get(3)?,
+        range_max: row.get(4)?,
+        reference_key: row.get(5)?,
+        description: row.get(6)?,
         sort_order: row.get(7)?,
     })
 }
@@ -28748,6 +29057,7 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
     let tracks_items = migration_applied(connection, 37)?;
     let tracks_npcs = migration_applied(connection, 38)?;
     let tracks_quests = migration_applied(connection, 39)?;
+    let tracks_curves = migration_applied(connection, 40)?;
     let expected_tables = [
         (
             "content_revision",
@@ -28809,7 +29119,9 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
         }
     }
 
-    let member_kind_marker = if tracks_quests {
+    let member_kind_marker = if tracks_curves {
+        "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING', 'MAP', 'ITEM', 'NPC', 'QUEST', 'CURVE')"
+    } else if tracks_quests {
         "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING', 'MAP', 'ITEM', 'NPC', 'QUEST')"
     } else if tracks_npcs {
         "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING', 'MAP', 'ITEM', 'NPC')"
@@ -31941,6 +32253,161 @@ fn validate_v39_schema(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// 校验 v40 数值曲线展示目录；曲线引用和输入范围必须仍与编译期规则一致。
+fn validate_v40_schema(connection: &Connection) -> Result<(), String> {
+    validate_v39_schema(connection)?;
+    validate_column_names_and_types(
+        "numeric_curve",
+        &table_columns_with_type(connection, "numeric_curve")?,
+        &[
+            ("curve_key", "TEXT"),
+            ("name", "TEXT"),
+            ("unit", "TEXT"),
+            ("range_min", "INTEGER"),
+            ("range_max", "INTEGER"),
+            ("reference_key", "TEXT"),
+            ("description", "TEXT"),
+            ("sort_order", "INTEGER"),
+            ("created_at", "INTEGER"),
+        ],
+    )?;
+    validate_v10_table_sql(
+        connection,
+        "numeric_curve",
+        &[
+            ") STRICT",
+            "CURVE_KEY TEXT PRIMARY KEY",
+            "LENGTH(CURVE_KEY) BETWEEN 1 AND 96",
+            "CURVE_KEY = TRIM(CURVE_KEY)",
+            "CURVE_KEY GLOB",
+            "LENGTH(UNIT) BETWEEN 1 AND 32",
+            "RANGE_MIN >= 1",
+            "RANGE_MAX >= RANGE_MIN",
+            "REFERENCE_KEY IN",
+            "'PLAYER-LEVEL-EXP-V1'",
+            "'SKILL-PROFICIENCY-V1'",
+            "'SKILL-DAMAGE-PERCENT-V1'",
+            "LENGTH(DESCRIPTION) BETWEEN 1 AND 2000",
+            "SORT_ORDER >= 0",
+        ],
+    )
+    .map_err(|error| error.replace("v10", "v40"))?;
+    validate_v9_foreign_keys(connection, "numeric_curve", &[])
+        .map_err(|error| error.replace("v9", "v40"))?;
+    validate_v7_index(
+        connection,
+        "numeric_curve_name_unique",
+        true,
+        &["name"],
+        false,
+    )
+    .map_err(|error| error.replace("v7", "v40"))?;
+    validate_v7_index(
+        connection,
+        "numeric_curve_sort_order_unique",
+        true,
+        &["sort_order"],
+        false,
+    )
+    .map_err(|error| error.replace("v7", "v40"))?;
+    validate_v7_index(
+        connection,
+        "numeric_curve_page",
+        false,
+        &["sort_order", "curve_key"],
+        false,
+    )
+    .map_err(|error| error.replace("v7", "v40"))?;
+    validate_v10_custom_index_set(
+        connection,
+        "numeric_curve",
+        &[
+            "numeric_curve_name_unique",
+            "numeric_curve_page",
+            "numeric_curve_sort_order_unique",
+        ],
+    )
+    .map_err(|error| error.replace("v10", "v40"))?;
+
+    let expected_triggers = [
+        (
+            "numeric_curve_no_update",
+            "numeric_curve",
+            &["BEFORE UPDATE ON NUMERIC_CURVE", "RAISE(ABORT"] as &[&str],
+        ),
+        (
+            "numeric_curve_no_delete",
+            "numeric_curve",
+            &["BEFORE DELETE ON NUMERIC_CURVE", "RAISE(ABORT"] as &[&str],
+        ),
+        (
+            "numeric_curve_no_reinsert",
+            "numeric_curve",
+            &[
+                "BEFORE INSERT ON NUMERIC_CURVE",
+                "NUMERIC CURVE CATALOG IS APPEND-ONLY",
+            ] as &[&str],
+        ),
+    ];
+    for &(name, table, markers) in &expected_triggers {
+        let (actual_table, sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v40 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库缺少 v40 触发器 {name}"))?;
+        let normalized = sql.to_ascii_uppercase();
+        if actual_table != table || markers.iter().any(|marker| !normalized.contains(marker)) {
+            return Err(format!("v40 触发器 {name} 契约不匹配"));
+        }
+    }
+
+    let invalid_rows = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM numeric_curve curve
+                 WHERE (curve.reference_key = ?1 AND (
+                            curve.range_min <> 1 OR curve.range_max <> ?2
+                        ))
+                    OR (curve.reference_key IN (?3, ?4) AND (
+                            curve.range_min <> 1 OR curve.range_max <> ?5
+                        ))
+            ) OR EXISTS(
+                SELECT 1
+                  FROM content_revision_member member
+                  LEFT JOIN numeric_curve curve ON curve.curve_key = member.member_key
+                 WHERE member.member_kind = 'curve' AND curve.curve_key IS NULL
+            ) OR EXISTS(
+                SELECT 1
+                  FROM numeric_curve curve
+                 WHERE NOT EXISTS(
+                    SELECT 1 FROM content_revision_member member
+                     WHERE member.member_kind = 'curve'
+                       AND member.member_key = curve.curve_key
+                 )
+            )
+            "#,
+            params![
+                PLAYER_LEVEL_EXP_CURVE_REFERENCE,
+                MAX_PLAYER_LEVEL,
+                SKILL_PROFICIENCY_CURVE_REFERENCE,
+                SKILL_DAMAGE_PERCENT_CURVE_REFERENCE,
+                MAX_SKILL_LEVEL,
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v40 数值曲线目录边界失败：{error}"))?;
+    if invalid_rows {
+        return Err("v40 检测到越界、孤立或未登记的数值曲线目录成员".to_string());
+    }
+    Ok(())
+}
+
 fn validate_v24_table_sql(
     connection: &Connection,
     table: &str,
@@ -33811,9 +34278,9 @@ mod tests {
     use crate::content::{
         EffectPackageEntry, FORBID_SKILL_APPLY_PHASE, FORBID_SKILL_BLOCKED_ACTION,
         FORBID_SKILL_RULE_VERSION, ItemPackageEntry, MIN_FORBID_SKILL_DURATION_ROUNDS,
-        MapPackageEntry, NpcPackageEntry, QuestPackageEntry, QuestRequirementPackageEntry,
-        QuestRewardPackageEntry, SkillPackageEntry, SoulBeastPackageEntry, SoulRingPackageEntry,
-        WuhunPackageEntry, WuhunStatsPackageEntry,
+        MapPackageEntry, NpcPackageEntry, NumericCurvePackageEntry, QuestPackageEntry,
+        QuestRequirementPackageEntry, QuestRewardPackageEntry, SkillPackageEntry,
+        SoulBeastPackageEntry, SoulRingPackageEntry, WuhunPackageEntry, WuhunStatsPackageEntry,
     };
     use tempfile::tempdir;
 
@@ -33840,6 +34307,7 @@ mod tests {
             items: Vec::new(),
             npcs: Vec::new(),
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33893,6 +34361,7 @@ mod tests {
             items: Vec::new(),
             npcs: Vec::new(),
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: Vec::new(),
@@ -33940,6 +34409,7 @@ mod tests {
             }],
             npcs: Vec::new(),
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: Vec::new(),
@@ -33979,6 +34449,7 @@ mod tests {
                 sort_order: 30,
             }],
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: Vec::new(),
@@ -34066,6 +34537,7 @@ mod tests {
                     },
                 ],
             }],
+            numeric_curves: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: Vec::new(),
@@ -34075,6 +34547,48 @@ mod tests {
         };
         LoadedContentPackage {
             content_hash: content_hash(&package).expect("应计算任务内容包哈希"),
+            package,
+            source_format: "json".to_string(),
+        }
+    }
+
+    fn numeric_curve_content_package(
+        package_key: &str,
+        curve_key: &str,
+        name: &str,
+        reference_key: &str,
+        range_min: i64,
+        range_max: i64,
+        sort_order: i64,
+    ) -> LoadedContentPackage {
+        let package = ContentPackage {
+            package_key: package_key.to_string(),
+            revision: 1,
+            author: "curve-test".to_string(),
+            minimum_runtime: String::new(),
+            maps: Vec::new(),
+            items: Vec::new(),
+            npcs: Vec::new(),
+            quests: Vec::new(),
+            numeric_curves: vec![NumericCurvePackageEntry {
+                curve_key: curve_key.to_string(),
+                name: name.to_string(),
+                unit: "级".to_string(),
+                range_min,
+                range_max,
+                reference_key: reference_key.to_string(),
+                description: "只展示既有编译期数值规则的输入范围。".to_string(),
+                sort_order,
+            }],
+            wuhun: Vec::new(),
+            skills: Vec::new(),
+            effects: Vec::new(),
+            soul_beasts: Vec::new(),
+            soul_rings: Vec::new(),
+            transitions: Vec::new(),
+        };
+        LoadedContentPackage {
+            content_hash: content_hash(&package).expect("应计算数值曲线内容包哈希"),
             package,
             source_format: "json".to_string(),
         }
@@ -34371,6 +34885,7 @@ mod tests {
             items: Vec::new(),
             npcs: Vec::new(),
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -34414,6 +34929,7 @@ mod tests {
             items: Vec::new(),
             npcs: Vec::new(),
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -34460,6 +34976,7 @@ mod tests {
             items: Vec::new(),
             npcs: Vec::new(),
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -34504,6 +35021,7 @@ mod tests {
             items: Vec::new(),
             npcs: Vec::new(),
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -34548,6 +35066,7 @@ mod tests {
             items: Vec::new(),
             npcs: Vec::new(),
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -34592,6 +35111,7 @@ mod tests {
             items: Vec::new(),
             npcs: Vec::new(),
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -34728,6 +35248,7 @@ mod tests {
             items: Vec::new(),
             npcs: Vec::new(),
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "preview-skill".to_string(),
@@ -34799,6 +35320,7 @@ mod tests {
             items: Vec::new(),
             npcs: Vec::new(),
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: vec![WuhunPackageEntry {
                 name: "transition wuhun".to_string(),
                 category: "控制系".to_string(),
@@ -37466,7 +37988,8 @@ mod tests {
         connection
             .execute_batch(
                 r#"
-                DELETE FROM schema_migration WHERE version IN (37, 38, 39);
+                DELETE FROM schema_migration WHERE version IN (37, 38, 39, 40);
+                DROP TABLE numeric_curve;
                 CREATE TABLE content_revision_member_v36_test_backup AS
                 SELECT revision_id, member_kind, member_key, created_at
                   FROM content_revision_member
@@ -37793,7 +38316,8 @@ mod tests {
         connection
             .execute_batch(
                 r#"
-                DELETE FROM schema_migration WHERE version IN (38, 39);
+                DELETE FROM schema_migration WHERE version IN (38, 39, 40);
+                DROP TABLE numeric_curve;
                 CREATE TABLE content_revision_member_v37_test_backup AS
                 SELECT revision_id, member_kind, member_key, created_at
                   FROM content_revision_member
@@ -38033,6 +38557,260 @@ mod tests {
     }
 
     #[test]
+    fn v40_numeric_curve_package_follows_active_revision_without_rewriting_player_state() {
+        let (directory, store) = test_store();
+        register_awakened_pair(&store);
+        let baseline = store
+            .active_content_revision()
+            .expect("应读取数值曲线内容基线 revision");
+        let before_player = store
+            .player_status(&identity())
+            .expect("应读取角色状态")
+            .expect("应存在角色");
+        let level_curve_before = level_exp_required(10).expect("应读取既有等级经验规则");
+        let proficiency_curve_before =
+            skill_proficiency_threshold(10).expect("应读取既有熟练度规则");
+        let package = numeric_curve_content_package(
+            "test-numeric-curve-content",
+            "content-skill-proficiency-v40",
+            "内容魂技熟练度",
+            "skill-proficiency-v1",
+            1,
+            10,
+            0,
+        );
+
+        assert!(
+            store
+                .numeric_curves_page(1, 20)
+                .expect("基线曲线目录应可读")
+                .entries
+                .is_empty()
+        );
+        store
+            .stage_content_package(&package)
+            .expect("应暂存数值曲线内容包");
+        let report = store
+            .validate_content_draft("test-numeric-curve-content", 1)
+            .expect("应校验数值曲线内容包");
+        assert!(report.errors.is_empty(), "{report:?}");
+        store
+            .publish_content_draft("test-numeric-curve-content", 1)
+            .expect("应发布数值曲线内容包");
+
+        let page = store
+            .numeric_curves_page(1, 20)
+            .expect("active revision 应暴露新增数值曲线");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.entries[0].curve_key, "content-skill-proficiency-v40");
+        assert_eq!(page.entries[0].reference_key, "skill-proficiency-v1");
+        assert_eq!(
+            (page.entries[0].range_min, page.entries[0].range_max),
+            (1, 10)
+        );
+        let connection = store.open().expect("应打开数值曲线内容数据库");
+        assert!(
+            active_content_member_exists(&connection, "curve", "content-skill-proficiency-v40")
+                .expect("应读取新增数值曲线成员")
+        );
+        drop(connection);
+        assert_eq!(
+            store
+                .player_status(&identity())
+                .expect("应再次读取角色状态"),
+            Some(before_player.clone())
+        );
+        assert_eq!(level_exp_required(10), Ok(level_curve_before));
+        assert_eq!(
+            skill_proficiency_threshold(10),
+            Ok(proficiency_curve_before)
+        );
+
+        store
+            .rollback_content_revision(baseline.id)
+            .expect("应回滚数值曲线内容 revision");
+        assert!(
+            store
+                .numeric_curves_page(1, 20)
+                .expect("回滚后曲线目录应可读")
+                .entries
+                .is_empty()
+        );
+        let connection = store.open().expect("应读取回滚后的数值曲线目录");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM numeric_curve WHERE curve_key = 'content-skill-proficiency-v40'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("发布目录行应保留"),
+            1
+        );
+        drop(connection);
+        assert_eq!(
+            store
+                .player_status(&identity())
+                .expect("应读取回滚后的角色状态"),
+            Some(before_player)
+        );
+
+        drop(store);
+        let restarted = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("数值曲线回滚后的数据库应可重启");
+        assert!(
+            restarted
+                .numeric_curves_page(1, 20)
+                .expect("重启后曲线目录应可读")
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn v40_upgrade_from_v39_preserves_existing_members_and_player_state() {
+        let (directory, store) = test_store();
+        store
+            .register_player(&identity(), "v40 升级角色", "男")
+            .expect("应创建 v40 升级测试角色");
+        let before_player = store
+            .player_status(&identity())
+            .expect("应读取升级前角色状态")
+            .expect("应存在升级测试角色");
+        let connection = store.open().expect("应打开 v40 升级测试数据库");
+        let member_counts_before = connection
+            .prepare(
+                "SELECT revision_id, COUNT(*) FROM content_revision_member GROUP BY revision_id ORDER BY revision_id",
+            )
+            .expect("应准备升级前成员统计")
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .expect("应读取升级前成员统计")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("应解析升级前成员统计");
+        connection
+            .execute_batch(
+                r#"
+                DELETE FROM schema_migration WHERE version = 40;
+                DROP TABLE numeric_curve;
+                CREATE TABLE content_revision_member_v39_test_backup AS
+                SELECT revision_id, member_kind, member_key, created_at
+                  FROM content_revision_member;
+                DROP TRIGGER content_revision_member_no_update;
+                DROP TRIGGER content_revision_member_no_delete;
+                DROP TRIGGER content_revision_member_no_reinsert;
+                DROP INDEX content_revision_member_lookup;
+                DROP TABLE content_revision_member;
+                CREATE TABLE content_revision_member (
+                    revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
+                    member_kind TEXT NOT NULL CHECK(
+                        member_kind IN ('wuhun', 'skill', 'starter-skill', 'effect', 'beast', 'ring', 'map', 'item', 'npc', 'quest')
+                    ),
+                    member_key TEXT NOT NULL CHECK(
+                        length(member_key) BETWEEN 1 AND 200
+                        AND member_key = trim(member_key)
+                        AND instr(member_key, char(0)) = 0
+                    ),
+                    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+                    PRIMARY KEY(revision_id, member_kind, member_key)
+                ) STRICT, WITHOUT ROWID;
+                INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+                SELECT revision_id, member_kind, member_key, created_at
+                  FROM content_revision_member_v39_test_backup;
+                DROP TABLE content_revision_member_v39_test_backup;
+                CREATE INDEX content_revision_member_lookup
+                    ON content_revision_member(member_kind, member_key, revision_id);
+                CREATE TRIGGER content_revision_member_no_update
+                BEFORE UPDATE ON content_revision_member
+                BEGIN
+                    SELECT RAISE(ABORT, 'content revision member is immutable');
+                END;
+                CREATE TRIGGER content_revision_member_no_delete
+                BEFORE DELETE ON content_revision_member
+                BEGIN
+                    SELECT RAISE(ABORT, 'content revision member is immutable');
+                END;
+                CREATE TRIGGER content_revision_member_no_reinsert
+                BEFORE INSERT ON content_revision_member
+                WHEN EXISTS(
+                    SELECT 1 FROM content_revision_member
+                     WHERE revision_id = NEW.revision_id
+                       AND member_kind = NEW.member_kind
+                       AND member_key = NEW.member_key
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'content revision member is append-only');
+                END;
+                "#,
+            )
+            .expect("应构造 v39 内容成员表");
+        drop(connection);
+        drop(store);
+
+        let migrated = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v39 数据库应成功升级到 v40");
+        assert_eq!(
+            migrated
+                .player_status(&identity())
+                .expect("应读取升级后角色状态"),
+            Some(before_player)
+        );
+        assert!(
+            migrated
+                .numeric_curves_page(1, 20)
+                .expect("升级后空曲线目录应可读")
+                .entries
+                .is_empty()
+        );
+        let connection = migrated.open().expect("应打开升级后的 v40 数据库");
+        let member_counts_after = connection
+            .prepare(
+                "SELECT revision_id, COUNT(*) FROM content_revision_member GROUP BY revision_id ORDER BY revision_id",
+            )
+            .expect("应准备升级后成员统计")
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .expect("应读取升级后成员统计")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("应解析升级后成员统计");
+        assert_eq!(member_counts_after, member_counts_before);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migration WHERE version = 40",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("应读取 v40 迁移记录"),
+            1
+        );
+    }
+
+    #[test]
+    fn v40_numeric_curve_package_requires_the_declared_reference_range() {
+        let (_directory, store) = test_store();
+        let package = numeric_curve_content_package(
+            "test-numeric-curve-range",
+            "content-player-level-exp-v40",
+            "内容等级经验",
+            "player-level-exp-v1",
+            1,
+            10,
+            0,
+        );
+        store
+            .stage_content_package(&package)
+            .expect("范围不匹配的数值曲线仍应可暂存以记录校验结果");
+        let report = store
+            .validate_content_draft("test-numeric-curve-range", 1)
+            .expect("应校验范围不匹配的数值曲线");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("必须使用输入范围 1 到 120"))
+        );
+    }
+
+    #[test]
     fn v39_quest_package_requires_active_or_same_package_catalog_references() {
         let (_directory, store) = test_store();
         let mut missing_map = quest_content_package(
@@ -38210,7 +38988,8 @@ mod tests {
         connection
             .execute_batch(
                 r#"
-                DELETE FROM schema_migration WHERE version = 39;
+                DELETE FROM schema_migration WHERE version IN (39, 40);
+                DROP TABLE numeric_curve;
                 CREATE TABLE content_revision_member_v38_test_backup AS
                 SELECT revision_id, member_kind, member_key, created_at
                   FROM content_revision_member
@@ -42551,6 +43330,7 @@ mod tests {
             items: Vec::new(),
             npcs: Vec::new(),
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -43561,6 +44341,7 @@ mod tests {
             items: Vec::new(),
             npcs: Vec::new(),
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "test-starter".to_string(),
@@ -44579,6 +45360,7 @@ mod tests {
             items: Vec::new(),
             npcs: Vec::new(),
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: vec![WuhunPackageEntry {
                 name: "test catalog wuhun".to_string(),
                 category: "控制系".to_string(),
@@ -47304,6 +48086,55 @@ mod tests {
                 repeatable, enabled, created_at, updated_at
             ) VALUES('untracked-v39-quest', '未登记任务', 'v39 损坏探针', 'side',
                      'holy-soul-village', 1, 0, 1, 0, 0);
+            "#,
+        );
+    }
+
+    fn assert_v40_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v40 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v40 迁移应成功");
+        let connection = store.open().expect("应打开 v40 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v40 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v40 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v40")
+                || error.contains("v23")
+                || error.contains("content_revision_member")
+                || error.contains("数值曲线")
+                || error.contains("numeric_curve"),
+            "v40 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    #[test]
+    fn recorded_v40_numeric_curve_membership_damage_fails_closed() {
+        for mutation in [
+            "DROP INDEX numeric_curve_page;",
+            "DROP TRIGGER numeric_curve_no_reinsert;",
+            "DROP TRIGGER content_revision_member_no_reinsert;",
+        ] {
+            assert_v40_damage_fails_closed(mutation);
+        }
+        assert_v40_damage_fails_closed(
+            r#"
+            INSERT INTO numeric_curve(
+                curve_key, name, unit, range_min, range_max, reference_key,
+                description, sort_order, created_at
+            ) VALUES(
+                'invalid-v40-curve', '越界曲线', '级', 2, 120, 'player-level-exp-v1',
+                'v40 损坏探针', 99_999, 0
+            );
+            INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+            SELECT revision_id, 'curve', 'invalid-v40-curve', 0
+              FROM content_revision_activation
+             ORDER BY id DESC
+             LIMIT 1;
             "#,
         );
     }

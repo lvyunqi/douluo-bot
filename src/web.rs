@@ -1469,6 +1469,7 @@ mod tests {
             items: Vec::new(),
             npcs: Vec::new(),
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -1727,6 +1728,7 @@ mod tests {
             items: Vec::new(),
             npcs: Vec::new(),
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {

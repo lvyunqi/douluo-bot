@@ -58,6 +58,10 @@ const MENU_PAGES: &[MenuPage] = &[
                 description: "查看角色属性、武魂和位置",
             },
             MenuEntry {
+                command: "数值曲线 [页码]",
+                description: "查看当前发布的等级与魂技成长规则说明",
+            },
+            MenuEntry {
                 command: "放弃复活",
                 description: "复活窗口结束后放弃当前生命并进入下一世",
             },
@@ -286,6 +290,7 @@ const MENU_PAGES: &[MenuPage] = &[
 ];
 
 const MAP_PAGE_SIZE: usize = 5;
+const NUMERIC_CURVE_PAGE_SIZE: usize = 8;
 
 const CHECKIN_CURRENCY_CODE: &str = GOLD_SOUL_COIN;
 const CHECKIN_CURRENCY_NAME: &str = "金魂币";
@@ -2412,6 +2417,40 @@ impl GameService {
             .notice("地图拓扑来自游戏数据表；图片资源只负责展示，不决定可通行方向"))
     }
 
+    /// 展示当前 active revision 声明的数值规则目录，不读取或改写角色状态。
+    pub fn numeric_curves(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let page = parse_single_page(req.args.as_str(), "数值曲线")?;
+        let curves = self
+            .store
+            .numeric_curves_page(page, NUMERIC_CURVE_PAGE_SIZE)?;
+        let mut document = GameDocument::new("数值曲线")
+            .field("页码", format!("{} / {}", curves.page, curves.page_count))
+            .field("曲线总数", curves.total.to_string());
+        if curves.entries.is_empty() {
+            document = document.line("当前 active 内容 revision 尚未发布数值曲线说明");
+        } else {
+            for curve in &curves.entries {
+                document = document.line(format!(
+                    "{} · {} {} 到 {} {}\n{}\n引用：{}",
+                    curve.name,
+                    curve.range_min,
+                    curve.unit,
+                    curve.range_max,
+                    curve.unit,
+                    curve.description,
+                    curve.reference_key,
+                ));
+            }
+        }
+        if page > 1 {
+            document = document.command(format!("数值曲线 {}", page - 1));
+        }
+        if page < curves.page_count {
+            document = document.command(format!("数值曲线 {}", page + 1));
+        }
+        Ok(document.notice("该目录只说明既有编译期规则，不会修改等级、经验、属性或战斗数值"))
+    }
+
     pub fn move_direction(&self, req: &CommandRequest) -> Result<GameDocument, String> {
         let direction = parse_direction_arg(req.args.as_str())?;
         let identity = resolve_identity(req, &self.config.identity)?;
@@ -3814,6 +3853,32 @@ mod tests {
             Ok("状态")
         );
         assert!(parse_player_alias_target_arg("状态 额外", "查看快捷键 <原指令>").is_err());
+    }
+
+    #[test]
+    fn numeric_curves_command_reads_the_active_display_catalog_without_player_state() {
+        let directory = tempfile::tempdir().expect("应创建数值曲线临时目录");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("数值曲线数据库应初始化");
+        let service = GameService::with_assets(
+            store,
+            PluginConfig::default(),
+            IllustrationAssets::default(),
+        );
+
+        let text = crate::message::render_text(
+            &service
+                .numeric_curves(&command_request("数值曲线", "", "curve-empty"))
+                .expect("空数值曲线目录应可展示"),
+        );
+        assert!(text.contains("数值曲线"));
+        assert!(text.contains("尚未发布数值曲线说明"));
+        assert!(
+            service
+                .numeric_curves(&command_request("数值曲线", "0", "curve-invalid-page"))
+                .expect_err("非法曲线页码应拒绝")
+                .contains("页码")
+        );
     }
 
     #[test]

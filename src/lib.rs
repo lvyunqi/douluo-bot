@@ -431,6 +431,9 @@ fn dispatch_player_alias_command(request: &CommandRequest) -> CommandResponse {
         "状态" => with_service(request, true, true, |service| service.status(request)),
         "位置" => with_service(request, true, true, |service| service.location(request)),
         "地图列表" => with_service(request, true, true, |service| service.map_list(request)),
+        "数值曲线" => with_service(request, true, true, |service| {
+            service.numeric_curves(request)
+        }),
         "向" => with_service(request, false, true, |service| {
             service.move_direction(request)
         }),
@@ -944,6 +947,17 @@ mod plugin {
     )]
     fn map_list(req: &CommandRequest) -> CommandResponse {
         with_service(req, true, true, |service| service.map_list(req))
+    }
+
+    #[command(
+        name = "数值曲线",
+        description = "分页查看当前发布的等级与魂技成长规则说明：数值曲线 [页码]",
+        aliases = "成长曲线,曲线列表",
+        category = "斗罗大陆·角色",
+        scope = "all"
+    )]
+    fn numeric_curves(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.numeric_curves(req))
     }
 
     #[command(

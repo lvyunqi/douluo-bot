@@ -35,6 +35,7 @@ pub const PLAYER_ALIAS_TARGET_COMMANDS: &[&str] = &[
     "状态",
     "位置",
     "地图列表",
+    "数值曲线",
     "向",
     "传送",
     "掉落",
@@ -141,6 +142,9 @@ const REGISTERED_GAME_COMMAND_KEYS: &[&str] = &[
     "当前位置",
     "地图列表",
     "地图清单",
+    "数值曲线",
+    "成长曲线",
+    "曲线列表",
     "向",
     "传送",
     "掉落",
@@ -241,6 +245,7 @@ mod tests {
     fn only_normal_game_commands_can_be_alias_targets() {
         assert!(is_player_alias_target("状态"));
         assert!(is_player_alias_target("释放技能"));
+        assert!(is_player_alias_target("数值曲线"));
         assert!(!is_player_alias_target("旧档认领"));
         assert!(is_player_alias_target("\u{50a8}\u{7269}\u{5668}"));
         assert!(is_player_alias_target(

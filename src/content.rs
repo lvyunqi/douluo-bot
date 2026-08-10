@@ -93,6 +93,15 @@ pub const MIN_FORBID_SKILL_DURATION_ROUNDS: i64 = 2;
 /// 首版禁技持续时间上限，避免内容包声明无法审计的超长控制。
 pub const MAX_FORBID_SKILL_DURATION_ROUNDS: i64 = 10;
 
+/// 角色等级经验规则的只读展示引用。
+pub const PLAYER_LEVEL_EXP_CURVE_REFERENCE: &str = "player-level-exp-v1";
+
+/// 魂技熟练度规则的只读展示引用。
+pub const SKILL_PROFICIENCY_CURVE_REFERENCE: &str = "skill-proficiency-v1";
+
+/// 魂技等级伤害倍率规则的只读展示引用。
+pub const SKILL_DAMAGE_PERCENT_CURVE_REFERENCE: &str = "skill-damage-percent-v1";
+
 /// 可发布目录数据的文件格式。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -110,6 +119,8 @@ pub struct ContentPackage {
     pub npcs: Vec<NpcPackageEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quests: Vec<QuestPackageEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub numeric_curves: Vec<NumericCurvePackageEntry>,
     #[serde(default)]
     pub wuhun: Vec<WuhunPackageEntry>,
     #[serde(default)]
@@ -227,6 +238,20 @@ pub struct QuestRewardPackageEntry {
     pub amount: i64,
     pub sort_order: i64,
     pub description: String,
+}
+
+/// 内容包中的静态数值曲线展示目录；不承载公式、阈值或玩家状态。
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NumericCurvePackageEntry {
+    pub curve_key: String,
+    pub name: String,
+    pub unit: String,
+    pub range_min: i64,
+    pub range_max: i64,
+    pub reference_key: String,
+    pub description: String,
+    pub sort_order: i64,
 }
 
 /// 内容包中的武魂及其属性模板。
@@ -510,6 +535,7 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
         + package.items.len()
         + package.npcs.len()
         + package.quests.len()
+        + package.numeric_curves.len()
         + package.wuhun.len()
         + package.skills.len()
         + package.effects.len()
@@ -867,6 +893,65 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
                 false,
             );
         }
+    }
+
+    keys.clear();
+    let mut curve_names = BTreeSet::new();
+    let mut curve_sort_orders = BTreeSet::new();
+    for entry in &package.numeric_curves {
+        if !keys.insert(format!("curve:{}", entry.curve_key)) {
+            errors.push(format!("数值曲线键重复：{}", entry.curve_key));
+        }
+        if !curve_names.insert(entry.name.as_str()) {
+            errors.push(format!("数值曲线名称重复：{}", entry.name));
+        }
+        if !curve_sort_orders.insert(entry.sort_order) {
+            errors.push(format!("数值曲线排序重复：{}", entry.sort_order));
+        }
+        validate_key(&mut errors, "numeric_curve.curve_key", &entry.curve_key);
+        text_field(&mut errors, "numeric_curve.name", &entry.name, 128, true);
+        text_field(&mut errors, "numeric_curve.unit", &entry.unit, 32, true);
+        validate_key(
+            &mut errors,
+            "numeric_curve.reference_key",
+            &entry.reference_key,
+        );
+        if !matches!(
+            entry.reference_key.as_str(),
+            PLAYER_LEVEL_EXP_CURVE_REFERENCE
+                | SKILL_PROFICIENCY_CURVE_REFERENCE
+                | SKILL_DAMAGE_PERCENT_CURVE_REFERENCE
+        ) {
+            errors.push(format!(
+                "数值曲线 {} 的 reference_key 不受支持：{}",
+                entry.curve_key, entry.reference_key
+            ));
+        }
+        if entry.range_min < 1 {
+            errors.push(format!(
+                "数值曲线 {} 的 range_min 必须大于或等于 1",
+                entry.curve_key
+            ));
+        }
+        if entry.range_max < entry.range_min {
+            errors.push(format!(
+                "数值曲线 {} 的 range_max 不能小于 range_min",
+                entry.curve_key
+            ));
+        }
+        if entry.sort_order < 0 {
+            errors.push(format!(
+                "数值曲线 {} 的 sort_order 不能为负数",
+                entry.curve_key
+            ));
+        }
+        text_field(
+            &mut errors,
+            "numeric_curve.description",
+            &entry.description,
+            2000,
+            true,
+        );
     }
 
     keys.clear();
@@ -1500,6 +1585,7 @@ mod tests {
             items: Vec::new(),
             npcs: Vec::new(),
             quests: Vec::new(),
+            numeric_curves: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "test-skill".to_string(),
@@ -1574,6 +1660,7 @@ mod tests {
         assert!(!legacy.contains("\"items\""));
         assert!(!legacy.contains("\"npcs\""));
         assert!(!legacy.contains("\"quests\""));
+        assert!(!legacy.contains("\"numeric_curves\""));
 
         package.maps = vec![MapPackageEntry {
             map_key: "content-map".to_string(),
@@ -1809,6 +1896,58 @@ mod tests {
             errors
                 .iter()
                 .any(|error| error.contains("货币奖励只能使用 gold_soul_coin"))
+        );
+    }
+
+    #[test]
+    fn numeric_curves_preserve_legacy_hash_and_enforce_static_shape() {
+        let mut package = minimal_package();
+        let legacy = canonical_json(&package).expect("旧内容包应可规范化");
+        assert!(!legacy.contains("\"numeric_curves\""));
+
+        package.numeric_curves = vec![NumericCurvePackageEntry {
+            curve_key: "content-player-level-exp".to_string(),
+            name: "内容角色等级经验".to_string(),
+            unit: "级".to_string(),
+            range_min: 1,
+            range_max: 120,
+            reference_key: PLAYER_LEVEL_EXP_CURVE_REFERENCE.to_string(),
+            description: "只展示既有角色等级经验规则的输入范围。".to_string(),
+            sort_order: 0,
+        }];
+        assert!(validate_shape(&package).is_empty());
+
+        package.numeric_curves.push(NumericCurvePackageEntry {
+            curve_key: "content-player-level-exp".to_string(),
+            name: "内容角色等级经验".to_string(),
+            unit: String::new(),
+            range_min: 10,
+            range_max: 1,
+            reference_key: "unknown-curve-v1".to_string(),
+            description: String::new(),
+            sort_order: 0,
+        });
+        let errors = validate_shape(&package);
+        assert!(errors.iter().any(|error| error.contains("数值曲线键重复")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("数值曲线名称重复"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("数值曲线排序重复"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("reference_key 不受支持"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("range_max 不能小于 range_min"))
         );
     }
 
