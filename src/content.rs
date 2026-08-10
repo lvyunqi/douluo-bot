@@ -108,6 +108,8 @@ pub struct ContentPackage {
     pub items: Vec<ItemPackageEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub npcs: Vec<NpcPackageEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quests: Vec<QuestPackageEntry>,
     #[serde(default)]
     pub wuhun: Vec<WuhunPackageEntry>,
     #[serde(default)]
@@ -182,6 +184,49 @@ pub struct NpcPackageEntry {
     pub description: String,
     pub enabled: bool,
     pub sort_order: i64,
+}
+
+/// 内容包中的静态任务目录行；不承载玩家任务、进度或奖励发放状态。
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct QuestPackageEntry {
+    pub quest_key: String,
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub map_key: Option<String>,
+    pub level_required: i64,
+    pub repeatable: bool,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    pub requirements: Vec<QuestRequirementPackageEntry>,
+    pub rewards: Vec<QuestRewardPackageEntry>,
+}
+
+/// 静态任务的受控完成条件。
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct QuestRequirementPackageEntry {
+    pub requirement_kind: String,
+    pub target_key: String,
+    pub required_quantity: i64,
+    pub sort_order: i64,
+    pub description: String,
+}
+
+/// 静态任务的受控奖励目录行。
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct QuestRewardPackageEntry {
+    pub reward_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_key: Option<String>,
+    pub amount: i64,
+    pub sort_order: i64,
+    pub description: String,
 }
 
 /// 内容包中的武魂及其属性模板。
@@ -464,6 +509,7 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
     let total = package.maps.len()
         + package.items.len()
         + package.npcs.len()
+        + package.quests.len()
         + package.wuhun.len()
         + package.skills.len()
         + package.effects.len()
@@ -646,6 +692,180 @@ pub fn validate_shape(package: &ContentPackage) -> Vec<String> {
         }
         if entry.sort_order < 0 {
             errors.push(format!("NPC {} 的 sort_order 不能为负数", entry.npc_key));
+        }
+    }
+
+    keys.clear();
+    let mut quest_names = BTreeSet::new();
+    for entry in &package.quests {
+        if !keys.insert(format!("quest:{}", entry.quest_key)) {
+            errors.push(format!("任务键重复：{}", entry.quest_key));
+        }
+        if !quest_names.insert(entry.name.as_str()) {
+            errors.push(format!("任务名称重复：{}", entry.name));
+        }
+        validate_key(&mut errors, "quest.quest_key", &entry.quest_key);
+        text_field(&mut errors, "quest.name", &entry.name, 128, true);
+        text_field(
+            &mut errors,
+            "quest.description",
+            &entry.description,
+            2000,
+            true,
+        );
+        if !matches!(entry.category.as_str(), "main" | "side" | "daily") {
+            errors.push(format!("任务 {} 的 category 不受支持", entry.quest_key));
+        }
+        if let Some(map_key) = entry.map_key.as_deref() {
+            validate_key(&mut errors, "quest.map_key", map_key);
+        }
+        range_field(
+            &mut errors,
+            "quest.level_required",
+            &entry.quest_key,
+            entry.level_required,
+            1,
+            120,
+        );
+        if entry.repeatable {
+            errors.push(format!(
+                "当前发布切片不允许可重复新任务：{}",
+                entry.quest_key
+            ));
+        }
+        if !entry.enabled {
+            errors.push(format!("当前发布切片不允许禁用新任务：{}", entry.quest_key));
+        }
+        if entry.requirements.is_empty() {
+            errors.push(format!("任务 {} 至少需要一条完成条件", entry.quest_key));
+        }
+        if entry.requirements.len() > 100 {
+            errors.push(format!(
+                "任务 {} 的完成条件不能超过 100 条",
+                entry.quest_key
+            ));
+        }
+        let mut requirement_sort_orders = BTreeSet::new();
+        for requirement in &entry.requirements {
+            if !requirement_sort_orders.insert(requirement.sort_order) {
+                errors.push(format!(
+                    "任务 {} 的完成条件排序重复：{}",
+                    entry.quest_key, requirement.sort_order
+                ));
+            }
+            if !matches!(
+                requirement.requirement_kind.as_str(),
+                "item" | "visit" | "level"
+            ) {
+                errors.push(format!(
+                    "任务 {} 的 requirement_kind 不受支持：{}",
+                    entry.quest_key, requirement.requirement_kind
+                ));
+            }
+            match requirement.requirement_kind.as_str() {
+                "item" | "visit" => validate_key(
+                    &mut errors,
+                    "quest.requirement.target_key",
+                    &requirement.target_key,
+                ),
+                "level" if requirement.target_key != "level" => errors.push(format!(
+                    "任务 {} 的等级条件 target_key 必须是 level",
+                    entry.quest_key
+                )),
+                _ => {}
+            }
+            range_field(
+                &mut errors,
+                "quest.requirement.required_quantity",
+                &entry.quest_key,
+                requirement.required_quantity,
+                1,
+                9999,
+            );
+            if requirement.sort_order < 0 {
+                errors.push(format!(
+                    "任务 {} 的完成条件 sort_order 不能为负数",
+                    entry.quest_key
+                ));
+            }
+            text_field(
+                &mut errors,
+                "quest.requirement.description",
+                &requirement.description,
+                500,
+                false,
+            );
+        }
+        if entry.rewards.is_empty() {
+            errors.push(format!("任务 {} 至少需要一条奖励", entry.quest_key));
+        }
+        if entry.rewards.len() > 100 {
+            errors.push(format!("任务 {} 的奖励不能超过 100 条", entry.quest_key));
+        }
+        let mut reward_sort_orders = BTreeSet::new();
+        for reward in &entry.rewards {
+            if !reward_sort_orders.insert(reward.sort_order) {
+                errors.push(format!(
+                    "任务 {} 的奖励排序重复：{}",
+                    entry.quest_key, reward.sort_order
+                ));
+            }
+            if !matches!(reward.reward_kind.as_str(), "exp" | "currency" | "item") {
+                errors.push(format!(
+                    "任务 {} 的 reward_kind 不受支持：{}",
+                    entry.quest_key, reward.reward_kind
+                ));
+            }
+            match reward.reward_kind.as_str() {
+                "exp" if reward.currency_code.is_some() || reward.item_key.is_some() => {
+                    errors.push(format!(
+                        "任务 {} 的经验奖励不能声明货币或物品",
+                        entry.quest_key
+                    ));
+                }
+                "currency"
+                    if reward.currency_code.as_deref() != Some("gold_soul_coin")
+                        || reward.item_key.is_some() =>
+                {
+                    errors.push(format!(
+                        "任务 {} 的货币奖励只能使用 gold_soul_coin",
+                        entry.quest_key
+                    ));
+                }
+                "item" => {
+                    if reward.currency_code.is_some() || reward.item_key.is_none() {
+                        errors.push(format!(
+                            "任务 {} 的物品奖励必须只声明 item_key",
+                            entry.quest_key
+                        ));
+                    }
+                    if let Some(item_key) = reward.item_key.as_deref() {
+                        validate_key(&mut errors, "quest.reward.item_key", item_key);
+                    }
+                }
+                _ => {}
+            }
+            range_field(
+                &mut errors,
+                "quest.reward.amount",
+                &entry.quest_key,
+                reward.amount,
+                1,
+                999_999_999,
+            );
+            if reward.sort_order < 0 {
+                errors.push(format!(
+                    "任务 {} 的奖励 sort_order 不能为负数",
+                    entry.quest_key
+                ));
+            }
+            text_field(
+                &mut errors,
+                "quest.reward.description",
+                &reward.description,
+                500,
+                false,
+            );
         }
     }
 
@@ -1279,6 +1499,7 @@ mod tests {
             maps: Vec::new(),
             items: Vec::new(),
             npcs: Vec::new(),
+            quests: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "test-skill".to_string(),
@@ -1352,6 +1573,7 @@ mod tests {
         assert!(!legacy.contains("\"maps\""));
         assert!(!legacy.contains("\"items\""));
         assert!(!legacy.contains("\"npcs\""));
+        assert!(!legacy.contains("\"quests\""));
 
         package.maps = vec![MapPackageEntry {
             map_key: "content-map".to_string(),
@@ -1487,6 +1709,106 @@ mod tests {
             errors
                 .iter()
                 .any(|error| error.contains("sort_order 不能为负数"))
+        );
+    }
+
+    #[test]
+    fn quests_preserve_legacy_hash_and_enforce_static_shape() {
+        let mut package = minimal_package();
+        let legacy = canonical_json(&package).expect("旧内容包应可规范化");
+        assert!(!legacy.contains("\"quests\""));
+
+        package.quests = vec![QuestPackageEntry {
+            quest_key: "content-quest".to_string(),
+            name: "内容任务".to_string(),
+            description: "仅用于校验静态任务目录。".to_string(),
+            category: "side".to_string(),
+            map_key: Some("content-map".to_string()),
+            level_required: 1,
+            repeatable: false,
+            enabled: true,
+            requirements: vec![QuestRequirementPackageEntry {
+                requirement_kind: "item".to_string(),
+                target_key: "content-potion".to_string(),
+                required_quantity: 2,
+                sort_order: 0,
+                description: "拥有两瓶内容测试药".to_string(),
+            }],
+            rewards: vec![
+                QuestRewardPackageEntry {
+                    reward_kind: "exp".to_string(),
+                    currency_code: None,
+                    item_key: None,
+                    amount: 80,
+                    sort_order: 0,
+                    description: "经验奖励".to_string(),
+                },
+                QuestRewardPackageEntry {
+                    reward_kind: "currency".to_string(),
+                    currency_code: Some("gold_soul_coin".to_string()),
+                    item_key: None,
+                    amount: 30,
+                    sort_order: 1,
+                    description: "金魂币奖励".to_string(),
+                },
+            ],
+        }];
+        assert!(validate_shape(&package).is_empty());
+
+        package.quests.push(QuestPackageEntry {
+            quest_key: "content-quest".to_string(),
+            name: "内容任务".to_string(),
+            description: "重复任务必须拒绝。".to_string(),
+            category: "unknown".to_string(),
+            map_key: None,
+            level_required: 1,
+            repeatable: true,
+            enabled: false,
+            requirements: Vec::new(),
+            rewards: Vec::new(),
+        });
+        let errors = validate_shape(&package);
+        assert!(errors.iter().any(|error| error.contains("任务键重复")));
+        assert!(errors.iter().any(|error| error.contains("任务名称重复")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("category 不受支持"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("不允许可重复新任务"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("不允许禁用新任务"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("至少需要一条完成条件"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("至少需要一条奖励"))
+        );
+
+        package.quests.truncate(1);
+        package.quests[0].requirements[0].requirement_kind = "unknown".to_string();
+        package.quests[0].rewards[1].currency_code = Some("unknown".to_string());
+        let errors = validate_shape(&package);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("requirement_kind 不受支持"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("货币奖励只能使用 gold_soul_coin"))
         );
     }
 

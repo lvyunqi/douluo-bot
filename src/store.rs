@@ -6330,6 +6330,73 @@ SELECT revision.id, 'npc', npc.npc_key, npc.created_at
  );
 "#;
 
+// v39 将静态任务目录纳入内容成员账本，并为既有 revision 补登记已有任务。
+const MIGRATION_V39: &str = r#"
+CREATE TABLE content_revision_member_v39_backup AS
+SELECT revision_id, member_kind, member_key, created_at
+  FROM content_revision_member;
+
+DROP TRIGGER content_revision_member_no_update;
+DROP TRIGGER content_revision_member_no_delete;
+DROP TRIGGER content_revision_member_no_reinsert;
+DROP INDEX content_revision_member_lookup;
+DROP TABLE content_revision_member;
+
+CREATE TABLE content_revision_member (
+    revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
+    member_kind TEXT NOT NULL CHECK(
+        member_kind IN ('wuhun', 'skill', 'starter-skill', 'effect', 'beast', 'ring', 'map', 'item', 'npc', 'quest')
+    ),
+    member_key TEXT NOT NULL CHECK(
+        length(member_key) BETWEEN 1 AND 200
+        AND member_key = trim(member_key)
+        AND instr(member_key, char(0)) = 0
+    ),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    PRIMARY KEY(revision_id, member_kind, member_key)
+) STRICT, WITHOUT ROWID;
+
+INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+SELECT revision_id, member_kind, member_key, created_at
+  FROM content_revision_member_v39_backup;
+DROP TABLE content_revision_member_v39_backup;
+
+CREATE INDEX content_revision_member_lookup
+    ON content_revision_member(member_kind, member_key, revision_id);
+
+CREATE TRIGGER content_revision_member_no_update
+BEFORE UPDATE ON content_revision_member
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is immutable');
+END;
+CREATE TRIGGER content_revision_member_no_delete
+BEFORE DELETE ON content_revision_member
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is immutable');
+END;
+CREATE TRIGGER content_revision_member_no_reinsert
+BEFORE INSERT ON content_revision_member
+WHEN EXISTS(
+    SELECT 1 FROM content_revision_member
+     WHERE revision_id = NEW.revision_id
+       AND member_kind = NEW.member_kind
+       AND member_key = NEW.member_key
+)
+BEGIN
+    SELECT RAISE(ABORT, 'content revision member is append-only');
+END;
+
+INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+SELECT revision.id, 'quest', quest.quest_key, quest.created_at
+  FROM content_revision revision CROSS JOIN quest
+ WHERE NOT EXISTS(
+       SELECT 1 FROM content_revision_member member
+        WHERE member.revision_id = revision.id
+          AND member.member_kind = 'quest'
+          AND member.member_key = quest.quest_key
+ );
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -8072,6 +8139,9 @@ fn content_package_declared_member_set(package: &ContentPackage) -> BTreeSet<(St
     for entry in &package.npcs {
         members.insert(("npc".to_string(), entry.npc_key.clone()));
     }
+    for entry in &package.quests {
+        members.insert(("quest".to_string(), entry.quest_key.clone()));
+    }
     for entry in &package.wuhun {
         members.insert(("wuhun".to_string(), entry.name.clone()));
     }
@@ -8258,6 +8328,66 @@ fn validate_content_package_against_database(
                 "NPC {} 引用了不存在或不在当前 active revision 的地图 {}",
                 entry.npc_key, entry.map_key
             ));
+        }
+    }
+    names.clear();
+    for entry in &package.quests {
+        if !names.insert(entry.name.as_str()) {
+            errors.push(format!("内容包内任务名称重复：{}", entry.name));
+        }
+        if catalog_value_exists(connection, "quest", "quest_key", &entry.quest_key)?
+            || catalog_value_exists(connection, "quest", "name", &entry.name)?
+        {
+            errors.push(format!(
+                "任务键或名称已存在：{} / {}",
+                entry.quest_key, entry.name
+            ));
+        }
+        if let Some(map_key) = entry.map_key.as_deref()
+            && !package_map_keys.contains(map_key)
+            && !active_members.contains(&("map".to_string(), map_key.to_string()))
+        {
+            errors.push(format!(
+                "任务 {} 引用了不存在或不在当前 active revision 的地图 {}",
+                entry.quest_key, map_key
+            ));
+        }
+        for requirement in &entry.requirements {
+            match requirement.requirement_kind.as_str() {
+                "item"
+                    if !package_item_keys.contains(requirement.target_key.as_str())
+                        && !active_members
+                            .contains(&("item".to_string(), requirement.target_key.clone())) =>
+                {
+                    errors.push(format!(
+                        "任务 {} 的物品条件引用了不存在或不在当前 active revision 的物品 {}",
+                        entry.quest_key, requirement.target_key
+                    ));
+                }
+                "visit"
+                    if !package_map_keys.contains(requirement.target_key.as_str())
+                        && !active_members
+                            .contains(&("map".to_string(), requirement.target_key.clone())) =>
+                {
+                    errors.push(format!(
+                        "任务 {} 的到访条件引用了不存在或不在当前 active revision 的地图 {}",
+                        entry.quest_key, requirement.target_key
+                    ));
+                }
+                _ => {}
+            }
+        }
+        for reward in &entry.rewards {
+            if reward.reward_kind == "item"
+                && let Some(item_key) = reward.item_key.as_deref()
+                && !package_item_keys.contains(item_key)
+                && !active_members.contains(&("item".to_string(), item_key.to_string()))
+            {
+                errors.push(format!(
+                    "任务 {} 的物品奖励引用了不存在或不在当前 active revision 的物品 {}",
+                    entry.quest_key, item_key
+                ));
+            }
         }
     }
     names.clear();
@@ -8460,6 +8590,8 @@ fn catalog_value_exists(
         ("item", "item_key") => "SELECT EXISTS(SELECT 1 FROM item WHERE item_key = ?1)",
         ("item", "name") => "SELECT EXISTS(SELECT 1 FROM item WHERE name = ?1)",
         ("npc", "npc_key") => "SELECT EXISTS(SELECT 1 FROM npc WHERE npc_key = ?1)",
+        ("quest", "quest_key") => "SELECT EXISTS(SELECT 1 FROM quest WHERE quest_key = ?1)",
+        ("quest", "name") => "SELECT EXISTS(SELECT 1 FROM quest WHERE name = ?1)",
         _ => return Err(format!("未知内容目录查询：{table}.{column}")),
     };
     connection
@@ -8647,6 +8779,90 @@ fn publish_content_package_rows(
             revision_id,
             "item",
             &entry.item_key,
+            created_at,
+        )?;
+    }
+    for entry in &package.quests {
+        connection
+            .execute(
+                r#"
+                INSERT INTO quest(
+                    quest_key, name, description, category, map_key, level_required,
+                    repeatable, enabled, created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+                "#,
+                params![
+                    entry.quest_key,
+                    entry.name,
+                    entry.description,
+                    entry.category,
+                    entry.map_key,
+                    entry.level_required,
+                    entry.repeatable,
+                    entry.enabled,
+                    created_at
+                ],
+            )
+            .map_err(|error| format!("发布任务 {} 失败：{error}", entry.quest_key))?;
+        let quest_id = connection.last_insert_rowid();
+        for requirement in &entry.requirements {
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO quest_requirement(
+                        quest_id, requirement_kind, target_key, required_quantity,
+                        sort_order, description, created_at
+                    ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    "#,
+                    params![
+                        quest_id,
+                        requirement.requirement_kind,
+                        requirement.target_key,
+                        requirement.required_quantity,
+                        requirement.sort_order,
+                        requirement.description,
+                        created_at
+                    ],
+                )
+                .map_err(|error| {
+                    format!(
+                        "发布任务 {} 的完成条件 {} 失败：{error}",
+                        entry.quest_key, requirement.sort_order
+                    )
+                })?;
+        }
+        for reward in &entry.rewards {
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO quest_reward(
+                        quest_id, reward_kind, currency_code, item_key, amount,
+                        sort_order, description, created_at
+                    ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    "#,
+                    params![
+                        quest_id,
+                        reward.reward_kind,
+                        reward.currency_code,
+                        reward.item_key,
+                        reward.amount,
+                        reward.sort_order,
+                        reward.description,
+                        created_at
+                    ],
+                )
+                .map_err(|error| {
+                    format!(
+                        "发布任务 {} 的奖励 {} 失败：{error}",
+                        entry.quest_key, reward.sort_order
+                    )
+                })?;
+        }
+        ensure_content_revision_member(
+            connection,
+            revision_id,
+            "quest",
+            &entry.quest_key,
             created_at,
         )?;
     }
@@ -9828,7 +10044,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
                     format!(
-                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36/v37/v38 失败：{error}"
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36/v37/v38/v39 失败：{error}"
                     )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
@@ -10412,10 +10628,25 @@ impl Store {
                 validate_v38_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 39)? {
+                transaction
+                    .execute_batch(MIGRATION_V39)
+                    .map_err(|error| format!("执行数据库迁移 v39 失败：{error}"))?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(39, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v39 失败：{error}"))?;
+                validate_v39_schema(&transaction)?;
+            } else {
+                validate_v39_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36/v37/v38 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36/v37/v38/v39 失败：{error}"
                 )
             })?;
             Ok(())
@@ -10457,7 +10688,7 @@ impl Store {
                 validate_v34_schema(connection)?;
                 validate_v35_schema(connection)?;
                 validate_v36_schema(connection)?;
-                validate_v38_schema(connection)?;
+                validate_v39_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -12584,7 +12815,15 @@ impl Store {
                 r#"
                 SELECT COUNT(*)
                   FROM quest q
+                  JOIN content_revision_visible_member member
+                    ON member.member_kind = 'quest' AND member.member_key = q.quest_key
                  WHERE q.enabled = 1
+                   AND member.revision_id = (
+                       SELECT revision_id
+                         FROM content_revision_activation
+                        ORDER BY id DESC
+                        LIMIT 1
+                   )
                    AND q.level_required <= ?1
                    AND (q.map_key IS NULL OR q.map_key = ?2)
                    AND NOT EXISTS(
@@ -12615,10 +12854,18 @@ impl Store {
                        q.map_key, m.name, q.level_required, q.repeatable,
                        pq.status
                   FROM quest q
+                  JOIN content_revision_visible_member member
+                    ON member.member_kind = 'quest' AND member.member_key = q.quest_key
              LEFT JOIN map m ON m.map_key = q.map_key
              LEFT JOIN player_quest pq
                     ON pq.quest_id = q.id AND pq.player_id = ?1
                  WHERE q.enabled = 1
+                   AND member.revision_id = (
+                       SELECT revision_id
+                         FROM content_revision_activation
+                        ORDER BY id DESC
+                        LIMIT 1
+                   )
                    AND q.level_required <= ?2
                    AND (q.map_key IS NULL OR q.map_key = ?3)
                    AND NOT (COALESCE(pq.status, '') = 'completed' AND q.repeatable = 0)
@@ -12675,8 +12922,16 @@ impl Store {
                        pq.status
                   FROM player_quest pq
                   JOIN quest q ON q.id = pq.quest_id
+                  JOIN content_revision_visible_member member
+                    ON member.member_kind = 'quest' AND member.member_key = q.quest_key
              LEFT JOIN map m ON m.map_key = q.map_key
                  WHERE pq.player_id = ?1 AND pq.status = 'active'
+                   AND member.revision_id = (
+                       SELECT revision_id
+                         FROM content_revision_activation
+                        ORDER BY id DESC
+                        LIMIT 1
+                   )
                    AND (?2 IS NULL OR q.name = ?2 OR q.quest_key = ?2)
                  ORDER BY pq.id
                 "#,
@@ -12715,6 +12970,7 @@ impl Store {
         ensure_no_legacy_identity(&transaction, key)?;
         let sender = load_transfer_sender(&transaction, key)?;
         ensure_transfer_participant_eligible(&sender, "你的角色")?;
+        let quest = load_active_quest_by_name_or_key(&transaction, requested_name_or_key)?;
         if !operation.source_message_id.is_empty()
             && let Some(existing) = load_quest_action_by_message(
                 &transaction,
@@ -12722,10 +12978,7 @@ impl Store {
                 operation.source_message_id,
             )?
         {
-            if existing.action_kind != "accepted"
-                || existing.quest_id
-                    != load_quest_by_name_or_key(&transaction, requested_name_or_key)?.id
-            {
+            if existing.action_kind != "accepted" || existing.quest_id != quest.id {
                 return Err("该消息 ID 已用于不同的任务操作，拒绝重放".to_string());
             }
             return load_quest_action_receipt(
@@ -12736,7 +12989,6 @@ impl Store {
                 true,
             );
         }
-        let quest = load_quest_by_name_or_key(&transaction, requested_name_or_key)?;
         let enabled = transaction
             .query_row(
                 "SELECT enabled FROM quest WHERE id = ?1",
@@ -12845,7 +13097,7 @@ impl Store {
         ensure_no_legacy_identity(&transaction, key)?;
         let sender = load_transfer_sender(&transaction, key)?;
         ensure_transfer_participant_eligible(&sender, "你的角色")?;
-        let quest = load_quest_by_name_or_key(&transaction, requested_name_or_key)?;
+        let quest = load_active_quest_by_name_or_key(&transaction, requested_name_or_key)?;
         if !operation.source_message_id.is_empty()
             && let Some(existing) = load_quest_action_by_message(
                 &transaction,
@@ -13039,7 +13291,7 @@ impl Store {
         ensure_no_legacy_identity(&transaction, key)?;
         let sender = load_transfer_sender(&transaction, key)?;
         ensure_transfer_participant_eligible(&sender, "你的角色")?;
-        let quest = load_quest_by_name_or_key(&transaction, requested_name_or_key)?;
+        let quest = load_active_quest_by_name_or_key(&transaction, requested_name_or_key)?;
         if !operation.source_message_id.is_empty()
             && let Some(existing) = load_quest_action_by_message(
                 &transaction,
@@ -17204,7 +17456,8 @@ fn quest_record_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Re
     })
 }
 
-fn load_quest_by_name_or_key(
+/// 只读取当前 active revision 可见的任务；失活玩家任务保留但不允许继续操作。
+fn load_active_quest_by_name_or_key(
     connection: &Connection,
     requested_name_or_key: &str,
 ) -> Result<QuestRecord, String> {
@@ -17214,8 +17467,16 @@ fn load_quest_by_name_or_key(
             SELECT q.id, q.quest_key, q.name, q.description, q.category,
                    q.map_key, m.name, q.level_required, q.repeatable
               FROM quest q
+              JOIN content_revision_visible_member member
+                ON member.member_kind = 'quest' AND member.member_key = q.quest_key
          LEFT JOIN map m ON m.map_key = q.map_key
-             WHERE q.name = ?1 OR q.quest_key = ?1
+             WHERE member.revision_id = (
+                       SELECT revision_id
+                         FROM content_revision_activation
+                        ORDER BY id DESC
+                        LIMIT 1
+                   )
+               AND (q.name = ?1 OR q.quest_key = ?1)
              LIMIT 1
             "#,
             [requested_name_or_key],
@@ -17223,7 +17484,7 @@ fn load_quest_by_name_or_key(
         )
         .optional()
         .map_err(|error| format!("读取任务定义失败：{error}"))?
-        .ok_or_else(|| "当前世界不存在该任务".to_string())
+        .ok_or_else(|| "当前 active content revision 不存在该任务".to_string())
 }
 
 fn load_quest_list_entry(
@@ -24951,13 +25212,40 @@ fn validate_v11_schema(connection: &Connection) -> Result<(), String> {
     )?;
     validate_v11_triggers(connection)?;
 
-    let seed_counts = connection
-        .query_row(
-            "SELECT (SELECT COUNT(*) FROM quest), (SELECT COUNT(*) FROM quest_requirement), (SELECT COUNT(*) FROM quest_reward)",
-            [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
-        )
-        .map_err(|error| format!("读取 v11 任务种子失败：{error}"))?;
+    // v39 开始允许追加任务；仍必须完整保留 v11 的两条基础任务及其子目录。
+    let seed_counts = if migration_applied(connection, 39)? {
+        connection
+            .query_row(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM quest
+                      WHERE quest_key IN ('village-introduction', 'healing-supplies')),
+                    (SELECT COUNT(*) FROM quest_requirement requirement
+                      JOIN quest quest ON quest.id = requirement.quest_id
+                     WHERE quest.quest_key IN ('village-introduction', 'healing-supplies')),
+                    (SELECT COUNT(*) FROM quest_reward reward
+                      JOIN quest quest ON quest.id = reward.quest_id
+                     WHERE quest.quest_key IN ('village-introduction', 'healing-supplies'))
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .map_err(|error| format!("读取 v11 基础任务种子失败：{error}"))?
+    } else {
+        connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM quest), (SELECT COUNT(*) FROM quest_requirement), (SELECT COUNT(*) FROM quest_reward)",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+            )
+            .map_err(|error| format!("读取 v11 任务种子失败：{error}"))?
+    };
     if seed_counts != (2, 2, 4) {
         return Err(format!("v11 任务种子不完整：{seed_counts:?}"));
     }
@@ -28459,6 +28747,7 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
     let tracks_maps = migration_applied(connection, 36)?;
     let tracks_items = migration_applied(connection, 37)?;
     let tracks_npcs = migration_applied(connection, 38)?;
+    let tracks_quests = migration_applied(connection, 39)?;
     let expected_tables = [
         (
             "content_revision",
@@ -28520,7 +28809,9 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
         }
     }
 
-    let member_kind_marker = if tracks_npcs {
+    let member_kind_marker = if tracks_quests {
+        "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING', 'MAP', 'ITEM', 'NPC', 'QUEST')"
+    } else if tracks_npcs {
         "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING', 'MAP', 'ITEM', 'NPC')"
     } else if tracks_items {
         "MEMBER_KIND IN ('WUHUN', 'SKILL', 'STARTER-SKILL', 'EFFECT', 'BEAST', 'RING', 'MAP', 'ITEM')"
@@ -28685,6 +28976,9 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
                      OR (member.member_kind = 'npc' AND NOT EXISTS(
                          SELECT 1 FROM npc WHERE npc_key = member.member_key
                      ))
+                     OR (member.member_kind = 'quest' AND NOT EXISTS(
+                         SELECT 1 FROM quest WHERE quest_key = member.member_key
+                     ))
             )
             "#,
             [],
@@ -28750,8 +29044,15 @@ fn validate_v23_schema(connection: &Connection) -> Result<(), String> {
                       WHERE member.member_kind = 'npc' AND member.member_key = npc.npc_key
                   )
              ))
+             OR (?4 AND EXISTS(
+                 SELECT 1 FROM quest quest
+                  WHERE NOT EXISTS(
+                     SELECT 1 FROM content_revision_member member
+                      WHERE member.member_kind = 'quest' AND member.member_key = quest.quest_key
+                  )
+             ))
              "#,
-            [tracks_maps, tracks_items, tracks_npcs],
+            [tracks_maps, tracks_items, tracks_npcs, tracks_quests],
             |row| row.get::<_, bool>(0),
         )
         .map_err(|error| format!("校验 v23 未发布目录失败：{error}"))?;
@@ -31539,6 +31840,107 @@ fn validate_v38_schema(connection: &Connection) -> Result<(), String> {
     validate_v37_schema(connection)
 }
 
+/// 校验 v39 任务成员覆盖及其目录依赖；损坏时拒绝启动。
+fn validate_v39_schema(connection: &Connection) -> Result<(), String> {
+    validate_v38_schema(connection)?;
+    let untracked_quests = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM quest
+                 WHERE NOT EXISTS(
+                    SELECT 1 FROM content_revision_member member
+                     WHERE member.member_kind = 'quest'
+                       AND member.member_key = quest.quest_key
+                 )
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v39 任务成员覆盖失败：{error}"))?;
+    if untracked_quests {
+        return Err("v39 存在未被任何 revision 登记的任务目录成员".to_string());
+    }
+
+    let duplicate_names = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM quest
+                 GROUP BY name
+                HAVING COUNT(*) > 1
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v39 任务名称唯一性失败：{error}"))?;
+    if duplicate_names {
+        return Err("v39 检测到重复任务名称".to_string());
+    }
+
+    let invalid_dependencies = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM content_revision_member member
+                  JOIN quest quest ON quest.quest_key = member.member_key
+                 WHERE member.member_kind = 'quest'
+                   AND (
+                       (quest.map_key IS NOT NULL AND NOT EXISTS(
+                           SELECT 1 FROM content_revision_member map_member
+                            WHERE map_member.revision_id = member.revision_id
+                              AND map_member.member_kind = 'map'
+                              AND map_member.member_key = quest.map_key
+                       ))
+                       OR EXISTS(
+                           SELECT 1 FROM quest_requirement requirement
+                            WHERE requirement.quest_id = quest.id
+                              AND requirement.requirement_kind = 'item'
+                              AND NOT EXISTS(
+                                  SELECT 1 FROM content_revision_member item_member
+                                   WHERE item_member.revision_id = member.revision_id
+                                     AND item_member.member_kind = 'item'
+                                     AND item_member.member_key = requirement.target_key
+                              )
+                       )
+                       OR EXISTS(
+                           SELECT 1 FROM quest_requirement requirement
+                            WHERE requirement.quest_id = quest.id
+                              AND requirement.requirement_kind = 'visit'
+                              AND NOT EXISTS(
+                                  SELECT 1 FROM content_revision_member map_member
+                                   WHERE map_member.revision_id = member.revision_id
+                                     AND map_member.member_kind = 'map'
+                                     AND map_member.member_key = requirement.target_key
+                              )
+                       )
+                       OR EXISTS(
+                           SELECT 1 FROM quest_reward reward
+                            WHERE reward.quest_id = quest.id
+                              AND reward.reward_kind = 'item'
+                              AND NOT EXISTS(
+                                  SELECT 1 FROM content_revision_member item_member
+                                   WHERE item_member.revision_id = member.revision_id
+                                     AND item_member.member_kind = 'item'
+                                     AND item_member.member_key = reward.item_key
+                              )
+                       )
+                   )
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v39 任务目录依赖失败：{error}"))?;
+    if invalid_dependencies {
+        return Err("v39 任务成员引用了未登记的地图或物品目录".to_string());
+    }
+    Ok(())
+}
+
 fn validate_v24_table_sql(
     connection: &Connection,
     table: &str,
@@ -32868,8 +33270,8 @@ fn probe_v7_map_guards(connection: &Connection) -> Result<(), String> {
                 params![key, name, sort_order],
             )
         };
-        if valid_map("v7-probe", "v7-probe", 100_000).is_err() {
-            return Err("v7 地图探针无法插入合法地图".to_string());
+        if let Err(error) = valid_map("v7-probe", "v7-probe", 100_000) {
+            return Err(format!("v7 地图探针无法插入合法地图：{error}"));
         }
         if valid_map("Bad-Key", "v7-probe-bad-key", 100_001).is_ok() {
             return Err("v7 地图 key 约束探针被绕过".to_string());
@@ -33409,8 +33811,9 @@ mod tests {
     use crate::content::{
         EffectPackageEntry, FORBID_SKILL_APPLY_PHASE, FORBID_SKILL_BLOCKED_ACTION,
         FORBID_SKILL_RULE_VERSION, ItemPackageEntry, MIN_FORBID_SKILL_DURATION_ROUNDS,
-        MapPackageEntry, NpcPackageEntry, SkillPackageEntry, SoulBeastPackageEntry,
-        SoulRingPackageEntry, WuhunPackageEntry, WuhunStatsPackageEntry,
+        MapPackageEntry, NpcPackageEntry, QuestPackageEntry, QuestRequirementPackageEntry,
+        QuestRewardPackageEntry, SkillPackageEntry, SoulBeastPackageEntry, SoulRingPackageEntry,
+        WuhunPackageEntry, WuhunStatsPackageEntry,
     };
     use tempfile::tempdir;
 
@@ -33436,6 +33839,7 @@ mod tests {
             maps: Vec::new(),
             items: Vec::new(),
             npcs: Vec::new(),
+            quests: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33488,6 +33892,7 @@ mod tests {
             }],
             items: Vec::new(),
             npcs: Vec::new(),
+            quests: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: Vec::new(),
@@ -33534,6 +33939,7 @@ mod tests {
                 description: "内容包新增测试物品".to_string(),
             }],
             npcs: Vec::new(),
+            quests: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: Vec::new(),
@@ -33572,6 +33978,7 @@ mod tests {
                 enabled: true,
                 sort_order: 30,
             }],
+            quests: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: Vec::new(),
@@ -33581,6 +33988,93 @@ mod tests {
         };
         LoadedContentPackage {
             content_hash: content_hash(&package).expect("应计算 NPC 内容包哈希"),
+            package,
+            source_format: "json".to_string(),
+        }
+    }
+
+    fn quest_content_package(
+        package_key: &str,
+        quest_key: &str,
+        name: &str,
+        map_key: Option<&str>,
+    ) -> LoadedContentPackage {
+        let package = ContentPackage {
+            package_key: package_key.to_string(),
+            revision: 1,
+            author: "quest-test".to_string(),
+            minimum_runtime: String::new(),
+            maps: Vec::new(),
+            items: Vec::new(),
+            npcs: Vec::new(),
+            quests: vec![QuestPackageEntry {
+                quest_key: quest_key.to_string(),
+                name: name.to_string(),
+                description: "内容包静态任务测试条目".to_string(),
+                category: "side".to_string(),
+                map_key: map_key.map(str::to_string),
+                level_required: 1,
+                repeatable: false,
+                enabled: true,
+                requirements: vec![
+                    QuestRequirementPackageEntry {
+                        requirement_kind: "item".to_string(),
+                        target_key: "small-healing-potion".to_string(),
+                        required_quantity: 2,
+                        sort_order: 0,
+                        description: "拥有两瓶小回复药".to_string(),
+                    },
+                    QuestRequirementPackageEntry {
+                        requirement_kind: "visit".to_string(),
+                        target_key: "holy-soul-village".to_string(),
+                        required_quantity: 1,
+                        sort_order: 1,
+                        description: "到访圣魂村".to_string(),
+                    },
+                    QuestRequirementPackageEntry {
+                        requirement_kind: "level".to_string(),
+                        target_key: "level".to_string(),
+                        required_quantity: 1,
+                        sort_order: 2,
+                        description: "达到 1 级".to_string(),
+                    },
+                ],
+                rewards: vec![
+                    QuestRewardPackageEntry {
+                        reward_kind: "exp".to_string(),
+                        currency_code: None,
+                        item_key: None,
+                        amount: 80,
+                        sort_order: 0,
+                        description: "经验奖励".to_string(),
+                    },
+                    QuestRewardPackageEntry {
+                        reward_kind: "currency".to_string(),
+                        currency_code: Some("gold_soul_coin".to_string()),
+                        item_key: None,
+                        amount: 30,
+                        sort_order: 1,
+                        description: "金魂币奖励".to_string(),
+                    },
+                    QuestRewardPackageEntry {
+                        reward_kind: "item".to_string(),
+                        currency_code: None,
+                        item_key: Some("small-healing-potion".to_string()),
+                        amount: 1,
+                        sort_order: 2,
+                        description: "小回复药奖励".to_string(),
+                    },
+                ],
+            }],
+            wuhun: Vec::new(),
+            skills: Vec::new(),
+            effects: Vec::new(),
+            soul_beasts: Vec::new(),
+            soul_rings: Vec::new(),
+            transitions: Vec::new(),
+        };
+        LoadedContentPackage {
+            content_hash: content_hash(&package).expect("应计算任务内容包哈希"),
             package,
             source_format: "json".to_string(),
         }
@@ -33876,6 +34370,7 @@ mod tests {
             maps: Vec::new(),
             items: Vec::new(),
             npcs: Vec::new(),
+            quests: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33918,6 +34413,7 @@ mod tests {
             maps: Vec::new(),
             items: Vec::new(),
             npcs: Vec::new(),
+            quests: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -33963,6 +34459,7 @@ mod tests {
             maps: Vec::new(),
             items: Vec::new(),
             npcs: Vec::new(),
+            quests: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -34006,6 +34503,7 @@ mod tests {
             maps: Vec::new(),
             items: Vec::new(),
             npcs: Vec::new(),
+            quests: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -34049,6 +34547,7 @@ mod tests {
             maps: Vec::new(),
             items: Vec::new(),
             npcs: Vec::new(),
+            quests: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -34092,6 +34591,7 @@ mod tests {
             maps: Vec::new(),
             items: Vec::new(),
             npcs: Vec::new(),
+            quests: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -34227,6 +34727,7 @@ mod tests {
             maps: Vec::new(),
             items: Vec::new(),
             npcs: Vec::new(),
+            quests: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "preview-skill".to_string(),
@@ -34297,6 +34798,7 @@ mod tests {
             maps: Vec::new(),
             items: Vec::new(),
             npcs: Vec::new(),
+            quests: Vec::new(),
             wuhun: vec![WuhunPackageEntry {
                 name: "transition wuhun".to_string(),
                 category: "控制系".to_string(),
@@ -36964,11 +37466,11 @@ mod tests {
         connection
             .execute_batch(
                 r#"
-                DELETE FROM schema_migration WHERE version IN (37, 38);
+                DELETE FROM schema_migration WHERE version IN (37, 38, 39);
                 CREATE TABLE content_revision_member_v36_test_backup AS
                 SELECT revision_id, member_kind, member_key, created_at
                   FROM content_revision_member
-                 WHERE member_kind NOT IN ('item', 'npc');
+                 WHERE member_kind IN ('wuhun', 'skill', 'starter-skill', 'effect', 'beast', 'ring', 'map');
                 DROP TRIGGER content_revision_member_no_update;
                 DROP TRIGGER content_revision_member_no_delete;
                 DROP TRIGGER content_revision_member_no_reinsert;
@@ -37291,11 +37793,11 @@ mod tests {
         connection
             .execute_batch(
                 r#"
-                DELETE FROM schema_migration WHERE version = 38;
+                DELETE FROM schema_migration WHERE version IN (38, 39);
                 CREATE TABLE content_revision_member_v37_test_backup AS
                 SELECT revision_id, member_kind, member_key, created_at
                   FROM content_revision_member
-                 WHERE member_kind <> 'npc';
+                 WHERE member_kind IN ('wuhun', 'skill', 'starter-skill', 'effect', 'beast', 'ring', 'map', 'item');
                 DROP TRIGGER content_revision_member_no_update;
                 DROP TRIGGER content_revision_member_no_delete;
                 DROP TRIGGER content_revision_member_no_reinsert;
@@ -37372,6 +37874,439 @@ mod tests {
                 .expect("玩家 NPC 绑定应保留"),
             "holy-soul-village-grocer"
         );
+    }
+
+    #[test]
+    fn v39_quest_package_follows_active_revision_without_rewriting_player_quest_state() {
+        let (directory, store) = test_store();
+        register_awakened_pair(&store);
+        let baseline = store
+            .active_content_revision()
+            .expect("应读取任务内容基线 revision");
+        let package = quest_content_package(
+            "test-quest-content",
+            "content-quest-v39",
+            "内容任务",
+            Some("holy-soul-village"),
+        );
+
+        store
+            .stage_content_package(&package)
+            .expect("应暂存任务内容包");
+        let report = store
+            .validate_content_draft("test-quest-content", 1)
+            .expect("应校验任务内容包");
+        assert!(report.errors.is_empty(), "{report:?}");
+        store
+            .publish_content_draft("test-quest-content", 1)
+            .expect("应发布任务内容包");
+
+        let page = store
+            .quests_page(&identity(), 1, 20)
+            .expect("active revision 应暴露新增任务");
+        let listed = page
+            .entries
+            .iter()
+            .find(|entry| entry.quest.quest_key == "content-quest-v39")
+            .expect("新增任务应出现在目录");
+        assert_eq!(listed.progress.len(), 3);
+        assert_eq!(listed.rewards.len(), 3);
+        let connection = store.open().expect("应打开任务内容数据库");
+        assert!(
+            active_content_member_exists(&connection, "quest", "content-quest-v39")
+                .expect("应读取新增任务成员")
+        );
+        drop(connection);
+
+        let accepted = store
+            .accept_quest_with_operation(
+                &identity(),
+                "内容任务",
+                &map_operation("接取任务", "quest-v39-accept"),
+            )
+            .expect("active revision 应允许接取新增任务");
+        assert_eq!(accepted.progress.len(), 3);
+        assert_eq!(accepted.rewards.len(), 3);
+
+        let connection = store.open().expect("应读取玩家任务状态");
+        let before = connection
+            .query_row(
+                r#"
+                SELECT pq.status,
+                       (SELECT COUNT(*) FROM player_quest_progress progress
+                         WHERE progress.player_quest_id = pq.id),
+                       (SELECT COUNT(*) FROM player_quest_action action
+                         WHERE action.player_quest_id = pq.id)
+                  FROM player_quest pq
+                  JOIN quest q ON q.id = pq.quest_id
+                 WHERE q.quest_key = 'content-quest-v39'
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("应读取新增任务的玩家记录");
+        assert_eq!(before, ("active".to_string(), 3, 1));
+        drop(connection);
+
+        store
+            .rollback_content_revision(baseline.id)
+            .expect("应回滚任务内容 revision");
+        let rolled_back = store
+            .quests_page(&identity(), 1, 20)
+            .expect("回滚后任务目录仍应可读");
+        assert!(
+            !rolled_back
+                .entries
+                .iter()
+                .any(|entry| entry.quest.quest_key == "content-quest-v39")
+        );
+        assert!(
+            store
+                .active_quests(&identity(), None)
+                .expect("回滚后任务进度查询应可读")
+                .is_empty()
+        );
+        assert!(
+            store
+                .submit_quest_with_operation(
+                    &identity(),
+                    "内容任务",
+                    &map_operation("提交任务", "quest-v39-submit-after-rollback"),
+                )
+                .expect_err("失活任务不得提交")
+                .contains("active content revision")
+        );
+        assert!(
+            store
+                .abandon_quest_with_operation(
+                    &identity(),
+                    "内容任务",
+                    &map_operation("放弃任务", "quest-v39-abandon-after-rollback"),
+                )
+                .expect_err("失活任务不得放弃")
+                .contains("active content revision")
+        );
+
+        let connection = store.open().expect("应再次读取玩家任务状态");
+        let after = connection
+            .query_row(
+                r#"
+                SELECT pq.status,
+                       (SELECT COUNT(*) FROM player_quest_progress progress
+                         WHERE progress.player_quest_id = pq.id),
+                       (SELECT COUNT(*) FROM player_quest_action action
+                         WHERE action.player_quest_id = pq.id)
+                  FROM player_quest pq
+                  JOIN quest q ON q.id = pq.quest_id
+                 WHERE q.quest_key = 'content-quest-v39'
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("回滚后玩家任务记录应保留");
+        assert_eq!(after, before);
+        drop(connection);
+
+        drop(store);
+        let restarted = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("任务回滚后的数据库应可重启");
+        assert!(
+            restarted
+                .quests_page(&identity(), 1, 20)
+                .expect("重启后任务目录应可读")
+                .entries
+                .iter()
+                .all(|entry| entry.quest.quest_key != "content-quest-v39")
+        );
+    }
+
+    #[test]
+    fn v39_quest_package_requires_active_or_same_package_catalog_references() {
+        let (_directory, store) = test_store();
+        let mut missing_map = quest_content_package(
+            "test-quest-missing-map",
+            "content-quest-missing-map",
+            "失效地图任务",
+            Some("missing-v39-map"),
+        );
+        missing_map.package.quests[0].requirements[1].target_key = "missing-v39-map".to_string();
+        missing_map.content_hash = content_hash(&missing_map.package).expect("应更新任务哈希");
+        store
+            .stage_content_package(&missing_map)
+            .expect("应暂存失效地图任务");
+        let report = store
+            .validate_content_draft("test-quest-missing-map", 1)
+            .expect("应校验失效地图任务");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("任务 content-quest-missing-map 引用了不存在"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("到访条件引用了不存在"))
+        );
+
+        let mut missing_item = quest_content_package(
+            "test-quest-missing-item",
+            "content-quest-missing-item",
+            "失效物品任务",
+            Some("holy-soul-village"),
+        );
+        missing_item.package.quests[0].requirements[0].target_key = "missing-v39-item".to_string();
+        missing_item.package.quests[0].rewards[2].item_key = Some("missing-v39-item".to_string());
+        missing_item.content_hash = content_hash(&missing_item.package).expect("应更新任务哈希");
+        store
+            .stage_content_package(&missing_item)
+            .expect("应暂存失效物品任务");
+        let report = store
+            .validate_content_draft("test-quest-missing-item", 1)
+            .expect("应校验失效物品任务");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("物品条件引用了不存在"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("物品奖励引用了不存在"))
+        );
+
+        let mut same_package = quest_content_package(
+            "test-quest-same-package",
+            "content-quest-same-package",
+            "同包任务",
+            Some("content-quest-map-v39"),
+        );
+        let new_item_key = "content-quest-item-v39";
+        same_package.package.maps.push(MapPackageEntry {
+            map_key: "content-quest-map-v39".to_string(),
+            name: "任务内容地图".to_string(),
+            description: "与任务同包新增的地图".to_string(),
+            level_required: 1,
+            safe: true,
+            pvp_enabled: false,
+            teleport_enabled: true,
+            sort_order: 10_001,
+        });
+        same_package.package.items.push(ItemPackageEntry {
+            item_key: new_item_key.to_string(),
+            name: "任务内容物品".to_string(),
+            category: "consumable".to_string(),
+            quality: 2,
+            stackable: true,
+            max_stack: 99,
+            buy_price: 20,
+            sell_price: 5,
+            level_required: 1,
+            effect_kind: "restore_hp".to_string(),
+            effect_amount: 20,
+            revive_hp_percent: 0,
+            purchasable: false,
+            sellable: false,
+            usable: true,
+            description: "与任务同包新增的物品".to_string(),
+        });
+        same_package.package.quests[0].requirements[0].target_key = new_item_key.to_string();
+        same_package.package.quests[0].requirements[1].target_key =
+            "content-quest-map-v39".to_string();
+        same_package.package.quests[0].rewards[2].item_key = Some(new_item_key.to_string());
+        same_package.content_hash =
+            content_hash(&same_package.package).expect("应更新同包任务哈希");
+        store
+            .stage_content_package(&same_package)
+            .expect("同包任务引用应可暂存");
+        let report = store
+            .validate_content_draft("test-quest-same-package", 1)
+            .expect("应校验同包任务引用");
+        assert!(report.errors.is_empty(), "{report:?}");
+        store
+            .publish_content_draft("test-quest-same-package", 1)
+            .expect("同包任务引用应可发布");
+        let connection = store.open().expect("应打开同包任务数据库");
+        assert!(
+            active_content_member_exists(&connection, "quest", "content-quest-same-package")
+                .expect("应读取同包任务成员")
+        );
+        assert!(
+            active_content_member_exists(&connection, "map", "content-quest-map-v39")
+                .expect("应读取同包地图成员")
+        );
+        assert!(
+            active_content_member_exists(&connection, "item", new_item_key)
+                .expect("应读取同包物品成员")
+        );
+    }
+
+    #[test]
+    fn v39_migration_registers_existing_quests_without_touching_player_history() {
+        let (directory, store) = test_store();
+        register_awakened_pair(&store);
+        store
+            .accept_quest_with_operation(
+                &identity(),
+                "初入圣魂村",
+                &map_operation("接取任务", "quest-v39-migration-accept"),
+            )
+            .expect("应创建既有玩家任务记录");
+        let connection = store.open().expect("应打开 v39 迁移数据库");
+        let revision_ids = connection
+            .prepare("SELECT id FROM content_revision ORDER BY id")
+            .expect("应准备历史 revision 查询")
+            .query_map([], |row| row.get::<_, i64>(0))
+            .expect("应读取历史 revision")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("应解析历史 revision");
+        let quest_keys = connection
+            .prepare("SELECT quest_key FROM quest ORDER BY quest_key")
+            .expect("应准备既有任务查询")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("应读取既有任务")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("应解析既有任务");
+        let player_quest_before = connection
+            .query_row(
+                r#"
+                SELECT pq.status,
+                       (SELECT COUNT(*) FROM player_quest_progress progress
+                         WHERE progress.player_quest_id = pq.id),
+                       (SELECT COUNT(*) FROM player_quest_action action
+                         WHERE action.player_quest_id = pq.id)
+                  FROM player_quest pq
+                  JOIN quest q ON q.id = pq.quest_id
+                 WHERE q.quest_key = 'village-introduction'
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("应读取既有玩家任务状态");
+        assert!(!revision_ids.is_empty());
+        assert!(!quest_keys.is_empty());
+
+        connection
+            .execute_batch(
+                r#"
+                DELETE FROM schema_migration WHERE version = 39;
+                CREATE TABLE content_revision_member_v38_test_backup AS
+                SELECT revision_id, member_kind, member_key, created_at
+                  FROM content_revision_member
+                 WHERE member_kind <> 'quest';
+                DROP TRIGGER content_revision_member_no_update;
+                DROP TRIGGER content_revision_member_no_delete;
+                DROP TRIGGER content_revision_member_no_reinsert;
+                DROP INDEX content_revision_member_lookup;
+                DROP TABLE content_revision_member;
+                CREATE TABLE content_revision_member (
+                    revision_id INTEGER NOT NULL REFERENCES content_revision(id) ON DELETE RESTRICT,
+                    member_kind TEXT NOT NULL CHECK(
+                        member_kind IN ('wuhun', 'skill', 'starter-skill', 'effect', 'beast', 'ring', 'map', 'item', 'npc')
+                    ),
+                    member_key TEXT NOT NULL CHECK(
+                        length(member_key) BETWEEN 1 AND 200
+                        AND member_key = trim(member_key)
+                        AND instr(member_key, char(0)) = 0
+                    ),
+                    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+                    PRIMARY KEY(revision_id, member_kind, member_key)
+                ) STRICT, WITHOUT ROWID;
+                INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
+                SELECT revision_id, member_kind, member_key, created_at
+                  FROM content_revision_member_v38_test_backup;
+                DROP TABLE content_revision_member_v38_test_backup;
+                CREATE INDEX content_revision_member_lookup
+                    ON content_revision_member(member_kind, member_key, revision_id);
+                CREATE TRIGGER content_revision_member_no_update
+                BEFORE UPDATE ON content_revision_member
+                BEGIN
+                    SELECT RAISE(ABORT, 'content revision member is immutable');
+                END;
+                CREATE TRIGGER content_revision_member_no_delete
+                BEFORE DELETE ON content_revision_member
+                BEGIN
+                    SELECT RAISE(ABORT, 'content revision member is immutable');
+                END;
+                CREATE TRIGGER content_revision_member_no_reinsert
+                BEFORE INSERT ON content_revision_member
+                WHEN EXISTS(
+                    SELECT 1 FROM content_revision_member
+                     WHERE revision_id = NEW.revision_id
+                       AND member_kind = NEW.member_kind
+                       AND member_key = NEW.member_key
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'content revision member is append-only');
+                END;
+                "#,
+            )
+            .expect("应构造 v38 内容成员表");
+        drop(connection);
+        drop(store);
+
+        let migrated = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v38 数据库应成功升级到 v39");
+        let connection = migrated.open().expect("应打开升级后的 v39 数据库");
+        for revision_id in revision_ids {
+            let actual_quest_keys = connection
+                .prepare(
+                    "SELECT member_key FROM content_revision_member WHERE revision_id = ?1 AND member_kind = 'quest' ORDER BY member_key",
+                )
+                .expect("应准备 v39 任务成员查询")
+                .query_map([revision_id], |row| row.get::<_, String>(0))
+                .expect("应读取 v39 任务成员")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("应解析 v39 任务成员");
+            assert_eq!(
+                actual_quest_keys, quest_keys,
+                "revision {revision_id} 的任务成员不完整"
+            );
+        }
+        let player_quest_after = connection
+            .query_row(
+                r#"
+                SELECT pq.status,
+                       (SELECT COUNT(*) FROM player_quest_progress progress
+                         WHERE progress.player_quest_id = pq.id),
+                       (SELECT COUNT(*) FROM player_quest_action action
+                         WHERE action.player_quest_id = pq.id)
+                  FROM player_quest pq
+                  JOIN quest q ON q.id = pq.quest_id
+                 WHERE q.quest_key = 'village-introduction'
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("升级后应读取既有玩家任务状态");
+        assert_eq!(player_quest_after, player_quest_before);
     }
 
     #[test]
@@ -41615,6 +42550,7 @@ mod tests {
             maps: Vec::new(),
             items: Vec::new(),
             npcs: Vec::new(),
+            quests: Vec::new(),
             wuhun: Vec::new(),
             skills: Vec::new(),
             effects: vec![EffectPackageEntry {
@@ -42624,6 +43560,7 @@ mod tests {
             maps: Vec::new(),
             items: Vec::new(),
             npcs: Vec::new(),
+            quests: Vec::new(),
             wuhun: Vec::new(),
             skills: vec![SkillPackageEntry {
                 skill_key: "test-starter".to_string(),
@@ -43641,6 +44578,7 @@ mod tests {
             maps: Vec::new(),
             items: Vec::new(),
             npcs: Vec::new(),
+            quests: Vec::new(),
             wuhun: vec![WuhunPackageEntry {
                 name: "test catalog wuhun".to_string(),
                 category: "控制系".to_string(),
@@ -46325,6 +47263,47 @@ mod tests {
                 enabled, sort_order, created_at, updated_at
             ) VALUES('untracked-v38-npc', 'holy-soul-village', '未登记 NPC', 'elder',
                      'v38 损坏探针', 'v38 损坏探针', 1, 99_999, 0, 0);
+            "#,
+        );
+    }
+
+    fn assert_v39_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v39 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v39 迁移应成功");
+        let connection = store.open().expect("应打开 v39 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v39 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v39 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v39")
+                || error.contains("v23")
+                || error.contains("content_revision_member")
+                || error.contains("任务")
+                || error.contains("quest"),
+            "v39 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    #[test]
+    fn recorded_v39_quest_membership_damage_fails_closed() {
+        for mutation in [
+            "DROP INDEX content_revision_member_lookup;",
+            "DROP TRIGGER content_revision_member_no_reinsert;",
+        ] {
+            assert_v39_damage_fails_closed(mutation);
+        }
+        assert_v39_damage_fails_closed(
+            r#"
+            INSERT INTO quest(
+                quest_key, name, description, category, map_key, level_required,
+                repeatable, enabled, created_at, updated_at
+            ) VALUES('untracked-v39-quest', '未登记任务', 'v39 损坏探针', 'side',
+                     'holy-soul-village', 1, 0, 1, 0, 0);
             "#,
         );
     }
