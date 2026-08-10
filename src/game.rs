@@ -21,8 +21,10 @@ use crate::store::{
     MAX_SKILL_PROFICIENCY, MapExit, MapRecord, MapTravelReceipt, OperationLogInput, PlayerStatus,
     QuestActionReceipt, QuestListEntry, REVIVE_WINDOW_SECONDS, RevivalAbandonReceipt,
     SkillDamageModifierRecord, SkillEffectRecord, SkillLoadoutReceipt, SkillPage, SoulBeastPage,
-    SoulRingAbsorbReceipt, SoulRingDetachmentReceipt, SoulRingPage, Store, WuhunToggleReceipt,
-    experience_progress, skill_damage_percent, skill_proficiency_threshold,
+    SoulRingAbsorbReceipt, SoulRingDetachmentReceipt, SoulRingPage, StorageAttributeRecord,
+    StorageContainerRecord, StorageContents, StorageEquipmentReceipt, StorageMoveReceipt,
+    StorageSealReceipt, StorageUnsealReceipt, Store, WuhunToggleReceipt, experience_progress,
+    skill_damage_percent, skill_proficiency_threshold,
 };
 
 const MENU_PAGES: &[MenuPage] = &[
@@ -149,6 +151,38 @@ const MENU_PAGES: &[MenuPage] = &[
             MenuEntry {
                 command: "背包 [页码]",
                 description: "查看随身物品",
+            },
+            MenuEntry {
+                command: "储物器",
+                description: "查看已绑定储物器",
+            },
+            MenuEntry {
+                command: "查看储物器 <储物器>",
+                description: "查看未封印储物器内容",
+            },
+            MenuEntry {
+                command: "存入 <储物器> <物品> [数量]",
+                description: "把随身物品存入储物器",
+            },
+            MenuEntry {
+                command: "取出 <储物器> <物品> [数量]",
+                description: "从储物器取回物品",
+            },
+            MenuEntry {
+                command: "封印储物器 <储物器>",
+                description: "封印当前玩家绑定的储物器",
+            },
+            MenuEntry {
+                command: "解封储物器 <储物器>",
+                description: "解封并生成一次性随机属性",
+            },
+            MenuEntry {
+                command: "装备魂导器 <储物器>",
+                description: "装备已解封的便携魂导器",
+            },
+            MenuEntry {
+                command: "卸下魂导器 <储物器>",
+                description: "卸下便携魂导器并停止随身访问",
             },
             MenuEntry {
                 command: "购买 <物品> [数量]",
@@ -1169,6 +1203,139 @@ impl GameService {
             .command("使用 <物品>")
             .command("商店")
             .command("钱包"))
+    }
+
+    pub fn storage_containers(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        if !req.args.as_str().trim().is_empty() {
+            return Err("用法：储物器".to_string());
+        }
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let containers = self.store.storage_containers(&key)?;
+        let mut document =
+            GameDocument::new("储物器").field("储物器数量", containers.len().to_string());
+        if containers.is_empty() {
+            return Ok(document.line("当前没有已发放的储物器").command("背包"));
+        }
+        for container in &containers {
+            document = document
+                .line(storage_container_summary(container))
+                .command(format!("查看储物器 {}", container.name));
+        }
+        Ok(document.command("背包"))
+    }
+
+    pub fn view_storage(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let name_or_id = parse_required_catalog_name(req.args.as_str(), "查看储物器 <储物器>")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let contents = self.store.storage_contents(&key, name_or_id)?;
+        Ok(storage_contents_document(contents))
+    }
+
+    pub fn store_item(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let (container_name, item_name, quantity) = parse_storage_move_args(
+            req.args.as_str(),
+            self.config.messages.legacy_hyphen_arguments,
+            "存入 <储物器> <物品> [数量]",
+        )?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self.store.store_item_with_operation(
+            &key,
+            &container_name,
+            &item_name,
+            quantity,
+            &operation,
+        )?;
+        Ok(storage_move_document(receipt)
+            .command(format!("查看储物器 {container_name}"))
+            .command("储物器")
+            .command("背包"))
+    }
+
+    pub fn withdraw_item(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let (container_name, item_name, quantity) = parse_storage_move_args(
+            req.args.as_str(),
+            self.config.messages.legacy_hyphen_arguments,
+            "取出 <储物器> <物品> [数量]",
+        )?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self.store.withdraw_item_with_operation(
+            &key,
+            &container_name,
+            &item_name,
+            quantity,
+            &operation,
+        )?;
+        Ok(storage_move_document(receipt)
+            .command(format!("查看储物器 {container_name}"))
+            .command("储物器")
+            .command("背包"))
+    }
+
+    pub fn seal_storage(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let name_or_id = parse_required_catalog_name(req.args.as_str(), "封印储物器 <储物器>")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self
+            .store
+            .seal_storage_with_operation(&key, name_or_id, &operation)?;
+        Ok(storage_seal_document(receipt)
+            .command("储物器")
+            .command("背包"))
+    }
+
+    pub fn unseal_storage(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let name_or_id = parse_required_catalog_name(req.args.as_str(), "解封储物器 <储物器>")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self
+            .store
+            .unseal_storage_with_operation(&key, name_or_id, &operation)?;
+        Ok(storage_unseal_document(receipt)
+            .command(format!("装备魂导器 {}", name_or_id))
+            .command("储物器")
+            .command("背包"))
+    }
+
+    pub fn equip_storage(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let name_or_id = parse_required_catalog_name(req.args.as_str(), "装备魂导器 <储物器>")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self
+            .store
+            .equip_storage_with_operation(&key, name_or_id, &operation)?;
+        Ok(storage_equipment_document(receipt)
+            .command(format!("查看储物器 {}", name_or_id))
+            .command("储物器")
+            .command("背包"))
+    }
+
+    pub fn unequip_storage(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let name_or_id = parse_required_catalog_name(req.args.as_str(), "卸下魂导器 <储物器>")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt = self
+            .store
+            .unequip_storage_with_operation(&key, name_or_id, &operation)?;
+        Ok(storage_equipment_document(receipt)
+            .command(format!("装备魂导器 {}", name_or_id))
+            .command("储物器")
+            .command("背包"))
     }
 
     pub fn ground_drops(&self, req: &CommandRequest) -> Result<GameDocument, String> {
@@ -2764,6 +2931,37 @@ fn parse_item_quantity<'a>(
     Ok((args, 1))
 }
 
+fn parse_storage_move_args(
+    args: &str,
+    legacy_hyphen: bool,
+    usage: &str,
+) -> Result<(String, String, i64), String> {
+    let args = args.trim();
+    if let Some((container, item_args)) = split_first_argument(args) {
+        if item_args.is_empty() {
+            return Err(format!("用法：{usage}"));
+        }
+        let container = parse_required_catalog_name(container, usage)?;
+        let (item, quantity) = parse_item_quantity(item_args, legacy_hyphen, usage)?;
+        return Ok((container.to_string(), item.to_string(), quantity));
+    }
+
+    if legacy_hyphen
+        && let Some((head, quantity_text)) = args.rsplit_once('-')
+        && let Ok(quantity) = quantity_text.trim().parse::<i64>()
+        && let Some((container, item)) = head.split_once('-')
+    {
+        if !(1..=9999).contains(&quantity) {
+            return Err("数量必须在 1 到 9999 之间".to_string());
+        }
+        let container = parse_required_catalog_name(container.trim(), usage)?;
+        let item = parse_required_catalog_name(item.trim(), usage)?;
+        return Ok((container.to_string(), item.to_string(), quantity));
+    }
+
+    Err(format!("用法：{usage}"))
+}
+
 fn parse_transfer_args(
     args: &str,
     mention: Option<String>,
@@ -2902,6 +3100,178 @@ fn item_effect_description(item: &crate::store::ItemRecord) -> String {
         "revive" => format!("复活并恢复 {}% 生命", item.revive_hp_percent),
         _ => item.description.clone(),
     }
+}
+
+fn storage_type_label(storage_type: &str) -> &'static str {
+    match storage_type {
+        "ring" => "储物戒指",
+        "bag" => "储物袋",
+        "bracelet" => "储物手镯",
+        "space" => "储物空间",
+        "warehouse" => "仓库",
+        _ => "未知储物器",
+    }
+}
+
+fn storage_container_summary(container: &StorageContainerRecord) -> String {
+    let seal = if container.sealed { " · 封印" } else { "" };
+    let equipped = if container.equipped {
+        " · 已装备"
+    } else {
+        ""
+    };
+    let portable = if container.portable {
+        "随身"
+    } else {
+        "固定"
+    };
+    let binding = if container.bound {
+        "玩家绑定"
+    } else {
+        "未绑定"
+    };
+    format!(
+        "#{} · {} · {}/{} 槽 · {} · {} · {} · {} · {}",
+        container.id,
+        container.name,
+        container.used_slots,
+        container.capacity,
+        storage_type_label(container.storage_type.as_str()),
+        portable,
+        binding,
+        seal,
+        equipped
+    )
+}
+
+fn storage_contents_document(contents: StorageContents) -> GameDocument {
+    let container = contents.container;
+    let mut document = GameDocument::new(format!("储物器 · {}", container.name))
+        .field("类型", storage_type_label(container.storage_type.as_str()))
+        .field(
+            "绑定",
+            if container.bound {
+                "当前玩家"
+            } else {
+                "未绑定"
+            },
+        )
+        .field(
+            "容量",
+            format!("{}/{} 槽", container.used_slots, container.capacity),
+        )
+        .field(
+            "装备",
+            if container.equipped {
+                "已装备"
+            } else {
+                "未装备"
+            },
+        )
+        .field(
+            "随机属性",
+            container
+                .attribute
+                .as_ref()
+                .map(storage_attribute_document)
+                .unwrap_or_else(|| "无".to_string()),
+        );
+    if contents.entries.is_empty() {
+        document = document.line("储物器为空");
+    } else {
+        for entry in contents.entries {
+            document = document.line(format!(
+                "[{}] {} x{} · {}",
+                entry.slot_index,
+                entry.item.name,
+                entry.quantity,
+                item_quality_label(entry.item.quality)
+            ));
+        }
+    }
+    document
+        .command(format!("存入 {} <物品> [数量]", container.name))
+        .command(format!("取出 {} <物品> [数量]", container.name))
+        .command("储物器")
+        .command("背包")
+}
+
+fn storage_move_document(receipt: StorageMoveReceipt) -> GameDocument {
+    let (title, action) = if receipt.action == "store" {
+        ("存入成功", "存入")
+    } else {
+        ("取出成功", "取出")
+    };
+    GameDocument::new(title)
+        .field("储物器", receipt.container.name)
+        .field(
+            "物品",
+            format!("{} x{}", receipt.item.name, receipt.quantity),
+        )
+        .field("槽位", receipt.slot_index.to_string())
+        .field(
+            "背包数量",
+            format!("{} → {}", receipt.inventory_before, receipt.inventory_after),
+        )
+        .field(
+            "储物器数量",
+            format!("{} → {}", receipt.storage_before, receipt.storage_after),
+        )
+        .notice(format!(
+            "{}、背包、储物器和操作日志已在同一事务完成",
+            action
+        ))
+}
+
+fn storage_seal_document(receipt: StorageSealReceipt) -> GameDocument {
+    GameDocument::new("储物器已封印")
+        .field("储物器", receipt.container.name)
+        .field("绑定", "当前玩家")
+        .notice("封印后不能查看、存入或取出；便携魂导器可用解封储物器生成一次性属性")
+}
+
+fn storage_attribute_label(attribute: &StorageAttributeRecord) -> &'static str {
+    match attribute.attribute_key.as_str() {
+        "capacity_bonus" => "容量强化",
+        "stack_bonus" => "堆叠强化",
+        _ => "未知属性",
+    }
+}
+
+fn storage_attribute_document(attribute: &StorageAttributeRecord) -> String {
+    format!(
+        "{} +{}",
+        storage_attribute_label(attribute),
+        attribute.attribute_value
+    )
+}
+
+fn storage_unseal_document(receipt: StorageUnsealReceipt) -> GameDocument {
+    GameDocument::new("魂导器已解封")
+        .field("储物器", receipt.container.name)
+        .field("随机属性", storage_attribute_document(&receipt.attribute))
+        .field("容量", format!("{} 槽", receipt.container.capacity))
+        .notice("随机属性只在首次解封时生成并永久保留")
+}
+
+fn storage_equipment_document(receipt: StorageEquipmentReceipt) -> GameDocument {
+    let (title, notice) = if receipt.action == "equip" {
+        ("魂导器已装备", "装备后才能访问便携储物器内容")
+    } else {
+        ("魂导器已卸下", "卸下后不能查看、存入或取出便携储物器物品")
+    };
+    GameDocument::new(title)
+        .field("储物器", receipt.container.name)
+        .field(
+            "随机属性",
+            receipt
+                .container
+                .attribute
+                .as_ref()
+                .map(storage_attribute_document)
+                .unwrap_or_else(|| "无".to_string()),
+        )
+        .notice(notice)
 }
 
 fn display_direction(direction: &str) -> &'static str {
@@ -3167,7 +3537,9 @@ fn format_battle_event(event: &BattleEventRecord) -> String {
 mod tests {
     use abi_stable::std_types::RString;
 
-    use crate::store::{PlayerSoulRingRecord, SkillRecord, SoulRingDropRecord, SoulRingRecord};
+    use crate::store::{
+        IdentityKey, PlayerSoulRingRecord, SkillRecord, SoulRingDropRecord, SoulRingRecord,
+    };
 
     use super::*;
 
@@ -3197,6 +3569,20 @@ mod tests {
             Ok(("唐-小三", "男"))
         );
         assert!(parse_registration_args("唐小三-男", false).is_err());
+    }
+
+    #[test]
+    fn storage_arguments_accept_space_and_legacy_hyphen_shapes() {
+        assert_eq!(
+            parse_storage_move_args("测试戒指 小回复药 2", true, "存入 <储物器> <物品> [数量]"),
+            Ok(("测试戒指".to_string(), "小回复药".to_string(), 2))
+        );
+        assert_eq!(
+            parse_storage_move_args("测试戒指-小回复药-2", true, "取出 <储物器> <物品> [数量]"),
+            Ok(("测试戒指".to_string(), "小回复药".to_string(), 2))
+        );
+        assert!(parse_storage_move_args("测试戒指 小回复药 0", true, "存入").is_err());
+        assert!(parse_storage_move_args("测试戒指", true, "存入").is_err());
     }
 
     #[test]
@@ -3911,6 +4297,133 @@ mod tests {
         );
         assert!(sale.contains("小回复药 x1"));
         assert!(sale.contains("背包数量：1"));
+    }
+
+    #[test]
+    fn storage_commands_render_move_and_seal_boundaries() {
+        let directory = tempfile::tempdir().expect("临时目录应创建");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("储物命令数据库应初始化");
+        let service = GameService::with_assets(
+            store.clone(),
+            PluginConfig::default(),
+            IllustrationAssets::default(),
+        );
+        service
+            .register(&command_request(
+                "开始穿越",
+                "储物命令 男",
+                "storage-register",
+            ))
+            .expect("应创建储物命令角色");
+        let key = IdentityKey {
+            protocol: crate::message::Protocol::OneBot11,
+            account_id: "10001",
+            namespace: "default",
+            subject_kind: "user",
+            subject_id: "economy-user",
+        };
+        store
+            .create_storage_container(&key, "命令戒指", "ring", 2, true)
+            .expect("应创建命令测试储物器");
+        service
+            .talk(&command_request("对话", "杂货商人", "storage-command-talk"))
+            .expect("应绑定储物命令测试商人");
+        service
+            .daily_checkin(&command_request("签到", "", "storage-command-checkin"))
+            .expect("应准备命令测试资金");
+        service
+            .buy(&command_request(
+                "购买",
+                "小回复药 2",
+                "storage-command-buy",
+            ))
+            .expect("应准备命令测试物品");
+
+        let list = crate::message::render_text(
+            &service
+                .storage_containers(&command_request("储物器", "", "storage-list"))
+                .expect("应渲染储物器列表"),
+        );
+        assert!(list.contains("命令戒指"));
+        assert!(list.contains("玩家绑定"));
+
+        let unsealed = crate::message::render_text(
+            &service
+                .unseal_storage(&command_request(
+                    "解封储物器",
+                    "命令戒指",
+                    "storage-command-unseal",
+                ))
+                .expect("应渲染解封回执"),
+        );
+        assert!(unsealed.contains("魂导器已解封"));
+        assert!(unsealed.contains("随机属性"));
+
+        let equipped = crate::message::render_text(
+            &service
+                .equip_storage(&command_request(
+                    "装备魂导器",
+                    "命令戒指",
+                    "storage-command-equip",
+                ))
+                .expect("应渲染装备回执"),
+        );
+        assert!(equipped.contains("魂导器已装备"));
+
+        let stored = crate::message::render_text(
+            &service
+                .store_item(&command_request(
+                    "存入",
+                    "命令戒指 小回复药 2",
+                    "storage-command-store",
+                ))
+                .expect("应渲染存入回执"),
+        );
+        assert!(stored.contains("存入成功"));
+        assert!(stored.contains("背包数量：2 → 0"));
+        assert!(stored.contains("储物器数量：0 → 2"));
+
+        let viewed = crate::message::render_text(
+            &service
+                .view_storage(&command_request(
+                    "查看储物器",
+                    "命令戒指",
+                    "storage-command-view",
+                ))
+                .expect("应渲染储物器内容"),
+        );
+        assert!(viewed.contains("小回复药 x2"));
+
+        let unequipped = crate::message::render_text(
+            &service
+                .unequip_storage(&command_request(
+                    "卸下魂导器",
+                    "命令戒指",
+                    "storage-command-unequip",
+                ))
+                .expect("应渲染卸下回执"),
+        );
+        assert!(unequipped.contains("魂导器已卸下"));
+
+        let reseal_error = service
+            .seal_storage(&command_request(
+                "封印储物器",
+                "命令戒指",
+                "storage-command-seal",
+            ))
+            .expect_err("解封后的魂导器不能再次封印");
+        assert!(reseal_error.contains("再次") || reseal_error.contains("sealed again"));
+        assert!(
+            service
+                .view_storage(&command_request(
+                    "查看储物器",
+                    "命令戒指",
+                    "storage-command-view-after-unequip",
+                ))
+                .is_err(),
+            "卸下后便携魂导器应停止访问"
+        );
     }
 
     #[test]

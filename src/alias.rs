@@ -20,6 +20,14 @@ pub const PLAYER_ALIAS_TARGET_COMMANDS: &[&str] = &[
     "对话",
     "商店",
     "背包",
+    "储物器",
+    "查看储物器",
+    "存入",
+    "取出",
+    "封印储物器",
+    "解封储物器",
+    "装备魂导器",
+    "卸下魂导器",
     "购买",
     "出售",
     "使用",
@@ -95,6 +103,20 @@ const REGISTERED_GAME_COMMAND_KEYS: &[&str] = &[
     "随身物品",
     "物品",
     "道具",
+    "储物器",
+    "储物",
+    "储物器列表",
+    "查看储物器",
+    "打开储物器",
+    "存入",
+    "取出",
+    "封印储物器",
+    "解封储物器",
+    "解封",
+    "装备魂导器",
+    "装备储物器",
+    "卸下魂导器",
+    "卸下储物器",
     "购买",
     "购买物品",
     "买",
@@ -212,6 +234,10 @@ mod tests {
         assert!(is_player_alias_target("状态"));
         assert!(is_player_alias_target("释放技能"));
         assert!(!is_player_alias_target("旧档认领"));
+        assert!(is_player_alias_target("\u{50a8}\u{7269}\u{5668}"));
+        assert!(is_player_alias_target(
+            "\u{67e5}\u{770b}\u{50a8}\u{7269}\u{5668}"
+        ));
         assert!(!is_player_alias_target("plugins"));
     }
 
@@ -219,6 +245,8 @@ mod tests {
     fn reserved_command_keys_cannot_be_reused_as_player_aliases() {
         assert!(validate_player_alias_name("状态").is_err());
         assert!(validate_player_alias_name("设置快捷键").is_err());
+        assert!(validate_player_alias_name("\u{50a8}\u{7269}\u{5668}").is_err());
+        assert!(validate_player_alias_name("\u{6253}\u{5f00}\u{50a8}\u{7269}\u{5668}").is_err());
         assert!(validate_player_alias_name("plugins").is_err());
         assert!(validate_player_alias_name("查询状态").is_ok());
     }

@@ -5367,6 +5367,433 @@ BEGIN
 END;
 "#;
 
+// v33 只新增储物器空结构，不迁移或重写现有玩家背包。玩家绑定由
+// storage_container.player_id 固定，存取时再由 Store 在同一事务内校验。
+const MIGRATION_V33: &str = r#"
+CREATE TABLE storage_container (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL CHECK(
+        length(name) BETWEEN 1 AND 128
+        AND name = trim(name)
+        AND instr(name, char(0)) = 0
+        AND name NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    storage_type TEXT NOT NULL CHECK(
+        storage_type IN ('ring', 'bag', 'bracelet', 'space', 'warehouse')
+    ),
+    capacity INTEGER NOT NULL CHECK(capacity BETWEEN 1 AND 200),
+    portable INTEGER NOT NULL CHECK(portable IN (0, 1)),
+    sealed INTEGER NOT NULL DEFAULT 0 CHECK(sealed IN (0, 1)),
+    seal_type TEXT NOT NULL DEFAULT 'none' CHECK(seal_type IN ('none', 'owner')),
+    bound INTEGER NOT NULL DEFAULT 1 CHECK(bound IN (0, 1)),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+    UNIQUE(player_id, name),
+    CHECK(
+        (sealed = 0 AND seal_type = 'none')
+        OR (sealed = 1 AND seal_type = 'owner')
+    ),
+    CHECK(
+        (storage_type IN ('ring', 'bracelet') AND portable = 1)
+        OR (storage_type IN ('bag', 'space', 'warehouse') AND portable = 0)
+    )
+) STRICT;
+
+CREATE INDEX storage_container_player_page
+    ON storage_container(player_id, id);
+
+CREATE TABLE storage_item (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    container_id INTEGER NOT NULL REFERENCES storage_container(id) ON DELETE RESTRICT,
+    slot_index INTEGER NOT NULL CHECK(slot_index >= 0),
+    item_key TEXT NOT NULL REFERENCES item(item_key) ON DELETE RESTRICT,
+    quantity INTEGER NOT NULL CHECK(quantity BETWEEN 1 AND 999999),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+    UNIQUE(container_id, slot_index),
+    UNIQUE(container_id, item_key)
+) STRICT;
+
+CREATE INDEX storage_item_container_page
+    ON storage_item(container_id, slot_index, id);
+
+-- 玩家绑定和绑定标记不可在本切片中被改写；后续所有权转移必须另行定义。
+CREATE TRIGGER storage_container_binding_guard
+BEFORE UPDATE OF player_id, bound ON storage_container
+WHEN NEW.player_id <> OLD.player_id OR NEW.bound <> OLD.bound
+BEGIN
+    SELECT RAISE(ABORT, 'storage container binding is immutable');
+END;
+
+-- 槽位范围和物品堆叠上限必须同时落在容器与物品目录约束内。
+CREATE TRIGGER storage_item_scope_guard
+BEFORE INSERT ON storage_item
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM storage_container container
+      JOIN item catalog ON catalog.item_key = NEW.item_key
+     WHERE container.id = NEW.container_id
+       AND NEW.slot_index < container.capacity
+       AND NEW.quantity <= catalog.max_stack
+)
+BEGIN
+    SELECT RAISE(ABORT, 'storage item scope or stack mismatch');
+END;
+
+CREATE TRIGGER storage_item_scope_update_guard
+BEFORE UPDATE OF container_id, slot_index, item_key, quantity ON storage_item
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM storage_container container
+      JOIN item catalog ON catalog.item_key = NEW.item_key
+     WHERE container.id = NEW.container_id
+       AND NEW.slot_index < container.capacity
+       AND NEW.quantity <= catalog.max_stack
+)
+BEGIN
+    SELECT RAISE(ABORT, 'storage item scope or stack mismatch');
+END;
+
+CREATE TRIGGER item_storage_stack_update
+BEFORE UPDATE OF max_stack ON item
+WHEN EXISTS(
+    SELECT 1
+      FROM storage_item stored
+     WHERE stored.item_key = OLD.item_key
+       AND stored.quantity > NEW.max_stack
+)
+BEGIN
+    SELECT RAISE(ABORT, 'item max_stack is below existing storage');
+END;
+"#;
+
+// v34 为魂导器增加一次性随机属性和装备事件。属性在解封事务中生成，装备状态
+// 由追加事件投影得到；不回填 v33 已存在的玩家容器，也不改写背包或魂环历史。
+const MIGRATION_V34: &str = r#"
+CREATE TABLE storage_container_attribute (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    container_id INTEGER NOT NULL REFERENCES storage_container(id) ON DELETE RESTRICT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    attribute_key TEXT NOT NULL CHECK(attribute_key IN ('capacity_bonus', 'stack_bonus')),
+    attribute_value INTEGER NOT NULL CHECK(
+        (attribute_key = 'capacity_bonus' AND attribute_value BETWEEN 1 AND 20)
+        OR (attribute_key = 'stack_bonus' AND attribute_value BETWEEN 1 AND 50)
+    ),
+    source_message_id TEXT NOT NULL CHECK(
+        length(source_message_id) BETWEEN 1 AND 256
+        AND instr(source_message_id, char(0)) = 0
+        AND source_message_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    operation_log_id INTEGER NOT NULL UNIQUE REFERENCES operation_log(id) ON DELETE RESTRICT,
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    UNIQUE(container_id),
+    UNIQUE(player_id, source_message_id)
+) STRICT;
+
+CREATE INDEX storage_container_attribute_player_page
+    ON storage_container_attribute(player_id, id);
+
+CREATE TRIGGER storage_container_attribute_no_update
+BEFORE UPDATE ON storage_container_attribute
+BEGIN
+    SELECT RAISE(ABORT, 'storage container attribute is immutable');
+END;
+
+CREATE TRIGGER storage_container_attribute_no_delete
+BEFORE DELETE ON storage_container_attribute
+BEGIN
+    SELECT RAISE(ABORT, 'storage container attribute is immutable');
+END;
+
+CREATE TRIGGER storage_container_attribute_no_reinsert
+BEFORE INSERT ON storage_container_attribute
+WHEN EXISTS(
+    SELECT 1 FROM storage_container_attribute
+     WHERE id = NEW.id OR operation_log_id = NEW.operation_log_id
+        OR container_id = NEW.container_id
+        OR (player_id = NEW.player_id AND source_message_id = NEW.source_message_id)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'storage container attribute is append-only');
+END;
+
+CREATE TRIGGER storage_container_attribute_scope_guard
+BEFORE INSERT ON storage_container_attribute
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM storage_container container
+      JOIN player player ON player.id = container.player_id
+      JOIN identity identity ON identity.id = player.identity_id
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE container.id = NEW.container_id
+       AND container.player_id = NEW.player_id
+       AND container.portable = 1
+       AND container.storage_type IN ('ring', 'bracelet')
+       AND container.sealed = 1
+       AND audit.protocol = identity.protocol
+       AND audit.account_id = identity.account_id
+       AND audit.namespace = identity.namespace
+       AND audit.subject_kind = identity.subject_kind
+       AND audit.subject_id = identity.subject_id
+       AND audit.command = '解封储物器'
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+       AND (
+           (NEW.attribute_key = 'capacity_bonus' AND NEW.attribute_value BETWEEN 1 AND 20)
+           OR (NEW.attribute_key = 'stack_bonus' AND NEW.attribute_value BETWEEN 1 AND 50)
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'storage container attribute scope or audit mismatch');
+END;
+
+CREATE TABLE storage_equipment_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    container_id INTEGER NOT NULL REFERENCES storage_container(id) ON DELETE RESTRICT,
+    storage_type TEXT NOT NULL CHECK(storage_type IN ('ring', 'bracelet')),
+    action TEXT NOT NULL CHECK(action IN ('equip', 'unequip')),
+    equipped_before INTEGER NOT NULL CHECK(equipped_before IN (0, 1)),
+    equipped_after INTEGER NOT NULL CHECK(equipped_after IN (0, 1)),
+    source_message_id TEXT NOT NULL CHECK(
+        length(source_message_id) BETWEEN 1 AND 256
+        AND instr(source_message_id, char(0)) = 0
+        AND source_message_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    operation_log_id INTEGER NOT NULL UNIQUE REFERENCES operation_log(id) ON DELETE RESTRICT,
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    CHECK(
+        (action = 'equip' AND equipped_before = 0 AND equipped_after = 1)
+        OR (action = 'unequip' AND equipped_before = 1 AND equipped_after = 0)
+    ),
+    UNIQUE(player_id, source_message_id)
+) STRICT;
+
+CREATE INDEX storage_equipment_event_player_page
+    ON storage_equipment_event(player_id, id);
+CREATE INDEX storage_equipment_event_container_page
+    ON storage_equipment_event(container_id, id);
+
+CREATE TRIGGER storage_equipment_event_no_update
+BEFORE UPDATE ON storage_equipment_event
+BEGIN
+    SELECT RAISE(ABORT, 'storage equipment event is immutable');
+END;
+
+CREATE TRIGGER storage_equipment_event_no_delete
+BEFORE DELETE ON storage_equipment_event
+BEGIN
+    SELECT RAISE(ABORT, 'storage equipment event is immutable');
+END;
+
+CREATE TRIGGER storage_equipment_event_no_reinsert
+BEFORE INSERT ON storage_equipment_event
+WHEN EXISTS(
+    SELECT 1 FROM storage_equipment_event
+     WHERE id = NEW.id OR operation_log_id = NEW.operation_log_id
+        OR (player_id = NEW.player_id AND source_message_id = NEW.source_message_id)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'storage equipment event is append-only');
+END;
+
+CREATE TRIGGER storage_equipment_event_scope_guard
+BEFORE INSERT ON storage_equipment_event
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM storage_container container
+      JOIN player player ON player.id = container.player_id
+      JOIN identity identity ON identity.id = player.identity_id
+      JOIN operation_log audit ON audit.id = NEW.operation_log_id
+     WHERE container.id = NEW.container_id
+       AND container.player_id = NEW.player_id
+       AND container.storage_type = NEW.storage_type
+       AND container.portable = 1
+       AND container.sealed = 0
+       AND EXISTS(
+           SELECT 1
+             FROM storage_container_attribute attribute
+            WHERE attribute.container_id = container.id
+       )
+       AND audit.protocol = identity.protocol
+       AND audit.account_id = identity.account_id
+       AND audit.namespace = identity.namespace
+       AND audit.subject_kind = identity.subject_kind
+       AND audit.subject_id = identity.subject_id
+       AND audit.command = CASE NEW.action
+           WHEN 'equip' THEN '装备魂导器'
+           WHEN 'unequip' THEN '卸下魂导器'
+       END
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+       AND NEW.equipped_before = COALESCE(
+           (
+               SELECT previous.equipped_after
+                 FROM storage_equipment_event previous
+                WHERE previous.container_id = NEW.container_id
+             ORDER BY previous.id DESC
+                LIMIT 1
+           ),
+           0
+       )
+       AND (
+           (NEW.action = 'equip'
+            AND NOT EXISTS(
+                SELECT 1
+                  FROM storage_container other
+                 WHERE other.player_id = NEW.player_id
+                   AND other.storage_type = NEW.storage_type
+                   AND other.id <> NEW.container_id
+                   AND COALESCE(
+                       (
+                           SELECT previous.equipped_after
+                             FROM storage_equipment_event previous
+                            WHERE previous.container_id = other.id
+                         ORDER BY previous.id DESC
+                            LIMIT 1
+                       ),
+                       0
+                   ) = 1
+            ))
+           OR
+           (NEW.action = 'unequip')
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'storage equipment scope, audit, or slot mismatch');
+END;
+
+CREATE TRIGGER storage_container_seal_guard
+BEFORE UPDATE OF sealed, seal_type ON storage_container
+WHEN NEW.sealed = 1
+  AND OLD.sealed = 0
+  AND EXISTS(
+      SELECT 1
+        FROM storage_container_attribute attribute
+       WHERE attribute.container_id = OLD.id
+  )
+
+BEGIN
+    SELECT RAISE(ABORT, 'unsealed storage container cannot be sealed again');
+END;
+
+CREATE TRIGGER storage_container_unseal_guard
+BEFORE UPDATE OF sealed, seal_type ON storage_container
+WHEN NEW.sealed = 0
+  AND OLD.sealed = 1
+  AND NOT EXISTS(
+      SELECT 1 FROM storage_container_attribute attribute
+       WHERE attribute.container_id = OLD.id
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'unseal state transition is controlled by the attribute transaction');
+END;
+
+CREATE TRIGGER storage_container_seal_equipped_guard
+BEFORE UPDATE OF sealed, seal_type ON storage_container
+WHEN NEW.sealed = 1
+  AND OLD.sealed = 0
+  AND EXISTS(
+      SELECT 1
+        FROM storage_equipment_event current_event
+       WHERE current_event.container_id = OLD.id
+         AND current_event.equipped_after = 1
+         AND current_event.id = (
+             SELECT MAX(latest.id)
+               FROM storage_equipment_event latest
+              WHERE latest.container_id = OLD.id
+         )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'equipped storage container must be unequipped before sealing');
+END;
+
+DROP TRIGGER storage_item_scope_guard;
+CREATE TRIGGER storage_item_scope_guard
+BEFORE INSERT ON storage_item
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM storage_container container
+      JOIN item catalog ON catalog.item_key = NEW.item_key
+     WHERE container.id = NEW.container_id
+       AND NEW.slot_index < container.capacity + COALESCE(
+           (
+               SELECT attribute.attribute_value
+                 FROM storage_container_attribute attribute
+                WHERE attribute.container_id = container.id
+                  AND attribute.attribute_key = 'capacity_bonus'
+           ),
+           0
+       )
+       AND NEW.quantity <= catalog.max_stack + COALESCE(
+           (
+               SELECT attribute.attribute_value
+                 FROM storage_container_attribute attribute
+                WHERE attribute.container_id = container.id
+                  AND attribute.attribute_key = 'stack_bonus'
+           ),
+           0
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'storage item scope or stack mismatch');
+END;
+
+DROP TRIGGER storage_item_scope_update_guard;
+CREATE TRIGGER storage_item_scope_update_guard
+BEFORE UPDATE OF container_id, slot_index, item_key, quantity ON storage_item
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM storage_container container
+      JOIN item catalog ON catalog.item_key = NEW.item_key
+     WHERE container.id = NEW.container_id
+       AND NEW.slot_index < container.capacity + COALESCE(
+           (
+               SELECT attribute.attribute_value
+                 FROM storage_container_attribute attribute
+                WHERE attribute.container_id = container.id
+                  AND attribute.attribute_key = 'capacity_bonus'
+           ),
+           0
+       )
+       AND NEW.quantity <= catalog.max_stack + COALESCE(
+           (
+               SELECT attribute.attribute_value
+                 FROM storage_container_attribute attribute
+                WHERE attribute.container_id = container.id
+                  AND attribute.attribute_key = 'stack_bonus'
+           ),
+           0
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'storage item scope or stack mismatch');
+END;
+
+DROP TRIGGER item_storage_stack_update;
+CREATE TRIGGER item_storage_stack_update
+BEFORE UPDATE OF max_stack ON item
+WHEN EXISTS(
+    SELECT 1
+      FROM storage_item stored
+      JOIN storage_container container ON container.id = stored.container_id
+     WHERE stored.item_key = OLD.item_key
+       AND stored.quantity > NEW.max_stack + COALESCE(
+           (
+               SELECT attribute.attribute_value
+                 FROM storage_container_attribute attribute
+                WHERE attribute.container_id = container.id
+                  AND attribute.attribute_key = 'stack_bonus'
+           ),
+           0
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'item max_stack is below existing storage');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -5732,6 +6159,81 @@ pub struct InventoryPage {
     pub page: usize,
     pub page_count: usize,
     pub total: usize,
+}
+
+/// 储物器摘要；`player_id` 不对外暴露，绑定由当前稳定身份在查询入口校验。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageContainerRecord {
+    pub id: i64,
+    pub name: String,
+    pub storage_type: String,
+    pub capacity: i64,
+    pub portable: bool,
+    pub sealed: bool,
+    pub bound: bool,
+    pub used_slots: i64,
+    pub equipped: bool,
+    pub attribute: Option<StorageAttributeRecord>,
+}
+
+/// 储物器中的一个物品槽位。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageItemRecord {
+    pub id: i64,
+    pub container_id: i64,
+    pub slot_index: i64,
+    pub item: ItemRecord,
+    pub quantity: i64,
+}
+
+/// 已打开储物器的只读内容。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageContents {
+    pub container: StorageContainerRecord,
+    pub entries: Vec<StorageItemRecord>,
+}
+
+/// 存入或取出后的原子资产回执。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageMoveReceipt {
+    pub action: String,
+    pub container: StorageContainerRecord,
+    pub item: ItemRecord,
+    pub slot_index: i64,
+    pub quantity: i64,
+    pub inventory_before: i64,
+    pub inventory_after: i64,
+    pub storage_before: i64,
+    pub storage_after: i64,
+}
+
+/// 封印储物器后的状态回执。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageSealReceipt {
+    pub container: StorageContainerRecord,
+}
+
+/// 魂导器解封时生成的一次性随机属性。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageAttributeRecord {
+    pub id: i64,
+    pub container_id: i64,
+    pub attribute_key: String,
+    pub attribute_value: i64,
+}
+
+/// 解封回执；属性和容器状态在同一事务中生成。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageUnsealReceipt {
+    pub container: StorageContainerRecord,
+    pub attribute: StorageAttributeRecord,
+}
+
+/// 魂导器装备或卸下回执。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageEquipmentReceipt {
+    pub action: String,
+    pub container: StorageContainerRecord,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8546,7 +9048,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
                     format!(
-                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32 失败：{error}"
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34 失败：{error}"
                     )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
@@ -9040,10 +9542,40 @@ impl Store {
                 validate_v32_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 33)? {
+                transaction
+                    .execute_batch(MIGRATION_V33)
+                    .map_err(|error| format!("执行数据库迁移 v33 失败：{error}"))?;
+                validate_v33_schema(&transaction)?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(33, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v33 失败：{error}"))?;
+            } else {
+                validate_v33_schema(&transaction)?;
+            }
+
+            if !migration_applied(&transaction, 34)? {
+                transaction
+                    .execute_batch(MIGRATION_V34)
+                    .map_err(|error| format!("执行数据库迁移 v34 失败：{error}"))?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(34, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v34 失败：{error}"))?;
+                validate_v34_schema(&transaction)?;
+            } else {
+                validate_v34_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34 失败：{error}"
                 )
             })?;
             Ok(())
@@ -9082,6 +9614,7 @@ impl Store {
                 validate_v30_schema(connection)?;
                 validate_v31_schema(connection)?;
                 validate_v32_schema(connection)?;
+                validate_v34_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -9901,6 +10434,11 @@ impl Store {
             return Err("转账金额必须大于 0".to_string());
         }
 
+        // 钱包转账在同一 Store 内串行进入 SQLite，避免并发提交把锁等待错误暴露成业务失败。
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| "钱包转账写锁已损坏".to_string())?;
         let mut connection = self.open()?;
         let transaction = self.begin_immediate(&mut connection, "开始钱包转账事务失败")?;
         ensure_no_legacy_identity(&transaction, key)?;
@@ -10343,6 +10881,517 @@ impl Store {
             page,
             page_count,
             total,
+        })
+    }
+
+    /// 创建一个已绑定当前玩家的储物器；当前只供系统发放和测试入口使用。
+    #[allow(dead_code)] // 聊天层不允许玩家自行伪造魂导器，发放由后续系统入口调用。
+    pub fn create_storage_container(
+        &self,
+        key: &IdentityKey<'_>,
+        name: &str,
+        storage_type: &str,
+        capacity: i64,
+        sealed: bool,
+    ) -> Result<StorageContainerRecord, String> {
+        validate_identity_key(key)?;
+        validate_catalog_lookup(name, "储物器名称")?;
+        let (_, portable) = storage_type_contract(storage_type)?;
+        if !(1..=200).contains(&capacity) {
+            return Err("储物器容量必须在 1 到 200 个物品槽之间".to_string());
+        }
+        let mut connection = self.open()?;
+        let transaction = self.begin_immediate(&mut connection, "开始创建储物器事务失败")?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let (player_id, state) = load_storage_player(&transaction, key)?;
+        ensure_storage_player_can_mutate(&transaction, player_id, &state)?;
+        let timestamp = now_timestamp()?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO storage_container(
+                    player_id, name, storage_type, capacity, portable,
+                    sealed, seal_type, bound, created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8)
+                "#,
+                params![
+                    player_id,
+                    name.trim(),
+                    storage_type,
+                    capacity,
+                    portable,
+                    sealed,
+                    if sealed { "owner" } else { "none" },
+                    timestamp
+                ],
+            )
+            .map_err(|error| format!("创建储物器失败：{error}"))?;
+        let container_id = transaction.last_insert_rowid();
+        let container = load_storage_container_by_id(&transaction, player_id, container_id)?
+            .ok_or_else(|| "创建储物器后无法读取记录".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交创建储物器事务失败：{error}"))?;
+        Ok(container)
+    }
+
+    /// 读取当前玩家的全部储物器摘要；不存在容器时返回空列表。
+    pub fn storage_containers(
+        &self,
+        key: &IdentityKey<'_>,
+    ) -> Result<Vec<StorageContainerRecord>, String> {
+        validate_identity_key(key)?;
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let (player_id, state) = load_storage_player(&connection, key)?;
+        if state == "deleted" {
+            return Err("角色已封存，不能查看储物器".to_string());
+        }
+        query_storage_containers(&connection, player_id)
+    }
+
+    /// 查看一个未封印储物器的内容；玩家绑定在查询入口强制校验。
+    pub fn storage_contents(
+        &self,
+        key: &IdentityKey<'_>,
+        name_or_id: &str,
+    ) -> Result<StorageContents, String> {
+        validate_identity_key(key)?;
+        validate_catalog_lookup(name_or_id, "储物器名称")?;
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let (player_id, state) = load_storage_player(&connection, key)?;
+        ensure_storage_player_can_mutate(&connection, player_id, &state)?;
+        let container = load_storage_container(&connection, player_id, name_or_id)?
+            .ok_or_else(|| "当前玩家没有这个储物器".to_string())?;
+        ensure_storage_container_usable(&container, "查看内容")?;
+        let entries = query_storage_items(&connection, container.id)?;
+        Ok(StorageContents { container, entries })
+    }
+
+    /// 在一个写事务中扣减随身背包并增加储物器槽位。
+    pub fn store_item_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        container_name_or_id: &str,
+        item_name_or_key: &str,
+        quantity: i64,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<StorageMoveReceipt, String> {
+        validate_identity_key(key)?;
+        validate_catalog_lookup(container_name_or_id, "储物器名称")?;
+        validate_catalog_lookup(item_name_or_key, "物品名称")?;
+        validate_storage_quantity(quantity)?;
+        validate_storage_operation(operation, "存入")?;
+
+        let mut connection = self.open()?;
+        let transaction = self.begin_immediate(&mut connection, "开始存入储物器事务失败")?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        reject_replayed_storage_operation(&transaction, key, operation)?;
+        let (player_id, state) = load_storage_player(&transaction, key)?;
+        ensure_storage_player_can_mutate(&transaction, player_id, &state)?;
+        let container = load_storage_container(&transaction, player_id, container_name_or_id)?
+            .ok_or_else(|| "当前玩家没有这个储物器".to_string())?;
+        ensure_storage_container_usable(&container, "存入物品")?;
+        let item = load_item_by_name_or_key(&transaction, item_name_or_key)?;
+        let storage_max_stack = storage_item_max_stack(&container, &item)?;
+        let inventory_before = inventory_quantity(&transaction, player_id, &item.item_key)?;
+        if inventory_before < quantity {
+            return Err(format!(
+                "背包中的{}不足：需要{}件，当前{}件",
+                item.name, quantity, inventory_before
+            ));
+        }
+
+        let stored = load_storage_slot_by_item(&transaction, container.id, &item.item_key)?;
+        let (slot_index, storage_before, storage_after) = if let Some(stored) = stored {
+            let storage_after = stored
+                .quantity
+                .checked_add(quantity)
+                .ok_or_else(|| "储物器物品数量溢出".to_string())?;
+            if storage_after > storage_max_stack {
+                return Err(format!(
+                    "储物器中的{}最多堆叠{}件，当前已有{}件",
+                    item.name, storage_max_stack, stored.quantity
+                ));
+            }
+            transaction
+                .execute(
+                    "UPDATE storage_item SET quantity = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![storage_after, now_timestamp()?, stored.id],
+                )
+                .map_err(|error| format!("更新储物器物品失败：{error}"))?;
+            (stored.slot_index, stored.quantity, storage_after)
+        } else {
+            if quantity > storage_max_stack {
+                return Err(format!(
+                    "储物器中的{}最多堆叠{}件",
+                    item.name, storage_max_stack
+                ));
+            }
+            let slot_index = next_storage_slot(&transaction, container.id, container.capacity)?;
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO storage_item(
+                        container_id, slot_index, item_key, quantity, created_at, updated_at
+                    ) VALUES(?1, ?2, ?3, ?4, ?5, ?5)
+                    "#,
+                    params![
+                        container.id,
+                        slot_index,
+                        item.item_key,
+                        quantity,
+                        now_timestamp()?
+                    ],
+                )
+                .map_err(|error| format!("写入储物器物品失败：{error}"))?;
+            (slot_index, 0, quantity)
+        };
+        let inventory_after = inventory_before
+            .checked_sub(quantity)
+            .ok_or_else(|| "存入后背包数量下溢".to_string())?;
+        set_inventory_quantity(
+            &transaction,
+            player_id,
+            &item.item_key,
+            inventory_after,
+            now_timestamp()?,
+        )?;
+        touch_storage_container(&transaction, container.id)?;
+        insert_operation_log(&transaction, key, operation)?;
+        let container = load_storage_container_by_id(&transaction, player_id, container.id)?
+            .ok_or_else(|| "存入物品后无法读取储物器".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交存入储物器事务失败：{error}"))?;
+        Ok(StorageMoveReceipt {
+            action: "store".to_string(),
+            container,
+            item,
+            slot_index,
+            quantity,
+            inventory_before,
+            inventory_after,
+            storage_before,
+            storage_after,
+        })
+    }
+
+    /// 在一个写事务中从储物器扣减物品并增加随身背包。
+    pub fn withdraw_item_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        container_name_or_id: &str,
+        item_name_or_key: &str,
+        quantity: i64,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<StorageMoveReceipt, String> {
+        validate_identity_key(key)?;
+        validate_catalog_lookup(container_name_or_id, "储物器名称")?;
+        validate_catalog_lookup(item_name_or_key, "物品名称")?;
+        validate_storage_quantity(quantity)?;
+        validate_storage_operation(operation, "取出")?;
+
+        let mut connection = self.open()?;
+        let transaction = self.begin_immediate(&mut connection, "开始取出储物器事务失败")?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        reject_replayed_storage_operation(&transaction, key, operation)?;
+        let (player_id, state) = load_storage_player(&transaction, key)?;
+        ensure_storage_player_can_mutate(&transaction, player_id, &state)?;
+        let container = load_storage_container(&transaction, player_id, container_name_or_id)?
+            .ok_or_else(|| "当前玩家没有这个储物器".to_string())?;
+        ensure_storage_container_usable(&container, "取出物品")?;
+        let stored =
+            load_storage_slot_by_name_or_key(&transaction, container.id, item_name_or_key)?
+                .ok_or_else(|| "该储物器中没有这个物品".to_string())?;
+        let item = stored.item;
+        if stored.quantity < quantity {
+            return Err(format!(
+                "储物器中的{}不足：需要{}件，当前{}件",
+                item.name, quantity, stored.quantity
+            ));
+        }
+        let inventory_before = inventory_quantity(&transaction, player_id, &item.item_key)?;
+        let inventory_after = inventory_before
+            .checked_add(quantity)
+            .ok_or_else(|| "取出后背包数量溢出".to_string())?;
+        if inventory_after > item.max_stack {
+            return Err(format!(
+                "背包中的{}最多堆叠{}件，当前已有{}件",
+                item.name, item.max_stack, inventory_before
+            ));
+        }
+        let storage_after = stored
+            .quantity
+            .checked_sub(quantity)
+            .ok_or_else(|| "取出后储物器数量下溢".to_string())?;
+        if storage_after == 0 {
+            transaction
+                .execute("DELETE FROM storage_item WHERE id = ?1", [stored.id])
+                .map_err(|error| format!("清理储物器物品失败：{error}"))?;
+        } else {
+            transaction
+                .execute(
+                    "UPDATE storage_item SET quantity = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![storage_after, now_timestamp()?, stored.id],
+                )
+                .map_err(|error| format!("更新储物器物品失败：{error}"))?;
+        }
+        set_inventory_quantity(
+            &transaction,
+            player_id,
+            &item.item_key,
+            inventory_after,
+            now_timestamp()?,
+        )?;
+        touch_storage_container(&transaction, container.id)?;
+        insert_operation_log(&transaction, key, operation)?;
+        let container = load_storage_container_by_id(&transaction, player_id, container.id)?
+            .ok_or_else(|| "取出物品后无法读取储物器".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交取出储物器事务失败：{error}"))?;
+        Ok(StorageMoveReceipt {
+            action: "withdraw".to_string(),
+            container,
+            item,
+            slot_index: stored.slot_index,
+            quantity,
+            inventory_before,
+            inventory_after,
+            storage_before: stored.quantity,
+            storage_after,
+        })
+    }
+
+    /// 封印储物器；已解封的魂导器不可再次封印。
+    pub fn seal_storage_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        name_or_id: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<StorageSealReceipt, String> {
+        validate_identity_key(key)?;
+        validate_catalog_lookup(name_or_id, "储物器名称")?;
+        validate_storage_operation(operation, "封印储物器")?;
+        let mut connection = self.open()?;
+        let transaction = self.begin_immediate(&mut connection, "开始封印储物器事务失败")?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        reject_replayed_storage_operation(&transaction, key, operation)?;
+        let (player_id, state) = load_storage_player(&transaction, key)?;
+        ensure_storage_player_can_mutate(&transaction, player_id, &state)?;
+        let container = load_storage_container(&transaction, player_id, name_or_id)?
+            .ok_or_else(|| "当前玩家没有这个储物器".to_string())?;
+        if container.sealed {
+            return Err(format!("储物器“{}”已经封印", container.name));
+        }
+        if container.equipped {
+            return Err(format!(
+                "储物器“{}”已经装备，请先卸下后再封印",
+                container.name
+            ));
+        }
+        transaction
+            .execute(
+                "UPDATE storage_container SET sealed = 1, seal_type = 'owner', updated_at = ?1 WHERE id = ?2 AND sealed = 0",
+                params![now_timestamp()?, container.id],
+            )
+            .map_err(|error| format!("保存储物器封印状态失败：{error}"))?;
+        insert_operation_log(&transaction, key, operation)?;
+        let container = load_storage_container_by_id(&transaction, player_id, container.id)?
+            .ok_or_else(|| "封印储物器后无法读取记录".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交封印储物器事务失败：{error}"))?;
+        Ok(StorageSealReceipt { container })
+    }
+
+    /// 解封储物器并在同一事务中生成一次性随机属性。
+    pub fn unseal_storage_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        name_or_id: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<StorageUnsealReceipt, String> {
+        validate_identity_key(key)?;
+        validate_catalog_lookup(name_or_id, "储物器名称")?;
+        validate_storage_operation(operation, "解封储物器")?;
+        let mut connection = self.open()?;
+        let transaction = self.begin_immediate(&mut connection, "开始解封储物器事务失败")?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        reject_replayed_storage_operation(&transaction, key, operation)?;
+        let (player_id, state) = load_storage_player(&transaction, key)?;
+        ensure_storage_player_can_mutate(&transaction, player_id, &state)?;
+        let container = load_storage_container(&transaction, player_id, name_or_id)?
+            .ok_or_else(|| "当前玩家没有这个储物器".to_string())?;
+        if !container.portable || !matches!(container.storage_type.as_str(), "ring" | "bracelet") {
+            return Err(format!(
+                "储物器“{}”是固定储物设施，不能解封为魂导器",
+                container.name
+            ));
+        }
+        if !container.sealed {
+            return Err(format!("储物器“{}”已经解封", container.name));
+        }
+        if load_storage_attribute(&transaction, container.id)?.is_some() {
+            return Err(format!(
+                "储物器“{}”已有随机属性，拒绝重复解封",
+                container.name
+            ));
+        }
+
+        let (kind_roll, capacity_roll, stack_roll) = transaction
+            .query_row(
+                "SELECT (random() & 9223372036854775807) % 100, (random() & 9223372036854775807) % 20, (random() & 9223372036854775807) % 50",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+            )
+            .map_err(|error| format!("生成魂导器随机属性失败：{error}"))?;
+        let (attribute_key, attribute_value) = if kind_roll < 60 {
+            ("capacity_bonus", capacity_roll + 1)
+        } else {
+            ("stack_bonus", stack_roll + 1)
+        };
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO storage_container_attribute(
+                    container_id, player_id, attribute_key, attribute_value,
+                    source_message_id, operation_log_id, created_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+                params![
+                    container.id,
+                    player_id,
+                    attribute_key,
+                    attribute_value,
+                    operation.source_message_id,
+                    operation_log_id,
+                    now_timestamp()?
+                ],
+            )
+            .map_err(|error| format!("保存魂导器随机属性失败：{error}"))?;
+        transaction
+            .execute(
+                "UPDATE storage_container SET sealed = 0, seal_type = 'none', updated_at = ?1 WHERE id = ?2 AND sealed = 1",
+                params![now_timestamp()?, container.id],
+            )
+            .map_err(|error| format!("保存储物器解封状态失败：{error}"))?;
+        let attribute = load_storage_attribute(&transaction, container.id)?
+            .ok_or_else(|| "解封后无法读取魂导器随机属性".to_string())?;
+        let container = load_storage_container_by_id(&transaction, player_id, container.id)?
+            .ok_or_else(|| "解封后无法读取储物器记录".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交解封储物器事务失败：{error}"))?;
+        Ok(StorageUnsealReceipt {
+            container,
+            attribute,
+        })
+    }
+
+    /// 装备一个已解封的便携魂导器；戒指和手镯各自占用一个装备槽。
+    pub fn equip_storage_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        name_or_id: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<StorageEquipmentReceipt, String> {
+        self.change_storage_equipment(key, name_or_id, operation, true)
+    }
+
+    /// 卸下一个便携魂导器；卸下后不能继续访问其中的物品。
+    pub fn unequip_storage_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        name_or_id: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<StorageEquipmentReceipt, String> {
+        self.change_storage_equipment(key, name_or_id, operation, false)
+    }
+
+    fn change_storage_equipment(
+        &self,
+        key: &IdentityKey<'_>,
+        name_or_id: &str,
+        operation: &OperationLogInput<'_>,
+        equip: bool,
+    ) -> Result<StorageEquipmentReceipt, String> {
+        validate_identity_key(key)?;
+        validate_catalog_lookup(name_or_id, "储物器名称")?;
+        let command = if equip {
+            "装备魂导器"
+        } else {
+            "卸下魂导器"
+        };
+        validate_storage_operation(operation, command)?;
+        let mut connection = self.open()?;
+        let transaction = self.begin_immediate(&mut connection, "开始变更魂导器装备事务失败")?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        reject_replayed_storage_operation(&transaction, key, operation)?;
+        let (player_id, state) = load_storage_player(&transaction, key)?;
+        ensure_storage_player_can_mutate(&transaction, player_id, &state)?;
+        let container = load_storage_container(&transaction, player_id, name_or_id)?
+            .ok_or_else(|| "当前玩家没有这个储物器".to_string())?;
+        if !container.portable {
+            return Err(format!(
+                "储物器“{}”是固定储物设施，不能装备或卸下",
+                container.name
+            ));
+        }
+        if container.sealed {
+            return Err(format!("储物器“{}”已封印，不能装备或卸下", container.name));
+        }
+        if load_storage_attribute(&transaction, container.id)?.is_none() {
+            return Err(format!(
+                "储物器“{}”尚未解封，不能装备或卸下",
+                container.name
+            ));
+        }
+        if container.equipped == equip {
+            return Err(if equip {
+                format!("储物器“{}”已经装备", container.name)
+            } else {
+                format!("储物器“{}”尚未装备", container.name)
+            });
+        }
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO storage_equipment_event(
+                    player_id, container_id, storage_type, action,
+                    equipped_before, equipped_after, source_message_id,
+                    operation_log_id, created_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+                params![
+                    player_id,
+                    container.id,
+                    container.storage_type,
+                    if equip { "equip" } else { "unequip" },
+                    if equip { 0 } else { 1 },
+                    if equip { 1 } else { 0 },
+                    operation.source_message_id,
+                    operation_log_id,
+                    now_timestamp()?
+                ],
+            )
+            .map_err(|error| format!("保存魂导器装备事件失败：{error}"))?;
+        let container = load_storage_container_by_id(&transaction, player_id, container.id)?
+            .ok_or_else(|| "变更魂导器装备后无法读取记录".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交魂导器装备事务失败：{error}"))?;
+        Ok(StorageEquipmentReceipt {
+            action: if equip {
+                "equip".to_string()
+            } else {
+                "unequip".to_string()
+            },
+            container,
         })
     }
 
@@ -17719,6 +18768,31 @@ fn validate_battle_operation(
     Ok(())
 }
 
+fn validate_storage_quantity(quantity: i64) -> Result<(), String> {
+    if !(1..=9999).contains(&quantity) {
+        return Err("储物器操作数量必须在 1 到 9999 之间".to_string());
+    }
+    Ok(())
+}
+
+fn validate_storage_operation(
+    operation: &OperationLogInput<'_>,
+    command: &str,
+) -> Result<(), String> {
+    validate_operation_input(operation)?;
+    if operation.command != command || operation.outcome != "ok" {
+        return Err(format!(
+            "{command}成功审计必须使用规范命令“{command}”和 ok 结果"
+        ));
+    }
+    if operation.source_message_id.is_empty() {
+        return Err(format!(
+            "{command}必须携带非空消息 ID，以保证资产操作不会重复执行"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_soul_ring_absorb_operation(operation: &OperationLogInput<'_>) -> Result<(), String> {
     validate_operation_input(operation)?;
     if operation.command != "吸收魂环" || operation.outcome != "ok" {
@@ -17897,6 +18971,387 @@ fn set_inventory_quantity(
             params![player_id, item_key, quantity, timestamp],
         )
         .map_err(|error| format!("更新背包物品失败：{error}"))?;
+    Ok(())
+}
+
+#[allow(dead_code)] // 由系统发放入口调用，聊天命令不直接暴露创建储物器。
+fn storage_type_contract(storage_type: &str) -> Result<(i64, bool), String> {
+    match storage_type {
+        "ring" => Ok((20, true)),
+        "bag" => Ok((50, false)),
+        "bracelet" => Ok((30, true)),
+        "space" => Ok((100, false)),
+        "warehouse" => Ok((200, false)),
+        _ => Err("储物器类型只能是 ring、bag、bracelet、space 或 warehouse".to_string()),
+    }
+}
+
+fn load_storage_player(
+    connection: &Connection,
+    key: &IdentityKey<'_>,
+) -> Result<(i64, String), String> {
+    connection
+        .query_row(
+            r#"
+            SELECT p.id, p.state
+              FROM identity i
+              JOIN player p ON p.identity_id = i.id
+             WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+               AND i.subject_kind = ?4 AND i.subject_id = ?5
+            "#,
+            params![
+                key.protocol.as_str(),
+                key.account_id,
+                key.namespace,
+                key.subject_kind,
+                key.subject_id
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("读取储物器所属角色失败：{error}"))?
+        .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())
+}
+
+fn ensure_storage_player_can_mutate(
+    connection: &Connection,
+    player_id: i64,
+    state: &str,
+) -> Result<(), String> {
+    match state {
+        "alive" => {}
+        "dead" => return Err("当前角色已死亡，不能操作储物器".to_string()),
+        "deleted" => return Err("角色已封存，不能操作储物器".to_string()),
+        _ => return Err("角色状态无效，拒绝操作储物器".to_string()),
+    }
+    ensure_no_active_battle_for_player(connection, player_id)
+}
+
+fn ensure_storage_container_usable(
+    container: &StorageContainerRecord,
+    action: &str,
+) -> Result<(), String> {
+    if container.sealed {
+        return Err(format!("储物器“{}”已封印，不能{}", container.name, action));
+    }
+    if container.portable && !container.equipped {
+        return Err(format!(
+            "储物器“{}”尚未装备，不能{}",
+            container.name, action
+        ));
+    }
+    Ok(())
+}
+
+fn storage_item_max_stack(
+    container: &StorageContainerRecord,
+    item: &ItemRecord,
+) -> Result<i64, String> {
+    let bonus = container
+        .attribute
+        .as_ref()
+        .filter(|attribute| attribute.attribute_key == "stack_bonus")
+        .map_or(0, |attribute| attribute.attribute_value);
+    item.max_stack
+        .checked_add(bonus)
+        .ok_or_else(|| "魂导器堆叠上限溢出".to_string())
+}
+
+fn storage_container_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StorageContainerRecord> {
+    Ok(StorageContainerRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        storage_type: row.get(2)?,
+        capacity: row.get(3)?,
+        portable: row.get(4)?,
+        sealed: row.get(5)?,
+        bound: row.get(6)?,
+        used_slots: row.get(7)?,
+        equipped: false,
+        attribute: None,
+    })
+}
+
+fn storage_attribute_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StorageAttributeRecord> {
+    Ok(StorageAttributeRecord {
+        id: row.get(0)?,
+        container_id: row.get(1)?,
+        attribute_key: row.get(2)?,
+        attribute_value: row.get(3)?,
+    })
+}
+
+fn load_storage_attribute(
+    connection: &Connection,
+    container_id: i64,
+) -> Result<Option<StorageAttributeRecord>, String> {
+    connection
+        .query_row(
+            "SELECT id, container_id, attribute_key, attribute_value FROM storage_container_attribute WHERE container_id = ?1",
+            [container_id],
+            storage_attribute_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取魂导器随机属性失败：{error}"))
+}
+
+fn storage_container_is_equipped(
+    connection: &Connection,
+    container_id: i64,
+) -> Result<bool, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT COALESCE(
+                (
+                    SELECT event.equipped_after
+                      FROM storage_equipment_event event
+                     WHERE event.container_id = ?1
+                  ORDER BY event.id DESC
+                     LIMIT 1
+                ),
+                0
+            )
+            "#,
+            [container_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("读取魂导器装备投影失败：{error}"))
+}
+
+fn hydrate_storage_container(
+    connection: &Connection,
+    container: &mut StorageContainerRecord,
+) -> Result<(), String> {
+    container.attribute = load_storage_attribute(connection, container.id)?;
+    container.equipped =
+        container.portable && storage_container_is_equipped(connection, container.id)?;
+    if let Some(attribute) = &container.attribute
+        && attribute.attribute_key == "capacity_bonus"
+    {
+        container.capacity = container
+            .capacity
+            .checked_add(attribute.attribute_value)
+            .ok_or_else(|| "魂导器有效容量溢出".to_string())?;
+    }
+    Ok(())
+}
+
+fn query_storage_containers(
+    connection: &Connection,
+    player_id: i64,
+) -> Result<Vec<StorageContainerRecord>, String> {
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT container.id, container.name, container.storage_type,
+                   container.capacity, container.portable, container.sealed,
+                   container.bound, COUNT(stored.id)
+              FROM storage_container container
+         LEFT JOIN storage_item stored ON stored.container_id = container.id
+             WHERE container.player_id = ?1
+          GROUP BY container.id
+          ORDER BY container.id
+            "#,
+        )
+        .map_err(|error| format!("准备储物器列表查询失败：{error}"))?;
+    let mut containers = statement
+        .query_map([player_id], storage_container_from_row)
+        .map_err(|error| format!("查询储物器列表失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析储物器列表失败：{error}"))?;
+    for container in &mut containers {
+        hydrate_storage_container(connection, container)?;
+    }
+    Ok(containers)
+}
+
+fn load_storage_container_by_id(
+    connection: &Connection,
+    player_id: i64,
+    container_id: i64,
+) -> Result<Option<StorageContainerRecord>, String> {
+    let container = connection
+        .query_row(
+            r#"
+            SELECT container.id, container.name, container.storage_type,
+                   container.capacity, container.portable, container.sealed,
+                   container.bound, COUNT(stored.id)
+              FROM storage_container container
+         LEFT JOIN storage_item stored ON stored.container_id = container.id
+             WHERE container.player_id = ?1 AND container.id = ?2
+          GROUP BY container.id
+            "#,
+            params![player_id, container_id],
+            storage_container_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取储物器失败：{error}"))?;
+    container
+        .map(|mut container| {
+            hydrate_storage_container(connection, &mut container)?;
+            Ok(container)
+        })
+        .transpose()
+}
+
+fn load_storage_container(
+    connection: &Connection,
+    player_id: i64,
+    name_or_id: &str,
+) -> Result<Option<StorageContainerRecord>, String> {
+    let container = connection
+        .query_row(
+            r#"
+            SELECT container.id, container.name, container.storage_type,
+                   container.capacity, container.portable, container.sealed,
+                   container.bound, COUNT(stored.id)
+              FROM storage_container container
+         LEFT JOIN storage_item stored ON stored.container_id = container.id
+             WHERE container.player_id = ?1
+               AND (container.name = ?2 OR CAST(container.id AS TEXT) = ?2)
+          GROUP BY container.id
+          ORDER BY container.id
+             LIMIT 1
+            "#,
+            params![player_id, name_or_id],
+            storage_container_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("按名称读取储物器失败：{error}"))?;
+    container
+        .map(|mut container| {
+            hydrate_storage_container(connection, &mut container)?;
+            Ok(container)
+        })
+        .transpose()
+}
+
+fn query_storage_items(
+    connection: &Connection,
+    container_id: i64,
+) -> Result<Vec<StorageItemRecord>, String> {
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT stored.id, stored.container_id, stored.slot_index,
+                   item.item_key, item.name, item.category, item.quality,
+                   item.stackable, item.max_stack, item.buy_price, item.sell_price,
+                   item.level_required, item.effect_kind, item.effect_amount,
+                   item.revive_hp_percent, item.purchasable, item.sellable,
+                   item.usable, item.description, stored.quantity
+              FROM storage_item stored
+              JOIN item ON item.item_key = stored.item_key
+             WHERE stored.container_id = ?1
+          ORDER BY stored.slot_index, stored.id
+            "#,
+        )
+        .map_err(|error| format!("准备储物器内容查询失败：{error}"))?;
+    statement
+        .query_map([container_id], |row| {
+            Ok(StorageItemRecord {
+                id: row.get(0)?,
+                container_id: row.get(1)?,
+                slot_index: row.get(2)?,
+                item: item_record_from_row(row, 3)?,
+                quantity: row.get(19)?,
+            })
+        })
+        .map_err(|error| format!("查询储物器内容失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析储物器内容失败：{error}"))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StorageSlotState {
+    id: i64,
+    slot_index: i64,
+    quantity: i64,
+}
+
+fn load_storage_slot_by_item(
+    connection: &Connection,
+    container_id: i64,
+    item_key: &str,
+) -> Result<Option<StorageSlotState>, String> {
+    connection
+        .query_row(
+            "SELECT id, slot_index, quantity FROM storage_item WHERE container_id = ?1 AND item_key = ?2",
+            params![container_id, item_key],
+            |row| {
+                Ok(StorageSlotState {
+                    id: row.get(0)?,
+                    slot_index: row.get(1)?,
+                    quantity: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取储物器物品槽位失败：{error}"))
+}
+
+fn load_storage_slot_by_name_or_key(
+    connection: &Connection,
+    container_id: i64,
+    item_name_or_key: &str,
+) -> Result<Option<StorageItemRecord>, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT stored.id, stored.container_id, stored.slot_index,
+                   item.item_key, item.name, item.category, item.quality,
+                   item.stackable, item.max_stack, item.buy_price, item.sell_price,
+                   item.level_required, item.effect_kind, item.effect_amount,
+                   item.revive_hp_percent, item.purchasable, item.sellable,
+                   item.usable, item.description, stored.quantity
+              FROM storage_item stored
+              JOIN item ON item.item_key = stored.item_key
+             WHERE stored.container_id = ?1
+               AND (item.name = ?2 OR item.item_key = ?2)
+             LIMIT 1
+            "#,
+            params![container_id, item_name_or_key],
+            |row| {
+                Ok(StorageItemRecord {
+                    id: row.get(0)?,
+                    container_id: row.get(1)?,
+                    slot_index: row.get(2)?,
+                    item: item_record_from_row(row, 3)?,
+                    quantity: row.get(19)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("按名称读取储物器物品失败：{error}"))
+}
+
+fn next_storage_slot(
+    connection: &Connection,
+    container_id: i64,
+    capacity: i64,
+) -> Result<i64, String> {
+    let occupied = connection
+        .prepare("SELECT slot_index FROM storage_item WHERE container_id = ?1")
+        .map_err(|error| format!("准备储物器槽位查询失败：{error}"))?
+        .query_map([container_id], |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("查询储物器槽位失败：{error}"))?
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|error| format!("解析储物器槽位失败：{error}"))?;
+    (0..capacity)
+        .find(|slot| !occupied.contains(slot))
+        .ok_or_else(|| "储物器槽位已满".to_string())
+}
+
+fn touch_storage_container(connection: &Connection, container_id: i64) -> Result<(), String> {
+    let updated = connection
+        .execute(
+            "UPDATE storage_container SET updated_at = ?1 WHERE id = ?2",
+            params![now_timestamp()?, container_id],
+        )
+        .map_err(|error| format!("更新储物器时间失败：{error}"))?;
+    if updated != 1 {
+        return Err("更新储物器时记录状态发生变化".to_string());
+    }
     Ok(())
 }
 
@@ -20948,6 +22403,8 @@ fn validate_v8_triggers(connection: &Connection) -> Result<(), String> {
                 | "ground_drop"
                 | "ground_drop_claim"
                 | "ground_drop_expiration"
+                | "storage_container"
+                | "storage_item"
                 | "soul_beast"
                 | "battle"
                 | "battle_event"
@@ -20957,6 +22414,9 @@ fn validate_v8_triggers(connection: &Connection) -> Result<(), String> {
         let declared = expected.iter().any(|(expected_name, expected_table)| {
             name == *expected_name && table == *expected_table
         });
+        if migration_applied(connection, 33)? && name == "item_storage_stack_update" {
+            continue;
+        }
         let touches_v8 = matches!(
             table.as_str(),
             "item" | "inventory" | "npc" | "shop_item" | "player_npc"
@@ -27178,6 +28638,676 @@ fn validate_v32_schema(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// 校验储物器结构、玩家绑定和物品槽位边界，损坏时拒绝启动。
+fn validate_v33_schema(connection: &Connection) -> Result<(), String> {
+    validate_v32_schema(connection)?;
+
+    let container_columns = table_columns_with_type(connection, "storage_container")?;
+    let expected_container_columns = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("name", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("storage_type", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("capacity", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("portable", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("sealed", "INTEGER", true, false, Some("0"), 0),
+        TableColumnInfo::new("seal_type", "TEXT", true, false, Some("'none'"), 0),
+        TableColumnInfo::new("bound", "INTEGER", true, false, Some("1"), 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("updated_at", "INTEGER", true, false, None, 0),
+    ];
+    if container_columns != expected_container_columns {
+        return Err(format!(
+            "数据库已标记迁移 v33，但 storage_container 字段不匹配：{container_columns:?}"
+        ));
+    }
+
+    let item_columns = table_columns_with_type(connection, "storage_item")?;
+    let expected_item_columns = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("container_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("slot_index", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("item_key", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("quantity", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("updated_at", "INTEGER", true, false, None, 0),
+    ];
+    if item_columns != expected_item_columns {
+        return Err(format!(
+            "数据库已标记迁移 v33，但 storage_item 字段不匹配：{item_columns:?}"
+        ));
+    }
+
+    validate_v10_table_sql(
+        connection,
+        "storage_container",
+        &[
+            ") STRICT",
+            "PLAYER_ID INTEGER NOT NULL REFERENCES PLAYER(ID) ON DELETE RESTRICT",
+            "STORAGE_TYPE TEXT NOT NULL CHECK(",
+            "CAPACITY INTEGER NOT NULL CHECK(CAPACITY BETWEEN 1 AND 200)",
+            "UNIQUE(PLAYER_ID, NAME)",
+            "SEALED = 0 AND SEAL_TYPE = 'NONE'",
+        ],
+    )
+    .map_err(|error| error.replace("v10", "v33"))?;
+    validate_v10_table_sql(
+        connection,
+        "storage_item",
+        &[
+            ") STRICT",
+            "CONTAINER_ID INTEGER NOT NULL REFERENCES STORAGE_CONTAINER(ID) ON DELETE RESTRICT",
+            "ITEM_KEY TEXT NOT NULL REFERENCES ITEM(ITEM_KEY) ON DELETE RESTRICT",
+            "SLOT_INDEX INTEGER NOT NULL CHECK(SLOT_INDEX >= 0)",
+            "UNIQUE(CONTAINER_ID, SLOT_INDEX)",
+            "UNIQUE(CONTAINER_ID, ITEM_KEY)",
+        ],
+    )
+    .map_err(|error| error.replace("v10", "v33"))?;
+    validate_v9_foreign_keys(
+        connection,
+        "storage_container",
+        &[("player", "player_id", "id", "NO ACTION", "RESTRICT")],
+    )
+    .map_err(|error| error.replace("v9", "v33"))?;
+    validate_v9_foreign_keys(
+        connection,
+        "storage_item",
+        &[
+            ("item", "item_key", "item_key", "NO ACTION", "RESTRICT"),
+            (
+                "storage_container",
+                "container_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+        ],
+    )
+    .map_err(|error| error.replace("v9", "v33"))?;
+    validate_v10_custom_index_set(
+        connection,
+        "storage_container",
+        &["storage_container_player_page"],
+    )
+    .map_err(|error| error.replace("v10", "v33"))?;
+    validate_v10_custom_index_set(connection, "storage_item", &["storage_item_container_page"])
+        .map_err(|error| error.replace("v10", "v33"))?;
+
+    let mut expected_triggers = vec![
+        (
+            "storage_container_binding_guard",
+            "storage_container",
+            &["BEFORE UPDATE OF PLAYER_ID, BOUND", "RAISE(ABORT"] as &[&str],
+        ),
+        (
+            "storage_item_scope_guard",
+            "storage_item",
+            &[
+                "BEFORE INSERT ON STORAGE_ITEM",
+                "JOIN ITEM",
+                "NEW.SLOT_INDEX",
+                "RAISE(ABORT",
+            ] as &[&str],
+        ),
+        (
+            "storage_item_scope_update_guard",
+            "storage_item",
+            &[
+                "BEFORE UPDATE OF CONTAINER_ID, SLOT_INDEX, ITEM_KEY, QUANTITY",
+                "JOIN ITEM",
+                "RAISE(ABORT",
+            ] as &[&str],
+        ),
+        (
+            "item_storage_stack_update",
+            "item",
+            &[
+                "BEFORE UPDATE OF MAX_STACK ON ITEM",
+                "STORED.ITEM_KEY = OLD.ITEM_KEY",
+                "RAISE(ABORT",
+            ] as &[&str],
+        ),
+    ];
+    if migration_applied(connection, 34)? {
+        expected_triggers.extend([
+            (
+                "storage_container_attribute_no_update",
+                "storage_container_attribute",
+                &[
+                    "BEFORE UPDATE ON STORAGE_CONTAINER_ATTRIBUTE",
+                    "RAISE(ABORT",
+                ] as &[&str],
+            ),
+            (
+                "storage_container_attribute_no_delete",
+                "storage_container_attribute",
+                &[
+                    "BEFORE DELETE ON STORAGE_CONTAINER_ATTRIBUTE",
+                    "RAISE(ABORT",
+                ] as &[&str],
+            ),
+            (
+                "storage_container_attribute_no_reinsert",
+                "storage_container_attribute",
+                &[
+                    "BEFORE INSERT ON STORAGE_CONTAINER_ATTRIBUTE",
+                    "APPEND-ONLY",
+                ] as &[&str],
+            ),
+            (
+                "storage_container_attribute_scope_guard",
+                "storage_container_attribute",
+                &["BEFORE INSERT ON STORAGE_CONTAINER_ATTRIBUTE", "解封储物器"] as &[&str],
+            ),
+            (
+                "storage_equipment_event_no_update",
+                "storage_equipment_event",
+                &["BEFORE UPDATE ON STORAGE_EQUIPMENT_EVENT", "RAISE(ABORT"] as &[&str],
+            ),
+            (
+                "storage_equipment_event_no_delete",
+                "storage_equipment_event",
+                &["BEFORE DELETE ON STORAGE_EQUIPMENT_EVENT", "RAISE(ABORT"] as &[&str],
+            ),
+            (
+                "storage_equipment_event_no_reinsert",
+                "storage_equipment_event",
+                &["BEFORE INSERT ON STORAGE_EQUIPMENT_EVENT", "APPEND-ONLY"] as &[&str],
+            ),
+            (
+                "storage_equipment_event_scope_guard",
+                "storage_equipment_event",
+                &["BEFORE INSERT ON STORAGE_EQUIPMENT_EVENT", "装备魂导器"] as &[&str],
+            ),
+            (
+                "storage_container_seal_guard",
+                "storage_container",
+                &[
+                    "BEFORE UPDATE OF SEALED, SEAL_TYPE ON STORAGE_CONTAINER",
+                    "UNSEALED STORAGE CONTAINER",
+                ] as &[&str],
+            ),
+            (
+                "storage_container_unseal_guard",
+                "storage_container",
+                &[
+                    "BEFORE UPDATE OF SEALED, SEAL_TYPE ON STORAGE_CONTAINER",
+                    "UNSEAL STATE TRANSITION",
+                ] as &[&str],
+            ),
+            (
+                "storage_container_seal_equipped_guard",
+                "storage_container",
+                &[
+                    "BEFORE UPDATE OF SEALED, SEAL_TYPE ON STORAGE_CONTAINER",
+                    "EQUIPPED STORAGE CONTAINER",
+                ] as &[&str],
+            ),
+        ]);
+    }
+    for &(name, table, markers) in &expected_triggers {
+        let (actual_table, sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v33 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库缺少 v33 触发器 {name}"))?;
+        let normalized = sql.to_ascii_uppercase();
+        if actual_table != table || markers.iter().any(|marker| !normalized.contains(marker)) {
+            return Err(format!("v33 触发器 {name} 契约不匹配"));
+        }
+    }
+
+    let invalid_rows = storage_v33_rows_invalid(connection, migration_applied(connection, 34)?)?;
+    if invalid_rows {
+        return Err("v33 检测到越界或不一致的储物器数据".to_string());
+    }
+
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v33 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v33 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v33 全库触发器失败：{error}"))?;
+    for (name, table, sql) in triggers {
+        let declared = expected_triggers
+            .iter()
+            .any(|(expected_name, expected_table, _)| {
+                name == *expected_name && table == *expected_table
+            });
+        let touches_v33 = matches!(table.as_str(), "storage_container" | "storage_item")
+            || ["storage_container", "storage_item"]
+                .iter()
+                .any(|identifier| sql_mentions_identifier(&sql, identifier));
+        if touches_v33 && !declared {
+            return Err(format!(
+                "数据库已标记迁移 v33，但触发器 {name}（目标表 {table}）未声明却引用储物器结构"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn storage_v33_rows_invalid(
+    connection: &Connection,
+    include_attributes: bool,
+) -> Result<bool, String> {
+    let query = if include_attributes {
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+              FROM storage_container container
+             WHERE container.bound NOT IN (0, 1)
+                OR container.sealed NOT IN (0, 1)
+                OR container.seal_type NOT IN ('none', 'owner')
+                OR (container.sealed = 0 AND container.seal_type <> 'none')
+                OR (container.sealed = 1 AND container.seal_type <> 'owner')
+                OR (container.storage_type IN ('ring', 'bracelet') AND container.portable <> 1)
+                OR (container.storage_type IN ('bag', 'space', 'warehouse') AND container.portable <> 0)
+        ) OR EXISTS(
+            SELECT 1
+              FROM storage_item stored
+              JOIN storage_container container ON container.id = stored.container_id
+              JOIN item catalog ON catalog.item_key = stored.item_key
+             WHERE stored.slot_index < 0
+                OR stored.slot_index >= container.capacity + COALESCE(
+                    (
+                        SELECT attribute.attribute_value
+                          FROM storage_container_attribute attribute
+                         WHERE attribute.container_id = container.id
+                           AND attribute.attribute_key = 'capacity_bonus'
+                    ),
+                    0
+                )
+                OR stored.quantity > catalog.max_stack + COALESCE(
+                    (
+                        SELECT attribute.attribute_value
+                          FROM storage_container_attribute attribute
+                         WHERE attribute.container_id = container.id
+                           AND attribute.attribute_key = 'stack_bonus'
+                    ),
+                    0
+                )
+        )
+        "#
+    } else {
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+              FROM storage_container container
+             WHERE container.bound NOT IN (0, 1)
+                OR container.sealed NOT IN (0, 1)
+                OR container.seal_type NOT IN ('none', 'owner')
+                OR (container.sealed = 0 AND container.seal_type <> 'none')
+                OR (container.sealed = 1 AND container.seal_type <> 'owner')
+                OR (container.storage_type IN ('ring', 'bracelet') AND container.portable <> 1)
+                OR (container.storage_type IN ('bag', 'space', 'warehouse') AND container.portable <> 0)
+        ) OR EXISTS(
+            SELECT 1
+              FROM storage_item stored
+              JOIN storage_container container ON container.id = stored.container_id
+              JOIN item catalog ON catalog.item_key = stored.item_key
+             WHERE stored.slot_index < 0
+                OR stored.slot_index >= container.capacity
+                OR stored.quantity > catalog.max_stack
+        )
+        "#
+    };
+    connection
+        .query_row(query, [], |row| row.get::<_, bool>(0))
+        .map_err(|error| format!("检查 v33 储物器数据边界失败：{error}"))
+}
+
+/// 校验魂导器随机属性、装备事件和当前投影，任何越界或伪造审计都拒绝启动。
+fn validate_v34_schema(connection: &Connection) -> Result<(), String> {
+    validate_v33_schema(connection)?;
+
+    let attribute_columns = table_columns_with_type(connection, "storage_container_attribute")?;
+    let expected_attribute_columns = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("container_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("attribute_key", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("attribute_value", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("source_message_id", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("operation_log_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+    ];
+    if attribute_columns != expected_attribute_columns {
+        return Err(format!(
+            "数据库已标记迁移 v34，但 storage_container_attribute 字段不匹配：{attribute_columns:?}"
+        ));
+    }
+
+    let equipment_columns = table_columns_with_type(connection, "storage_equipment_event")?;
+    let expected_equipment_columns = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("container_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("storage_type", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("action", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("equipped_before", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("equipped_after", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("source_message_id", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("operation_log_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+    ];
+    if equipment_columns != expected_equipment_columns {
+        return Err(format!(
+            "数据库已标记迁移 v34，但 storage_equipment_event 字段不匹配：{equipment_columns:?}"
+        ));
+    }
+
+    validate_v10_table_sql(
+        connection,
+        "storage_container_attribute",
+        &[
+            ") STRICT",
+            "CONTAINER_ID INTEGER NOT NULL REFERENCES STORAGE_CONTAINER(ID) ON DELETE RESTRICT",
+            "PLAYER_ID INTEGER NOT NULL REFERENCES PLAYER(ID) ON DELETE RESTRICT",
+            "ATTRIBUTE_KEY TEXT NOT NULL CHECK(ATTRIBUTE_KEY IN ('CAPACITY_BONUS', 'STACK_BONUS'))",
+            "UNIQUE(CONTAINER_ID)",
+        ],
+    )
+    .map_err(|error| error.replace("v10", "v34"))?;
+    validate_v10_table_sql(
+        connection,
+        "storage_equipment_event",
+        &[
+            ") STRICT",
+            "PLAYER_ID INTEGER NOT NULL REFERENCES PLAYER(ID) ON DELETE RESTRICT",
+            "CONTAINER_ID INTEGER NOT NULL REFERENCES STORAGE_CONTAINER(ID) ON DELETE RESTRICT",
+            "STORAGE_TYPE TEXT NOT NULL CHECK(STORAGE_TYPE IN ('RING', 'BRACELET'))",
+            "UNIQUE(PLAYER_ID, SOURCE_MESSAGE_ID)",
+        ],
+    )
+    .map_err(|error| error.replace("v10", "v34"))?;
+    validate_v9_foreign_keys(
+        connection,
+        "storage_container_attribute",
+        &[
+            (
+                "storage_container",
+                "container_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+            (
+                "operation_log",
+                "operation_log_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+        ],
+    )
+    .map_err(|error| error.replace("v9", "v34"))?;
+    validate_v9_foreign_keys(
+        connection,
+        "storage_equipment_event",
+        &[
+            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+            (
+                "storage_container",
+                "container_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            (
+                "operation_log",
+                "operation_log_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+        ],
+    )
+    .map_err(|error| error.replace("v9", "v34"))?;
+    validate_v10_custom_index_set(
+        connection,
+        "storage_container_attribute",
+        &["storage_container_attribute_player_page"],
+    )
+    .map_err(|error| error.replace("v10", "v34"))?;
+    validate_v10_custom_index_set(
+        connection,
+        "storage_equipment_event",
+        &[
+            "storage_equipment_event_player_page",
+            "storage_equipment_event_container_page",
+        ],
+    )
+    .map_err(|error| error.replace("v10", "v34"))?;
+
+    let expected_triggers = [
+        (
+            "storage_container_attribute_no_update",
+            "storage_container_attribute",
+            &[
+                "BEFORE UPDATE ON STORAGE_CONTAINER_ATTRIBUTE",
+                "RAISE(ABORT",
+            ] as &[&str],
+        ),
+        (
+            "storage_container_attribute_no_delete",
+            "storage_container_attribute",
+            &[
+                "BEFORE DELETE ON STORAGE_CONTAINER_ATTRIBUTE",
+                "RAISE(ABORT",
+            ] as &[&str],
+        ),
+        (
+            "storage_container_attribute_no_reinsert",
+            "storage_container_attribute",
+            &[
+                "BEFORE INSERT ON STORAGE_CONTAINER_ATTRIBUTE",
+                "APPEND-ONLY",
+            ] as &[&str],
+        ),
+        (
+            "storage_container_attribute_scope_guard",
+            "storage_container_attribute",
+            &["BEFORE INSERT ON STORAGE_CONTAINER_ATTRIBUTE", "解封储物器"] as &[&str],
+        ),
+        (
+            "storage_equipment_event_no_update",
+            "storage_equipment_event",
+            &["BEFORE UPDATE ON STORAGE_EQUIPMENT_EVENT", "RAISE(ABORT"] as &[&str],
+        ),
+        (
+            "storage_equipment_event_no_delete",
+            "storage_equipment_event",
+            &["BEFORE DELETE ON STORAGE_EQUIPMENT_EVENT", "RAISE(ABORT"] as &[&str],
+        ),
+        (
+            "storage_equipment_event_no_reinsert",
+            "storage_equipment_event",
+            &["BEFORE INSERT ON STORAGE_EQUIPMENT_EVENT", "APPEND-ONLY"] as &[&str],
+        ),
+        (
+            "storage_equipment_event_scope_guard",
+            "storage_equipment_event",
+            &["BEFORE INSERT ON STORAGE_EQUIPMENT_EVENT", "装备魂导器"] as &[&str],
+        ),
+        (
+            "storage_container_seal_guard",
+            "storage_container",
+            &[
+                "BEFORE UPDATE OF SEALED, SEAL_TYPE ON STORAGE_CONTAINER",
+                "UNSEALED STORAGE CONTAINER",
+            ] as &[&str],
+        ),
+        (
+            "storage_container_unseal_guard",
+            "storage_container",
+            &[
+                "BEFORE UPDATE OF SEALED, SEAL_TYPE ON STORAGE_CONTAINER",
+                "UNSEAL STATE TRANSITION",
+            ] as &[&str],
+        ),
+        (
+            "storage_container_seal_equipped_guard",
+            "storage_container",
+            &[
+                "BEFORE UPDATE OF SEALED, SEAL_TYPE ON STORAGE_CONTAINER",
+                "EQUIPPED STORAGE CONTAINER",
+            ] as &[&str],
+        ),
+    ];
+    for (name, table, markers) in expected_triggers {
+        let (actual_table, sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v34 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库缺少 v34 触发器 {name}"))?;
+        let normalized = sql.to_ascii_uppercase();
+        if actual_table != table || markers.iter().any(|marker| !normalized.contains(marker)) {
+            return Err(format!("v34 触发器 {name} 契约不匹配"));
+        }
+    }
+
+    let invalid_rows = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM storage_container_attribute attribute
+                  LEFT JOIN storage_container container
+                    ON container.id = attribute.container_id
+                  LEFT JOIN operation_log audit
+                    ON audit.id = attribute.operation_log_id
+                  LEFT JOIN player player
+                    ON player.id = attribute.player_id
+                  LEFT JOIN identity identity
+                    ON identity.id = player.identity_id
+                 WHERE container.id IS NULL
+                    OR container.player_id <> attribute.player_id
+                    OR container.portable <> 1
+                    OR container.storage_type NOT IN ('ring', 'bracelet')
+                    OR container.sealed <> 0
+                    OR (
+                        attribute.attribute_key = 'capacity_bonus'
+                        AND attribute.attribute_value NOT BETWEEN 1 AND 20
+                    )
+                    OR (
+                        attribute.attribute_key = 'stack_bonus'
+                        AND attribute.attribute_value NOT BETWEEN 1 AND 50
+                    )
+                    OR attribute.attribute_key NOT IN ('capacity_bonus', 'stack_bonus')
+                    OR audit.id IS NULL
+                    OR audit.protocol <> identity.protocol
+                    OR audit.account_id <> identity.account_id
+                    OR audit.namespace <> identity.namespace
+                    OR audit.subject_kind <> identity.subject_kind
+                    OR audit.subject_id <> identity.subject_id
+                    OR audit.command <> '解封储物器'
+                    OR audit.outcome <> 'ok'
+                    OR audit.source_message_id <> attribute.source_message_id
+            ) OR EXISTS(
+                SELECT 1
+                  FROM storage_equipment_event event
+                  LEFT JOIN storage_container container
+                    ON container.id = event.container_id
+                  LEFT JOIN operation_log audit
+                    ON audit.id = event.operation_log_id
+                  LEFT JOIN player player
+                    ON player.id = event.player_id
+                  LEFT JOIN identity identity
+                    ON identity.id = player.identity_id
+                 WHERE container.id IS NULL
+                    OR container.player_id <> event.player_id
+                    OR container.storage_type <> event.storage_type
+                    OR container.portable <> 1
+                    OR container.sealed <> 0
+                    OR event.equipped_before <> COALESCE(
+                        (
+                            SELECT previous.equipped_after
+                              FROM storage_equipment_event previous
+                             WHERE previous.container_id = event.container_id
+                               AND previous.id < event.id
+                          ORDER BY previous.id DESC
+                             LIMIT 1
+                        ),
+                        0
+                    )
+                    OR (
+                        event.action = 'equip'
+                        AND (event.equipped_before <> 0 OR event.equipped_after <> 1)
+                    )
+                    OR (
+                        event.action = 'unequip'
+                        AND (event.equipped_before <> 1 OR event.equipped_after <> 0)
+                    )
+                    OR event.action NOT IN ('equip', 'unequip')
+                    OR audit.id IS NULL
+                    OR audit.protocol <> identity.protocol
+                    OR audit.account_id <> identity.account_id
+                    OR audit.namespace <> identity.namespace
+                    OR audit.subject_kind <> identity.subject_kind
+                    OR audit.subject_id <> identity.subject_id
+                    OR audit.command <> CASE event.action
+                        WHEN 'equip' THEN '装备魂导器'
+                        WHEN 'unequip' THEN '卸下魂导器'
+                    END
+                    OR audit.outcome <> 'ok'
+                    OR audit.source_message_id <> event.source_message_id
+            ) OR EXISTS(
+                SELECT 1
+                  FROM storage_container first_container
+                  JOIN storage_container second_container
+                    ON second_container.player_id = first_container.player_id
+                   AND second_container.storage_type = first_container.storage_type
+                   AND second_container.id > first_container.id
+                 WHERE COALESCE(
+                           (
+                               SELECT event.equipped_after
+                                 FROM storage_equipment_event event
+                                WHERE event.container_id = first_container.id
+                             ORDER BY event.id DESC
+                                LIMIT 1
+                           ),
+                           0
+                       ) = 1
+                   AND COALESCE(
+                           (
+                               SELECT event.equipped_after
+                                 FROM storage_equipment_event event
+                                WHERE event.container_id = second_container.id
+                             ORDER BY event.id DESC
+                                LIMIT 1
+                           ),
+                           0
+                       ) = 1
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v34 魂导器数据边界失败：{error}"))?;
+    if invalid_rows {
+        return Err("v34 检测到越界、伪造审计或重复装备的魂导器数据".to_string());
+    }
+    Ok(())
+}
+
 fn validate_v24_table_sql(
     connection: &Connection,
     table: &str,
@@ -28643,6 +30773,43 @@ fn reject_replayed_operation(
         .map_err(|error| format!("检查经济操作幂等键失败：{error}"))?;
     if replayed {
         return Err("该消息对应的操作已经处理，拒绝重复执行".to_string());
+    }
+    Ok(())
+}
+
+fn reject_replayed_storage_operation(
+    connection: &Connection,
+    key: &IdentityKey<'_>,
+    operation: &OperationLogInput<'_>,
+) -> Result<(), String> {
+    let previous_command = connection
+        .query_row(
+            r#"
+            SELECT command
+              FROM operation_log
+             WHERE protocol = ?1 AND account_id = ?2 AND namespace = ?3
+               AND subject_kind = ?4 AND subject_id = ?5
+               AND source_message_id = ?6 AND outcome = 'ok'
+          ORDER BY id DESC
+             LIMIT 1
+            "#,
+            params![
+                key.protocol.as_str(),
+                key.account_id,
+                key.namespace,
+                key.subject_kind,
+                key.subject_id,
+                operation.source_message_id
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("检查储物器操作幂等键失败：{error}"))?;
+    if let Some(previous_command) = previous_command {
+        if previous_command != operation.command {
+            return Err("该消息 ID 已用于不同的储物器操作，拒绝重放".to_string());
+        }
+        return Err("该消息对应的储物器操作已经处理，拒绝重复执行".to_string());
     }
     Ok(())
 }
@@ -40000,6 +42167,476 @@ mod tests {
             INSERT INTO content_revision_member(revision_id, member_kind, member_key, created_at)
             VALUES(999999, 'skill', 'entangle', 0);
             PRAGMA foreign_keys = ON;
+            "#,
+        );
+    }
+
+    #[test]
+    fn p4_storage_moves_are_bound_sealed_and_replay_safe() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "储物测试角色", "男")
+            .expect("应创建储物测试角色");
+        store
+            .register_player(&recipient_identity(), "储物接收角色", "女")
+            .expect("应创建绑定边界测试角色");
+        store
+            .create_storage_container(&identity(), "测试戒指", "ring", 1, true)
+            .expect("应创建小容量储物器");
+        store
+            .create_storage_container(&identity(), "测试空间", "space", 1, false)
+            .expect("应创建第二个储物器");
+        store
+            .unseal_storage_with_operation(
+                &identity(),
+                "测试戒指",
+                &transfer_operation("解封储物器", "storage-unseal"),
+            )
+            .expect("应先解封测试戒指");
+        store
+            .equip_storage_with_operation(
+                &identity(),
+                "测试戒指",
+                &transfer_operation("装备魂导器", "storage-equip"),
+            )
+            .expect("应装备测试戒指");
+        seed_inventory(&store, &identity(), "small-healing-potion", 5);
+        seed_inventory(&store, &identity(), "soul-power-potion", 1);
+
+        let containers = store
+            .storage_containers(&identity())
+            .expect("应读取当前玩家储物器");
+        assert_eq!(containers.len(), 2);
+        assert!(containers.iter().all(|container| container.bound));
+
+        let deposited = store
+            .store_item_with_operation(
+                &identity(),
+                "测试空间",
+                "小回复药",
+                2,
+                &transfer_operation("存入", "storage-deposit"),
+            )
+            .expect("应原子存入物品");
+        assert_eq!(deposited.slot_index, 0);
+        assert_eq!(deposited.inventory_before, 5);
+        assert_eq!(deposited.inventory_after, 3);
+        assert_eq!(deposited.storage_before, 0);
+        assert_eq!(deposited.storage_after, 2);
+        assert_eq!(
+            inventory_for(&store, &identity(), "small-healing-potion"),
+            3
+        );
+
+        assert!(
+            store
+                .store_item_with_operation(
+                    &identity(),
+                    "测试空间",
+                    "魂力恢复药",
+                    1,
+                    &transfer_operation("存入", "storage-no-slot"),
+                )
+                .expect_err("满槽储物器不能存入第二类物品")
+                .contains("槽位")
+        );
+        assert_eq!(inventory_for(&store, &identity(), "soul-power-potion"), 1);
+
+        let replay = store
+            .store_item_with_operation(
+                &identity(),
+                "测试空间",
+                "小回复药",
+                2,
+                &transfer_operation("存入", "storage-deposit"),
+            )
+            .expect_err("相同消息不能再次存入");
+        assert!(replay.contains("已经处理") || replay.contains("重复"));
+        assert_eq!(
+            inventory_for(&store, &identity(), "small-healing-potion"),
+            3
+        );
+        assert!(
+            store
+                .withdraw_item_with_operation(
+                    &identity(),
+                    "测试空间",
+                    "小回复药",
+                    1,
+                    &transfer_operation("取出", "storage-deposit"),
+                )
+                .expect_err("同一消息改成取出也必须拒绝")
+                .contains("不同的储物器操作")
+        );
+
+        let withdrawn = store
+            .withdraw_item_with_operation(
+                &identity(),
+                "测试空间",
+                "小回复药",
+                1,
+                &transfer_operation("取出", "storage-withdraw"),
+            )
+            .expect("应原子取出物品");
+        assert_eq!(withdrawn.inventory_before, 3);
+        assert_eq!(withdrawn.inventory_after, 4);
+        assert_eq!(withdrawn.storage_before, 2);
+        assert_eq!(withdrawn.storage_after, 1);
+
+        store
+            .unequip_storage_with_operation(
+                &identity(),
+                "测试戒指",
+                &transfer_operation("卸下魂导器", "storage-unequip"),
+            )
+            .expect("应卸下测试戒指");
+
+        let other_view = store
+            .storage_contents(&recipient_identity(), "测试空间")
+            .expect_err("其他玩家不能访问绑定储物器");
+        assert!(other_view.contains("没有这个储物器"));
+
+        let sealed = store
+            .seal_storage_with_operation(
+                &identity(),
+                "测试空间",
+                &transfer_operation("封印储物器", "storage-seal"),
+            )
+            .expect("应封印绑定储物器");
+        assert!(sealed.container.sealed);
+        assert!(
+            store
+                .storage_contents(&identity(), "测试空间")
+                .expect_err("封印后不能查看内容")
+                .contains("已封印")
+        );
+        assert!(
+            store
+                .withdraw_item_with_operation(
+                    &identity(),
+                    "测试空间",
+                    "小回复药",
+                    1,
+                    &transfer_operation("取出", "storage-sealed-withdraw"),
+                )
+                .expect_err("封印后不能取出物品")
+                .contains("已封印")
+        );
+        assert_eq!(
+            inventory_for(&store, &identity(), "small-healing-potion"),
+            4
+        );
+    }
+
+    #[test]
+    fn p4_storage_failure_rolls_back_both_sides() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "储物回滚角色", "男")
+            .expect("应创建储物回滚角色");
+        store
+            .create_storage_container(&identity(), "回滚空间", "space", 2, false)
+            .expect("应创建回滚储物器");
+        seed_inventory(&store, &identity(), "small-healing-potion", 2);
+
+        let connection = store.open().expect("应打开储物回滚数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER storage_test_operation_failure
+                BEFORE INSERT ON operation_log
+                WHEN NEW.command = '存入'
+                BEGIN
+                    SELECT RAISE(ABORT, 'storage operation test failure');
+                END;
+                "#,
+            )
+            .expect("应安装储物操作失败探针");
+        drop(connection);
+
+        assert!(
+            store
+                .store_item_with_operation(
+                    &identity(),
+                    "回滚空间",
+                    "小回复药",
+                    2,
+                    &transfer_operation("存入", "storage-atomic-failure"),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            inventory_for(&store, &identity(), "small-healing-potion"),
+            2
+        );
+        let contents = store
+            .storage_contents(&identity(), "回滚空间")
+            .expect("失败事务后储物器仍可读取");
+        assert!(contents.entries.is_empty());
+    }
+
+    #[test]
+    fn p4_storage_survives_expired_revival_settlement() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "储物三世角色", "男")
+            .expect("应创建储物三世角色");
+        store
+            .create_storage_container(&identity(), "保留空间", "space", 2, false)
+            .expect("应创建保留储物器");
+        seed_inventory(&store, &identity(), "small-healing-potion", 1);
+        store
+            .store_item_with_operation(
+                &identity(),
+                "保留空间",
+                "小回复药",
+                1,
+                &transfer_operation("存入", "storage-before-revival"),
+            )
+            .expect("应先存入待保留物品");
+        let player_id = player_id_for(&store, &identity());
+        store
+            .open()
+            .expect("应打开储物三世数据库")
+            .execute(
+                "UPDATE player SET state = 'dead', hp = 0, updated_at = 0 WHERE id = ?1",
+                [player_id],
+            )
+            .expect("应设置过期死亡状态");
+
+        store
+            .abandon_revival_with_operation(
+                &identity(),
+                &transfer_operation("放弃复活", "storage-revival-settlement"),
+            )
+            .expect("应完成过期复活结算");
+        let contents = store
+            .storage_contents(&identity(), "保留空间")
+            .expect("复活结算后储物器仍可访问");
+        assert_eq!(contents.entries.len(), 1);
+        assert_eq!(contents.entries[0].item.item_key, "small-healing-potion");
+        assert_eq!(contents.entries[0].quantity, 1);
+    }
+
+    #[test]
+    fn p4_soul_conductor_unseal_attribute_and_equipment_are_replay_safe() {
+        let (_directory, store) = test_store();
+        store
+            .register_player(&identity(), "魂导器测试角色", "男")
+            .expect("应创建魂导器测试角色");
+        store
+            .create_storage_container(&identity(), "测试魂导戒指", "ring", 1, true)
+            .expect("应创建封印魂导器");
+
+        let unsealed = store
+            .unseal_storage_with_operation(
+                &identity(),
+                "测试魂导戒指",
+                &transfer_operation("解封储物器", "conductor-unseal"),
+            )
+            .expect("应解封并生成随机属性");
+        assert!(!unsealed.container.sealed);
+        assert_eq!(
+            unsealed.container.attribute,
+            Some(unsealed.attribute.clone())
+        );
+        assert!(matches!(
+            unsealed.attribute.attribute_key.as_str(),
+            "capacity_bonus" | "stack_bonus"
+        ));
+        assert!((1..=50).contains(&unsealed.attribute.attribute_value));
+        if unsealed.attribute.attribute_key == "capacity_bonus" {
+            assert_eq!(
+                unsealed.container.capacity,
+                1 + unsealed.attribute.attribute_value
+            );
+        } else {
+            assert_eq!(unsealed.container.capacity, 1);
+        }
+
+        let replay = store
+            .unseal_storage_with_operation(
+                &identity(),
+                "测试魂导戒指",
+                &transfer_operation("解封储物器", "conductor-unseal"),
+            )
+            .expect_err("相同消息不能重复解封");
+        assert!(replay.contains("已经处理") || replay.contains("重复"));
+        let attribute_count = store
+            .open()
+            .expect("应打开魂导器数据库")
+            .query_row(
+                "SELECT COUNT(*) FROM storage_container_attribute",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("应读取随机属性数量");
+        assert_eq!(attribute_count, 1);
+
+        assert!(
+            store
+                .storage_contents(&identity(), "测试魂导戒指")
+                .expect_err("未装备便携魂导器不能访问")
+                .contains("尚未装备")
+        );
+        let equipped = store
+            .equip_storage_with_operation(
+                &identity(),
+                "测试魂导戒指",
+                &transfer_operation("装备魂导器", "conductor-equip"),
+            )
+            .expect("应装备魂导器");
+        assert!(equipped.container.equipped);
+
+        store
+            .create_storage_container(&identity(), "第二枚戒指", "ring", 1, true)
+            .expect("应创建第二枚封印戒指");
+        store
+            .create_storage_container(&identity(), "固定设施", "space", 1, true)
+            .expect("应创建固定储物设施");
+        assert!(
+            store
+                .unseal_storage_with_operation(
+                    &identity(),
+                    "固定设施",
+                    &transfer_operation("解封储物器", "conductor-unseal-fixed"),
+                )
+                .expect_err("固定储物设施不能解封为魂导器")
+                .contains("固定储物设施")
+        );
+        store
+            .create_storage_container(&identity(), "未授权解封", "ring", 1, true)
+            .expect("应创建未授权解封测试容器");
+        assert!(
+            store
+                .open()
+                .expect("应打开未授权解封数据库")
+                .execute(
+                    "UPDATE storage_container SET sealed = 0, seal_type = 'none' WHERE name = '未授权解封'",
+                    [],
+                )
+                .is_err(),
+            "直接 SQL 解封必须被触发器拒绝"
+        );
+        store
+            .unseal_storage_with_operation(
+                &identity(),
+                "第二枚戒指",
+                &transfer_operation("解封储物器", "conductor-unseal-second"),
+            )
+            .expect("应解封第二枚戒指");
+        assert!(
+            store
+                .equip_storage_with_operation(
+                    &identity(),
+                    "第二枚戒指",
+                    &transfer_operation("装备魂导器", "conductor-equip-second"),
+                )
+                .expect_err("同一装备槽不能同时装备两枚戒指")
+                .contains("装备")
+        );
+        assert!(
+            store
+                .seal_storage_with_operation(
+                    &identity(),
+                    "测试魂导戒指",
+                    &transfer_operation("封印储物器", "conductor-seal-equipped"),
+                )
+                .expect_err("已装备魂导器不能直接封印")
+                .contains("卸下")
+        );
+        store
+            .unequip_storage_with_operation(
+                &identity(),
+                "测试魂导戒指",
+                &transfer_operation("卸下魂导器", "conductor-unequip"),
+            )
+            .expect("应卸下魂导器");
+        assert!(
+            store
+                .seal_storage_with_operation(
+                    &identity(),
+                    "测试魂导戒指",
+                    &transfer_operation("封印储物器", "conductor-seal"),
+                )
+                .is_err(),
+            "解封后的魂导器不能再次封印"
+        );
+    }
+
+    fn assert_v33_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v33 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v33 迁移应成功");
+        let connection = store.open().expect("应打开 v33 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v33 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v33 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v33") || error.contains("storage_"),
+            "v33 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    #[test]
+    fn recorded_v33_storage_schema_or_trigger_damage_fails_closed() {
+        for mutation in [
+            "DROP TABLE storage_item;",
+            "DROP INDEX storage_container_player_page;",
+            "DROP TRIGGER storage_item_scope_guard;",
+        ] {
+            assert_v33_damage_fails_closed(mutation);
+        }
+        assert_v33_damage_fails_closed(
+            r#"
+            CREATE TRIGGER storage_container_shadow
+            AFTER INSERT ON storage_container
+            BEGIN
+                SELECT 1;
+            END;
+            "#,
+        );
+    }
+
+    fn assert_v34_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v34 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v34 迁移应成功");
+        let connection = store.open().expect("应打开 v34 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v34 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v34 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v34") || error.contains("storage_") || error.contains("魂导器"),
+            "v34 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    #[test]
+    fn recorded_v34_soul_conductor_schema_or_trigger_damage_fails_closed() {
+        for mutation in [
+            "DROP TABLE storage_container_attribute;",
+            "DROP INDEX storage_equipment_event_container_page;",
+            "DROP TRIGGER storage_equipment_event_scope_guard;",
+            "DROP TRIGGER storage_container_unseal_guard;",
+        ] {
+            assert_v34_damage_fails_closed(mutation);
+        }
+        assert_v34_damage_fails_closed(
+            r#"
+            CREATE TRIGGER storage_container_attribute_shadow
+            AFTER INSERT ON storage_container
+            BEGIN
+                SELECT 1;
+            END;
             "#,
         );
     }

@@ -402,6 +402,28 @@ fn dispatch_player_alias_command(request: &CommandRequest) -> CommandResponse {
         "对话" => with_service(request, false, true, |service| service.talk(request)),
         "商店" => with_service(request, true, true, |service| service.shop(request)),
         "背包" => with_service(request, true, true, |service| service.inventory(request)),
+        "储物器" => with_service(request, true, true, |service| {
+            service.storage_containers(request)
+        }),
+        "查看储物器" => {
+            with_service(request, true, true, |service| service.view_storage(request))
+        }
+        "存入" => with_service(request, false, true, |service| service.store_item(request)),
+        "取出" => with_service(request, false, true, |service| {
+            service.withdraw_item(request)
+        }),
+        "封印储物器" => with_service(request, false, true, |service| {
+            service.seal_storage(request)
+        }),
+        "解封储物器" => with_service(request, false, true, |service| {
+            service.unseal_storage(request)
+        }),
+        "装备魂导器" => with_service(request, false, true, |service| {
+            service.equip_storage(request)
+        }),
+        "卸下魂导器" => with_service(request, false, true, |service| {
+            service.unequip_storage(request)
+        }),
         "购买" => with_service(request, false, true, |service| service.buy(request)),
         "出售" => with_service(request, false, true, |service| service.sell(request)),
         "使用" => with_service(request, false, true, |service| service.use_item(request)),
@@ -760,6 +782,91 @@ mod plugin {
     )]
     fn inventory(req: &CommandRequest) -> CommandResponse {
         with_service(req, true, true, |service| service.inventory(req))
+    }
+
+    #[command(
+        name = "储物器",
+        description = "查看已绑定储物器：储物器",
+        aliases = "储物,储物器列表",
+        category = "斗罗大陆·经济",
+        scope = "all"
+    )]
+    fn storage_containers(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.storage_containers(req))
+    }
+
+    #[command(
+        name = "查看储物器",
+        description = "查看未封印储物器内容：查看储物器 <储物器>",
+        aliases = "打开储物器",
+        category = "斗罗大陆·经济",
+        scope = "all"
+    )]
+    fn view_storage(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.view_storage(req))
+    }
+
+    #[command(
+        name = "存入",
+        description = "把随身物品存入储物器：存入 <储物器> <物品> [数量]",
+        category = "斗罗大陆·经济",
+        scope = "all"
+    )]
+    fn store_item(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.store_item(req))
+    }
+
+    #[command(
+        name = "取出",
+        description = "从储物器取回物品：取出 <储物器> <物品> [数量]",
+        category = "斗罗大陆·经济",
+        scope = "all"
+    )]
+    fn withdraw_item(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.withdraw_item(req))
+    }
+
+    #[command(
+        name = "封印储物器",
+        description = "封印当前玩家绑定的储物器：封印储物器 <储物器>",
+        category = "斗罗大陆·经济",
+        scope = "all"
+    )]
+    fn seal_storage(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.seal_storage(req))
+    }
+
+    #[command(
+        name = "解封储物器",
+        description = "解封并生成一次性随机属性：解封储物器 <储物器>",
+        aliases = "解封",
+        category = "斗罗大陆·经济",
+        scope = "all"
+    )]
+    fn unseal_storage(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.unseal_storage(req))
+    }
+
+    #[command(
+        name = "装备魂导器",
+        description = "装备已解封的便携魂导器：装备魂导器 <储物器>",
+        aliases = "装备储物器",
+        category = "斗罗大陆·经济",
+        scope = "all"
+    )]
+    fn equip_storage(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.equip_storage(req))
+    }
+
+    #[command(
+        name = "卸下魂导器",
+        description = "卸下便携魂导器：卸下魂导器 <储物器>",
+        aliases = "卸下储物器",
+        category = "斗罗大陆·经济",
+        scope = "all"
+    )]
+    fn unequip_storage(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.unequip_storage(req))
     }
 
     #[command(
