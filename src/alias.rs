@@ -50,6 +50,10 @@ pub const PLAYER_ALIAS_TARGET_COMMANDS: &[&str] = &[
     "逃跑",
     "战斗状态",
     "战斗日志",
+    "决斗",
+    "决斗状态",
+    "接受决斗",
+    "取消决斗",
 ];
 
 const REGISTERED_GAME_COMMAND_KEYS: &[&str] = &[
@@ -172,6 +176,10 @@ const REGISTERED_GAME_COMMAND_KEYS: &[&str] = &[
     "战斗",
     "查看战斗",
     "战斗日志",
+    "决斗",
+    "决斗状态",
+    "接受决斗",
+    "取消决斗",
     "旧档检查",
     "旧档认领",
     "授权上下文",

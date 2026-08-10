@@ -1109,6 +1109,46 @@ mod plugin {
     }
 
     #[command(
+        name = "决斗",
+        description = "向同一身份域的玩家发起决斗邀请：决斗 <用户ID>",
+        category = "斗罗大陆·战斗",
+        scope = "all"
+    )]
+    fn duel(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.duel(req))
+    }
+
+    #[command(
+        name = "决斗状态",
+        description = "查看当前身份发出和收到的未过期决斗邀请",
+        category = "斗罗大陆·战斗",
+        scope = "all"
+    )]
+    fn duel_status(req: &CommandRequest) -> CommandResponse {
+        with_service(req, true, true, |service| service.duel_status(req))
+    }
+
+    #[command(
+        name = "接受决斗",
+        description = "接受指定挑战者的决斗邀请：接受决斗 <挑战者ID>",
+        category = "斗罗大陆·战斗",
+        scope = "all"
+    )]
+    fn accept_duel(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.accept_duel(req))
+    }
+
+    #[command(
+        name = "取消决斗",
+        description = "取消自己发出的决斗邀请：取消决斗 <目标ID>",
+        category = "斗罗大陆·战斗",
+        scope = "all"
+    )]
+    fn cancel_duel(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.cancel_duel(req))
+    }
+
+    #[command(
         name = "旧档检查",
         description = "检查指定用户的旧版存档认领状态",
         category = "斗罗大陆·管理",

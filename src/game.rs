@@ -19,6 +19,7 @@ use crate::store::{
     BattleSkillEffectRecord, BattleSnapshot, DailyCheckinInput, DailyCheckinResult, GOLD_SOUL_COIN,
     IdentityKey, LegacyClaimActor, LegacyClaimResult, LegacyIdentityState, MAX_SKILL_LEVEL,
     MAX_SKILL_PROFICIENCY, MapExit, MapRecord, MapTravelReceipt, OperationLogInput, PlayerStatus,
+    PvpDuelCancelReceipt, PvpDuelInviteReceipt, PvpDuelSettlementReceipt, PvpDuelStatus,
     QuestActionReceipt, QuestListEntry, REVIVE_WINDOW_SECONDS, RevivalAbandonReceipt,
     SkillDamageModifierRecord, SkillEffectRecord, SkillLoadoutReceipt, SkillPage, SoulBeastPage,
     SoulRingAbsorbReceipt, SoulRingDetachmentReceipt, SoulRingPage, StorageAttributeRecord,
@@ -263,6 +264,22 @@ const MENU_PAGES: &[MenuPage] = &[
             MenuEntry {
                 command: "战斗日志",
                 description: "查看最近战斗事件",
+            },
+            MenuEntry {
+                command: "决斗 <用户ID>",
+                description: "向同一身份域的玩家发起 PVP 邀请",
+            },
+            MenuEntry {
+                command: "决斗状态",
+                description: "查看发出和收到的未过期决斗邀请",
+            },
+            MenuEntry {
+                command: "接受决斗 <挑战者ID>",
+                description: "接受邀请并立即结算双方确定性战力",
+            },
+            MenuEntry {
+                command: "取消决斗 <目标ID>",
+                description: "取消自己发出的决斗邀请",
             },
         ],
     },
@@ -1562,6 +1579,176 @@ impl GameService {
             .battle_log(&key, limit)?
             .ok_or_else(|| "还没有战斗记录，请先使用“挑战 <魂兽>”".to_string())?;
         Ok(self.battle_log_document(log))
+    }
+
+    pub fn duel(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let target_subject_id = parse_required_pvp_subject_id(req.args.as_str(), "决斗 <用户ID>")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt =
+            self.store
+                .create_pvp_duel_with_operation(&key, target_subject_id, &operation)?;
+        Ok(self.pvp_invite_document(receipt))
+    }
+
+    pub fn duel_status(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        if !req.args.as_str().trim().is_empty() {
+            return Err("用法：决斗状态".to_string());
+        }
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let status = self.store.pvp_duel_status(&key)?;
+        Ok(self.pvp_status_document(status))
+    }
+
+    pub fn accept_duel(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let challenger_subject_id =
+            parse_required_pvp_subject_id(req.args.as_str(), "接受决斗 <挑战者ID>")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt =
+            self.store
+                .accept_pvp_duel_with_operation(&key, challenger_subject_id, &operation)?;
+        Ok(self.pvp_settlement_document(receipt))
+    }
+
+    pub fn cancel_duel(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let target_subject_id =
+            parse_required_pvp_subject_id(req.args.as_str(), "取消决斗 <目标ID>")?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        let details = operation_details(req, identity.protocol);
+        let operation = successful_operation(req, &details);
+        let receipt =
+            self.store
+                .cancel_pvp_duel_with_operation(&key, target_subject_id, &operation)?;
+        Ok(self.pvp_cancel_document(receipt))
+    }
+
+    fn pvp_invite_document(&self, receipt: PvpDuelInviteReceipt) -> GameDocument {
+        let remaining = pvp_remaining_seconds(receipt.invitation.expires_at);
+        GameDocument::new(if receipt.replayed {
+            "决斗邀请回执"
+        } else {
+            "决斗邀请已发出"
+        })
+        .field(
+            "目标",
+            format!(
+                "{}（{}）",
+                receipt.invitation.target_name, receipt.invitation.target_subject_id
+            ),
+        )
+        .field("地图", receipt.invitation.map_name)
+        .field("剩余有效期", format!("{} 秒", remaining))
+        .command("决斗状态")
+        .command(format!("取消决斗 {}", receipt.invitation.target_subject_id))
+        .notice(if receipt.replayed {
+            "检测到相同消息的重复请求，已返回原决斗邀请，未创建第二条记录"
+        } else {
+            "邀请有效 300 秒；接受时会再次校验双方状态、地图和 PVE 战斗"
+        })
+    }
+
+    fn pvp_status_document(&self, status: PvpDuelStatus) -> GameDocument {
+        let mut document = GameDocument::new("决斗状态")
+            .field("发出邀请", status.outgoing.len().to_string())
+            .field("收到邀请", status.incoming.len().to_string());
+        if status.outgoing.is_empty() && status.incoming.is_empty() {
+            return document
+                .line("当前没有未过期的决斗邀请")
+                .command("决斗 <用户ID>");
+        }
+        for invitation in &status.outgoing {
+            document = document
+                .line(format!(
+                    "发出：{}（{}）· {} · 剩余 {} 秒",
+                    invitation.target_name,
+                    invitation.target_subject_id,
+                    invitation.map_name,
+                    pvp_remaining_seconds(invitation.expires_at)
+                ))
+                .command(format!("取消决斗 {}", invitation.target_subject_id));
+        }
+        for invitation in &status.incoming {
+            document = document
+                .line(format!(
+                    "收到：{}（{}）· {} · 剩余 {} 秒",
+                    invitation.challenger_name,
+                    invitation.challenger_subject_id,
+                    invitation.map_name,
+                    pvp_remaining_seconds(invitation.expires_at)
+                ))
+                .command(format!("接受决斗 {}", invitation.challenger_subject_id));
+        }
+        document
+    }
+
+    fn pvp_settlement_document(&self, receipt: PvpDuelSettlementReceipt) -> GameDocument {
+        let result = pvp_result_label(&receipt.result);
+        GameDocument::new(if receipt.replayed {
+            "决斗结算回执"
+        } else {
+            "决斗结算"
+        })
+        .field(
+            "挑战者",
+            format!(
+                "{}（{}）· 战力 {}",
+                receipt.invitation.challenger_name,
+                receipt.invitation.challenger_subject_id,
+                receipt.challenger_power
+            ),
+        )
+        .field(
+            "被挑战者",
+            format!(
+                "{}（{}）· 战力 {}",
+                receipt.invitation.target_name,
+                receipt.invitation.target_subject_id,
+                receipt.target_power
+            ),
+        )
+        .field("结果", result)
+        .field(
+            "胜者",
+            receipt
+                .winner_subject_id
+                .as_deref()
+                .unwrap_or("平局")
+                .to_string(),
+        )
+        .command("决斗状态")
+        .notice(if receipt.replayed {
+            "检测到相同消息的重复请求，已返回原结算；没有再次扣血或修改玩家资产"
+        } else {
+            "本次决斗只记录胜负和平局及双方战力，不扣 HP、不掉落、不修改钱包、背包、魂环或魂技"
+        })
+    }
+
+    fn pvp_cancel_document(&self, receipt: PvpDuelCancelReceipt) -> GameDocument {
+        GameDocument::new(if receipt.replayed {
+            "决斗取消回执"
+        } else {
+            "决斗邀请已取消"
+        })
+        .field(
+            "目标",
+            format!(
+                "{}（{}）",
+                receipt.invitation.target_name, receipt.invitation.target_subject_id
+            ),
+        )
+        .command("决斗状态")
+        .notice(if receipt.replayed {
+            "检测到相同消息的重复请求，已返回原取消回执"
+        } else {
+            "取消只追加终局事件，不修改双方玩家状态"
+        })
     }
 
     fn soul_beasts_document(&self, beasts: SoulBeastPage) -> GameDocument {
@@ -3298,6 +3485,31 @@ fn current_unix_timestamp() -> Result<i64, String> {
         .and_then(|duration| {
             i64::try_from(duration.as_secs()).map_err(|_| "系统时间戳超出 i64 范围".to_string())
         })
+}
+
+fn parse_required_pvp_subject_id<'a>(args: &'a str, usage: &str) -> Result<&'a str, String> {
+    let mut parts = args.split_whitespace();
+    let subject_id = parts.next().unwrap_or_default();
+    if subject_id.is_empty() || parts.next().is_some() {
+        return Err(format!("用法：{usage}"));
+    }
+    parse_target_subject_id(subject_id).map(|_| subject_id)
+}
+
+fn pvp_remaining_seconds(expires_at: i64) -> i64 {
+    current_unix_timestamp()
+        .ok()
+        .map(|now| expires_at.saturating_sub(now).max(0))
+        .unwrap_or(0)
+}
+
+fn pvp_result_label(result: &str) -> &'static str {
+    match result {
+        "challenger_win" => "挑战者胜",
+        "target_win" => "被挑战者胜",
+        "draw" => "平局",
+        _ => "未知",
+    }
 }
 
 #[cfg(test)]

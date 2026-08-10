@@ -5794,6 +5794,341 @@ BEGIN
 END;
 "#;
 
+// v35 只追加 PVP 邀请与终局账本，不修改任何玩家、战斗或资产状态。
+const MIGRATION_V35: &str = r#"
+CREATE TABLE pvp_duel (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    protocol TEXT NOT NULL CHECK(protocol IN ('onebot11', 'qq-official')),
+    account_id TEXT NOT NULL CHECK(
+        length(account_id) BETWEEN 1 AND 128
+        AND account_id = trim(account_id)
+        AND instr(account_id, char(0)) = 0
+        AND account_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    namespace TEXT NOT NULL CHECK(
+        length(namespace) BETWEEN 1 AND 64
+        AND namespace = trim(namespace)
+        AND namespace GLOB '[A-Za-z0-9._-]*'
+        AND namespace NOT GLOB '*[^A-Za-z0-9._-]*'
+    ),
+    subject_kind TEXT NOT NULL CHECK(subject_kind = 'user'),
+    challenger_identity_id INTEGER NOT NULL REFERENCES identity(id) ON DELETE RESTRICT,
+    challenger_player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    challenger_subject_id TEXT NOT NULL CHECK(
+        length(challenger_subject_id) BETWEEN 1 AND 256
+        AND instr(challenger_subject_id, char(0)) = 0
+        AND challenger_subject_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    target_identity_id INTEGER NOT NULL REFERENCES identity(id) ON DELETE RESTRICT,
+    target_player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    target_subject_id TEXT NOT NULL CHECK(
+        length(target_subject_id) BETWEEN 1 AND 256
+        AND instr(target_subject_id, char(0)) = 0
+        AND target_subject_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    map_key TEXT NOT NULL REFERENCES map(map_key) ON DELETE RESTRICT,
+    source_message_id TEXT NOT NULL CHECK(
+        length(source_message_id) <= 256
+        AND instr(source_message_id, char(0)) = 0
+        AND source_message_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    operation_log_id INTEGER NOT NULL UNIQUE REFERENCES operation_log(id) ON DELETE RESTRICT,
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    expires_at INTEGER NOT NULL CHECK(expires_at = created_at + 300),
+    CHECK(challenger_identity_id <> target_identity_id),
+    CHECK(challenger_player_id <> target_player_id),
+    UNIQUE(challenger_player_id, source_message_id)
+) STRICT;
+
+CREATE INDEX pvp_duel_challenger_page
+    ON pvp_duel(challenger_player_id, id);
+CREATE INDEX pvp_duel_target_page
+    ON pvp_duel(target_player_id, id);
+CREATE INDEX pvp_duel_scope_page
+    ON pvp_duel(protocol, account_id, namespace, id);
+CREATE INDEX pvp_duel_challenger_pending
+    ON pvp_duel(challenger_player_id, expires_at, id);
+CREATE INDEX pvp_duel_target_pending
+    ON pvp_duel(target_player_id, expires_at, id);
+
+CREATE TRIGGER pvp_duel_no_update
+BEFORE UPDATE ON pvp_duel
+BEGIN
+    SELECT RAISE(ABORT, 'pvp duel invitation is immutable');
+END;
+
+CREATE TRIGGER pvp_duel_no_delete
+BEFORE DELETE ON pvp_duel
+BEGIN
+    SELECT RAISE(ABORT, 'pvp duel invitation is immutable');
+END;
+
+CREATE TRIGGER pvp_duel_no_reinsert
+BEFORE INSERT ON pvp_duel
+WHEN EXISTS(
+    SELECT 1
+      FROM pvp_duel previous
+     WHERE previous.id = NEW.id
+        OR previous.operation_log_id = NEW.operation_log_id
+        OR (
+            previous.challenger_player_id = NEW.challenger_player_id
+            AND previous.source_message_id = NEW.source_message_id
+        )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'pvp duel invitation is append-only');
+END;
+
+CREATE TABLE pvp_duel_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    duel_id INTEGER NOT NULL UNIQUE REFERENCES pvp_duel(id) ON DELETE RESTRICT,
+    event_kind TEXT NOT NULL CHECK(event_kind IN ('accepted', 'cancelled')),
+    actor_identity_id INTEGER NOT NULL REFERENCES identity(id) ON DELETE RESTRICT,
+    actor_player_id INTEGER NOT NULL REFERENCES player(id) ON DELETE RESTRICT,
+    result TEXT CHECK(result IS NULL OR result IN ('challenger_win', 'target_win', 'draw')),
+    winner_player_id INTEGER REFERENCES player(id) ON DELETE RESTRICT,
+    challenger_power INTEGER NOT NULL CHECK(challenger_power >= 0),
+    target_power INTEGER NOT NULL CHECK(target_power >= 0),
+    source_message_id TEXT NOT NULL CHECK(
+        length(source_message_id) <= 256
+        AND instr(source_message_id, char(0)) = 0
+        AND source_message_id NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+    ),
+    operation_log_id INTEGER NOT NULL UNIQUE REFERENCES operation_log(id) ON DELETE RESTRICT,
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    CHECK(
+        (event_kind = 'accepted' AND result IS NOT NULL)
+        OR (
+            event_kind = 'cancelled'
+            AND result IS NULL
+            AND winner_player_id IS NULL
+            AND challenger_power = 0
+            AND target_power = 0
+        )
+    ),
+    UNIQUE(actor_player_id, source_message_id)
+) STRICT;
+
+CREATE INDEX pvp_duel_event_actor_page
+    ON pvp_duel_event(actor_player_id, id);
+CREATE INDEX pvp_duel_event_duel_page
+    ON pvp_duel_event(duel_id, id);
+
+CREATE TRIGGER pvp_duel_pending_player_guard
+BEFORE INSERT ON pvp_duel
+WHEN EXISTS(
+    SELECT 1
+      FROM pvp_duel pending
+     WHERE pending.expires_at > NEW.created_at
+       AND NOT EXISTS(
+           SELECT 1 FROM pvp_duel_event event
+            WHERE event.duel_id = pending.id
+       )
+       AND (
+           pending.challenger_player_id IN (NEW.challenger_player_id, NEW.target_player_id)
+           OR pending.target_player_id IN (NEW.challenger_player_id, NEW.target_player_id)
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'a player already has a pending pvp duel');
+END;
+
+CREATE TRIGGER pvp_duel_scope_guard
+BEFORE INSERT ON pvp_duel
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM identity challenger_identity
+      JOIN player challenger
+        ON challenger.identity_id = challenger_identity.id
+      JOIN player_map challenger_map
+        ON challenger_map.player_id = challenger.id
+      JOIN identity target_identity
+        ON target_identity.id = NEW.target_identity_id
+      JOIN player target
+        ON target.identity_id = target_identity.id
+       AND target.id = NEW.target_player_id
+      JOIN player_map target_map
+        ON target_map.player_id = target.id
+       AND target_map.map_key = challenger_map.map_key
+      JOIN map map
+        ON map.map_key = challenger_map.map_key
+      JOIN operation_log audit
+        ON audit.id = NEW.operation_log_id
+     WHERE challenger_identity.id = NEW.challenger_identity_id
+       AND challenger.id = NEW.challenger_player_id
+       AND challenger_identity.protocol = NEW.protocol
+       AND challenger_identity.account_id = NEW.account_id
+       AND challenger_identity.namespace = NEW.namespace
+       AND challenger_identity.subject_kind = NEW.subject_kind
+       AND challenger_identity.subject_id = NEW.challenger_subject_id
+       AND target_identity.protocol = NEW.protocol
+       AND target_identity.account_id = NEW.account_id
+       AND target_identity.namespace = NEW.namespace
+       AND target_identity.subject_kind = NEW.subject_kind
+       AND target_identity.subject_id = NEW.target_subject_id
+       AND NEW.map_key = map.map_key
+       AND map.safe = 0
+       AND map.pvp_enabled = 1
+       AND challenger.state = 'alive'
+       AND challenger.hp > 0
+       AND EXISTS(
+           SELECT 1 FROM player_wuhun awakened
+            WHERE awakened.player_id = challenger.id
+       )
+       AND EXISTS(
+           SELECT 1 FROM player_wuhun_state challenger_wuhun
+            WHERE challenger_wuhun.player_id = challenger.id
+              AND challenger_wuhun.slot = 1
+              AND challenger_wuhun.enabled = 1
+              AND challenger_wuhun.stability > 0
+       )
+       AND NOT EXISTS(
+           SELECT 1 FROM battle active_battle
+            WHERE active_battle.player_id = challenger.id
+              AND active_battle.status = 'active'
+       )
+       AND audit.protocol = NEW.protocol
+       AND audit.account_id = NEW.account_id
+       AND audit.namespace = NEW.namespace
+       AND audit.subject_kind = NEW.subject_kind
+       AND audit.subject_id = NEW.challenger_subject_id
+       AND audit.command = '决斗'
+       AND audit.outcome = 'ok'
+       AND audit.source_message_id = NEW.source_message_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'pvp duel invitation scope or audit mismatch');
+END;
+
+CREATE TRIGGER pvp_duel_event_no_update
+BEFORE UPDATE ON pvp_duel_event
+BEGIN
+    SELECT RAISE(ABORT, 'pvp duel event is immutable');
+END;
+
+CREATE TRIGGER pvp_duel_event_no_delete
+BEFORE DELETE ON pvp_duel_event
+BEGIN
+    SELECT RAISE(ABORT, 'pvp duel event is immutable');
+END;
+
+CREATE TRIGGER pvp_duel_event_no_reinsert
+BEFORE INSERT ON pvp_duel_event
+WHEN EXISTS(
+    SELECT 1
+      FROM pvp_duel_event previous
+     WHERE previous.id = NEW.id
+        OR previous.duel_id = NEW.duel_id
+        OR previous.operation_log_id = NEW.operation_log_id
+        OR (
+            previous.actor_player_id = NEW.actor_player_id
+            AND previous.source_message_id = NEW.source_message_id
+        )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'pvp duel event is append-only');
+END;
+
+CREATE TRIGGER pvp_duel_event_scope_guard
+BEFORE INSERT ON pvp_duel_event
+WHEN NOT EXISTS(
+    SELECT 1
+      FROM pvp_duel duel
+      JOIN identity challenger_identity
+        ON challenger_identity.id = duel.challenger_identity_id
+      JOIN player challenger
+        ON challenger.id = duel.challenger_player_id
+      JOIN player_map challenger_map
+        ON challenger_map.player_id = challenger.id
+      JOIN identity target_identity
+        ON target_identity.id = duel.target_identity_id
+      JOIN player target
+        ON target.id = duel.target_player_id
+      JOIN player_map target_map
+        ON target_map.player_id = target.id
+       AND target_map.map_key = challenger_map.map_key
+      JOIN map map
+        ON map.map_key = challenger_map.map_key
+      JOIN operation_log audit
+        ON audit.id = NEW.operation_log_id
+     WHERE duel.id = NEW.duel_id
+       AND challenger_identity.protocol = duel.protocol
+       AND target_identity.protocol = duel.protocol
+       AND challenger_identity.account_id = duel.account_id
+       AND target_identity.account_id = duel.account_id
+       AND challenger_identity.namespace = duel.namespace
+       AND target_identity.namespace = duel.namespace
+       AND challenger_identity.subject_kind = duel.subject_kind
+       AND target_identity.subject_kind = duel.subject_kind
+       AND challenger_identity.subject_id = duel.challenger_subject_id
+       AND target_identity.subject_id = duel.target_subject_id
+       AND challenger_map.map_key = duel.map_key
+       AND map.safe = 0
+       AND map.pvp_enabled = 1
+       AND audit.protocol = duel.protocol
+       AND audit.account_id = duel.account_id
+       AND audit.namespace = duel.namespace
+       AND audit.subject_kind = duel.subject_kind
+       AND audit.source_message_id = NEW.source_message_id
+       AND audit.outcome = 'ok'
+       AND (
+           (
+               NEW.event_kind = 'accepted'
+               AND NEW.actor_identity_id = duel.target_identity_id
+               AND NEW.actor_player_id = duel.target_player_id
+               AND audit.subject_id = duel.target_subject_id
+               AND audit.command = '接受决斗'
+               AND duel.expires_at > NEW.created_at
+               AND challenger.state = 'alive'
+               AND challenger.hp > 0
+               AND target.state = 'alive'
+               AND target.hp > 0
+               AND EXISTS(
+                   SELECT 1
+                     FROM player_wuhun_state target_wuhun
+                    WHERE target_wuhun.player_id = target.id
+                      AND target_wuhun.slot = 1
+                      AND target_wuhun.enabled = 1
+                      AND target_wuhun.stability > 0
+               )
+               AND EXISTS(
+                   SELECT 1
+                     FROM player_wuhun_state challenger_wuhun
+                    WHERE challenger_wuhun.player_id = challenger.id
+                      AND challenger_wuhun.slot = 1
+                      AND challenger_wuhun.enabled = 1
+                      AND challenger_wuhun.stability > 0
+               )
+               AND EXISTS(
+                   SELECT 1 FROM player_wuhun awakened
+                    WHERE awakened.player_id = challenger.id
+               )
+               AND EXISTS(
+                   SELECT 1 FROM player_wuhun awakened
+                    WHERE awakened.player_id = target.id
+               )
+               AND NOT EXISTS(
+                   SELECT 1 FROM battle active_battle
+                    WHERE active_battle.status = 'active'
+                      AND active_battle.player_id IN (challenger.id, target.id)
+               )
+           )
+           OR
+           (
+               NEW.event_kind = 'cancelled'
+               AND NEW.actor_identity_id = duel.challenger_identity_id
+               AND NEW.actor_player_id = duel.challenger_player_id
+               AND audit.subject_id = duel.challenger_subject_id
+               AND audit.command = '取消决斗'
+               AND duel.expires_at > NEW.created_at
+           )
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'pvp duel event scope or audit mismatch');
+END;
+"#;
+
 const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
@@ -6125,6 +6460,58 @@ pub struct MapTravelReceipt {
     pub to: MapRecord,
     pub travel_kind: String,
     pub direction: Option<String>,
+}
+
+/// PVP 邀请有效期；过期只由读操作和接受/取消入口懒判断。
+pub const PVP_DUEL_INVITATION_TTL_SECONDS: i64 = 300;
+
+/// PVP 邀请的脱敏展示记录，不暴露内部 player/identity 主键。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PvpDuelInvitation {
+    pub id: i64,
+    pub(crate) challenger_player_id: i64,
+    pub(crate) target_player_id: i64,
+    pub(crate) map_key: String,
+    pub challenger_subject_id: String,
+    pub challenger_name: String,
+    pub target_subject_id: String,
+    pub target_name: String,
+    pub map_name: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+/// 当前稳定身份发出和收到的未过期邀请。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PvpDuelStatus {
+    pub outgoing: Vec<PvpDuelInvitation>,
+    pub incoming: Vec<PvpDuelInvitation>,
+}
+
+/// 创建邀请后的回执；重复消息只返回原邀请。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PvpDuelInviteReceipt {
+    pub invitation: PvpDuelInvitation,
+    pub replayed: bool,
+}
+
+/// 取消邀请后的回执。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PvpDuelCancelReceipt {
+    pub invitation: PvpDuelInvitation,
+    pub replayed: bool,
+}
+
+/// 接受邀请后的不可变终局回执；结算不修改玩家生命或其他资产。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PvpDuelSettlementReceipt {
+    pub event_id: i64,
+    pub invitation: PvpDuelInvitation,
+    pub result: String,
+    pub winner_subject_id: Option<String>,
+    pub challenger_power: i64,
+    pub target_power: i64,
+    pub replayed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -9048,7 +9435,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
                     format!(
-                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34 失败：{error}"
+                        "开始数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35 失败：{error}"
                     )
                 })?;
             // 所有版本检查都在同一写锁内，后启动者只会看到已提交版本并执行校验。
@@ -9572,10 +9959,25 @@ impl Store {
                 validate_v34_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 35)? {
+                transaction
+                    .execute_batch(MIGRATION_V35)
+                    .map_err(|error| format!("执行数据库迁移 v35 失败：{error}"))?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(35, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v35 失败：{error}"))?;
+                validate_v35_schema(&transaction)?;
+            } else {
+                validate_v35_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35 失败：{error}"
                 )
             })?;
             Ok(())
@@ -9615,6 +10017,7 @@ impl Store {
                 validate_v31_schema(connection)?;
                 validate_v32_schema(connection)?;
                 validate_v34_schema(connection)?;
+                validate_v35_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -12483,6 +12886,372 @@ impl Store {
             equipped,
             equipped_count: equipped_count_after,
             capacity: MAX_EQUIPPED_SKILLS,
+            replayed: false,
+        })
+    }
+
+    /// 创建一个同身份域内的 PVP 邀请；邀请本身只追加账本记录，不改变玩家状态。
+    pub fn create_pvp_duel_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        target_subject_id: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<PvpDuelInviteReceipt, String> {
+        let timestamp = now_timestamp()?;
+        self.create_pvp_duel_at(key, target_subject_id, operation, timestamp)
+    }
+
+    fn create_pvp_duel_at(
+        &self,
+        key: &IdentityKey<'_>,
+        target_subject_id: &str,
+        operation: &OperationLogInput<'_>,
+        timestamp: i64,
+    ) -> Result<PvpDuelInviteReceipt, String> {
+        validate_identity_key(key)?;
+        validate_pvp_subject_id(target_subject_id)?;
+        validate_pvp_operation(operation, "决斗")?;
+        if target_subject_id == key.subject_id {
+            return Err("不能向自己发起决斗".to_string());
+        }
+
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| "决斗邀请写锁已损坏".to_string())?;
+        let mut connection = self.open()?;
+        let transaction = self.begin_immediate(&mut connection, "开始创建决斗邀请事务失败")?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let challenger = load_pvp_player_by_key(&transaction, key)?
+            .ok_or_else(|| "你还没有角色，请先使用“开始穿越 <角色名> <男|女>”".to_string())?;
+
+        if let Some(invitation) = load_pvp_invitation_by_challenger_message(
+            &transaction,
+            challenger.player_id,
+            operation.source_message_id,
+        )? {
+            if invitation.target_subject_id != target_subject_id {
+                return Err("该消息 ID 已用于不同的决斗邀请，拒绝重放".to_string());
+            }
+            transaction
+                .commit()
+                .map_err(|error| format!("提交决斗邀请重放事务失败：{error}"))?;
+            return Ok(PvpDuelInviteReceipt {
+                invitation,
+                replayed: true,
+            });
+        }
+        reject_replayed_pvp_operation(&transaction, key, operation, "决斗")?;
+
+        ensure_pvp_player_eligible(&transaction, &challenger, "你")?;
+        let target_key = IdentityKey {
+            protocol: key.protocol,
+            account_id: key.account_id,
+            namespace: key.namespace,
+            subject_kind: key.subject_kind,
+            subject_id: target_subject_id,
+        };
+        let target = load_pvp_player_by_key(&transaction, &target_key)?
+            .ok_or_else(|| "目标用户还没有斗罗大陆角色，无法发起决斗".to_string())?;
+        ensure_same_pvp_map(&challenger, &target)?;
+        ensure_pvp_map_allows_duel(&challenger)?;
+        ensure_no_pending_pvp_duel(&transaction, challenger.player_id, timestamp, "你")?;
+        ensure_no_pending_pvp_duel(&transaction, target.player_id, timestamp, "目标用户")?;
+
+        let expires_at = timestamp
+            .checked_add(PVP_DUEL_INVITATION_TTL_SECONDS)
+            .ok_or_else(|| "决斗邀请过期时间溢出".to_string())?;
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO pvp_duel(
+                    protocol, account_id, namespace, subject_kind,
+                    challenger_identity_id, challenger_player_id, challenger_subject_id,
+                    target_identity_id, target_player_id, target_subject_id,
+                    map_key, source_message_id, operation_log_id, created_at, expires_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                          ?11, ?12, ?13, ?14, ?15)
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind,
+                    challenger.identity_id,
+                    challenger.player_id,
+                    challenger.subject_id,
+                    target.identity_id,
+                    target.player_id,
+                    target.subject_id,
+                    challenger.map_key,
+                    operation.source_message_id,
+                    operation_log_id,
+                    timestamp,
+                    expires_at,
+                ],
+            )
+            .map_err(|error| format!("写入决斗邀请失败：{error}"))?;
+        let duel_id = transaction.last_insert_rowid();
+        let invitation = load_pvp_invitation_by_id(&transaction, duel_id)?
+            .ok_or_else(|| "写入后无法读取决斗邀请".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交决斗邀请事务失败：{error}"))?;
+        Ok(PvpDuelInviteReceipt {
+            invitation,
+            replayed: false,
+        })
+    }
+
+    /// 读取当前身份发出和收到的未过期邀请，不为过期记录追加任何状态。
+    pub fn pvp_duel_status(&self, key: &IdentityKey<'_>) -> Result<PvpDuelStatus, String> {
+        validate_identity_key(key)?;
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let player_id = load_pvp_player_by_key(&connection, key)?
+            .ok_or_else(|| "你还没有角色，请先使用“开始穿越 <角色名> <男|女>”".to_string())?
+            .player_id;
+        let timestamp = now_timestamp()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE (duel.challenger_player_id = ?1 OR duel.target_player_id = ?1) AND NOT EXISTS(SELECT 1 FROM pvp_duel_event event WHERE event.duel_id = duel.id) AND duel.expires_at > ?2 ORDER BY duel.id",
+                pvp_duel_invitation_select_sql()
+            ))
+            .map_err(|error| format!("准备决斗状态查询失败：{error}"))?;
+        let invitations = statement
+            .query_map(params![player_id, timestamp], pvp_duel_invitation_from_row)
+            .map_err(|error| format!("查询决斗状态失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析决斗状态失败：{error}"))?;
+        let (outgoing, incoming) = invitations
+            .into_iter()
+            .partition(|invitation| invitation.challenger_subject_id == key.subject_id);
+        Ok(PvpDuelStatus { outgoing, incoming })
+    }
+
+    /// 接受指定挑战者的邀请，并在同一事务内写入一次终局战力事件。
+    pub fn accept_pvp_duel_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        challenger_subject_id: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<PvpDuelSettlementReceipt, String> {
+        let timestamp = now_timestamp()?;
+        self.accept_pvp_duel_at(key, challenger_subject_id, operation, timestamp)
+    }
+
+    fn accept_pvp_duel_at(
+        &self,
+        key: &IdentityKey<'_>,
+        challenger_subject_id: &str,
+        operation: &OperationLogInput<'_>,
+        timestamp: i64,
+    ) -> Result<PvpDuelSettlementReceipt, String> {
+        validate_identity_key(key)?;
+        validate_pvp_subject_id(challenger_subject_id)?;
+        validate_pvp_operation(operation, "接受决斗")?;
+
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| "接受决斗写锁已损坏".to_string())?;
+        let mut connection = self.open()?;
+        let transaction = self.begin_immediate(&mut connection, "开始接受决斗事务失败")?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let target = load_pvp_player_by_key(&transaction, key)?
+            .ok_or_else(|| "你还没有角色，请先使用“开始穿越 <角色名> <男|女>”".to_string())?;
+
+        if let Some(event) = load_pvp_event_by_actor_message(
+            &transaction,
+            target.player_id,
+            operation.source_message_id,
+        )? {
+            if event.event_kind != "accepted" {
+                return Err("该消息 ID 已用于不同的决斗终局操作，拒绝重放".to_string());
+            }
+            let invitation = load_pvp_invitation_by_id(&transaction, event.duel_id)?
+                .ok_or_else(|| "原决斗邀请不存在，拒绝重放".to_string())?;
+            if invitation.challenger_subject_id != challenger_subject_id
+                || invitation.target_player_id != target.player_id
+            {
+                return Err("该消息 ID 已用于不同的决斗接受操作，拒绝重放".to_string());
+            }
+            let receipt = pvp_settlement_receipt(&invitation, &event, true);
+            transaction
+                .commit()
+                .map_err(|error| format!("提交接受决斗重放事务失败：{error}"))?;
+            return Ok(receipt);
+        }
+        reject_replayed_pvp_operation(&transaction, key, operation, "接受决斗")?;
+
+        let invitation = load_pending_pvp_invitation_for_target(
+            &transaction,
+            target.player_id,
+            challenger_subject_id,
+        )?
+        .ok_or_else(|| "没有来自该用户的未过期决斗邀请".to_string())?;
+        if invitation.expires_at <= timestamp {
+            return Err("该决斗邀请已过期".to_string());
+        }
+        let challenger_key = IdentityKey {
+            protocol: key.protocol,
+            account_id: key.account_id,
+            namespace: key.namespace,
+            subject_kind: key.subject_kind,
+            subject_id: invitation.challenger_subject_id.as_str(),
+        };
+        let challenger = load_pvp_player_by_key(&transaction, &challenger_key)?
+            .ok_or_else(|| "挑战者角色不存在，拒绝结算".to_string())?;
+        if challenger.player_id != invitation.challenger_player_id
+            || target.player_id != invitation.target_player_id
+        {
+            return Err("决斗邀请的角色绑定已损坏，拒绝结算".to_string());
+        }
+        ensure_pvp_player_eligible(&transaction, &challenger, "挑战者")?;
+        ensure_pvp_player_eligible(&transaction, &target, "你的角色")?;
+        ensure_same_pvp_map(&challenger, &target)?;
+        ensure_pvp_invitation_map(&invitation, &challenger, &target)?;
+        ensure_pvp_map_allows_duel(&challenger)?;
+        let challenger_power = pvp_combat_power(&transaction, &challenger)?;
+        let target_power = pvp_combat_power(&transaction, &target)?;
+        let (result, winner_player_id) = match challenger_power.cmp(&target_power) {
+            std::cmp::Ordering::Greater => ("challenger_win", Some(challenger.player_id)),
+            std::cmp::Ordering::Less => ("target_win", Some(target.player_id)),
+            std::cmp::Ordering::Equal => ("draw", None),
+        };
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO pvp_duel_event(
+                    duel_id, event_kind, actor_identity_id, actor_player_id,
+                    result, winner_player_id, challenger_power, target_power,
+                    source_message_id, operation_log_id, created_at
+                ) VALUES(?1, 'accepted', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "#,
+                params![
+                    invitation.id,
+                    target.identity_id,
+                    target.player_id,
+                    result,
+                    winner_player_id,
+                    challenger_power,
+                    target_power,
+                    operation.source_message_id,
+                    operation_log_id,
+                    timestamp,
+                ],
+            )
+            .map_err(|error| format!("写入决斗结算事件失败：{error}"))?;
+        let event_id = transaction.last_insert_rowid();
+        let event = PvpDuelEventSnapshot {
+            id: event_id,
+            duel_id: invitation.id,
+            event_kind: "accepted".to_string(),
+            result: Some(result.to_string()),
+            winner_player_id,
+            challenger_power,
+            target_power,
+        };
+        let receipt = pvp_settlement_receipt(&invitation, &event, false);
+        transaction
+            .commit()
+            .map_err(|error| format!("提交决斗结算事务失败：{error}"))?;
+        Ok(receipt)
+    }
+
+    /// 仅允许挑战者取消仍未过期的邀请，取消也只追加终局事件。
+    pub fn cancel_pvp_duel_with_operation(
+        &self,
+        key: &IdentityKey<'_>,
+        target_subject_id: &str,
+        operation: &OperationLogInput<'_>,
+    ) -> Result<PvpDuelCancelReceipt, String> {
+        let timestamp = now_timestamp()?;
+        self.cancel_pvp_duel_at(key, target_subject_id, operation, timestamp)
+    }
+
+    fn cancel_pvp_duel_at(
+        &self,
+        key: &IdentityKey<'_>,
+        target_subject_id: &str,
+        operation: &OperationLogInput<'_>,
+        timestamp: i64,
+    ) -> Result<PvpDuelCancelReceipt, String> {
+        validate_identity_key(key)?;
+        validate_pvp_subject_id(target_subject_id)?;
+        validate_pvp_operation(operation, "取消决斗")?;
+
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| "取消决斗写锁已损坏".to_string())?;
+        let mut connection = self.open()?;
+        let transaction = self.begin_immediate(&mut connection, "开始取消决斗事务失败")?;
+        ensure_no_legacy_identity(&transaction, key)?;
+        let challenger = load_pvp_player_by_key(&transaction, key)?
+            .ok_or_else(|| "你还没有角色，请先使用“开始穿越 <角色名> <男|女>”".to_string())?;
+
+        if let Some(event) = load_pvp_event_by_actor_message(
+            &transaction,
+            challenger.player_id,
+            operation.source_message_id,
+        )? {
+            if event.event_kind != "cancelled" {
+                return Err("该消息 ID 已用于不同的决斗终局操作，拒绝重放".to_string());
+            }
+            let invitation = load_pvp_invitation_by_id(&transaction, event.duel_id)?
+                .ok_or_else(|| "原决斗邀请不存在，拒绝重放".to_string())?;
+            if invitation.target_subject_id != target_subject_id
+                || invitation.challenger_player_id != challenger.player_id
+            {
+                return Err("该消息 ID 已用于不同的决斗取消操作，拒绝重放".to_string());
+            }
+            transaction
+                .commit()
+                .map_err(|error| format!("提交取消决斗重放事务失败：{error}"))?;
+            return Ok(PvpDuelCancelReceipt {
+                invitation,
+                replayed: true,
+            });
+        }
+        reject_replayed_pvp_operation(&transaction, key, operation, "取消决斗")?;
+
+        let invitation = load_pending_pvp_invitation_for_challenger(
+            &transaction,
+            challenger.player_id,
+            target_subject_id,
+        )?
+        .ok_or_else(|| "没有发给该用户的未过期决斗邀请".to_string())?;
+        if invitation.expires_at <= timestamp {
+            return Err("该决斗邀请已过期".to_string());
+        }
+        let operation_log_id = insert_operation_log(&transaction, key, operation)?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO pvp_duel_event(
+                    duel_id, event_kind, actor_identity_id, actor_player_id,
+                    result, winner_player_id, challenger_power, target_power,
+                    source_message_id, operation_log_id, created_at
+                ) VALUES(?1, 'cancelled', ?2, ?3, NULL, NULL, 0, 0, ?4, ?5, ?6)
+                "#,
+                params![
+                    invitation.id,
+                    challenger.identity_id,
+                    challenger.player_id,
+                    operation.source_message_id,
+                    operation_log_id,
+                    timestamp,
+                ],
+            )
+            .map_err(|error| format!("写入取消决斗事件失败：{error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交取消决斗事务失败：{error}"))?;
+        Ok(PvpDuelCancelReceipt {
+            invitation,
             replayed: false,
         })
     }
@@ -15754,6 +16523,45 @@ struct PlayerQuestActionRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct PvpPlayerSnapshot {
+    identity_id: i64,
+    player_id: i64,
+    subject_id: String,
+    name: String,
+    state: String,
+    level: i64,
+    hp: i64,
+    max_hp: i64,
+    max_soul_power: i64,
+    strength: i64,
+    agility: i64,
+    spirit: i64,
+    endurance: i64,
+    perception: i64,
+    luck: i64,
+    map_key: String,
+    map_name: String,
+    map_safe: bool,
+    map_pvp_enabled: bool,
+    awakened: bool,
+    wuhun_id: Option<i64>,
+    wuhun_category: Option<String>,
+    wuhun_enabled: Option<bool>,
+    wuhun_stability: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PvpDuelEventSnapshot {
+    id: i64,
+    duel_id: i64,
+    event_kind: String,
+    result: Option<String>,
+    winner_player_id: Option<i64>,
+    challenger_power: i64,
+    target_power: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct BattlePlayerSnapshot {
     identity_id: i64,
     player_id: i64,
@@ -17970,6 +18778,381 @@ fn wuhun_effect_after_damage(
     })
 }
 
+fn pvp_duel_invitation_select_sql() -> &'static str {
+    r#"
+    SELECT duel.id,
+           duel.challenger_player_id, duel.target_player_id, duel.map_key,
+           challenger_identity.subject_id, challenger.name,
+           target_identity.subject_id, target.name,
+           map.name, duel.created_at, duel.expires_at
+      FROM pvp_duel duel
+      JOIN identity challenger_identity
+        ON challenger_identity.id = duel.challenger_identity_id
+      JOIN player challenger
+        ON challenger.id = duel.challenger_player_id
+      JOIN identity target_identity
+        ON target_identity.id = duel.target_identity_id
+      JOIN player target
+        ON target.id = duel.target_player_id
+      JOIN map
+        ON map.map_key = duel.map_key
+    "#
+}
+
+fn pvp_duel_invitation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PvpDuelInvitation> {
+    Ok(PvpDuelInvitation {
+        id: row.get(0)?,
+        challenger_player_id: row.get(1)?,
+        target_player_id: row.get(2)?,
+        map_key: row.get(3)?,
+        challenger_subject_id: row.get(4)?,
+        challenger_name: row.get(5)?,
+        target_subject_id: row.get(6)?,
+        target_name: row.get(7)?,
+        map_name: row.get(8)?,
+        created_at: row.get(9)?,
+        expires_at: row.get(10)?,
+    })
+}
+
+fn pvp_duel_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PvpDuelEventSnapshot> {
+    Ok(PvpDuelEventSnapshot {
+        id: row.get(0)?,
+        duel_id: row.get(1)?,
+        event_kind: row.get(2)?,
+        result: row.get(3)?,
+        winner_player_id: row.get(4)?,
+        challenger_power: row.get(5)?,
+        target_power: row.get(6)?,
+    })
+}
+
+fn load_pvp_player_by_key(
+    connection: &Connection,
+    key: &IdentityKey<'_>,
+) -> Result<Option<PvpPlayerSnapshot>, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT i.id, p.id, i.subject_id, p.name, p.state, p.level, p.hp,
+                   p.max_hp, p.max_soul_power, p.strength, p.agility, p.spirit,
+                   p.endurance, p.perception, p.luck,
+                   player_map.map_key, map.name, map.safe, map.pvp_enabled,
+                   EXISTS(
+                       SELECT 1 FROM player_wuhun awakened
+                        WHERE awakened.player_id = p.id
+                   ),
+                   player_wuhun.wuhun_id, wuhun.category,
+                   wuhun_state.enabled, wuhun_state.stability
+              FROM identity i
+              JOIN player p
+                ON p.identity_id = i.id
+              JOIN player_map
+                ON player_map.player_id = p.id
+              JOIN map
+                ON map.map_key = player_map.map_key
+         LEFT JOIN player_wuhun
+                ON player_wuhun.player_id = p.id
+               AND player_wuhun.slot = 1
+         LEFT JOIN wuhun
+                ON wuhun.id = player_wuhun.wuhun_id
+         LEFT JOIN player_wuhun_state wuhun_state
+                ON wuhun_state.player_id = p.id
+               AND wuhun_state.slot = 1
+               AND wuhun_state.wuhun_id = player_wuhun.wuhun_id
+             WHERE i.protocol = ?1
+               AND i.account_id = ?2
+               AND i.namespace = ?3
+               AND i.subject_kind = ?4
+               AND i.subject_id = ?5
+            "#,
+            params![
+                key.protocol.as_str(),
+                key.account_id,
+                key.namespace,
+                key.subject_kind,
+                key.subject_id
+            ],
+            |row| {
+                Ok(PvpPlayerSnapshot {
+                    identity_id: row.get(0)?,
+                    player_id: row.get(1)?,
+                    subject_id: row.get(2)?,
+                    name: row.get(3)?,
+                    state: row.get(4)?,
+                    level: row.get(5)?,
+                    hp: row.get(6)?,
+                    max_hp: row.get(7)?,
+                    max_soul_power: row.get(8)?,
+                    strength: row.get(9)?,
+                    agility: row.get(10)?,
+                    spirit: row.get(11)?,
+                    endurance: row.get(12)?,
+                    perception: row.get(13)?,
+                    luck: row.get(14)?,
+                    map_key: row.get(15)?,
+                    map_name: row.get(16)?,
+                    map_safe: row.get(17)?,
+                    map_pvp_enabled: row.get(18)?,
+                    awakened: row.get(19)?,
+                    wuhun_id: row.get(20)?,
+                    wuhun_category: row.get(21)?,
+                    wuhun_enabled: row.get(22)?,
+                    wuhun_stability: row.get(23)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取 PVP 角色状态失败：{error}"))
+}
+
+fn load_pvp_invitation_by_id(
+    connection: &Connection,
+    duel_id: i64,
+) -> Result<Option<PvpDuelInvitation>, String> {
+    connection
+        .query_row(
+            &format!("{} WHERE duel.id = ?1", pvp_duel_invitation_select_sql()),
+            [duel_id],
+            pvp_duel_invitation_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取决斗邀请失败：{error}"))
+}
+
+fn load_pvp_invitation_by_challenger_message(
+    connection: &Connection,
+    challenger_player_id: i64,
+    source_message_id: &str,
+) -> Result<Option<PvpDuelInvitation>, String> {
+    connection
+        .query_row(
+            &format!(
+                "{} WHERE duel.challenger_player_id = ?1 AND duel.source_message_id = ?2",
+                pvp_duel_invitation_select_sql()
+            ),
+            params![challenger_player_id, source_message_id],
+            pvp_duel_invitation_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取决斗邀请幂等记录失败：{error}"))
+}
+
+fn load_pending_pvp_invitation_for_target(
+    connection: &Connection,
+    target_player_id: i64,
+    challenger_subject_id: &str,
+) -> Result<Option<PvpDuelInvitation>, String> {
+    connection
+        .query_row(
+            &format!(
+                "{} WHERE duel.target_player_id = ?1 AND challenger_identity.subject_id = ?2 AND NOT EXISTS(SELECT 1 FROM pvp_duel_event event WHERE event.duel_id = duel.id)",
+                pvp_duel_invitation_select_sql()
+            ),
+            params![target_player_id, challenger_subject_id],
+            pvp_duel_invitation_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取待接受决斗邀请失败：{error}"))
+}
+
+fn load_pending_pvp_invitation_for_challenger(
+    connection: &Connection,
+    challenger_player_id: i64,
+    target_subject_id: &str,
+) -> Result<Option<PvpDuelInvitation>, String> {
+    connection
+        .query_row(
+            &format!(
+                "{} WHERE duel.challenger_player_id = ?1 AND target_identity.subject_id = ?2 AND NOT EXISTS(SELECT 1 FROM pvp_duel_event event WHERE event.duel_id = duel.id)",
+                pvp_duel_invitation_select_sql()
+            ),
+            params![challenger_player_id, target_subject_id],
+            pvp_duel_invitation_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取待取消决斗邀请失败：{error}"))
+}
+
+fn load_pvp_event_by_actor_message(
+    connection: &Connection,
+    actor_player_id: i64,
+    source_message_id: &str,
+) -> Result<Option<PvpDuelEventSnapshot>, String> {
+    connection
+        .query_row(
+            r#"
+            SELECT id, duel_id, event_kind, result, winner_player_id,
+                   challenger_power, target_power
+              FROM pvp_duel_event
+             WHERE actor_player_id = ?1
+               AND source_message_id = ?2
+            "#,
+            params![actor_player_id, source_message_id],
+            pvp_duel_event_from_row,
+        )
+        .optional()
+        .map_err(|error| format!("读取决斗终局幂等记录失败：{error}"))
+}
+
+fn pvp_settlement_receipt(
+    invitation: &PvpDuelInvitation,
+    event: &PvpDuelEventSnapshot,
+    replayed: bool,
+) -> PvpDuelSettlementReceipt {
+    let winner_subject_id = match event.result.as_deref() {
+        Some("challenger_win") => Some(invitation.challenger_subject_id.clone()),
+        Some("target_win") => Some(invitation.target_subject_id.clone()),
+        _ => None,
+    };
+    PvpDuelSettlementReceipt {
+        event_id: event.id,
+        invitation: invitation.clone(),
+        result: event.result.clone().unwrap_or_else(|| "draw".to_string()),
+        winner_subject_id,
+        challenger_power: event.challenger_power,
+        target_power: event.target_power,
+        replayed,
+    }
+}
+
+fn ensure_no_pending_pvp_duel(
+    connection: &Connection,
+    player_id: i64,
+    timestamp: i64,
+    label: &str,
+) -> Result<(), String> {
+    let pending = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM pvp_duel duel
+             LEFT JOIN pvp_duel_event event
+                    ON event.duel_id = duel.id
+                 WHERE event.id IS NULL
+                   AND duel.expires_at > ?2
+                   AND (duel.challenger_player_id = ?1 OR duel.target_player_id = ?1)
+            )
+            "#,
+            params![player_id, timestamp],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查{label}待处理决斗失败：{error}"))?;
+    if pending {
+        return Err(format!("{label}已有一个未过期的待处理决斗邀请"));
+    }
+    Ok(())
+}
+
+fn ensure_same_pvp_map(
+    challenger: &PvpPlayerSnapshot,
+    target: &PvpPlayerSnapshot,
+) -> Result<(), String> {
+    if challenger.map_key != target.map_key {
+        return Err("双方必须在同一张地图才能发起决斗".to_string());
+    }
+    Ok(())
+}
+
+fn ensure_pvp_map_allows_duel(player: &PvpPlayerSnapshot) -> Result<(), String> {
+    if player.map_safe || !player.map_pvp_enabled {
+        return Err(format!(
+            "当前地图“{}”不是可进行 PVP 的区域",
+            player.map_name
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_pvp_invitation_map(
+    invitation: &PvpDuelInvitation,
+    challenger: &PvpPlayerSnapshot,
+    target: &PvpPlayerSnapshot,
+) -> Result<(), String> {
+    if challenger.map_key != invitation.map_key || target.map_key != invitation.map_key {
+        return Err("双方已离开创建邀请时的地图，不能接受该决斗邀请".to_string());
+    }
+    Ok(())
+}
+
+fn ensure_pvp_player_eligible(
+    connection: &Connection,
+    player: &PvpPlayerSnapshot,
+    label: &str,
+) -> Result<(), String> {
+    if player.state != "alive" || player.hp <= 0 || player.max_hp <= 0 {
+        return Err(format!("{label}当前不是存活状态，不能进行决斗"));
+    }
+    if !player.awakened || player.wuhun_id.is_none() || player.wuhun_category.is_none() {
+        return Err(format!("{label}尚未觉醒武魂，不能进行决斗"));
+    }
+    if player.wuhun_enabled != Some(true) || player.wuhun_stability.unwrap_or(0) <= 0 {
+        return Err(format!("{label}的武魂未开启或稳定度不足，不能进行决斗"));
+    }
+    let active_battle = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM battle WHERE player_id = ?1 AND status = 'active')",
+            [player.player_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查{label} PVE 战斗状态失败：{error}"))?;
+    if active_battle {
+        return Err(format!("{label}正在魂兽战斗中，不能进行决斗"));
+    }
+    Ok(())
+}
+
+/// 用当前角色属性和武魂攻防修正计算可重放的确定性战力，不读取当前 HP。
+fn pvp_combat_power(connection: &Connection, player: &PvpPlayerSnapshot) -> Result<i64, String> {
+    let wuhun_id = player
+        .wuhun_id
+        .ok_or_else(|| "角色缺少当前武魂，无法计算战力".to_string())?;
+    let category = player
+        .wuhun_category
+        .as_deref()
+        .ok_or_else(|| "角色缺少当前武魂类别，无法计算战力".to_string())?;
+    let modifier = load_wuhun_combat_modifier(connection, wuhun_id, category)?;
+    let attack_base = pvp_power_sum(
+        "决斗攻击战力",
+        &[
+            (player.level, 100),
+            (player.max_soul_power, 1),
+            (player.strength, 10),
+            (player.agility, 5),
+            (player.spirit, 10),
+            (player.perception, 5),
+            (player.luck, 2),
+        ],
+    )?;
+    let defense_base = pvp_power_sum(
+        "决斗防御战力",
+        &[
+            (player.max_hp, 1),
+            (player.endurance, 10),
+            (player.agility, 5),
+            (player.perception, 5),
+            (player.luck, 2),
+        ],
+    )?;
+    let attack = scale_combat_value(attack_base, modifier.attack_percent, "决斗攻击修正")?;
+    let defense = scale_combat_value(defense_base, modifier.defense_percent, "决斗防御修正")?;
+    attack
+        .checked_add(defense)
+        .ok_or_else(|| "决斗战力汇总溢出".to_string())
+}
+
+fn pvp_power_sum(label: &str, terms: &[(i64, i64)]) -> Result<i64, String> {
+    terms.iter().try_fold(0_i64, |total, (value, weight)| {
+        let term = value
+            .checked_mul(*weight)
+            .ok_or_else(|| format!("{label}计算溢出"))?;
+        total
+            .checked_add(term)
+            .ok_or_else(|| format!("{label}汇总溢出"))
+    })
+}
+
 fn load_battle_player(
     connection: &Connection,
     key: &IdentityKey<'_>,
@@ -18764,6 +19947,68 @@ fn validate_battle_operation(
         return Err(format!(
             "{command}成功审计必须使用规范命令“{command}”和 ok 结果"
         ));
+    }
+    Ok(())
+}
+
+fn validate_pvp_operation(operation: &OperationLogInput<'_>, command: &str) -> Result<(), String> {
+    validate_operation_input(operation)?;
+    if operation.command != command || operation.outcome != "ok" {
+        return Err(format!(
+            "{command}成功审计必须使用规范命令“{command}”和 ok 结果"
+        ));
+    }
+    if operation.source_message_id.is_empty() {
+        return Err(format!("{command}必须携带非空消息 ID，以保证 PVP 操作幂等"));
+    }
+    Ok(())
+}
+
+fn validate_pvp_subject_id(value: &str) -> Result<(), String> {
+    if value != value.trim() || !valid_audit_value(value, 256) {
+        return Err("用户 ID 必须是 1 到 256 个无控制字符的非空字符串".to_string());
+    }
+    Ok(())
+}
+
+fn reject_replayed_pvp_operation(
+    connection: &Connection,
+    key: &IdentityKey<'_>,
+    operation: &OperationLogInput<'_>,
+    command: &str,
+) -> Result<(), String> {
+    let previous_command = connection
+        .query_row(
+            r#"
+            SELECT command
+              FROM operation_log
+             WHERE protocol = ?1
+               AND account_id = ?2
+               AND namespace = ?3
+               AND subject_kind = ?4
+               AND subject_id = ?5
+               AND source_message_id = ?6
+               AND outcome = 'ok'
+          ORDER BY id DESC
+             LIMIT 1
+            "#,
+            params![
+                key.protocol.as_str(),
+                key.account_id,
+                key.namespace,
+                key.subject_kind,
+                key.subject_id,
+                operation.source_message_id,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("检查{command} PVP 幂等键失败：{error}"))?;
+    if let Some(previous_command) = previous_command {
+        if previous_command != command {
+            return Err("该消息 ID 已用于不同的 PVP 操作，拒绝重放".to_string());
+        }
+        return Err("该消息已有成功审计但 PVP 账本缺失，拒绝重复执行".to_string());
     }
     Ok(())
 }
@@ -22408,6 +23653,8 @@ fn validate_v8_triggers(connection: &Connection) -> Result<(), String> {
                 | "soul_beast"
                 | "battle"
                 | "battle_event"
+                | "pvp_duel"
+                | "pvp_duel_event"
         ) {
             continue;
         }
@@ -23625,6 +24872,9 @@ fn validate_v13_schema(connection: &Connection) -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("解析 v13 全库触发器失败：{error}"))?;
     for (name, table, trigger_sql) in triggers {
+        if table == "pvp_duel" || table == "pvp_duel_event" {
+            continue;
+        }
         let declared = expected_triggers
             .iter()
             .any(|(expected_name, expected_table, _)| {
@@ -28102,7 +29352,7 @@ fn validate_v29_schema(connection: &Connection) -> Result<(), String> {
             &["BEFORE UPDATE", "RAISE(ABORT"] as &[&str],
         ),
     ];
-    for (name, table, markers) in expected_triggers {
+    for &(name, table, markers) in &expected_triggers {
         let (actual_table, trigger_sql) = connection
             .query_row(
                 "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
@@ -29168,7 +30418,7 @@ fn validate_v34_schema(connection: &Connection) -> Result<(), String> {
             ] as &[&str],
         ),
     ];
-    for (name, table, markers) in expected_triggers {
+    for &(name, table, markers) in &expected_triggers {
         let (actual_table, sql) = connection
             .query_row(
                 "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
@@ -29304,6 +30554,374 @@ fn validate_v34_schema(connection: &Connection) -> Result<(), String> {
         .map_err(|error| format!("检查 v34 魂导器数据边界失败：{error}"))?;
     if invalid_rows {
         return Err("v34 检测到越界、伪造审计或重复装备的魂导器数据".to_string());
+    }
+    Ok(())
+}
+
+/// 校验 PVP 邀请和终局账本；缺表、缺触发器、伪造范围或重复终局均拒绝启动。
+fn validate_v35_schema(connection: &Connection) -> Result<(), String> {
+    validate_v34_schema(connection)?;
+
+    let duel_columns = table_columns_with_type(connection, "pvp_duel")?;
+    let expected_duel_columns = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("protocol", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("account_id", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("namespace", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("subject_kind", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("challenger_identity_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("challenger_player_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("challenger_subject_id", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("target_identity_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("target_player_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("target_subject_id", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("map_key", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("source_message_id", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("operation_log_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("expires_at", "INTEGER", true, false, None, 0),
+    ];
+    if duel_columns != expected_duel_columns {
+        return Err(format!(
+            "数据库已标记迁移 v35，但 pvp_duel 字段不匹配：{duel_columns:?}"
+        ));
+    }
+
+    let event_columns = table_columns_with_type(connection, "pvp_duel_event")?;
+    let expected_event_columns = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("duel_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("event_kind", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("actor_identity_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("actor_player_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("result", "TEXT", false, false, None, 0),
+        TableColumnInfo::new("winner_player_id", "INTEGER", false, false, None, 0),
+        TableColumnInfo::new("challenger_power", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("target_power", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("source_message_id", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("operation_log_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("created_at", "INTEGER", true, false, None, 0),
+    ];
+    if event_columns != expected_event_columns {
+        return Err(format!(
+            "数据库已标记迁移 v35，但 pvp_duel_event 字段不匹配：{event_columns:?}"
+        ));
+    }
+
+    validate_v10_table_sql(
+        connection,
+        "pvp_duel",
+        &[
+            ") STRICT",
+            "CHALLENGER_IDENTITY_ID INTEGER NOT NULL REFERENCES IDENTITY(ID) ON DELETE RESTRICT",
+            "TARGET_PLAYER_ID INTEGER NOT NULL REFERENCES PLAYER(ID) ON DELETE RESTRICT",
+            "MAP_KEY TEXT NOT NULL REFERENCES MAP(MAP_KEY) ON DELETE RESTRICT",
+            "CHECK(EXPIRES_AT = CREATED_AT + 300)",
+            "UNIQUE(CHALLENGER_PLAYER_ID, SOURCE_MESSAGE_ID)",
+        ],
+    )
+    .map_err(|error| error.replace("v10", "v35"))?;
+    validate_v10_table_sql(
+        connection,
+        "pvp_duel_event",
+        &[
+            ") STRICT",
+            "DUEL_ID INTEGER NOT NULL UNIQUE REFERENCES PVP_DUEL(ID) ON DELETE RESTRICT",
+            "ACTOR_PLAYER_ID INTEGER NOT NULL REFERENCES PLAYER(ID) ON DELETE RESTRICT",
+            "EVENT_KIND TEXT NOT NULL CHECK(EVENT_KIND IN ('ACCEPTED', 'CANCELLED'))",
+            "UNIQUE(ACTOR_PLAYER_ID, SOURCE_MESSAGE_ID)",
+        ],
+    )
+    .map_err(|error| error.replace("v10", "v35"))?;
+
+    validate_v9_foreign_keys(
+        connection,
+        "pvp_duel",
+        &[
+            (
+                "identity",
+                "challenger_identity_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            (
+                "identity",
+                "target_identity_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("map", "map_key", "map_key", "NO ACTION", "RESTRICT"),
+            (
+                "operation_log",
+                "operation_log_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            (
+                "player",
+                "challenger_player_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("player", "target_player_id", "id", "NO ACTION", "RESTRICT"),
+        ],
+    )
+    .map_err(|error| error.replace("v9", "v35"))?;
+    validate_v9_foreign_keys(
+        connection,
+        "pvp_duel_event",
+        &[
+            (
+                "identity",
+                "actor_identity_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            (
+                "operation_log",
+                "operation_log_id",
+                "id",
+                "NO ACTION",
+                "RESTRICT",
+            ),
+            ("player", "actor_player_id", "id", "NO ACTION", "RESTRICT"),
+            ("player", "winner_player_id", "id", "NO ACTION", "RESTRICT"),
+            ("pvp_duel", "duel_id", "id", "NO ACTION", "RESTRICT"),
+        ],
+    )
+    .map_err(|error| error.replace("v9", "v35"))?;
+
+    validate_v10_custom_index_set(
+        connection,
+        "pvp_duel",
+        &[
+            "pvp_duel_challenger_page",
+            "pvp_duel_target_page",
+            "pvp_duel_scope_page",
+            "pvp_duel_challenger_pending",
+            "pvp_duel_target_pending",
+        ],
+    )
+    .map_err(|error| error.replace("v10", "v35"))?;
+    validate_v10_custom_index_set(
+        connection,
+        "pvp_duel_event",
+        &["pvp_duel_event_actor_page", "pvp_duel_event_duel_page"],
+    )
+    .map_err(|error| error.replace("v10", "v35"))?;
+
+    let expected_triggers = [
+        (
+            "pvp_duel_no_update",
+            "pvp_duel",
+            &["BEFORE UPDATE ON PVP_DUEL", "RAISE(ABORT"] as &[&str],
+        ),
+        (
+            "pvp_duel_no_delete",
+            "pvp_duel",
+            &["BEFORE DELETE ON PVP_DUEL", "RAISE(ABORT"] as &[&str],
+        ),
+        (
+            "pvp_duel_no_reinsert",
+            "pvp_duel",
+            &["BEFORE INSERT ON PVP_DUEL", "APPEND-ONLY"] as &[&str],
+        ),
+        (
+            "pvp_duel_pending_player_guard",
+            "pvp_duel",
+            &["BEFORE INSERT ON PVP_DUEL", "PVP_DUEL_EVENT", "PENDING"] as &[&str],
+        ),
+        (
+            "pvp_duel_scope_guard",
+            "pvp_duel",
+            &["BEFORE INSERT ON PVP_DUEL", "PVP DUEL INVITATION SCOPE"] as &[&str],
+        ),
+        (
+            "pvp_duel_event_no_update",
+            "pvp_duel_event",
+            &["BEFORE UPDATE ON PVP_DUEL_EVENT", "RAISE(ABORT"] as &[&str],
+        ),
+        (
+            "pvp_duel_event_no_delete",
+            "pvp_duel_event",
+            &["BEFORE DELETE ON PVP_DUEL_EVENT", "RAISE(ABORT"] as &[&str],
+        ),
+        (
+            "pvp_duel_event_no_reinsert",
+            "pvp_duel_event",
+            &["BEFORE INSERT ON PVP_DUEL_EVENT", "APPEND-ONLY"] as &[&str],
+        ),
+        (
+            "pvp_duel_event_scope_guard",
+            "pvp_duel_event",
+            &["BEFORE INSERT ON PVP_DUEL_EVENT", "PVP DUEL EVENT SCOPE"] as &[&str],
+        ),
+    ];
+    for &(name, table, markers) in &expected_triggers {
+        let (actual_table, sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v35 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库缺少 v35 触发器 {name}"))?;
+        let normalized = sql.to_ascii_uppercase();
+        if actual_table != table || markers.iter().any(|marker| !normalized.contains(marker)) {
+            return Err(format!("v35 触发器 {name} 契约不匹配"));
+        }
+    }
+
+    let invalid_rows = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM pvp_duel duel
+             LEFT JOIN identity challenger_identity
+                    ON challenger_identity.id = duel.challenger_identity_id
+             LEFT JOIN player challenger
+                    ON challenger.id = duel.challenger_player_id
+             LEFT JOIN identity target_identity
+                    ON target_identity.id = duel.target_identity_id
+             LEFT JOIN player target
+                    ON target.id = duel.target_player_id
+             LEFT JOIN map map
+                    ON map.map_key = duel.map_key
+             LEFT JOIN operation_log audit
+                    ON audit.id = duel.operation_log_id
+                 WHERE challenger_identity.id IS NULL
+                    OR challenger.id IS NULL
+                    OR target_identity.id IS NULL
+                    OR target.id IS NULL
+                    OR map.map_key IS NULL
+                    OR audit.id IS NULL
+                    OR duel.challenger_identity_id = duel.target_identity_id
+                    OR duel.challenger_player_id = duel.target_player_id
+                    OR duel.expires_at <> duel.created_at + 300
+                    OR challenger_identity.protocol <> duel.protocol
+                    OR target_identity.protocol <> duel.protocol
+                    OR challenger_identity.account_id <> duel.account_id
+                    OR target_identity.account_id <> duel.account_id
+                    OR challenger_identity.namespace <> duel.namespace
+                    OR target_identity.namespace <> duel.namespace
+                    OR challenger_identity.subject_id <> duel.challenger_subject_id
+                    OR target_identity.subject_id <> duel.target_subject_id
+                    OR audit.protocol <> duel.protocol
+                    OR audit.account_id <> duel.account_id
+                    OR audit.namespace <> duel.namespace
+                    OR audit.subject_kind <> duel.subject_kind
+                    OR audit.subject_id <> duel.challenger_subject_id
+                    OR audit.command <> '决斗'
+                    OR audit.outcome <> 'ok'
+                    OR audit.source_message_id <> duel.source_message_id
+            ) OR EXISTS(
+                SELECT 1
+                  FROM pvp_duel_event event
+             LEFT JOIN pvp_duel duel
+                    ON duel.id = event.duel_id
+             LEFT JOIN identity actor_identity
+                    ON actor_identity.id = event.actor_identity_id
+             LEFT JOIN operation_log audit
+                    ON audit.id = event.operation_log_id
+                 WHERE duel.id IS NULL
+                    OR actor_identity.id IS NULL
+                    OR audit.id IS NULL
+                    OR event.event_kind NOT IN ('accepted', 'cancelled')
+                    OR event.challenger_power < 0
+                    OR event.target_power < 0
+                    OR (
+                        event.event_kind = 'accepted'
+                        AND (
+                            event.result IS NULL
+                            OR (
+                                event.result = 'challenger_win'
+                                AND event.winner_player_id <> duel.challenger_player_id
+                            )
+                            OR (
+                                event.result = 'target_win'
+                                AND event.winner_player_id <> duel.target_player_id
+                            )
+                            OR (event.result = 'draw' AND event.winner_player_id IS NOT NULL)
+                        )
+                    )
+                    OR (
+                        event.event_kind = 'cancelled'
+                        AND (
+                            event.result IS NOT NULL
+                            OR event.winner_player_id IS NOT NULL
+                            OR event.challenger_power <> 0
+                            OR event.target_power <> 0
+                        )
+                    )
+                    OR audit.protocol <> duel.protocol
+                    OR audit.account_id <> duel.account_id
+                    OR audit.namespace <> duel.namespace
+                    OR audit.subject_kind <> duel.subject_kind
+                    OR audit.source_message_id <> event.source_message_id
+                    OR (
+                        event.event_kind = 'accepted'
+                        AND (
+                            event.actor_identity_id <> duel.target_identity_id
+                            OR event.actor_player_id <> duel.target_player_id
+                            OR audit.subject_id <> duel.target_subject_id
+                            OR audit.command <> '接受决斗'
+                        )
+                    )
+                    OR (
+                        event.event_kind = 'cancelled'
+                        AND (
+                            event.actor_identity_id <> duel.challenger_identity_id
+                            OR event.actor_player_id <> duel.challenger_player_id
+                            OR audit.subject_id <> duel.challenger_subject_id
+                            OR audit.command <> '取消决斗'
+                        )
+                    )
+                    OR audit.outcome <> 'ok'
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v35 PVP 账本数据边界失败：{error}"))?;
+    if invalid_rows {
+        return Err("v35 检测到越界、伪造审计或不一致的 PVP 账本数据".to_string());
+    }
+
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v35 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v35 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v35 全库触发器失败：{error}"))?;
+    for (name, table, sql) in triggers {
+        let declared = expected_triggers
+            .iter()
+            .any(|(expected_name, expected_table, _)| {
+                name == *expected_name && table == *expected_table
+            });
+        let touches_v35 = matches!(table.as_str(), "pvp_duel" | "pvp_duel_event")
+            || ["pvp_duel", "pvp_duel_event"]
+                .iter()
+                .any(|identifier| sql_mentions_identifier(&sql, identifier));
+        if touches_v35 && !declared {
+            return Err(format!(
+                "数据库已标记迁移 v35，但触发器 {name}（目标表 {table}）未声明却引用 PVP 账本结构"
+            ));
+        }
     }
     Ok(())
 }
@@ -29666,7 +31284,9 @@ fn validate_v12_triggers(connection: &Connection) -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("解析 v12 全库触发器失败：{error}"))?;
     for (name, table, sql) in triggers {
-        if table == "battle_wuhun_modifier"
+        if table == "pvp_duel"
+            || table == "pvp_duel_event"
+            || table == "battle_wuhun_modifier"
             || table == "battle_skill_event"
             || table == "battle_skill_modifier"
             || table == "skill_progress_event"
@@ -30601,6 +32221,8 @@ fn validate_v7_triggers(connection: &Connection) -> Result<(), String> {
                 | "soul_beast"
                 | "battle"
                 | "battle_event"
+                | "pvp_duel"
+                | "pvp_duel_event"
         ) {
             continue;
         }
@@ -32089,6 +33711,38 @@ mod tests {
         store
             .awaken_wuhun(&recipient_identity())
             .expect("接收方应完成武魂觉醒");
+    }
+
+    fn prepare_pvp_pair(store: &Store) {
+        register_awakened_pair(store);
+        store
+            .set_wuhun_enabled_with_operation(
+                &identity(),
+                true,
+                &transfer_operation("开武魂", "pvp-open-challenger"),
+            )
+            .expect("挑战者应开启武魂");
+        store
+            .set_wuhun_enabled_with_operation(
+                &recipient_identity(),
+                true,
+                &transfer_operation("开武魂", "pvp-open-target"),
+            )
+            .expect("被挑战者应开启武魂");
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "pvp-map-challenger"),
+            )
+            .expect("挑战者应进入 PVP 地图");
+        store
+            .teleport_with_operation(
+                &recipient_identity(),
+                Some("落日森林"),
+                &map_operation("传送", "pvp-map-target"),
+            )
+            .expect("被挑战者应进入 PVP 地图");
     }
 
     fn absorb_test_soul_ring(
@@ -42634,6 +44288,435 @@ mod tests {
             r#"
             CREATE TRIGGER storage_container_attribute_shadow
             AFTER INSERT ON storage_container
+            BEGIN
+                SELECT 1;
+            END;
+            "#,
+        );
+    }
+
+    #[test]
+    fn p4_pvp_duel_acceptance_is_replay_safe_and_does_not_mutate_players() {
+        let (_directory, store) = test_store();
+        prepare_pvp_pair(&store);
+        let challenger_before = store
+            .player_status(&identity())
+            .expect("应读取挑战者结算前状态")
+            .expect("挑战者应存在");
+        let target_before = store
+            .player_status(&recipient_identity())
+            .expect("应读取被挑战者结算前状态")
+            .expect("被挑战者应存在");
+
+        let invitation = store
+            .create_pvp_duel_with_operation(
+                &identity(),
+                recipient_identity().subject_id,
+                &transfer_operation("决斗", "pvp-invite-1"),
+            )
+            .expect("应创建决斗邀请");
+        assert!(!invitation.replayed);
+        assert_eq!(invitation.invitation.map_name, "落日森林");
+        let invitation_replay = store
+            .create_pvp_duel_with_operation(
+                &identity(),
+                recipient_identity().subject_id,
+                &transfer_operation("决斗", "pvp-invite-1"),
+            )
+            .expect("重复邀请应返回原记录");
+        assert!(invitation_replay.replayed);
+        assert_eq!(invitation.invitation.id, invitation_replay.invitation.id);
+
+        let status = store
+            .pvp_duel_status(&recipient_identity())
+            .expect("被挑战者应看到待处理邀请");
+        assert!(status.outgoing.is_empty());
+        assert_eq!(status.incoming.len(), 1);
+
+        let settlement = store
+            .accept_pvp_duel_with_operation(
+                &recipient_identity(),
+                identity().subject_id,
+                &transfer_operation("接受决斗", "pvp-accept-1"),
+            )
+            .expect("应接受并结算决斗");
+        assert!(!settlement.replayed);
+        assert!(settlement.challenger_power > 0);
+        assert!(settlement.target_power > 0);
+        assert!(matches!(
+            settlement.result.as_str(),
+            "challenger_win" | "target_win" | "draw"
+        ));
+
+        let settlement_replay = store
+            .accept_pvp_duel_with_operation(
+                &recipient_identity(),
+                identity().subject_id,
+                &transfer_operation("接受决斗", "pvp-accept-1"),
+            )
+            .expect("重复接受应返回原结算");
+        assert!(settlement_replay.replayed);
+        assert_eq!(settlement.event_id, settlement_replay.event_id);
+        assert_eq!(settlement.result, settlement_replay.result);
+        assert_eq!(
+            (settlement.challenger_power, settlement.target_power),
+            (
+                settlement_replay.challenger_power,
+                settlement_replay.target_power
+            )
+        );
+        assert_eq!(
+            store
+                .pvp_duel_status(&identity())
+                .expect("挑战者状态应可读取")
+                .outgoing
+                .len(),
+            0
+        );
+        assert_eq!(
+            store
+                .pvp_duel_status(&recipient_identity())
+                .expect("被挑战者状态应可读取")
+                .incoming
+                .len(),
+            0
+        );
+
+        let challenger_after = store
+            .player_status(&identity())
+            .expect("应读取挑战者结算后状态")
+            .expect("挑战者应存在");
+        let target_after = store
+            .player_status(&recipient_identity())
+            .expect("应读取被挑战者结算后状态")
+            .expect("被挑战者应存在");
+        assert_eq!(challenger_before, challenger_after);
+        assert_eq!(target_before, target_after);
+
+        let connection = store.open().expect("应打开 PVP 账本");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pvp_duel WHERE id = ?1",
+                    [invitation.invitation.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("应统计邀请"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pvp_duel_event WHERE duel_id = ?1",
+                    [invitation.invitation.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("应统计终局事件"),
+            1
+        );
+    }
+
+    #[test]
+    fn p4_pvp_duel_scope_pending_and_sql_bypass_fail_closed() {
+        let (_directory, store) = test_store();
+        register_awakened_pair(&store);
+        for (key, message_id) in [
+            (&identity(), "pvp-scope-open-challenger"),
+            (&recipient_identity(), "pvp-scope-open-target"),
+        ] {
+            store
+                .set_wuhun_enabled_with_operation(
+                    key,
+                    true,
+                    &transfer_operation("开武魂", message_id),
+                )
+                .expect("测试角色应开启武魂");
+        }
+        assert!(
+            store
+                .create_pvp_duel_with_operation(
+                    &identity(),
+                    recipient_identity().subject_id,
+                    &transfer_operation("决斗", "pvp-safe-map"),
+                )
+                .expect_err("安全区不能创建 PVP 邀请")
+                .contains("PVP")
+        );
+
+        store
+            .teleport_with_operation(
+                &identity(),
+                Some("落日森林"),
+                &map_operation("传送", "pvp-scope-map-challenger"),
+            )
+            .expect("挑战者应进入落日森林");
+        assert!(
+            store
+                .create_pvp_duel_with_operation(
+                    &identity(),
+                    recipient_identity().subject_id,
+                    &transfer_operation("决斗", "pvp-different-map"),
+                )
+                .expect_err("跨地图不能创建 PVP 邀请")
+                .contains("同一张地图")
+        );
+        store
+            .teleport_with_operation(
+                &recipient_identity(),
+                Some("落日森林"),
+                &map_operation("传送", "pvp-scope-map-target"),
+            )
+            .expect("被挑战者应进入落日森林");
+
+        let invitation = store
+            .create_pvp_duel_with_operation(
+                &identity(),
+                recipient_identity().subject_id,
+                &transfer_operation("决斗", "pvp-pending-1"),
+            )
+            .expect("同地图 PVP 邀请应成功");
+        assert!(
+            store
+                .create_pvp_duel_with_operation(
+                    &identity(),
+                    recipient_identity().subject_id,
+                    &transfer_operation("决斗", "pvp-pending-2"),
+                )
+                .expect_err("同一挑战者不能同时发出第二个邀请")
+                .contains("待处理")
+        );
+        assert!(
+            store
+                .create_pvp_duel_with_operation(
+                    &recipient_identity(),
+                    identity().subject_id,
+                    &transfer_operation("决斗", "pvp-pending-reverse"),
+                )
+                .expect_err("同一被挑战者不能同时收到第二个邀请")
+                .contains("待处理")
+        );
+
+        let target_player_id = player_id_for(&store, &recipient_identity());
+        let connection = store.open().expect("应打开 SQL 绕过测试数据库");
+        let (target_identity_id, duel_id) = connection
+            .query_row(
+                "SELECT target_identity_id, id FROM pvp_duel WHERE id = ?1",
+                [invitation.invitation.id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .expect("应读取邀请内部绑定");
+        drop(connection);
+        let operation_log_id = store
+            .append_operation(
+                &recipient_identity(),
+                "状态",
+                "ok",
+                "pvp-sql-bypass",
+                r#"{"context":"private","has_args":false}"#,
+            )
+            .expect("应写入错误审计作为绕过探针");
+        let connection = store.open().expect("应重新打开 SQL 绕过测试数据库");
+        assert!(
+            connection
+                .execute(
+                    r#"
+                INSERT INTO pvp_duel_event(
+                    duel_id, event_kind, actor_identity_id, actor_player_id,
+                    result, winner_player_id, challenger_power, target_power,
+                    source_message_id, operation_log_id, created_at
+                ) VALUES(?1, 'accepted', ?2, ?3, 'draw', NULL, 1, 1, ?4, ?5, ?6)
+                "#,
+                    params![
+                        duel_id,
+                        target_identity_id,
+                        target_player_id,
+                        "pvp-sql-bypass",
+                        operation_log_id,
+                        now_timestamp().expect("应读取当前时间"),
+                    ],
+                )
+                .is_err(),
+            "错误的操作命令不能直接写入 PVP 终局"
+        );
+    }
+
+    #[test]
+    fn p4_pvp_expiration_is_lazy_and_expired_invitation_can_be_replaced() {
+        let (_directory, store) = test_store();
+        prepare_pvp_pair(&store);
+        let expired = store
+            .create_pvp_duel_at(
+                &identity(),
+                recipient_identity().subject_id,
+                &transfer_operation("决斗", "pvp-expired-invite"),
+                0,
+            )
+            .expect("应创建用于过期测试的邀请");
+        assert!(
+            store
+                .pvp_duel_status(&identity())
+                .expect("过期查询应成功")
+                .outgoing
+                .is_empty()
+        );
+        assert!(
+            store
+                .accept_pvp_duel_with_operation(
+                    &recipient_identity(),
+                    identity().subject_id,
+                    &transfer_operation("接受决斗", "pvp-expired-accept"),
+                )
+                .expect_err("过期邀请不能接受")
+                .contains("过期")
+        );
+
+        let replacement = store
+            .create_pvp_duel_with_operation(
+                &identity(),
+                recipient_identity().subject_id,
+                &transfer_operation("决斗", "pvp-replacement"),
+            )
+            .expect("过期邀请不应阻塞新邀请");
+        assert_ne!(expired.invitation.id, replacement.invitation.id);
+        assert_eq!(
+            store
+                .pvp_duel_status(&identity())
+                .expect("替代邀请状态应可读取")
+                .outgoing
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn p4_pvp_duel_cancellation_is_challenger_only_and_replay_safe() {
+        let (_directory, store) = test_store();
+        prepare_pvp_pair(&store);
+        let invitation = store
+            .create_pvp_duel_with_operation(
+                &identity(),
+                recipient_identity().subject_id,
+                &transfer_operation("决斗", "pvp-cancel-invite"),
+            )
+            .expect("应创建待取消邀请");
+        assert!(
+            store
+                .cancel_pvp_duel_with_operation(
+                    &recipient_identity(),
+                    identity().subject_id,
+                    &transfer_operation("取消决斗", "pvp-cancel-by-target"),
+                )
+                .is_err(),
+            "被挑战者不能取消挑战者发出的邀请"
+        );
+
+        let cancelled = store
+            .cancel_pvp_duel_with_operation(
+                &identity(),
+                recipient_identity().subject_id,
+                &transfer_operation("取消决斗", "pvp-cancel-1"),
+            )
+            .expect("挑战者应取消邀请");
+        assert!(!cancelled.replayed);
+        assert_eq!(cancelled.invitation.id, invitation.invitation.id);
+        let replayed = store
+            .cancel_pvp_duel_with_operation(
+                &identity(),
+                recipient_identity().subject_id,
+                &transfer_operation("取消决斗", "pvp-cancel-1"),
+            )
+            .expect("重复取消应返回原回执");
+        assert!(replayed.replayed);
+        assert_eq!(cancelled.invitation.id, replayed.invitation.id);
+        assert!(
+            store
+                .accept_pvp_duel_with_operation(
+                    &recipient_identity(),
+                    identity().subject_id,
+                    &transfer_operation("接受决斗", "pvp-cancel-accept"),
+                )
+                .is_err(),
+            "已取消邀请不能再次接受"
+        );
+    }
+
+    #[test]
+    fn p4_pvp_duel_concurrent_same_message_has_one_invitation() {
+        let (_directory, store) = test_store();
+        prepare_pvp_pair(&store);
+        let barrier = Arc::new(Barrier::new(2));
+        let first_store = store.clone();
+        let first_barrier = barrier.clone();
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_store.create_pvp_duel_with_operation(
+                &identity(),
+                recipient_identity().subject_id,
+                &transfer_operation("决斗", "pvp-concurrent"),
+            )
+        });
+        let second_store = store.clone();
+        let second_barrier = barrier.clone();
+        let second = std::thread::spawn(move || {
+            second_barrier.wait();
+            second_store.create_pvp_duel_with_operation(
+                &identity(),
+                recipient_identity().subject_id,
+                &transfer_operation("决斗", "pvp-concurrent"),
+            )
+        });
+        let first = first
+            .join()
+            .expect("第一条并发邀请线程应结束")
+            .expect("第一条邀请应成功");
+        let second = second
+            .join()
+            .expect("第二条并发邀请线程应结束")
+            .expect("第二条邀请应返回");
+        assert_ne!(first.replayed, second.replayed);
+        assert_eq!(first.invitation.id, second.invitation.id);
+        assert_eq!(
+            store
+                .pvp_duel_status(&identity())
+                .expect("并发后状态应可读取")
+                .outgoing
+                .len(),
+            1
+        );
+    }
+
+    fn assert_v35_damage_fails_closed(mutation: &str) {
+        let directory = tempdir().expect("应创建 v35 损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v35 迁移应成功");
+        let connection = store.open().expect("应打开 v35 损坏测试数据库");
+        connection
+            .execute_batch(mutation)
+            .expect("应能构造 v35 schema 损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("记录 v35 后损坏 schema 必须拒绝启动");
+        assert!(
+            error.contains("v35") || error.contains("PVP") || error.contains("pvp_"),
+            "v35 损坏未由对应校验拒绝：{mutation}；实际错误：{error}"
+        );
+    }
+
+    #[test]
+    fn recorded_v35_pvp_schema_or_trigger_damage_fails_closed() {
+        for mutation in [
+            "DROP TABLE pvp_duel;",
+            "DROP INDEX pvp_duel_event_actor_page;",
+            "DROP TRIGGER pvp_duel_event_scope_guard;",
+            "DROP TRIGGER pvp_duel_pending_player_guard;",
+        ] {
+            assert_v35_damage_fails_closed(mutation);
+        }
+        assert_v35_damage_fails_closed(
+            r#"
+            CREATE TRIGGER pvp_duel_shadow
+            AFTER INSERT ON pvp_duel
             BEGIN
                 SELECT 1;
             END;
