@@ -58,6 +58,10 @@ const MENU_PAGES: &[MenuPage] = &[
                 description: "查看角色属性、武魂和位置",
             },
             MenuEntry {
+                command: "排行榜 [页码]",
+                description: "查看同一机器人分区内的基础等级排行",
+            },
+            MenuEntry {
                 command: "数值曲线 [页码]",
                 description: "查看当前发布的等级与魂技成长规则说明",
             },
@@ -291,6 +295,7 @@ const MENU_PAGES: &[MenuPage] = &[
 
 const MAP_PAGE_SIZE: usize = 5;
 const NUMERIC_CURVE_PAGE_SIZE: usize = 8;
+const LEADERBOARD_PAGE_SIZE: usize = 10;
 
 const CHECKIN_CURRENCY_CODE: &str = GOLD_SOUL_COIN;
 const CHECKIN_CURRENCY_NAME: &str = "金魂币";
@@ -2352,6 +2357,47 @@ impl GameService {
         Ok(self.status_document(player))
     }
 
+    /// 展示同一稳定机器人账户与命名空间内未封存角色的基础等级排行榜。
+    ///
+    /// 该入口只读取当前等级与累计经验，不创建赛季积分或修改任何角色状态。
+    pub fn leaderboard(&self, req: &CommandRequest) -> Result<GameDocument, String> {
+        let page = parse_leaderboard_page(req.args.as_str())?;
+        let identity = resolve_identity(req, &self.config.identity)?;
+        let key = self.identity_key(&identity, &identity.subject_id);
+        self.store
+            .player_status(&key)?
+            .ok_or_else(|| "你还没有角色，请先使用“开始穿越 角色名 性别”".to_string())?;
+        let leaderboard = self
+            .store
+            .leaderboard_page(&key, page, LEADERBOARD_PAGE_SIZE)?;
+        let mut document = GameDocument::new("基础等级排行榜")
+            .field(
+                "页码",
+                format!("{} / {}", leaderboard.page, leaderboard.page_count),
+            )
+            .field("上榜角色", leaderboard.total.to_string());
+        if leaderboard.entries.is_empty() {
+            document = document.line("当前范围没有可上榜角色");
+        } else {
+            for entry in &leaderboard.entries {
+                document = document.line(format!(
+                    "第{}名 · {} · Lv.{} · 总经验 {}",
+                    entry.rank, entry.name, entry.level, entry.total_exp
+                ));
+            }
+        }
+        if leaderboard.page > 1 {
+            document = document.command(format!("排行榜 {}", leaderboard.page - 1));
+        }
+        if leaderboard.page < leaderboard.page_count {
+            document = document.command(format!("排行榜 {}", leaderboard.page + 1));
+        }
+        Ok(
+            document
+                .notice("仅统计同一协议、Bot account_id 和命名空间内未封存角色；不包含赛季积分"),
+        )
+    }
+
     pub fn location(&self, req: &CommandRequest) -> Result<GameDocument, String> {
         if !req.args.as_str().trim().is_empty() {
             return Err("用法：位置".to_string());
@@ -2999,6 +3045,23 @@ fn parse_map_page(args: &str) -> Result<usize, String> {
         .map_err(|_| "用法：地图列表 [页码]".to_string())?;
     if parts.next().is_some() || page == 0 || page > 100 {
         return Err("地图页码必须在 1 到 100 之间".to_string());
+    }
+    Ok(page)
+}
+
+fn parse_leaderboard_page(args: &str) -> Result<usize, String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Ok(1);
+    }
+    let mut parts = args.split_whitespace();
+    let page = parts
+        .next()
+        .ok_or_else(|| "用法：排行榜 [页码]".to_string())?
+        .parse::<usize>()
+        .map_err(|_| "用法：排行榜 [页码]".to_string())?;
+    if parts.next().is_some() || page == 0 || page > 100 {
+        return Err("排行榜页码必须在 1 到 100 之间".to_string());
     }
     Ok(page)
 }
@@ -3882,6 +3945,95 @@ mod tests {
     }
 
     #[test]
+    fn leaderboard_command_renders_pages_without_mutating_player_state() {
+        let directory = tempfile::tempdir().expect("应创建排行榜临时目录");
+        let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
+            .expect("排行榜数据库应初始化");
+        let service = GameService::with_assets(
+            store.clone(),
+            PluginConfig::default(),
+            IllustrationAssets::default(),
+        );
+
+        assert!(
+            service
+                .leaderboard(&command_request(
+                    "排行榜",
+                    "",
+                    "leaderboard-before-register"
+                ))
+                .is_err(),
+            "没有角色时不得读取排行榜"
+        );
+        service
+            .register(&command_request(
+                "开始穿越",
+                "排行命令 男",
+                "leaderboard-register",
+            ))
+            .expect("应创建排行榜命令测试角色");
+        let identity = resolve_identity(
+            &command_request("排行榜", "", "leaderboard-identity"),
+            &service.config.identity,
+        )
+        .expect("排行榜命令身份应解析");
+        let key = service.identity_key(&identity, &identity.subject_id);
+        for level in 2..=12_i64 {
+            let subject_id = format!("leaderboard-peer-{level}");
+            let name = format!("排行{level}");
+            let peer = IdentityKey {
+                protocol: key.protocol,
+                account_id: key.account_id,
+                namespace: key.namespace,
+                subject_kind: key.subject_kind,
+                subject_id: &subject_id,
+            };
+            store
+                .register_player(&peer, &name, "女")
+                .expect("应创建同榜角色");
+        }
+        let player_before = store
+            .player_status(&key)
+            .expect("查询前应读取命令角色状态")
+            .expect("命令角色应存在");
+
+        let first = crate::message::render_text(
+            &service
+                .leaderboard(&command_request("排行榜", "", "leaderboard-first"))
+                .expect("排行榜第一页应渲染"),
+        );
+        assert!(first.contains("基础等级排行榜"));
+        assert!(first.contains("第1名 · 排行命令 · Lv.1 · 总经验 0"));
+        assert!(first.contains("第10名 · 排行10 · Lv.1 · 总经验 0"));
+        assert!(first.contains("排行榜 2"));
+
+        let second = crate::message::render_text(
+            &service
+                .leaderboard(&command_request("排行榜", "2", "leaderboard-second"))
+                .expect("排行榜第二页应渲染"),
+        );
+        assert!(second.contains("第11名 · 排行11 · Lv.1 · 总经验 0"));
+        assert!(second.contains("第12名 · 排行12 · Lv.1 · 总经验 0"));
+        assert!(second.contains("排行榜 1"));
+        for invalid_page in ["0", "101", "2 extra"] {
+            assert!(
+                service
+                    .leaderboard(&command_request(
+                        "排行榜",
+                        invalid_page,
+                        "leaderboard-invalid-page",
+                    ))
+                    .is_err(),
+                "非法页码必须拒绝：{invalid_page}"
+            );
+        }
+        assert_eq!(
+            store.player_status(&key).expect("查询后应读取命令角色状态"),
+            Some(player_before)
+        );
+    }
+
+    #[test]
     fn player_alias_commands_keep_registered_player_and_command_boundaries() {
         let directory = tempfile::tempdir().expect("应创建快捷键临时目录");
         let store = Store::initialize(directory.path(), &crate::config::DatabaseConfig::default())
@@ -4024,6 +4176,15 @@ mod tests {
         assert_eq!(parse_optional_map_name(""), Ok(None));
         assert_eq!(parse_optional_map_name("圣魂村"), Ok(Some("圣魂村")));
         assert!(parse_optional_map_name("圣魂村 多余").is_err());
+    }
+
+    #[test]
+    fn leaderboard_page_arguments_are_bounded() {
+        assert_eq!(parse_leaderboard_page(""), Ok(1));
+        assert_eq!(parse_leaderboard_page("2"), Ok(2));
+        assert!(parse_leaderboard_page("0").is_err());
+        assert!(parse_leaderboard_page("101").is_err());
+        assert!(parse_leaderboard_page("2 extra").is_err());
     }
 
     #[test]
@@ -4366,6 +4527,7 @@ mod tests {
         let second = crate::message::render_text(&service.menu("2").expect("第二页应有效"));
         assert!(second.contains("武魂觉醒：觉醒第一武魂"));
         assert!(second.contains("状态：查看角色属性、武魂和位置"));
+        assert!(second.contains("排行榜 [页码]：查看同一机器人分区内的基础等级排行"));
         assert!(second.contains("技能：查看已学习魂技和魂力消耗"));
         assert!(second.contains("签到：领取每日经验和金魂币"));
         assert!(second.contains("钱包：查看金魂币余额"));

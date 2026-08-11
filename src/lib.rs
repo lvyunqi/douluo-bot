@@ -432,6 +432,7 @@ fn dispatch_player_alias_command(request: &CommandRequest) -> CommandResponse {
         "使用" => with_service(request, false, true, |service| service.use_item(request)),
         "发送物品" => with_service(request, false, true, |service| service.gift_item(request)),
         "状态" => with_service(request, true, true, |service| service.status(request)),
+        "排行榜" => with_service(request, false, true, |service| service.leaderboard(request)),
         "位置" => with_service(request, true, true, |service| service.location(request)),
         "地图列表" => with_service(request, true, true, |service| service.map_list(request)),
         "数值曲线" => with_service(request, true, true, |service| {
@@ -928,6 +929,17 @@ mod plugin {
     )]
     fn status(req: &CommandRequest) -> CommandResponse {
         with_service(req, true, true, |service| service.status(req))
+    }
+
+    #[command(
+        name = "排行榜",
+        description = "分页查看同一机器人分区内的基础等级排行：排行榜 [页码]",
+        aliases = "排行,排名",
+        category = "斗罗大陆·角色",
+        scope = "all"
+    )]
+    fn leaderboard(req: &CommandRequest) -> CommandResponse {
+        with_service(req, false, true, |service| service.leaderboard(req))
     }
 
     #[command(

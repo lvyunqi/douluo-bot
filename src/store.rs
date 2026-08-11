@@ -6988,6 +6988,24 @@ pub struct PlayerStatus {
     pub revive_window_seconds_remaining: Option<i64>,
 }
 
+/// 基础等级排行榜的一条脱敏展示记录；内部身份与玩家主键不向聊天侧暴露。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaderboardEntry {
+    pub rank: usize,
+    pub name: String,
+    pub level: i64,
+    pub total_exp: i64,
+}
+
+/// 同一稳定机器人账户与命名空间内的基础等级排行榜分页结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaderboardPage {
+    pub entries: Vec<LeaderboardEntry>,
+    pub page: usize,
+    pub page_count: usize,
+    pub total: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RevivalAbandonReceipt {
     pub life_before: i64,
@@ -11752,6 +11770,110 @@ impl Store {
             None
         };
         Ok(Some(status))
+    }
+
+    /// 分页读取同一协议、稳定账户、命名空间和身份类型内未封存角色的基础等级排行榜。
+    ///
+    /// 排行只读取当前角色等级和累计经验；内部玩家主键仅用于固定同分排序，不会进入返回结果。
+    pub fn leaderboard_page(
+        &self,
+        key: &IdentityKey<'_>,
+        page: usize,
+        limit: usize,
+    ) -> Result<LeaderboardPage, String> {
+        validate_identity_key(key)?;
+        validate_catalog_page(page, limit, "排行榜")?;
+        let connection = self.open()?;
+        ensure_no_legacy_identity(&connection, key)?;
+        let total = connection
+            .query_row(
+                r#"
+                SELECT COUNT(*)
+                  FROM identity i
+                  JOIN player p ON p.identity_id = i.id
+                 WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+                   AND i.subject_kind = ?4
+                   AND p.state != 'deleted'
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("统计排行榜角色数量失败：{error}"))?;
+        let total =
+            usize::try_from(total).map_err(|_| "排行榜角色数量超出可分页范围".to_string())?;
+        let page_count = total.div_ceil(limit).max(1);
+        if page > page_count {
+            return Err(format!("排行榜页码必须在 1 到 {page_count} 之间"));
+        }
+        let offset = page
+            .checked_sub(1)
+            .and_then(|page| page.checked_mul(limit))
+            .ok_or_else(|| "排行榜分页偏移量溢出".to_string())?;
+        let fetch_limit = i64::try_from(limit).map_err(|_| "排行榜分页数量无法转换".to_string())?;
+        let sql_offset =
+            i64::try_from(offset).map_err(|_| "排行榜分页偏移量无法转换".to_string())?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT p.name, p.level, p.exp
+                  FROM identity i
+                  JOIN player p ON p.identity_id = i.id
+                 WHERE i.protocol = ?1 AND i.account_id = ?2 AND i.namespace = ?3
+                   AND i.subject_kind = ?4
+                   AND p.state != 'deleted'
+                 ORDER BY p.level DESC, p.exp DESC, p.id ASC
+                 LIMIT ?5 OFFSET ?6
+                "#,
+            )
+            .map_err(|error| format!("准备排行榜分页查询失败：{error}"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind,
+                    fetch_limit,
+                    sql_offset
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .map_err(|error| format!("查询排行榜分页失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析排行榜分页失败：{error}"))?;
+        let entries = rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, level, total_exp))| {
+                let rank = offset
+                    .checked_add(index)
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or_else(|| "排行榜名次溢出".to_string())?;
+                Ok(LeaderboardEntry {
+                    rank,
+                    name,
+                    level,
+                    total_exp,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(LeaderboardPage {
+            entries,
+            page,
+            page_count,
+            total,
+        })
     }
 
     /// 在复活窗口结束后结算当前生命；三世用尽时只封存角色，不删除魂环历史。
@@ -38801,6 +38923,167 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    #[test]
+    fn leaderboard_page_is_scoped_ordered_paginated_and_read_only() {
+        let (_directory, store) = test_store();
+        let key = identity();
+        let seed = |key: &IdentityKey<'_>, name: &str, level: i64, exp: i64, state: &str| {
+            store
+                .register_player(key, name, "男")
+                .expect("应创建排行榜测试角色");
+            let player_id = player_id_for(&store, key);
+            store
+                .open()
+                .expect("应打开排行榜测试数据库")
+                .execute(
+                    "UPDATE player SET level = ?1, exp = ?2, state = ?3, updated_at = 1 WHERE id = ?4",
+                    params![level, exp, state, player_id],
+                )
+                .expect("应设置排行榜测试角色属性");
+        };
+
+        seed(&key, "查询角色", 1, 0, "alive");
+        for (subject_id, name, level, exp) in [
+            ("leader-01", "同分甲", 20, 2_000),
+            ("leader-02", "同分乙", 20, 2_000),
+            ("leader-03", "经验次高", 20, 1_999),
+            ("leader-04", "等级十九", 19, 99_999),
+            ("leader-05", "等级十八", 18, 88_888),
+            ("leader-06", "等级十七", 17, 77_777),
+            ("leader-07", "等级十六", 16, 66_666),
+            ("leader-08", "等级十五", 15, 55_555),
+            ("leader-09", "等级十四", 14, 44_444),
+            ("leader-10", "等级十三", 13, 33_333),
+            ("leader-11", "等级十二", 12, 22_222),
+        ] {
+            let peer = IdentityKey {
+                protocol: key.protocol,
+                account_id: key.account_id,
+                namespace: key.namespace,
+                subject_kind: key.subject_kind,
+                subject_id,
+            };
+            seed(&peer, name, level, exp, "alive");
+        }
+
+        let sealed = IdentityKey {
+            protocol: key.protocol,
+            account_id: key.account_id,
+            namespace: key.namespace,
+            subject_kind: key.subject_kind,
+            subject_id: "leader-deleted",
+        };
+        seed(&sealed, "封存第一", 120, 999_999, "deleted");
+        for (protocol, account_id, namespace, subject_id, name) in [
+            (
+                Protocol::QqOfficial,
+                key.account_id,
+                key.namespace,
+                "leader-qq",
+                "跨协议",
+            ),
+            (
+                key.protocol,
+                "10002",
+                key.namespace,
+                "leader-account",
+                "跨账号",
+            ),
+            (
+                key.protocol,
+                key.account_id,
+                "leaderboard-other",
+                "leader-namespace",
+                "跨命名空间",
+            ),
+        ] {
+            let peer = IdentityKey {
+                protocol,
+                account_id,
+                namespace,
+                subject_kind: key.subject_kind,
+                subject_id,
+            };
+            seed(&peer, name, 120, 999_999, "alive");
+        }
+
+        let player_before = store
+            .player_status(&key)
+            .expect("查询前应读取角色状态")
+            .expect("查询角色应存在");
+        let operation_count_before = store
+            .open()
+            .expect("应读取查询前操作日志")
+            .query_row("SELECT COUNT(*) FROM operation_log", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("应统计查询前操作日志");
+
+        let first = store
+            .leaderboard_page(&key, 1, 10)
+            .expect("排行榜第一页应可读取");
+        assert_eq!((first.page, first.page_count, first.total), (1, 2, 12));
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "同分甲",
+                "同分乙",
+                "经验次高",
+                "等级十九",
+                "等级十八",
+                "等级十七",
+                "等级十六",
+                "等级十五",
+                "等级十四",
+                "等级十三",
+            ]
+        );
+        assert_eq!(first.entries[0].rank, 1);
+        assert_eq!(first.entries[1].rank, 2);
+        assert_eq!(first.entries[9].rank, 10);
+
+        let second = store
+            .leaderboard_page(&key, 2, 10)
+            .expect("排行榜第二页应可读取");
+        assert_eq!(
+            second.entries,
+            vec![
+                LeaderboardEntry {
+                    rank: 11,
+                    name: "等级十二".to_string(),
+                    level: 12,
+                    total_exp: 22_222,
+                },
+                LeaderboardEntry {
+                    rank: 12,
+                    name: "查询角色".to_string(),
+                    level: 1,
+                    total_exp: 0,
+                },
+            ]
+        );
+        assert!(store.leaderboard_page(&key, 0, 10).is_err());
+        assert!(store.leaderboard_page(&key, 1, 0).is_err());
+        assert!(store.leaderboard_page(&key, 3, 10).is_err());
+
+        assert_eq!(
+            store.player_status(&key).expect("查询后应读取角色状态"),
+            Some(player_before)
+        );
+        let operation_count_after = store
+            .open()
+            .expect("应读取查询后操作日志")
+            .query_row("SELECT COUNT(*) FROM operation_log", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("应统计查询后操作日志");
+        assert_eq!(operation_count_after, operation_count_before);
     }
 
     #[test]

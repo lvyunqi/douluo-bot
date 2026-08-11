@@ -33,6 +33,7 @@ pub const PLAYER_ALIAS_TARGET_COMMANDS: &[&str] = &[
     "使用",
     "发送物品",
     "状态",
+    "排行榜",
     "位置",
     "地图列表",
     "数值曲线",
@@ -137,6 +138,9 @@ const REGISTERED_GAME_COMMAND_KEYS: &[&str] = &[
     "状态",
     "我的状态",
     "属性",
+    "排行榜",
+    "排行",
+    "排名",
     "位置",
     "地图",
     "当前位置",
@@ -244,6 +248,7 @@ mod tests {
     #[test]
     fn only_normal_game_commands_can_be_alias_targets() {
         assert!(is_player_alias_target("状态"));
+        assert!(is_player_alias_target("排行榜"));
         assert!(is_player_alias_target("释放技能"));
         assert!(is_player_alias_target("数值曲线"));
         assert!(!is_player_alias_target("旧档认领"));
@@ -257,6 +262,7 @@ mod tests {
     #[test]
     fn reserved_command_keys_cannot_be_reused_as_player_aliases() {
         assert!(validate_player_alias_name("状态").is_err());
+        assert!(validate_player_alias_name("排行榜").is_err());
         assert!(validate_player_alias_name("设置快捷键").is_err());
         assert!(validate_player_alias_name("\u{50a8}\u{7269}\u{5668}").is_err());
         assert!(validate_player_alias_name("\u{6253}\u{5f00}\u{50a8}\u{7269}\u{5668}").is_err());
