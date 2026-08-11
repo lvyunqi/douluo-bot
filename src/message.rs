@@ -264,6 +264,32 @@ pub fn response_for(
     }
 }
 
+/// 仅为 QQ 官方群/C2C 的第二条独立媒体消息提取 direct 本地插图。
+///
+/// 正常主回复仍由 `response_for` 生成完整 Markdown 或文字；调用方只能在宿主确认主回复
+/// 成功后，才将返回的字节交给官方 QQ 媒体发送队列。
+pub(crate) fn qq_official_direct_inline_image(
+    document: &GameDocument,
+    illustrations: &IllustrationConfig,
+) -> Option<Arc<[u8]>> {
+    if !illustrations.enabled || illustrations.mode != IllustrationMode::Direct {
+        return None;
+    }
+    match document.illustration.as_ref()?.source {
+        IllustrationSource::InlineImage(ref bytes) => Some(Arc::clone(bytes)),
+        IllustrationSource::DirectHttps(_) | IllustrationSource::RemoteAsset(_) => None,
+    }
+}
+
+/// 构造单独的 QQ 官方本地图片段，不把 Base64 写入日志、持久化状态或普通主回复。
+pub(crate) fn qq_official_inline_image_segments(bytes: &[u8]) -> String {
+    json!([{
+        "type": "image",
+        "data": { "file": format!("base64://{}", STANDARD.encode(bytes)) }
+    }])
+    .to_string()
+}
+
 pub fn render_text(document: &GameDocument) -> String {
     let mut output = vec![format!("== {} ==", document.title)];
     output.extend(document.lines.iter().cloned());
@@ -654,6 +680,39 @@ mod tests {
         }
         assert!(!response.action.segments_json.contains("base64://"));
         assert!(!content.contains("!["));
+    }
+
+    #[test]
+    fn qq_official_independent_image_only_uses_direct_inline_source() {
+        let inline = GameDocument::new("状态").illustration(
+            Illustration::inline_image_bytes("状态卡片", b"GIF89a", 1, 1)
+                .expect("测试 GIF 应可内联"),
+        );
+        assert!(qq_official_direct_inline_image(&inline, &IllustrationConfig::default()).is_some());
+
+        let https = GameDocument::new("状态").illustration(
+            Illustration::https("状态卡片", "https://media.example.com/status.webp", 1, 1)
+                .expect("公网图片应有效"),
+        );
+        assert!(qq_official_direct_inline_image(&https, &IllustrationConfig::default()).is_none());
+
+        let remote = GameDocument::new("状态").illustration(
+            Illustration::remote_asset("状态卡片", "cards/status.webp", 1, 1)
+                .expect("远程资源键应有效"),
+        );
+        let remote_config = IllustrationConfig {
+            enabled: true,
+            mode: IllustrationMode::Remote,
+            remote_base_url: "https://media.example.com/douluo".to_string(),
+            ..IllustrationConfig::default()
+        };
+        assert!(qq_official_direct_inline_image(&remote, &remote_config).is_none());
+
+        let disabled = IllustrationConfig {
+            enabled: false,
+            ..IllustrationConfig::default()
+        };
+        assert!(qq_official_direct_inline_image(&inline, &disabled).is_none());
     }
 
     #[test]

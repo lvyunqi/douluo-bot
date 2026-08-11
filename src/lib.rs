@@ -13,6 +13,7 @@ pub mod message;
 pub mod player_stage_confirmation;
 pub mod player_staging;
 pub mod public_seed;
+mod qq_media;
 mod store;
 mod web;
 
@@ -54,6 +55,7 @@ fn initialize(config: PluginInitConfig) -> Result<(), String> {
     let _transition = runtime_transition_slot()
         .lock()
         .map_err(|_| "插件运行时切换锁已损坏".to_string())?;
+    qq_media::clear_pending_images();
     let parsed = parse_config(config.config_json.as_str())?;
     catalog::validate_embedded_manifest()?;
     let data_dir = config.data_dir.as_str().trim();
@@ -125,6 +127,7 @@ fn shutdown_runtime() {
     let Ok(_transition) = runtime_transition_slot().lock() else {
         return;
     };
+    qq_media::clear_pending_images();
     if let Ok(mut slot) = management_server_slot().lock()
         && let Some(mut server) = slot.take()
     {
@@ -339,6 +342,9 @@ fn with_service(
         Ok(document) => document,
         Err(error) => GameDocument::new("操作失败").line(error),
     };
+    if outcome == "ok" {
+        qq_media::stage_command_image(req, &document, service.illustration_config());
+    }
     response_for(
         req,
         &document,
@@ -510,9 +516,21 @@ mod plugin {
         };
         let response = dispatch_player_alias_command(&canonical_request);
         if queue_interceptor_response(request, &response) {
+            if let Some(image) = qq_media::take_after_completion(request) {
+                qq_media::send_image(image);
+            }
             InterceptorResponse::block()
         } else {
+            qq_media::discard_for_interceptor(request);
             InterceptorResponse::allow()
+        }
+    }
+
+    /// 主回复成功后才发送 QQ 群/C2C 的独立本地图片，避免图片先于完整正文出现。
+    #[after_completion]
+    fn qq_official_inline_image_after_completion(request: &InterceptorRequest) {
+        if let Some(image) = qq_media::take_after_completion(request) {
+            qq_media::send_image(image);
         }
     }
 
