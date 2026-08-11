@@ -22,11 +22,16 @@ install -d -o douluo-media -g douluo-media -m 0755 /srv/douluo-media/published
 
 ```bash
 /usr/local/bin/douluo-media catalog publish --root /srv/douluo-media/releases/<revision>
+/usr/local/bin/douluo-media catalog verify --root /srv/douluo-media/releases/<revision>
 mount --bind /srv/douluo-media/releases/<revision> /srv/douluo-media/published
 mount -o remount,bind,ro /srv/douluo-media/published
 systemctl daemon-reload
 systemctl enable --now douluo-media.service
 ```
+
+`catalog verify` 只重建发布目录索引，并以只读方式比对既有 SQLite catalog；它不会写入
+catalog、媒体文件或游戏数据库，也不会监听 HTTP 端口。目录不在默认位置时可追加
+`--catalog /path/to/catalog.sqlite`。
 
 服务仅监听回环 `127.0.0.1:18182`，公网读取必须经过 Caddy/Nginx 等反向代理。
 
@@ -57,4 +62,4 @@ remote_base_url = "https://media.example.com/douluo"
 
 ## 更新边界
 
-只读 root 的文件变化不会热加载。推荐顺序是：准备新 revision 目录、执行 `catalog publish`、执行 `media-remote-smoke.ps1` 或同等验收、切换只读 mount、重启 `douluo-media`、检查 `/readyz`，最后确认插件消息中的 URL 和公网 HTTPS 响应。`/media/{asset_key}` 优先读取 `chat` 变体，`/media/variants/{variant}/{asset_key}` 可显式读取 `chat`、`thumb` 或 `large`；运行期 catalog 与文件不一致会拒绝启动。此切片只使用本地文件与 SQLite catalog，不增加对象存储、上传接口、管理密钥、玩家状态迁移、快照、回滚或 QimenBot 宿主改动。
+只读 root 的文件变化不会热加载。推荐顺序是：准备新 revision 目录、执行 `catalog publish`、执行 `catalog verify`、执行 `media-remote-smoke.ps1` 或同等验收、切换只读 mount、重启 `douluo-media`、检查 `/readyz`，最后确认插件消息中的 URL 和公网 HTTPS 响应。`/media/{asset_key}` 优先读取 `chat` 变体，`/media/variants/{variant}/{asset_key}` 可显式读取 `chat`、`thumb` 或 `large`；运行期 catalog 与文件不一致会拒绝启动。此切片只使用本地文件与 SQLite catalog，不增加对象存储、上传接口、管理密钥、玩家状态迁移、快照、回滚或 QimenBot 宿主改动。

@@ -479,8 +479,8 @@ impl MediaIndex {
         if !directory.exists() {
             return Ok(());
         }
-        let canonical_directory = fs::canonicalize(&directory)
-            .map_err(|_| MediaError::IndexUnavailable)?;
+        let canonical_directory =
+            fs::canonicalize(&directory).map_err(|_| MediaError::IndexUnavailable)?;
         if !is_within_root(&self.root, &canonical_directory)
             || !fs::metadata(&canonical_directory)
                 .map_err(|_| MediaError::IndexUnavailable)?
@@ -503,8 +503,8 @@ impl MediaIndex {
                 return Err(MediaError::IndexUnavailable);
             };
             let path = entry.path();
-            let canonical_variant_directory = fs::canonicalize(&path)
-                .map_err(|_| MediaError::IndexUnavailable)?;
+            let canonical_variant_directory =
+                fs::canonicalize(&path).map_err(|_| MediaError::IndexUnavailable)?;
             if !is_within_root(&self.root, &canonical_variant_directory)
                 || !fs::metadata(&canonical_variant_directory)
                     .map_err(|_| MediaError::IndexUnavailable)?
@@ -706,6 +706,15 @@ pub fn publish_catalog(
 ) -> Result<(), MediaError> {
     let index = MediaIndex::build(root)?;
     catalog::publish_catalog(&index, catalog_path).map_err(|_| MediaError::CatalogUnavailable)
+}
+
+/// 离线验证 published root 与既有 catalog 是否一致，不写入文件、数据库或网络。
+pub fn verify_catalog(
+    root: impl AsRef<Path>,
+    catalog_path: impl AsRef<Path>,
+) -> Result<usize, MediaError> {
+    let state = MediaState::from_catalog(root, catalog_path)?;
+    Ok(state.index().len())
 }
 
 async fn shutdown_signal() {
@@ -1196,10 +1205,7 @@ fn if_none_match_matches(value: Option<&HeaderValue>, digest: &str) -> bool {
     })
 }
 
-fn if_range_matches<R: IndexedResource + ?Sized>(
-    value: Option<&HeaderValue>,
-    asset: &R,
-) -> bool {
+fn if_range_matches<R: IndexedResource + ?Sized>(value: Option<&HeaderValue>, asset: &R) -> bool {
     let Some(value) = value.and_then(|value| value.to_str().ok()) else {
         return value.is_none();
     };
@@ -1330,26 +1336,21 @@ fn image_dimensions(path: &Path, mime: &str) -> (Option<u32>, Option<u32>) {
         return (None, None);
     };
     let dimensions = match mime {
-        "image/png" if bytes.len() >= 24 => match (
-            be_u32(&bytes[16..20]),
-            be_u32(&bytes[20..24]),
-        ) {
-            (Some(width), Some(height)) => Some((width, height)),
-            _ => None,
-        },
+        "image/png" if bytes.len() >= 24 => {
+            match (be_u32(&bytes[16..20]), be_u32(&bytes[20..24])) {
+                (Some(width), Some(height)) => Some((width, height)),
+                _ => None,
+            }
+        }
         "image/gif" if bytes.len() >= 10 => Some((
             u16::from_le_bytes(bytes[6..8].try_into().ok().unwrap_or([0; 2])) as u32,
             u16::from_le_bytes(bytes[8..10].try_into().ok().unwrap_or([0; 2])) as u32,
         )),
         "image/bmp" if bytes.len() >= 26 => {
-            let width = i32::from_le_bytes(
-                bytes[18..22].try_into().ok().unwrap_or([0; 4]),
-            )
-            .unsigned_abs();
-            let height = i32::from_le_bytes(
-                bytes[22..26].try_into().ok().unwrap_or([0; 4]),
-            )
-            .unsigned_abs();
+            let width =
+                i32::from_le_bytes(bytes[18..22].try_into().ok().unwrap_or([0; 4])).unsigned_abs();
+            let height =
+                i32::from_le_bytes(bytes[22..26].try_into().ok().unwrap_or([0; 4])).unsigned_abs();
             Some((width, height))
         }
         "image/jpeg" => jpeg_dimensions(&bytes),
@@ -1481,7 +1482,7 @@ fn safe_indexed_path<R: IndexedResource + ?Sized>(
     (metadata.is_file()
         && metadata.len() == asset.size()
         && metadata.modified().unwrap_or(UNIX_EPOCH) == asset.modified())
-        .then_some(canonical)
+    .then_some(canonical)
 }
 
 fn is_safe_raw_media_path(path: &str) -> bool {
@@ -1673,12 +1674,8 @@ mod tests {
     async fn prefers_chat_variant_and_serves_explicit_variants() {
         let directory = tempfile::tempdir().expect("tempdir");
         let original = directory.path().join("maps/village.png");
-        let chat = directory
-            .path()
-            .join("__variants/chat/maps/village.png");
-        let large = directory
-            .path()
-            .join("__variants/large/maps/village.png");
+        let chat = directory.path().join("__variants/chat/maps/village.png");
+        let large = directory.path().join("__variants/large/maps/village.png");
         fs::create_dir_all(original.parent().expect("parent")).expect("mkdir");
         fs::create_dir_all(chat.parent().expect("parent")).expect("mkdir");
         fs::create_dir_all(large.parent().expect("parent")).expect("mkdir");
@@ -1853,12 +1850,33 @@ mod tests {
     }
 
     #[test]
+    fn offline_catalog_verify_is_read_only_and_refuses_mismatches() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let image = directory.path().join("maps").join("village.png");
+        fs::create_dir_all(image.parent().expect("parent")).expect("mkdir");
+        fs::write(&image, b"\x89PNG\r\n\x1a\nrelease-one").expect("fixture");
+        let catalog = directory.path().join("catalog.sqlite");
+
+        publish_catalog(directory.path(), &catalog).expect("publish catalog");
+        let before = fs::read(&catalog).expect("read catalog");
+        assert_eq!(
+            verify_catalog(directory.path(), &catalog).expect("verify catalog"),
+            1
+        );
+        assert_eq!(fs::read(&catalog).expect("read catalog"), before);
+
+        fs::write(&image, b"\x89PNG\r\n\x1a\nrelease-two").expect("replace fixture");
+        assert!(matches!(
+            verify_catalog(directory.path(), &catalog),
+            Err(MediaError::CatalogUnavailable)
+        ));
+    }
+
+    #[test]
     fn catalog_backed_state_refuses_variant_changed_outside_publish_command() {
         let directory = tempfile::tempdir().expect("tempdir");
         let image = directory.path().join("maps/village.png");
-        let variant = directory
-            .path()
-            .join("__variants/chat/maps/village.png");
+        let variant = directory.path().join("__variants/chat/maps/village.png");
         fs::create_dir_all(image.parent().expect("parent")).expect("mkdir");
         fs::create_dir_all(variant.parent().expect("parent")).expect("mkdir");
         fs::write(&image, b"\x89PNG\r\n\x1a\nrelease").expect("image");

@@ -1128,9 +1128,7 @@ mod tests {
     fn changed_variant_creates_new_parent_version_without_reactivating_history() {
         let directory = tempfile::tempdir().expect("临时目录");
         let image = directory.path().join("maps/village.png");
-        let variant = directory
-            .path()
-            .join("__variants/chat/maps/village.png");
+        let variant = directory.path().join("__variants/chat/maps/village.png");
         let catalog_path = directory.path().join("catalog.sqlite");
         write_png(&image, b"original");
         write_png(&variant, b"chat-v1");
@@ -1217,5 +1215,4 @@ mod tests {
         assert_eq!(status, STATUS_DISABLED);
         assert_eq!(current_version_count, 0);
     }
-
 }

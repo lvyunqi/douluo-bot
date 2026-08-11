@@ -49,6 +49,11 @@ cargo build --manifest-path services/douluo-media/Cargo.toml --release --locked
 生产只读卷、Caddy HTTPS/base-path 配置、资源更新重启边界和插件 `remote` 模式冒烟见
 [douluo-media 部署说明](deploy/douluo-media/README.md)。
 媒体服务只读取本地 published root 和 SQLite catalog；`chat`、`thumb`、`large` 变体位于 `__variants/`，不使用对象存储。
+切换只读卷前可执行纯离线校验，不会启动 HTTP 服务或写入 catalog：
+
+```text
+douluo-media catalog verify --root <published-root>
+```
 
 ## Load In QimenBot
 
