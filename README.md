@@ -136,6 +136,25 @@ remote_base_url = ""
 
 命令前缀、群聊 @、私聊裸命令和管理员入口由 QimenBot 宿主统一配置。
 
+## QQ Official Manual Smoke
+
+`scripts/qq-official-smoke.ps1` prepares an isolated Windows QimenBot host for the QQ
+official group/C2C `direct` image check. Its default mode only validates the DLL, host
+binary, and whether `QQBOT_APPID` / `QQBOT_SECRET` are present; it does not start a
+Gateway or make a network request.
+
+After configuring those environment variables and enabling `GROUP_AND_C2C_EVENT` for a
+dedicated test bot, start the manual run explicitly:
+
+```powershell
+.\scripts\qq-official-smoke.ps1 -HostWorktree C:\projects\QimenBot -StartGateway
+```
+
+The script uses a temporary 1x1 WebP and asks the operator to verify a group mention and
+a C2C `斗罗系统` command. Each should display complete text before one independent image.
+It does not print credentials, Base64, or raw message logs, and cleans up its temporary
+host after the operator finishes.
+
 ## Development Checks
 
 ```powershell
