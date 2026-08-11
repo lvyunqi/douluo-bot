@@ -14,6 +14,7 @@ import {
   RefreshCw,
   ScrollText,
   ShieldCheck,
+  UserRoundPlus,
 } from 'lucide-react'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -22,6 +23,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { ContentWritePanel, type WriteFeedback } from '@/components/management/content-write-panel'
 import { ContentDraftDiffPreviewPanel } from '@/components/management/content-draft-diff-preview'
+import { PlayerStageConfirmationPanel } from '@/components/management/player-stage-confirmation-panel'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -36,6 +38,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   getActiveRevision,
+  confirmPlayerStage,
   getContentDraftDiff,
   listIllustrations,
   listActivations,
@@ -64,7 +67,15 @@ import {
 } from '@/lib/api'
 import { formatNumber, formatTimestamp, packageLabel, shortHash, statusLabel, statusVariant } from '@/lib/format'
 
-type TabValue = 'overview' | 'illustrations' | 'operations' | 'drafts' | 'revisions' | 'activations' | 'audits'
+type TabValue =
+  | 'overview'
+  | 'illustrations'
+  | 'operations'
+  | 'player-staging'
+  | 'drafts'
+  | 'revisions'
+  | 'activations'
+  | 'audits'
 type PageValue =
   | ContentDraft
   | ContentRevisionSummary
@@ -108,6 +119,7 @@ const tabs: Array<{ icon: typeof Activity; label: string; value: TabValue }> = [
   { icon: Activity, label: '概览', value: 'overview' },
   { icon: Image, label: '插图', value: 'illustrations' },
   { icon: FileUp, label: '写入', value: 'operations' },
+  { icon: UserRoundPlus, label: '玩家导入', value: 'player-staging' },
   { icon: ClipboardList, label: '草稿', value: 'drafts' },
   { icon: BookOpenCheck, label: '版本', value: 'revisions' },
   { icon: History, label: '激活', value: 'activations' },
@@ -152,6 +164,18 @@ function writeErrorMessage(error: unknown): string {
     }
     if (error.code === 'not_found') {
       return '目标已不存在，请刷新后重新选择。'
+    }
+    if (error.code === 'invalid_player_stage_file') {
+      return 'stage 文件路径无效。'
+    }
+    if (error.code === 'invalid_player_stage') {
+      return 'stage 文件不是可确认的 v42.1 资料。'
+    }
+    if (error.code === 'player_stage_not_confirmable') {
+      return '候选状态或等级经验不满足确认条件。'
+    }
+    if (error.code === 'player_stage_conflict') {
+      return '候选已经确认，或目标身份已存在。'
     }
   }
   return '操作未完成，请稍后重试。'
@@ -475,6 +499,14 @@ export function ManagementDashboard({
       `rollback:${revision.id}`,
       () => rollbackContentRevision(revision.id, session.csrf_token),
       (result) => `已追加回滚 activation #${result.activation_id}，当前 revision 为 #${result.active_revision_id}。`,
+    )
+  }
+
+  function confirmStagedPlayer(stageFile: string, sourcePlayerId: number) {
+    return runContentWrite(
+      `player-stage-confirm:${sourcePlayerId}`,
+      () => confirmPlayerStage(stageFile, sourcePlayerId, session.csrf_token),
+      (result) => `${result.name} 已确认导入为 Lv.${result.level}，初始位置为${result.map_name}。`,
     )
   }
 
@@ -813,6 +845,16 @@ export function ManagementDashboard({
               onValidate={validateDraft}
               pendingAction={pendingAction}
               revisions={snapshot.revisions.entries}
+            />
+          </TabsContent>
+
+          <TabsContent value="player-staging">
+            <PlayerStageConfirmationPanel
+              disabled={dashboardDisabled}
+              feedback={writeFeedback}
+              onConfirm={confirmStagedPlayer}
+              onSessionExpired={onSessionExpired}
+              pendingAction={pendingAction}
             />
           </TabsContent>
 

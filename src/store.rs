@@ -19,6 +19,7 @@ use crate::content::{
     is_shield_v1_parameters, is_stun_v1_parameters, is_target_v1_parameters, validate_shape,
 };
 use crate::message::Protocol;
+use crate::player_stage_confirmation::{PlayerStageCandidate, validate_player_stage_candidate};
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migration (
@@ -6659,7 +6660,58 @@ BEGIN
 END;
 "#;
 
-const LEGACY_CLAIM_REQUIRED: &str =
+// v42 只新增 stage 确认审计，不回填、重写或接管任何既有玩家数据。
+const MIGRATION_V42: &str = r#"
+CREATE TABLE player_stage_confirmation (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_role TEXT NOT NULL CHECK(actor_role = 'content_admin'),
+    actor_fingerprint TEXT NOT NULL CHECK(
+        length(actor_fingerprint) = 64
+        AND actor_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    source_sha256 TEXT NOT NULL CHECK(
+        length(source_sha256) = 64
+        AND source_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    source_player_id INTEGER NOT NULL CHECK(source_player_id > 0),
+    identity_id INTEGER NOT NULL UNIQUE REFERENCES identity(id) ON DELETE RESTRICT,
+    player_id INTEGER NOT NULL UNIQUE REFERENCES player(id) ON DELETE RESTRICT,
+    confirmed_at INTEGER NOT NULL CHECK(confirmed_at >= 0),
+    UNIQUE(source_sha256, source_player_id)
+) STRICT;
+
+-- 审计必须绑定同一笔新建 identity 与 player，避免直接 SQL 伪造确认关联。
+CREATE TRIGGER player_stage_confirmation_scope_guard
+BEFORE INSERT ON player_stage_confirmation
+WHEN NOT EXISTS(
+    SELECT 1 FROM player
+     WHERE player.id = NEW.player_id AND player.identity_id = NEW.identity_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'player stage confirmation identity mismatch');
+END;
+
+CREATE TRIGGER player_stage_confirmation_no_update
+BEFORE UPDATE ON player_stage_confirmation
+BEGIN
+    SELECT RAISE(ABORT, 'player stage confirmation is append-only');
+END;
+
+CREATE TRIGGER player_stage_confirmation_no_delete
+BEFORE DELETE ON player_stage_confirmation
+BEGIN
+    SELECT RAISE(ABORT, 'player stage confirmation is append-only');
+END;
+
+CREATE TRIGGER player_stage_confirmation_no_reinsert
+BEFORE INSERT ON player_stage_confirmation
+WHEN EXISTS(SELECT 1 FROM player_stage_confirmation WHERE id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'player stage confirmation id cannot be reused');
+END;
+"#;
+
+pub(crate) const LEGACY_CLAIM_REQUIRED: &str =
     "检测到尚未绑定机器人账号的旧存档，请联系机器人所有者在私聊中完成旧档认领";
 
 #[derive(Clone, Debug)]
@@ -6847,6 +6899,16 @@ pub struct ContentAdminDraftStageOperationRecord {
 pub struct ContentAdminDraftStageOperationPage {
     pub entries: Vec<ContentAdminDraftStageOperationRecord>,
     pub next_after_id: Option<i64>,
+}
+
+/// 单条 stage 确认完成后返回的新角色摘要，不回传管理员会话或 stage 文件路径。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerStageConfirmationReceipt {
+    pub player_id: i64,
+    pub source_player_id: i64,
+    pub name: String,
+    pub level: i64,
+    pub map_name: String,
 }
 
 /// 暂存内容文件后的草稿元数据与幂等结果。
@@ -8359,6 +8421,38 @@ fn record_content_admin_draft_stage_operation(
             ],
         )
         .map_err(|error| format!("写入内容管理员暂存审计失败：{error}"))?;
+    Ok(())
+}
+
+/// 将新建角色与管理员确认审计放在同一事务，审计失败时角色写入必须整体回滚。
+fn record_player_stage_confirmation(
+    transaction: &Transaction<'_>,
+    actor: ContentAdminAuditActor<'_>,
+    candidate: &PlayerStageCandidate,
+    identity_id: i64,
+    player_id: i64,
+    timestamp: i64,
+) -> Result<(), String> {
+    validate_content_admin_actor(actor)?;
+    transaction
+        .execute(
+            r#"
+            INSERT INTO player_stage_confirmation(
+                actor_role, actor_fingerprint, source_sha256, source_player_id,
+                identity_id, player_id, confirmed_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                actor.role,
+                actor.session_fingerprint,
+                candidate.source_sha256,
+                candidate.source_player_id,
+                identity_id,
+                player_id,
+                timestamp,
+            ],
+        )
+        .map_err(|error| format!("写入玩家 staging 确认审计失败：{error}"))?;
     Ok(())
 }
 
@@ -11179,10 +11273,25 @@ impl Store {
                 validate_v41_schema(&transaction)?;
             }
 
+            if !migration_applied(&transaction, 42)? {
+                transaction
+                    .execute_batch(MIGRATION_V42)
+                    .map_err(|error| format!("执行数据库迁移 v42 失败：{error}"))?;
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migration(version, applied_at) VALUES(42, ?1)",
+                        [now_timestamp()?],
+                    )
+                    .map_err(|error| format!("记录数据库迁移 v42 失败：{error}"))?;
+                validate_v42_schema(&transaction)?;
+            } else {
+                validate_v42_schema(&transaction)?;
+            }
+
             ensure_no_foreign_key_violations(&transaction)?;
             transaction.commit().map_err(|error| {
                 format!(
-                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36/v37/v38/v39/v40/v41 失败：{error}"
+                    "提交数据库迁移 v2/v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20/v21/v22/v23/v24/v25/v27/v28/v29/v30/v31/v32/v33/v34/v35/v36/v37/v38/v39/v40/v41/v42 失败：{error}"
                 )
             })?;
             Ok(())
@@ -11226,6 +11335,7 @@ impl Store {
                 validate_v36_schema(connection)?;
                 validate_v40_schema(connection)?;
                 validate_v41_schema(connection)?;
+                validate_v42_schema(connection)?;
                 Ok(())
             }
             (Err(migration_error), Ok(())) => Err(migration_error),
@@ -11292,6 +11402,146 @@ impl Store {
             .map_err(|error| format!("提交注册事务失败：{error}"))?;
         self.player_status(key)?
             .ok_or_else(|| "角色已经创建，但重新读取失败".to_string())
+    }
+
+    /// 仅由已认证管理端确认一条 v42.1 stage 候选；已有身份不会被接管、覆盖或合并。
+    pub fn confirm_player_stage_as_admin(
+        &self,
+        candidate: &PlayerStageCandidate,
+        actor: ContentAdminAuditActor<'_>,
+    ) -> Result<PlayerStageConfirmationReceipt, String> {
+        validate_content_admin_actor(actor)?;
+        validate_player_stage_candidate(candidate)?;
+        let expected_level = level_for_total_exp(candidate.exp)?;
+        if candidate.level != expected_level {
+            return Err("玩家 staging 等级与经验曲线不一致".to_string());
+        }
+        let key = IdentityKey {
+            protocol: Protocol::OneBot11,
+            account_id: &candidate.account_id,
+            namespace: &candidate.namespace,
+            subject_kind: "user",
+            subject_id: &candidate.subject_id,
+        };
+        validate_identity_key(&key)?;
+
+        let mut connection = self.open()?;
+        let transaction = self.begin_immediate(&mut connection, "开始玩家 staging 确认事务失败")?;
+        ensure_no_legacy_identity(&transaction, &key)?;
+        let candidate_confirmed = transaction
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM player_stage_confirmation
+                     WHERE source_sha256 = ?1 AND source_player_id = ?2
+                )
+                "#,
+                params![candidate.source_sha256, candidate.source_player_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("检查玩家 staging 确认记录失败：{error}"))?;
+        if candidate_confirmed {
+            return Err("玩家 staging 候选已经确认过".to_string());
+        }
+        let identity_exists = transaction
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM identity
+                     WHERE protocol = ?1 AND account_id = ?2 AND namespace = ?3
+                       AND subject_kind = ?4 AND subject_id = ?5
+                )
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind,
+                    key.subject_id,
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("检查目标玩家身份失败：{error}"))?;
+        if identity_exists {
+            return Err("目标玩家身份已存在".to_string());
+        }
+
+        let timestamp = now_timestamp()?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO identity(protocol, account_id, namespace, subject_kind, subject_id, created_at)
+                VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                params![
+                    key.protocol.as_str(),
+                    key.account_id,
+                    key.namespace,
+                    key.subject_kind,
+                    key.subject_id,
+                    timestamp,
+                ],
+            )
+            .map_err(|error| format!("创建确认导入目标身份失败：{error}"))?;
+        let identity_id = transaction.last_insert_rowid();
+        transaction
+            .execute(
+                r#"
+                INSERT INTO player(
+                    identity_id, name, gender, level, exp, hp, max_hp, soul_power,
+                    max_soul_power, strength, agility, spirit, endurance, perception, luck,
+                    life_count, state, created_at, updated_at
+                ) VALUES(
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                    ?16, 'alive', ?17, ?17
+                )
+                "#,
+                params![
+                    identity_id,
+                    candidate.name,
+                    candidate.gender,
+                    candidate.level,
+                    candidate.exp,
+                    candidate.hp,
+                    candidate.max_hp,
+                    candidate.soul_power,
+                    candidate.max_soul_power,
+                    candidate.strength,
+                    candidate.agility,
+                    candidate.spirit,
+                    candidate.endurance,
+                    candidate.perception,
+                    candidate.luck,
+                    candidate.life_count,
+                    timestamp,
+                ],
+            )
+            .map_err(|error| format!("创建确认导入基础角色失败：{error}"))?;
+        let player_id = transaction.last_insert_rowid();
+        transaction
+            .execute(
+                "INSERT INTO player_map(player_id, map_key, updated_at) VALUES(?1, 'holy-soul-village', ?2)",
+                params![player_id, timestamp],
+            )
+            .map_err(|error| format!("设置确认导入初始地图失败：{error}"))?;
+        record_player_stage_confirmation(
+            &transaction,
+            actor,
+            candidate,
+            identity_id,
+            player_id,
+            timestamp,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| format!("提交玩家 staging 确认事务失败：{error}"))?;
+        Ok(PlayerStageConfirmationReceipt {
+            player_id,
+            source_player_id: candidate.source_player_id,
+            name: candidate.name.clone(),
+            level: candidate.level,
+            map_name: "圣魂村".to_string(),
+        })
     }
 
     /// 读取当前稳定身份已设置的快捷键；未创建角色时拒绝返回游离数据。
@@ -32993,6 +33243,154 @@ fn validate_v41_schema(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// 校验 v42 单条 stage 确认审计；确认记录损坏时拒绝启动，不能变成无审计角色入口。
+fn validate_v42_schema(connection: &Connection) -> Result<(), String> {
+    validate_v41_schema(connection)?;
+    let actual = table_columns_with_type(connection, "player_stage_confirmation")?;
+    let expected = vec![
+        TableColumnInfo::new("id", "INTEGER", false, true, None, 0),
+        TableColumnInfo::new("actor_role", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("actor_fingerprint", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("source_sha256", "TEXT", true, false, None, 0),
+        TableColumnInfo::new("source_player_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("identity_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("player_id", "INTEGER", true, false, None, 0),
+        TableColumnInfo::new("confirmed_at", "INTEGER", true, false, None, 0),
+    ];
+    if actual != expected {
+        return Err(format!(
+            "数据库已标记迁移 v42，但 player_stage_confirmation 字段不匹配：{actual:?}"
+        ));
+    }
+    validate_v10_table_sql(
+        connection,
+        "player_stage_confirmation",
+        &[
+            ") STRICT",
+            "ACTOR_ROLE TEXT NOT NULL CHECK(ACTOR_ROLE = 'CONTENT_ADMIN')",
+            "LENGTH(ACTOR_FINGERPRINT) = 64",
+            "LENGTH(SOURCE_SHA256) = 64",
+            "SOURCE_PLAYER_ID INTEGER NOT NULL CHECK(SOURCE_PLAYER_ID > 0)",
+            "IDENTITY_ID INTEGER NOT NULL UNIQUE REFERENCES IDENTITY(ID) ON DELETE RESTRICT",
+            "PLAYER_ID INTEGER NOT NULL UNIQUE REFERENCES PLAYER(ID) ON DELETE RESTRICT",
+            "UNIQUE(SOURCE_SHA256, SOURCE_PLAYER_ID)",
+        ],
+    )
+    .map_err(|error| error.replace("v10", "v42"))?;
+    validate_v9_foreign_keys(
+        connection,
+        "player_stage_confirmation",
+        &[
+            ("identity", "identity_id", "id", "NO ACTION", "RESTRICT"),
+            ("player", "player_id", "id", "NO ACTION", "RESTRICT"),
+        ],
+    )
+    .map_err(|error| error.replace("v9", "v42"))?;
+    validate_v10_custom_index_set(connection, "player_stage_confirmation", &[])
+        .map_err(|error| error.replace("v10", "v42"))?;
+
+    let expected_triggers = [
+        (
+            "player_stage_confirmation_scope_guard",
+            "player_stage_confirmation",
+            &[
+                "BEFORE INSERT",
+                "FROM PLAYER",
+                "IDENTITY_ID = NEW.IDENTITY_ID",
+                "RAISE(ABORT",
+            ] as &[&str],
+        ),
+        (
+            "player_stage_confirmation_no_update",
+            "player_stage_confirmation",
+            &["BEFORE UPDATE", "RAISE(ABORT"] as &[&str],
+        ),
+        (
+            "player_stage_confirmation_no_delete",
+            "player_stage_confirmation",
+            &["BEFORE DELETE", "RAISE(ABORT"] as &[&str],
+        ),
+        (
+            "player_stage_confirmation_no_reinsert",
+            "player_stage_confirmation",
+            &["BEFORE INSERT", "ID CANNOT BE REUSED", "RAISE(ABORT"] as &[&str],
+        ),
+    ];
+    for &(name, table, markers) in &expected_triggers {
+        let (actual_table, trigger_sql) = connection
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("读取 v42 触发器 {name} 失败：{error}"))?
+            .ok_or_else(|| format!("数据库缺少 v42 触发器 {name}"))?;
+        let trigger_sql = trigger_sql.to_ascii_uppercase();
+        if actual_table != table || markers.iter().any(|marker| !trigger_sql.contains(marker)) {
+            return Err(format!("v42 触发器 {name} 契约不匹配"));
+        }
+    }
+
+    let invalid_confirmation = connection
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM player_stage_confirmation confirmation
+                  LEFT JOIN identity ON identity.id = confirmation.identity_id
+                  LEFT JOIN player ON player.id = confirmation.player_id
+                 WHERE identity.id IS NULL
+                    OR player.id IS NULL
+                    OR player.identity_id <> confirmation.identity_id
+                    OR confirmation.actor_role <> 'content_admin'
+                    OR length(confirmation.actor_fingerprint) <> 64
+                    OR confirmation.actor_fingerprint GLOB '*[^0-9a-f]*'
+                    OR length(confirmation.source_sha256) <> 64
+                    OR confirmation.source_sha256 GLOB '*[^0-9a-f]*'
+                    OR confirmation.source_player_id <= 0
+                    OR confirmation.confirmed_at < 0
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查 v42 玩家 staging 确认审计失败：{error}"))?;
+    if invalid_confirmation {
+        return Err("v42 检测到不一致的玩家 staging 确认审计".to_string());
+    }
+
+    let triggers = connection
+        .prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .map_err(|error| format!("读取 v42 全库触发器失败：{error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询 v42 全库触发器失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析 v42 全库触发器失败：{error}"))?;
+    for (name, table, trigger_sql) in triggers {
+        let declared = expected_triggers
+            .iter()
+            .any(|(expected_name, expected_table, _)| {
+                name == *expected_name && table == *expected_table
+            });
+        if (table == "player_stage_confirmation"
+            || sql_mentions_identifier(&trigger_sql, "player_stage_confirmation"))
+            && !declared
+        {
+            return Err(format!(
+                "v42 触发器 {name} 未声明却引用玩家 staging 确认审计结构 {table}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_v24_table_sql(
     connection: &Connection,
     table: &str,
@@ -49396,6 +49794,217 @@ mod tests {
              ORDER BY id DESC
              LIMIT 1;
             "#,
+        );
+    }
+
+    fn stage_candidate(subject_id: &str, source_player_id: i64) -> PlayerStageCandidate {
+        PlayerStageCandidate {
+            source_sha256: "a".repeat(64),
+            protocol: "onebot11".to_string(),
+            account_id: "10001".to_string(),
+            namespace: "test".to_string(),
+            source_player_id,
+            subject_id: subject_id.to_string(),
+            name: "确认角色".to_string(),
+            gender: "男".to_string(),
+            level: 1,
+            exp: 0,
+            hp: 100,
+            max_hp: 100,
+            soul_power: 50,
+            max_soul_power: 50,
+            strength: 12,
+            agility: 13,
+            spirit: 14,
+            endurance: 15,
+            perception: 16,
+            luck: 17,
+            life_count: 1,
+            state: "alive".to_string(),
+        }
+    }
+
+    #[test]
+    fn v42_confirm_stage_creates_only_base_player_and_append_only_audit() {
+        let (_directory, store) = test_store();
+        let candidate = stage_candidate("stage-user", 7);
+        let fingerprint = "b".repeat(64);
+        let receipt = store
+            .confirm_player_stage_as_admin(
+                &candidate,
+                ContentAdminAuditActor {
+                    role: "content_admin",
+                    session_fingerprint: &fingerprint,
+                },
+            )
+            .expect("可确认 stage 应创建基础角色");
+        assert_eq!(receipt.source_player_id, 7);
+        assert_eq!(receipt.name, "确认角色");
+        assert_eq!(receipt.level, 1);
+        assert_eq!(receipt.map_name, "圣魂村");
+
+        let key = IdentityKey {
+            protocol: Protocol::OneBot11,
+            account_id: "10001",
+            namespace: "test",
+            subject_kind: "user",
+            subject_id: "stage-user",
+        };
+        let status = store
+            .player_status(&key)
+            .expect("应读取确认后的角色")
+            .expect("确认后角色必须存在");
+        assert_eq!(status.level, 1);
+        assert_eq!(status.exp, 0);
+        assert_eq!(status.hp, 100);
+        assert_eq!(status.soul_power, 50);
+        assert_eq!(status.map_name, "圣魂村");
+        assert!(status.wuhun_name.is_none(), "确认导入不得创建武魂");
+
+        let connection = store.open().expect("应打开确认后的数据库");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT map_key FROM player_map WHERE player_id = ?1",
+                    [receipt.player_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("应读取初始地图"),
+            "holy-soul-village"
+        );
+        for table in ["player_soul_ring", "player_skill", "inventory", "wallet"] {
+            let count = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE player_id = ?1"),
+                    [receipt.player_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("应统计未迁移玩家关联数据");
+            assert_eq!(count, 0, "确认导入不得写入 {table}");
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM player_stage_confirmation",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("应统计确认审计"),
+            1
+        );
+        assert!(
+            connection
+                .execute(
+                    "UPDATE player_stage_confirmation SET confirmed_at = 1 WHERE id = 1",
+                    [],
+                )
+                .is_err(),
+            "确认审计必须不可更新"
+        );
+    }
+
+    #[test]
+    fn v42_confirmation_rejects_curve_conflicts_and_rolls_back_when_audit_fails() {
+        let (_directory, store) = test_store();
+        let fingerprint = "c".repeat(64);
+        let mut invalid_curve = stage_candidate("curve-user", 8);
+        invalid_curve.level = 2;
+        let error = store
+            .confirm_player_stage_as_admin(
+                &invalid_curve,
+                ContentAdminAuditActor {
+                    role: "content_admin",
+                    session_fingerprint: &fingerprint,
+                },
+            )
+            .expect_err("等级经验不一致必须拒绝");
+        assert!(error.contains("经验曲线"));
+
+        let connection = store.open().expect("应打开旧身份冲突测试数据库");
+        connection
+            .execute(
+                "INSERT INTO identity(protocol, namespace, subject_kind, subject_id, created_at) VALUES('onebot11', 'test', 'user', 'legacy-stage-user', 0)",
+                [],
+            )
+            .expect("应写入未认领旧身份");
+        drop(connection);
+        let error = store
+            .confirm_player_stage_as_admin(
+                &stage_candidate("legacy-stage-user", 10),
+                ContentAdminAuditActor {
+                    role: "content_admin",
+                    session_fingerprint: &fingerprint,
+                },
+            )
+            .expect_err("旧身份不得被 staging 确认接管");
+        assert_eq!(error, LEGACY_CLAIM_REQUIRED);
+
+        let connection = store.open().expect("应打开事务失败后的数据库");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER test_v42_audit_failure
+                BEFORE INSERT ON player_stage_confirmation
+                BEGIN
+                    SELECT RAISE(ABORT, 'test audit failure');
+                END;
+                "#,
+            )
+            .expect("应建立审计失败探针");
+        drop(connection);
+
+        let candidate = stage_candidate("rollback-user", 9);
+        assert!(
+            store
+                .confirm_player_stage_as_admin(
+                    &candidate,
+                    ContentAdminAuditActor {
+                        role: "content_admin",
+                        session_fingerprint: &fingerprint,
+                    },
+                )
+                .is_err(),
+            "审计失败必须回滚整笔确认"
+        );
+        let connection = store.open().expect("应重新打开数据库");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM identity WHERE subject_id = 'rollback-user'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("应统计回滚后的身份"),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM player_stage_confirmation",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("应统计回滚后的审计"),
+            0
+        );
+    }
+
+    #[test]
+    fn recorded_v42_stage_confirmation_schema_damage_fails_closed() {
+        let directory = tempdir().expect("应创建 v42 结构损坏测试目录");
+        let store = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect("v42 迁移应成功");
+        let connection = store.open().expect("应打开 v42 数据库");
+        connection
+            .execute_batch("DROP TRIGGER player_stage_confirmation_no_update;")
+            .expect("应构造 v42 触发器损坏");
+        drop(connection);
+        drop(store);
+        let error = Store::initialize(directory.path(), &DatabaseConfig::default())
+            .expect_err("v42 确认审计损坏必须拒绝启动");
+        assert!(
+            error.contains("v42") || error.contains("player_stage_confirmation"),
+            "v42 结构损坏未被拒绝：{error}"
         );
     }
 }

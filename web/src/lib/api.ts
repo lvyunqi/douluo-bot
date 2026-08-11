@@ -127,6 +127,46 @@ export type ContentRollbackResult = {
   activation_id: number
 }
 
+export type PlayerStageCandidate = {
+  source_player_id: number
+  subject_id: string
+  name: string
+  gender: string
+  level: number
+  exp: number
+  hp: number
+  max_hp: number
+  soul_power: number
+  max_soul_power: number
+  strength: number
+  agility: number
+  spirit: number
+  endurance: number
+  perception: number
+  luck: number
+  life_count: number
+}
+
+export type PlayerStageCandidates = {
+  protocol: string
+  account_id: string
+  namespace: string
+  staged_at: number
+  total_players: number
+  ready_players: number
+  rejected_players: number
+  entries: PlayerStageCandidate[]
+  next_after_source_player_id: number | null
+}
+
+export type PlayerStageConfirmation = {
+  player_id: number
+  source_player_id: number
+  name: string
+  level: number
+  map_name: string
+}
+
 export type CursorPage<T> = {
   entries: T[]
   next_after_id: number | null
@@ -307,6 +347,29 @@ export function rollbackContentRevision(
   csrfToken: string,
 ): Promise<ContentRollbackResult> {
   return request<ContentRollbackResult>(`/api/v1/content/revisions/${revisionId}/rollback`, {
+    headers: { 'x-csrf-token': csrfToken },
+    method: 'POST',
+  })
+}
+
+export function listPlayerStageCandidates(
+  stageFile: string,
+  afterSourcePlayerId?: number,
+): Promise<PlayerStageCandidates> {
+  const query = new URLSearchParams({ limit: '20', stage_file: stageFile })
+  if (afterSourcePlayerId !== undefined) {
+    query.set('after_source_player_id', String(afterSourcePlayerId))
+  }
+  return request<PlayerStageCandidates>(`/api/v1/player-staging/candidates?${query.toString()}`)
+}
+
+export function confirmPlayerStage(
+  stageFile: string,
+  sourcePlayerId: number,
+  csrfToken: string,
+): Promise<PlayerStageConfirmation> {
+  return request<PlayerStageConfirmation>('/api/v1/player-staging/confirm', {
+    body: JSON.stringify({ stage_file: stageFile, source_player_id: sourcePlayerId }),
     headers: { 'x-csrf-token': csrfToken },
     method: 'POST',
   })

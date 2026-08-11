@@ -11,9 +11,9 @@ use sha2::{Digest, Sha256};
 
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SOURCE_PLAYERS: usize = 10_000;
-const STAGING_SCHEMA_VERSION: i64 = 1;
+pub(crate) const STAGING_SCHEMA_VERSION: i64 = 1;
 const STAGING_OUTPUT_EXTENSION: &str = "sqlite";
-const SOURCE_FORMAT: &str = "recent-sqlite-player-v1";
+pub(crate) const SOURCE_FORMAT: &str = "recent-sqlite-player-v1";
 const REQUIRED_PLAYER_COLUMNS: [&str; 19] = [
     "id",
     "user_id",
@@ -469,6 +469,13 @@ fn normalize_state(value: Option<i64>, issues: &mut Vec<StageIssue>) -> Option<S
             return None;
         }
     };
+    if state != "alive" {
+        // 死亡、复活中和封存角色没有可安全恢复的最小状态，必须人工重新开始。
+        issues.push(StageIssue {
+            field: "state",
+            code: "state_not_confirmable",
+        });
+    }
     Some(state.to_string())
 }
 

@@ -28,10 +28,14 @@ use crate::{
     config::{WebConfig, is_safe_data_relative_path},
     content::{is_content_key, load_package_file},
     embedded_web::ManagementWebAssets,
+    player_stage_confirmation::{
+        PlayerStageCandidate, list_player_stage_candidates, load_player_stage_candidate,
+    },
     store::{
         ContentAdminAuditActor, ContentAdminDraftStageOperationRecord, ContentAdminOperationRecord,
         ContentAdminRollbackOperationRecord, ContentDraftDiffMember, ContentDraftRecord,
-        ContentRevisionActivationRecord, ContentRevisionRecord, ContentValidationReport, Store,
+        ContentRevisionActivationRecord, ContentRevisionRecord, ContentValidationReport,
+        LEGACY_CLAIM_REQUIRED, PlayerStageConfirmationReceipt, Store,
     },
 };
 
@@ -54,7 +58,10 @@ impl AdminRole {
             (self, permission),
             (
                 Self::ContentAdmin,
-                AdminPermission::ContentRead | AdminPermission::ContentWrite
+                AdminPermission::ContentRead
+                    | AdminPermission::ContentWrite
+                    | AdminPermission::PlayerStageRead
+                    | AdminPermission::PlayerStageWrite
             )
         )
     }
@@ -71,6 +78,8 @@ impl AdminRole {
 enum AdminPermission {
     ContentRead,
     ContentWrite,
+    PlayerStageRead,
+    PlayerStageWrite,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -281,6 +290,11 @@ fn build_router(state: Arc<ManagementState>) -> Router {
         .route("/api/v1/content/drafts", get(content_drafts))
         .route("/api/v1/content/drafts/stage", post(stage_content_draft))
         .route(
+            "/api/v1/player-staging/candidates",
+            get(player_stage_candidates),
+        )
+        .route("/api/v1/player-staging/confirm", post(confirm_player_stage))
+        .route(
             "/api/v1/content/drafts/{package_key}/{package_revision}/diff",
             get(content_draft_diff),
         )
@@ -352,6 +366,25 @@ struct LoginRequest {
 #[serde(deny_unknown_fields)]
 struct ContentDraftStageRequest {
     package_file: String,
+}
+
+/// 只接收受限 data_dir 内的 stage 文件与单条源角色 ID，不接受角色正文。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlayerStageConfirmRequest {
+    stage_file: String,
+    source_player_id: i64,
+}
+
+/// 管理端读取 stage 候选时使用独立游标，避免把外部源角色 ID 当成数据库主键。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlayerStageCandidatesQuery {
+    stage_file: String,
+    #[serde(default)]
+    after_source_player_id: Option<i64>,
+    #[serde(default = "default_content_page_limit")]
+    limit: usize,
 }
 
 #[derive(Serialize)]
@@ -478,6 +511,50 @@ struct ContentRollbackResponse {
     revision: ContentRevisionRecord,
     active_revision_id: i64,
     activation_id: i64,
+}
+
+/// 候选列表只返回确认所需的基础资料，不返回来源路径、来源摘要或校验问题正文。
+#[derive(Serialize)]
+struct PlayerStageCandidateListEntry {
+    source_player_id: i64,
+    subject_id: String,
+    name: String,
+    gender: String,
+    level: i64,
+    exp: i64,
+    hp: i64,
+    max_hp: i64,
+    soul_power: i64,
+    max_soul_power: i64,
+    strength: i64,
+    agility: i64,
+    spirit: i64,
+    endurance: i64,
+    perception: i64,
+    luck: i64,
+    life_count: i64,
+}
+
+#[derive(Serialize)]
+struct PlayerStageCandidatesResponse {
+    protocol: String,
+    account_id: String,
+    namespace: String,
+    staged_at: i64,
+    total_players: i64,
+    ready_players: i64,
+    rejected_players: i64,
+    entries: Vec<PlayerStageCandidateListEntry>,
+    next_after_source_player_id: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct PlayerStageConfirmationResponse {
+    player_id: i64,
+    source_player_id: i64,
+    name: String,
+    level: i64,
+    map_name: String,
 }
 
 /// 内容管理员审计 API 不返回会话指纹，避免把会话关联信息扩散到页面响应。
@@ -800,6 +877,92 @@ async fn stage_content_draft(
     }
 }
 
+/// 读取 data_dir 内已部署的 v42.1 stage 候选；不写入 stage 或目标角色库。
+async fn player_stage_candidates(
+    State(state): State<Arc<ManagementState>>,
+    headers: HeaderMap,
+    Query(query): Query<PlayerStageCandidatesQuery>,
+) -> Response {
+    if let Err(error) = require_permission(&state, &headers, AdminPermission::PlayerStageRead) {
+        return error.into_response();
+    }
+    let (after_source_player_id, limit) = match player_stage_page_params(&query) {
+        Ok(params) => params,
+        Err(code) => return api_error(StatusCode::BAD_REQUEST, code),
+    };
+    if !valid_player_stage_file_path(&query.stage_file) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_player_stage_file");
+    }
+    match list_player_stage_candidates(
+        &state.data_dir,
+        &query.stage_file,
+        after_source_player_id,
+        limit,
+    ) {
+        Ok(page) => json_response(
+            StatusCode::OK,
+            PlayerStageCandidatesResponse {
+                protocol: page.protocol,
+                account_id: page.account_id,
+                namespace: page.namespace,
+                staged_at: page.staged_at,
+                total_players: page.total_players,
+                ready_players: page.ready_players,
+                rejected_players: page.rejected_players,
+                entries: page
+                    .entries
+                    .into_iter()
+                    .map(player_stage_candidate_list_entry)
+                    .collect(),
+                next_after_source_player_id: page.next_after_source_player_id,
+            },
+        ),
+        Err(_) => api_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_player_stage"),
+    }
+}
+
+/// 从已验证 stage 重新读取单条候选，并由 Store 在同一事务中创建角色和确认审计。
+async fn confirm_player_stage(
+    State(state): State<Arc<ManagementState>>,
+    headers: HeaderMap,
+    Json(request): Json<PlayerStageConfirmRequest>,
+) -> Response {
+    let (session_id, session) =
+        match require_permission(&state, &headers, AdminPermission::PlayerStageWrite) {
+            Ok(session) => session,
+            Err(error) => return error.into_response(),
+        };
+    if !csrf_matches(&session, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "csrf_required");
+    }
+    if request.source_player_id <= 0 || !valid_player_stage_file_path(&request.stage_file) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_player_stage_request");
+    }
+    let candidate = match load_player_stage_candidate(
+        &state.data_dir,
+        &request.stage_file,
+        request.source_player_id,
+    ) {
+        Ok(candidate) => candidate,
+        Err(error) if error == "玩家 staging 候选不存在" => {
+            return api_error(StatusCode::NOT_FOUND, "not_found");
+        }
+        Err(_) => return api_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_player_stage"),
+    };
+    let session_fingerprint = session_audit_fingerprint(&session_id);
+    let actor = ContentAdminAuditActor {
+        role: session.role.as_str(),
+        session_fingerprint: &session_fingerprint,
+    };
+    match state.store.confirm_player_stage_as_admin(&candidate, actor) {
+        Ok(receipt) => json_response(
+            StatusCode::CREATED,
+            player_stage_confirmation_response(receipt),
+        ),
+        Err(error) => player_stage_confirmation_error(&error),
+    }
+}
+
 /// 校验已暂存草稿；请求不携带正文，避免 HTTP 层形成目录直写入口。
 async fn validate_content_draft(
     State(state): State<Arc<ManagementState>>,
@@ -1040,6 +1203,19 @@ fn content_page_params(query: ContentPageQuery) -> Result<(Option<i64>, usize), 
     Ok((query.after_id, query.limit))
 }
 
+fn player_stage_page_params(
+    query: &PlayerStageCandidatesQuery,
+) -> Result<(Option<i64>, usize), &'static str> {
+    if query
+        .after_source_player_id
+        .is_some_and(|source_player_id| source_player_id < 0)
+        || !(1..=100).contains(&query.limit)
+    {
+        return Err("invalid_pagination");
+    }
+    Ok((query.after_source_player_id, query.limit))
+}
+
 fn content_draft_list_entry(
     draft: ContentDraftRecord,
 ) -> Result<ContentDraftListEntry, serde_json::Error> {
@@ -1055,6 +1231,42 @@ fn content_draft_list_entry(
         created_at: draft.created_at,
         updated_at: draft.updated_at,
     })
+}
+
+fn player_stage_candidate_list_entry(
+    candidate: PlayerStageCandidate,
+) -> PlayerStageCandidateListEntry {
+    PlayerStageCandidateListEntry {
+        source_player_id: candidate.source_player_id,
+        subject_id: candidate.subject_id,
+        name: candidate.name,
+        gender: candidate.gender,
+        level: candidate.level,
+        exp: candidate.exp,
+        hp: candidate.hp,
+        max_hp: candidate.max_hp,
+        soul_power: candidate.soul_power,
+        max_soul_power: candidate.max_soul_power,
+        strength: candidate.strength,
+        agility: candidate.agility,
+        spirit: candidate.spirit,
+        endurance: candidate.endurance,
+        perception: candidate.perception,
+        luck: candidate.luck,
+        life_count: candidate.life_count,
+    }
+}
+
+fn player_stage_confirmation_response(
+    receipt: PlayerStageConfirmationReceipt,
+) -> PlayerStageConfirmationResponse {
+    PlayerStageConfirmationResponse {
+        player_id: receipt.player_id,
+        source_player_id: receipt.source_player_id,
+        name: receipt.name,
+        level: receipt.level,
+        map_name: receipt.map_name,
+    }
 }
 
 fn content_activation_list_entry(
@@ -1155,6 +1367,14 @@ fn valid_content_package_file_path(package_file: &str) -> bool {
     )
 }
 
+fn valid_player_stage_file_path(stage_file: &str) -> bool {
+    is_safe_data_relative_path(stage_file)
+        && FsPath::new(stage_file)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("sqlite"))
+}
+
 /// 只按稳定错误类别返回写操作失败，避免把 SQLite 或目录内部细节暴露给管理端。
 fn content_write_error(error: &str) -> Response {
     match error {
@@ -1188,6 +1408,22 @@ fn content_stage_error(error: &str) -> Response {
         api_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_package")
     } else {
         api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
+    }
+}
+
+/// stage 错误不暴露路径、SQLite 细节或来源资料，冲突与不可确认状态保持稳定类别。
+fn player_stage_confirmation_error(error: &str) -> Response {
+    match error {
+        "目标玩家身份已存在" | "玩家 staging 候选已经确认过" | LEGACY_CLAIM_REQUIRED => {
+            api_error(StatusCode::CONFLICT, "player_stage_conflict")
+        }
+        "玩家 staging 等级与经验曲线不一致" | "玩家 staging 状态不可确认" => {
+            api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "player_stage_not_confirmable",
+            )
+        }
+        _ => api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
     }
 }
 
@@ -1383,10 +1619,12 @@ mod tests {
         ContentPackage, EffectPackageEntry, LoadedContentPackage, SoulBeastPackageEntry,
         SoulBeastSkillPoolPackageEntry, StatePackageEntry, content_hash,
     };
+    use crate::player_staging::{PlayerStagingMetadata, stage_recent_sqlite_player_profiles};
     use axum::{
         body::{Body, to_bytes},
         http::{Method, Request},
     };
+    use rusqlite::Connection;
     use std::fs;
     use tempfile::TempDir;
     use tower::ServiceExt;
@@ -1404,6 +1642,53 @@ mod tests {
             ManagementState::new(store, &web_config, directory.path()).expect("应创建管理服务状态"),
         );
         (directory, state)
+    }
+
+    fn create_player_stage_file(data_dir: &std::path::Path) {
+        let source_path = data_dir.join("web-recent.sqlite");
+        let source = Connection::open(&source_path).expect("应创建 Web stage 源库");
+        source
+            .execute_batch(
+                r#"
+                CREATE TABLE player(
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER,
+                    name TEXT,
+                    nickname TEXT,
+                    sex TEXT,
+                    level INTEGER,
+                    exp INTEGER,
+                    hp INTEGER,
+                    max_hp INTEGER,
+                    mp INTEGER,
+                    max_mp INTEGER,
+                    strength INTEGER,
+                    agility INTEGER,
+                    spirit INTEGER,
+                    endurance INTEGER,
+                    perception INTEGER,
+                    luck INTEGER,
+                    life_count INTEGER,
+                    state INTEGER
+                );
+                INSERT INTO player VALUES(
+                    1, 30001, 'Web确认角色', NULL, '女', 1, 0, 100, 100, 50, 50,
+                    12, 13, 14, 15, 16, 17, 1, 0
+                );
+                "#,
+            )
+            .expect("应写入 Web stage 源资料");
+        drop(source);
+        stage_recent_sqlite_player_profiles(
+            &source_path,
+            &data_dir.join("web-stage.sqlite"),
+            &PlayerStagingMetadata {
+                protocol: "onebot11".to_string(),
+                account_id: "10001".to_string(),
+                namespace: "default".to_string(),
+            },
+        )
+        .expect("应生成 Web stage 文件");
     }
 
     async fn request(
@@ -2408,6 +2693,119 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(response_json(response).await["error"], "invalid_pagination");
+    }
+
+    #[tokio::test]
+    async fn player_stage_routes_require_auth_csrf_and_confirm_one_candidate() {
+        let (directory, state) = state();
+        create_player_stage_file(directory.path());
+        let app = build_router(state.clone());
+        let candidates_path = "/api/v1/player-staging/candidates?stage_file=web-stage.sqlite";
+        let confirm_path = "/api/v1/player-staging/confirm";
+
+        let response = request(&app, Method::GET, candidates_path, &[], b"").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let (cookie, csrf_token) = login_for_test(&app).await;
+        let read_headers = [("cookie", cookie.as_str())];
+        let write_headers = [
+            ("cookie", cookie.as_str()),
+            ("x-csrf-token", csrf_token.as_str()),
+            ("content-type", "application/json"),
+        ];
+        let response = request(
+            &app,
+            Method::GET,
+            "/api/v1/player-staging/candidates?stage_file=../web-stage.sqlite",
+            &read_headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["error"],
+            "invalid_player_stage_file"
+        );
+
+        let response = request(&app, Method::GET, candidates_path, &read_headers, b"").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let candidates = response_json(response).await;
+        assert_eq!(candidates["protocol"], "onebot11");
+        assert_eq!(candidates["account_id"], "10001");
+        assert_eq!(candidates["entries"][0]["source_player_id"], 1);
+        assert_eq!(candidates["entries"][0]["subject_id"], "30001");
+        assert_eq!(candidates["entries"][0]["name"], "Web确认角色");
+        assert!(candidates.get("source_sha256").is_none());
+        assert!(candidates["entries"][0].get("source_sha256").is_none());
+
+        let response = request(
+            &app,
+            Method::POST,
+            confirm_path,
+            &[
+                ("cookie", cookie.as_str()),
+                ("content-type", "application/json"),
+            ],
+            br#"{"stage_file":"web-stage.sqlite","source_player_id":1}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_json(response).await["error"], "csrf_required");
+
+        let response = request(
+            &app,
+            Method::POST,
+            confirm_path,
+            &write_headers,
+            br#"{"stage_file":"web-stage.sqlite","source_player_id":1}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let receipt = response_json(response).await;
+        assert_eq!(receipt["source_player_id"], 1);
+        assert_eq!(receipt["name"], "Web确认角色");
+        assert_eq!(receipt["level"], 1);
+        assert_eq!(receipt["map_name"], "圣魂村");
+        assert!(receipt.get("actor_fingerprint").is_none());
+
+        let response = request(
+            &app,
+            Method::POST,
+            confirm_path,
+            &write_headers,
+            br#"{"stage_file":"web-stage.sqlite","source_player_id":1}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["error"],
+            "player_stage_conflict"
+        );
+        assert_eq!(
+            state
+                .store
+                .player_status(&crate::store::IdentityKey {
+                    protocol: crate::message::Protocol::OneBot11,
+                    account_id: "10001",
+                    namespace: "default",
+                    subject_kind: "user",
+                    subject_id: "30001",
+                })
+                .expect("应读取 HTTP 确认后的角色")
+                .expect("HTTP 确认后角色必须存在")
+                .name,
+            "Web确认角色"
+        );
+    }
+
+    #[tokio::test]
+    async fn player_stage_legacy_identity_error_maps_to_conflict() {
+        let response = player_stage_confirmation_error(LEGACY_CLAIM_REQUIRED);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["error"],
+            "player_stage_conflict"
+        );
     }
 
     #[test]
