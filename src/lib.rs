@@ -6,6 +6,7 @@ mod catalog;
 pub mod config;
 mod content;
 mod context;
+mod direct_asset_upload;
 mod embedded_web;
 mod game;
 mod identity;
@@ -77,13 +78,14 @@ fn initialize(config: PluginInitConfig) -> Result<(), String> {
         }
     }
     let web_config = parsed.web.clone();
-    let illustration_assets = IllustrationAssets::load(data_dir, &parsed.illustrations)?;
+    let illustration_config = parsed.illustrations.clone();
+    let illustration_assets = IllustrationAssets::load(data_dir, &illustration_config)?;
     let service = Arc::new(GameService::with_assets(
         store.clone(),
         parsed,
         illustration_assets,
     ));
-    replace_management_server(&web_config, store, data_dir)?;
+    replace_management_server(&web_config, &illustration_config, store, data_dir)?;
     let mut slot = runtime_slot()
         .write()
         .map_err(|_| "插件运行时锁已损坏".to_string())?;
@@ -94,6 +96,7 @@ fn initialize(config: PluginInitConfig) -> Result<(), String> {
 /// 先释放旧监听再启动新配置；新配置失败时尽力恢复旧服务，避免 reload 留下空窗。
 fn replace_management_server(
     web_config: &crate::config::WebConfig,
+    illustration_config: &crate::config::IllustrationConfig,
     store: Store,
     data_dir: &Path,
 ) -> Result<(), String> {
@@ -104,7 +107,7 @@ fn replace_management_server(
     if let Some(server) = previous.as_mut() {
         server.stop()?;
     }
-    match ManagementServer::start_if_enabled(web_config, store, data_dir) {
+    match ManagementServer::start_if_enabled(web_config, illustration_config, store, data_dir) {
         Ok(replacement) => {
             *slot = replacement;
             Ok(())
@@ -1263,7 +1266,7 @@ mod tests {
     use abi_stable::std_types::RString;
 
     use super::*;
-    use crate::config::{AuthorizationMode, PluginConfig, WebConfig};
+    use crate::config::{AuthorizationMode, IllustrationConfig, PluginConfig, WebConfig};
     use crate::store::IdentityKey;
 
     static MANAGEMENT_RUNTIME_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1344,7 +1347,8 @@ mod tests {
             admin_secret: "0123456789abcdef".to_string(),
             ..WebConfig::default()
         };
-        replace_management_server(&enabled, store.clone(), directory.path())
+        let illustrations = IllustrationConfig::default();
+        replace_management_server(&enabled, &illustrations, store.clone(), directory.path())
             .expect("应启动初始管理服务");
         assert!(
             management_server_slot()
@@ -1357,7 +1361,10 @@ mod tests {
             bind: "invalid-bind".to_string(),
             ..enabled
         };
-        assert!(replace_management_server(&invalid, store.clone(), directory.path()).is_err());
+        assert!(
+            replace_management_server(&invalid, &illustrations, store.clone(), directory.path())
+                .is_err()
+        );
         assert!(
             management_server_slot()
                 .lock()
@@ -1366,7 +1373,7 @@ mod tests {
         );
 
         let disabled = WebConfig::default();
-        replace_management_server(&disabled, store, directory.path())
+        replace_management_server(&disabled, &illustrations, store, directory.path())
             .expect("禁用配置应停止管理服务");
         assert!(
             management_server_slot()

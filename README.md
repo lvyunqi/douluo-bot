@@ -9,8 +9,8 @@ QimenBot 动态插件版斗罗大陆文字游戏，插件 ID 为 `douluo-game`�
 - 跨协议消息：兼容 OneBot 11 与 QQ 官方机器人，回复优先使用通用消息段。
 - 插图支持：支持本地 Base64 图片和公网 HTTPS 图片地址；未配置图片时仍返回完整文本。
 - 可选媒体服务：仓库包含一个独立的静态图片服务示例，可用于向 QQ 官方 Markdown 暴露公网图片。
-- 可选管理服务：默认仅回环监听，提供健康检查、短期管理会话、内容元数据、受限内容文件暂存、草稿校验/发布/回滚与追加式管理员审计。
-- 内置管理端：使用 React、Vite 和 shadcn/ui 构建，只读呈现内容 revision 与脱敏审计数据；构建产物编入动态插件，不依赖 QimenBot 宿主页。
+- 可选管理服务：默认仅回环监听，提供健康检查、短期管理会话、内容元数据、受限内容文件暂存、草稿校验/发布/回滚、受限 direct 本地插图上传与追加式管理员审计。
+- 内置管理端：使用 React、Vite 和 shadcn/ui 构建，呈现内容 revision、脱敏审计与受限本地插图上传；构建产物编入动态插件，不依赖 QimenBot 宿主页。
 
 ## Requirements
 
@@ -95,6 +95,7 @@ remote_base_url = ""
 - 非回环监听必须同时设置 `web.allow_remote = true` 和公网 HTTPS `web.public_base_url`，并由反向代理终止 TLS。
 - `web.admin_secret` 只用于建立短期 HttpOnly 会话，不会由插件显示或写入日志。
 - `illustrations.mode = "direct"` 会读取本地图片并交给宿主按协议发送。
+- 启用管理服务且使用 `direct` 模式时，插图页只能向已编译 manifest 的 `.webp` 资源键上传 PNG/JPEG/BMP/WebP；服务在 `direct_asset_root` 内重编码为 WebP，单次输入/输出上限为 8 MiB，保存后需 reload 插件才生效。
 - `illustrations.mode = "remote"` 会拼接 `remote_base_url` 生成公网图片地址，适合 QQ 官方 Markdown。
 - QQ 官方机器人使用远程图片时，地址必须是平台可访问的 HTTPS URL。
 
@@ -104,6 +105,7 @@ remote_base_url = ""
 
 - `POST /api/v1/session`：以管理密钥建立短期会话并返回 CSRF token。
 - `GET /api/v1/session`、`DELETE /api/v1/session`：读取或结束当前会话；退出请求需要 CSRF token。
+- `POST /api/v1/illustrations/upload`：仅 `content_admin` 会话可写入已声明的 direct 本地插图。正文为原始图片字节，必须携带 `X-CSRF-Token` 和 `X-Illustration-Asset-Key`；不会接受路径、文件名或远程 URL。
 - `GET /api/v1/content/active`：读取当前激活内容 revision，要求 `content_admin` 会话。
 - `GET /api/v1/content/revisions`：读取 revision 元数据和成员数量，使用 `after_id` 游标与 `limit=1..100`。
 - `GET /api/v1/content/drafts`：读取草稿状态、哈希和校验错误，使用相同游标；不返回草稿正文。
@@ -117,7 +119,7 @@ remote_base_url = ""
 - `GET /api/v1/content/rollback-operations`：读取 rollback 专用的追加式管理员审计，使用相同游标；不会返回会话指纹。
 - `GET /api/v1/content/stage-operations`：读取受限暂存的追加式管理员审计，使用相同游标；不会返回会话指纹或文件路径。
 
-写路由只操作既有文件、已暂存草稿或既有 revision，并通过 Store 事务同步写入管理员审计；不提供草稿正文、目录直写或文件系统写入。暂存不会创建、覆盖或删除文件。rollback 不删除目录、草稿或 revision，不恢复已剥离魂环/魂技，也不会迁移或改写任何玩家、魂环或魂技状态。
+内容写路由只操作既有文件、已暂存草稿或既有 revision，并通过 Store 事务同步写入管理员审计；不提供草稿正文或目录直写。`/api/v1/illustrations/upload` 是唯一的文件系统写入口，且只允许受限 direct 根、manifest 键和图片字节，不写游戏数据库、catalog、实体绑定或上传历史。暂存不会创建、覆盖或删除内容文件。rollback 不删除目录、草稿或 revision，不恢复已剥离魂环/魂技，也不会迁移或改写任何玩家、魂环或魂技状态。
 
 ## Management UI
 
@@ -127,7 +129,7 @@ remote_base_url = ""
 - active revision、草稿、revision、activation 元数据。
 - `operations`、`rollback-operations` 与 `stage-operations` 的脱敏游标分页。
 
-页面不调用 stage、validate、publish 或 rollback，不提供文件、目录或玩家状态写控件。管理密钥仅用于登录请求；cookie 由 HttpOnly/SameSite 会话管理，CSRF token 只保留在页面内存。服务只提供 `/` 和精确的 `/assets/*` 静态资源路径，未知路径返回 404；页面 CSP 限制脚本、样式、连接和字体为同源，所有静态响应均使用 `no-store`、`nosniff`、`DENY` 和 `no-referrer`。
+页面复用既有的 stage、validate、publish、rollback、单条玩家确认和受限 direct 插图上传入口；插图上传完成后需 reload 插件才读取新字节。管理密钥仅用于登录请求；cookie 由 HttpOnly/SameSite 会话管理，CSRF token 只保留在页面内存。服务只提供 `/` 和精确的 `/assets/*` 静态资源路径，未知路径返回 404；页面 CSP 限制脚本、样式、连接和字体为同源，所有静态响应均使用 `no-store`、`nosniff`、`DENY` 和 `no-referrer`。
 
 ## Common Commands
 

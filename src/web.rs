@@ -12,6 +12,7 @@ use std::{
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
@@ -25,8 +26,9 @@ use tokio::{net::TcpListener, runtime::Builder as RuntimeBuilder, sync::oneshot}
 
 use crate::{
     catalog,
-    config::{WebConfig, is_safe_data_relative_path},
+    config::{IllustrationConfig, WebConfig, is_safe_data_relative_path},
     content::{is_content_key, load_package_file},
+    direct_asset_upload::{self, DirectAssetUploadError, MAX_DIRECT_ASSET_UPLOAD_BYTES},
     embedded_web::ManagementWebAssets,
     player_stage_confirmation::{
         PlayerStageCandidate, list_player_stage_candidates, load_player_stage_candidate,
@@ -108,17 +110,24 @@ struct AdminSession {
     expires_at: Instant,
 }
 
-/// 管理服务共享状态。数据库仍通过 Store API 访问，路由不直接写目录表。
+/// 管理服务共享状态。目录写入仅限已配置的 direct 插图根，游戏数据库仍通过 Store API 访问。
 struct ManagementState {
     store: Store,
     data_dir: PathBuf,
+    illustrations: IllustrationConfig,
+    direct_asset_write_lock: Mutex<()>,
     admin_secret_hash: [u8; 32],
     sessions: Mutex<HashMap<String, AdminSession>>,
     secure_cookie: bool,
 }
 
 impl ManagementState {
-    fn new(store: Store, web_config: &WebConfig, data_dir: &FsPath) -> Result<Self, String> {
+    fn new(
+        store: Store,
+        web_config: &WebConfig,
+        illustrations: &IllustrationConfig,
+        data_dir: &FsPath,
+    ) -> Result<Self, String> {
         let data_dir = fs::canonicalize(data_dir)
             .map_err(|error| format!("解析管理内容根目录失败：{error}"))?;
         if !data_dir.is_dir() {
@@ -127,6 +136,8 @@ impl ManagementState {
         Ok(Self {
             store,
             data_dir,
+            illustrations: illustrations.clone(),
+            direct_asset_write_lock: Mutex::new(()),
             admin_secret_hash: hash_secret(&web_config.admin_secret),
             sessions: Mutex::new(HashMap::new()),
             // 只有配置了 HTTPS 公开基址时才附加 Secure，避免本地回环 HTTP 无法建立会话。
@@ -151,23 +162,30 @@ impl ManagementServer {
     /// 仅在明确启用管理端时监听端口，默认部署不创建后台线程。
     pub(crate) fn start_if_enabled(
         web_config: &WebConfig,
+        illustrations: &IllustrationConfig,
         store: Store,
         data_dir: &FsPath,
     ) -> Result<Option<Self>, String> {
         if !web_config.enabled {
             return Ok(None);
         }
-        Self::start(web_config, store, data_dir).map(Some)
+        Self::start(web_config, illustrations, store, data_dir).map(Some)
     }
 
     /// 同步完成端口绑定和线程就绪握手，确保插件 init 不会报告一个未启动的服务。
     pub(crate) fn start(
         web_config: &WebConfig,
+        illustrations: &IllustrationConfig,
         store: Store,
         data_dir: &FsPath,
     ) -> Result<Self, String> {
         let listen_addr = web_config.socket_addr()?;
-        let state = Arc::new(ManagementState::new(store, web_config, data_dir)?);
+        let state = Arc::new(ManagementState::new(
+            store,
+            web_config,
+            illustrations,
+            data_dir,
+        )?);
         Self::start_with_state(listen_addr, state)
     }
 
@@ -285,6 +303,11 @@ fn build_router(state: Arc<ManagementState>) -> Router {
             get(current_session).post(login).delete(logout),
         )
         .route("/api/v1/illustrations", get(illustration_bindings))
+        .route(
+            "/api/v1/illustrations/upload",
+            post(upload_direct_illustration)
+                .layer(DefaultBodyLimit::max(MAX_DIRECT_ASSET_UPLOAD_BYTES)),
+        )
         .route("/api/v1/content/active", get(active_content_revision))
         .route("/api/v1/content/revisions", get(content_revisions))
         .route("/api/v1/content/drafts", get(content_drafts))
@@ -409,6 +432,16 @@ struct IllustrationBindingListEntry {
 #[derive(Serialize)]
 struct IllustrationBindingsResponse {
     entries: Vec<IllustrationBindingListEntry>,
+}
+
+/// direct 根目录写入成功后的脱敏结果，浏览器不需要知道真实文件路径。
+#[derive(Serialize)]
+struct DirectIllustrationUploadResponse {
+    asset_key: String,
+    byte_size: usize,
+    height: u32,
+    mime_type: &'static str,
+    width: u32,
 }
 
 /// 管理列表统一使用受限的自增 ID 游标，避免无界 offset 查询。
@@ -729,6 +762,51 @@ async fn illustration_bindings(
         })
         .collect();
     json_response(StatusCode::OK, IllustrationBindingsResponse { entries })
+}
+
+/// 将一个已声明的插图写入 direct 根目录。请求正文是原始图片字节，资源键只从受控请求头读取。
+async fn upload_direct_illustration(
+    State(state): State<Arc<ManagementState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (_, session) = match require_permission(&state, &headers, AdminPermission::ContentWrite) {
+        Ok(session) => session,
+        Err(error) => return error.into_response(),
+    };
+    if !csrf_matches(&session, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "csrf_required");
+    }
+    let asset_key = match headers
+        .get("x-illustration-asset-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+    {
+        Some(asset_key) => asset_key,
+        None => return api_error(StatusCode::BAD_REQUEST, "invalid_illustration_asset"),
+    };
+    let _write_lock = match state.direct_asset_write_lock.lock() {
+        Ok(lock) => lock,
+        Err(_) => return api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+    };
+    match direct_asset_upload::store_direct_asset(
+        &state.data_dir,
+        &state.illustrations,
+        asset_key,
+        body.as_ref(),
+    ) {
+        Ok(receipt) => json_response(
+            StatusCode::CREATED,
+            DirectIllustrationUploadResponse {
+                asset_key: receipt.asset_key,
+                byte_size: receipt.byte_size,
+                height: receipt.height,
+                mime_type: receipt.mime_type,
+                width: receipt.width,
+            },
+        ),
+        Err(error) => direct_asset_upload_error(error),
+    }
 }
 
 async fn content_revisions(
@@ -1411,6 +1489,25 @@ fn content_stage_error(error: &str) -> Response {
     }
 }
 
+/// 本地插图上传不暴露目录、解码器或文件系统细节，只返回可由管理端处理的稳定类别。
+fn direct_asset_upload_error(error: DirectAssetUploadError) -> Response {
+    match error {
+        DirectAssetUploadError::DirectModeUnavailable => {
+            api_error(StatusCode::CONFLICT, "direct_asset_upload_unavailable")
+        }
+        DirectAssetUploadError::InvalidAsset => {
+            api_error(StatusCode::BAD_REQUEST, "invalid_illustration_asset")
+        }
+        DirectAssetUploadError::InvalidImage => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_illustration_file",
+        ),
+        DirectAssetUploadError::StorageUnavailable => {
+            api_error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
+        }
+    }
+}
+
 /// stage 错误不暴露路径、SQLite 细节或来源资料，冲突与不可确认状态保持稳定类别。
 fn player_stage_confirmation_error(error: &str) -> Response {
     match error {
@@ -1612,7 +1709,7 @@ fn secure_response(mut response: Response) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::{Cursor, Read, Write};
     use std::net::TcpStream;
 
     use crate::content::{
@@ -1624,6 +1721,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Method, Request},
     };
+    use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
     use rusqlite::Connection;
     use std::fs;
     use tempfile::TempDir;
@@ -1639,7 +1737,13 @@ mod tests {
             ..WebConfig::default()
         };
         let state = Arc::new(
-            ManagementState::new(store, &web_config, directory.path()).expect("应创建管理服务状态"),
+            ManagementState::new(
+                store,
+                &web_config,
+                &IllustrationConfig::default(),
+                directory.path(),
+            )
+            .expect("应创建管理服务状态"),
         );
         (directory, state)
     }
@@ -1706,6 +1810,39 @@ mod tests {
             .oneshot(request.body(Body::from(body)).expect("应构建请求"))
             .await
             .expect("路由应响应")
+    }
+
+    async fn request_bytes(
+        app: &Router,
+        method: Method,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Response {
+        let mut request = Request::builder().method(method).uri(path);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        app.clone()
+            .oneshot(request.body(Body::from(body)).expect("应构建请求"))
+            .await
+            .expect("路由应响应")
+    }
+
+    fn upload_png() -> Vec<u8> {
+        let image = DynamicImage::ImageRgba8(RgbaImage::from_fn(32, 32, |x, y| {
+            Rgba([
+                ((x * 29 + y * 17) & 0xff) as u8,
+                ((x * 11 + y * 43) & 0xff) as u8,
+                ((x * 47 + y * 7) & 0xff) as u8,
+                255,
+            ])
+        }));
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .expect("上传测试 PNG 应编码");
+        bytes
     }
 
     async fn response_json(response: Response) -> serde_json::Value {
@@ -2063,6 +2200,76 @@ mod tests {
             assert!(entry.get("storage_key").is_none());
             assert!(entry.get("sha256").is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn direct_illustration_upload_requires_auth_csrf_and_a_known_asset_key() {
+        let (directory, state) = state();
+        let app = build_router(state.clone());
+        let path = "/api/v1/illustrations/upload";
+        let asset_key = "maps/holy-soul-village/cover.webp";
+        assert!(upload_png().len() > MAX_API_BODY_BYTES);
+
+        let response = request_bytes(&app, Method::POST, path, &[], upload_png()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let (cookie, csrf_token) = login_for_test(&app).await;
+        let response = request_bytes(
+            &app,
+            Method::POST,
+            path,
+            &[
+                ("cookie", cookie.as_str()),
+                ("x-illustration-asset-key", asset_key),
+            ],
+            upload_png(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_json(response).await["error"], "csrf_required");
+
+        let response = request_bytes(
+            &app,
+            Method::POST,
+            path,
+            &[
+                ("cookie", cookie.as_str()),
+                ("x-csrf-token", csrf_token.as_str()),
+                ("x-illustration-asset-key", "maps/unknown/cover.webp"),
+            ],
+            upload_png(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["error"],
+            "invalid_illustration_asset"
+        );
+
+        let response = request_bytes(
+            &app,
+            Method::POST,
+            path,
+            &[
+                ("cookie", cookie.as_str()),
+                ("x-csrf-token", csrf_token.as_str()),
+                ("x-illustration-asset-key", asset_key),
+            ],
+            upload_png(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let receipt = response_json(response).await;
+        assert_eq!(receipt["asset_key"], asset_key);
+        assert_eq!(receipt["mime_type"], "image/webp");
+        assert_eq!(receipt["width"], 32);
+        assert_eq!(receipt["height"], 32);
+        assert!(receipt.get("path").is_none());
+
+        let stored = fs::read(directory.path().join("douluo-game/assets").join(asset_key))
+            .expect("上传文件应写入受限 direct 根");
+        assert!(stored.starts_with(b"RIFF"));
+        assert_eq!(&stored[8..12], b"WEBP");
     }
 
     #[tokio::test]
@@ -2817,9 +3024,13 @@ mod tests {
             admin_secret: "0123456789abcdef".to_string(),
             ..WebConfig::default()
         };
-        let mut server =
-            ManagementServer::start(&web_config, state.store.clone(), directory.path())
-                .expect("管理服务应启动");
+        let mut server = ManagementServer::start(
+            &web_config,
+            &IllustrationConfig::default(),
+            state.store.clone(),
+            directory.path(),
+        )
+        .expect("管理服务应启动");
         assert!(server.local_addr().ip().is_loopback());
         assert_ne!(server.local_addr().port(), 0);
         let mut stream = TcpStream::connect(server.local_addr()).expect("应连接管理服务");

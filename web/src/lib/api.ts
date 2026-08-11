@@ -82,6 +82,14 @@ export type IllustrationBinding = {
   height: number
 }
 
+export type DirectIllustrationUploadResult = {
+  asset_key: string
+  byte_size: number
+  height: number
+  mime_type: string
+  width: number
+}
+
 export type ContentValidation = {
   package_key: string
   package_revision: number
@@ -263,6 +271,23 @@ export function getActiveRevision(): Promise<{ revision: ContentRevision }> {
 
 export function listIllustrations(): Promise<{ entries: IllustrationBinding[] }> {
   return request<{ entries: IllustrationBinding[] }>('/api/v1/illustrations')
+}
+
+// 图片二进制只发给同源管理端，资源键和 CSRF token 通过受控请求头传递。
+export function uploadDirectIllustration(
+  assetKey: string,
+  file: File,
+  csrfToken: string,
+): Promise<DirectIllustrationUploadResult> {
+  return request<DirectIllustrationUploadResult>('/api/v1/illustrations/upload', {
+    body: file,
+    headers: {
+      'content-type': file.type || 'application/octet-stream',
+      'x-csrf-token': csrfToken,
+      'x-illustration-asset-key': assetKey,
+    },
+    method: 'POST',
+  })
 }
 
 export function listDrafts(afterId?: number): Promise<CursorPage<ContentDraft>> {

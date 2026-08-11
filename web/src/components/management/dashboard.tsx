@@ -23,6 +23,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { ContentWritePanel, type WriteFeedback } from '@/components/management/content-write-panel'
 import { ContentDraftDiffPreviewPanel } from '@/components/management/content-draft-diff-preview'
+import { DirectIllustrationUploadPanel } from '@/components/management/direct-illustration-upload-panel'
 import { PlayerStageConfirmationPanel } from '@/components/management/player-stage-confirmation-panel'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -51,6 +52,7 @@ import {
   publishContentDraft,
   rollbackContentRevision,
   stageContentDraft,
+  uploadDirectIllustration,
   validateContentDraft,
   logout,
   type ContentActivation,
@@ -181,6 +183,27 @@ function writeErrorMessage(error: unknown): string {
   return '操作未完成，请稍后重试。'
 }
 
+function illustrationUploadErrorMessage(error: unknown): string {
+  if (error instanceof ManagementApiError) {
+    if (error.status === 401) {
+      return '管理会话已失效。'
+    }
+    if (error.status === 403 && error.code === 'csrf_required') {
+      return '会话校验已失效，请重新登录。'
+    }
+    if (error.code === 'direct_asset_upload_unavailable') {
+      return '当前配置未启用 direct 本地插图。'
+    }
+    if (error.code === 'invalid_illustration_asset') {
+      return '资源键不在当前插图 manifest 中。'
+    }
+    if (error.code === 'invalid_illustration_file') {
+      return '图片格式、尺寸或大小不符合本地插图限制。'
+    }
+  }
+  return '图片未保存，请稍后重试。'
+}
+
 function DataTable<T>({
   columns,
   emptyLabel,
@@ -307,6 +330,7 @@ export function ManagementDashboard({
   const [pendingAction, setPendingAction] = useState<string | null>(null)
   const [signingOut, setSigningOut] = useState(false)
   const [writeFeedback, setWriteFeedback] = useState<WriteFeedback | null>(null)
+  const [illustrationFeedback, setIllustrationFeedback] = useState<WriteFeedback | null>(null)
   const [draftDiffPreview, setDraftDiffPreview] = useState<ContentDraftDiffPreview | null>(null)
   const [draftDiffDraft, setDraftDiffDraft] = useState<ContentDraft | null>(null)
   const [draftDiffLoadingId, setDraftDiffLoadingId] = useState<number | null>(null)
@@ -510,6 +534,37 @@ export function ManagementDashboard({
     )
   }
 
+  async function uploadIllustration(assetKey: string, file: File): Promise<boolean> {
+    if (pendingAction || loadingMore || loading || draftDiffLoadingId !== null) {
+      return false
+    }
+    setPendingAction(`illustration-upload:${assetKey}`)
+    setIllustrationFeedback(null)
+    setError(null)
+    try {
+      const result = await uploadDirectIllustration(assetKey, file, session.csrf_token)
+      setIllustrationFeedback({
+        description: `${result.asset_key} 已保存为 ${result.width} × ${result.height} WebP。重新加载插件后生效。`,
+        kind: 'success',
+        title: '本地插图已保存',
+      })
+      return true
+    } catch (requestError) {
+      if (requestError instanceof ManagementApiError && requestError.status === 401) {
+        onSessionExpired()
+        return false
+      }
+      setIllustrationFeedback({
+        description: illustrationUploadErrorMessage(requestError),
+        kind: 'error',
+        title: '上传被拒绝',
+      })
+      return false
+    } finally {
+      setPendingAction(null)
+    }
+  }
+
   async function signOut() {
     if (signingOut) {
       return
@@ -578,29 +633,6 @@ export function ManagementDashboard({
       },
     ],
     [dashboardDisabled, draftDiffLoadingId, previewDraft],
-  )
-
-  const illustrationColumns = useMemo<Array<TableColumn<IllustrationBinding>>>(
-    () => [
-      {
-        header: '实体',
-        render: (binding) => (
-          <div className="space-y-0.5">
-            <p className="font-medium">{binding.entity_key}</p>
-            <p className="text-xs text-muted-foreground">{binding.entity_type}</p>
-          </div>
-        ),
-      },
-      { header: '用途', render: (binding) => <Badge variant="outline">{binding.media_role}</Badge> },
-      {
-        className: 'max-w-72 font-mono text-xs',
-        header: '资源键',
-        render: (binding) => <span className="block truncate">{binding.asset_key}</span>,
-      },
-      { className: 'max-w-48', header: '说明', render: (binding) => <span className="block truncate">{binding.alt}</span> },
-      { header: '尺寸', render: (binding) => `${binding.width} × ${binding.height}` },
-    ],
-    [],
   )
 
   const revisionColumns = useMemo<Array<TableColumn<ContentRevisionSummary>>>(
@@ -819,17 +851,12 @@ export function ManagementDashboard({
           </TabsContent>
 
           <TabsContent value="illustrations">
-            <PagePanel
-              columns={illustrationColumns}
-              description="当前编译期 manifest 中的实体插图绑定"
+            <DirectIllustrationUploadPanel
+              bindings={snapshot.illustrations}
               disabled={dashboardDisabled}
-              emptyLabel="暂无插图绑定"
-              entries={snapshot.illustrations}
-              isLoadingMore={false}
-              nextAfterId={null}
-              onLoadMore={() => undefined}
-              rowKey={(binding) => `${binding.entity_type}:${binding.entity_key}:${binding.media_role}`}
-              title="插图绑定"
+              feedback={illustrationFeedback}
+              onUpload={uploadIllustration}
+              pendingAction={pendingAction}
             />
           </TabsContent>
 

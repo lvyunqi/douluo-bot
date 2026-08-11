@@ -16,6 +16,7 @@ abi_stable = "0.11"
 axum = "0.8.8"
 base64 = "=0.22.1"
 getrandom = "0.3.4"
+image = { version = "=0.25.10", default-features = false, features = ["bmp", "jpeg", "png", "webp"] }
 qimen-dynamic-plugin-derive = "=0.1.13"
 rusqlite = { version = "0.34", features = ["bundled"] }
 rust-embed = { version = "8.12.0", features = ["debug-embed"] }

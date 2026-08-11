@@ -206,7 +206,7 @@
         },
         "direct_asset_root": {
           "title": "本地插图根目录",
-          "description": "direct 模式从 QimenBot data_dir 下此相对目录预加载图片；文件路径必须与稳定 asset_key 一致，目录不存在时纯文字降级。",
+          "description": "direct 模式从 QimenBot data_dir 下此相对目录预加载图片；文件路径必须与稳定 asset_key 一致，目录不存在时纯文字降级。启用管理服务后只能向已声明资源键写入，并需 reload 插件才生效。",
           "type": "string",
           "maxLength": 200,
           "default": "douluo-game/assets"
