@@ -40,7 +40,7 @@ cargo build --release --locked
 - macOS：`libqimen_dynamic_plugin_douluo_game-{x86_64|aarch64}-apple-darwin.dylib`
 
 GNU/Linux Release 在 Debian 11 构建，最低 glibc 为 `2.31`。发布资产、字节数和 SHA256 见
-[v0.1.1 Release](https://github.com/lvyunqi/douluo-bot/releases/tag/v0.1.1)。
+[v0.1.2 Release](https://github.com/lvyunqi/douluo-bot/releases/tag/v0.1.2)。
 
 `build.rs` 会执行 `pnpm --dir web run build`，再将 `web/dist` 的哈希 CSS、JavaScript 和本地字体通过 `rust-embed` 编入动态库。部署运行时不需要 Node.js、pnpm、`web/node_modules` 或 `web/dist`。
 
