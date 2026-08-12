@@ -16,7 +16,7 @@ QimenBot 动态插件版斗罗大陆文字游戏，插件 ID 为 `douluo-game`�
 
 - QimenBot `0.1.18+`，推荐 `0.1.20+`。
 - Rust stable，项目使用 `Cargo.lock` 固定依赖。
-- Windows x64 MSVC、Linux x64 GNU 或 Linux ARM64 GNU。
+- Windows、GNU/Linux、macOS 的 x86_64 或 ARM64；Release 提供六个原生 target。
 - Linux musl 宿主不支持动态插件加载。
 
 ## Build
@@ -35,8 +35,12 @@ cargo build --release --locked
 
 平台产物：
 
-- Windows：`target/release/qimen_dynamic_plugin_douluo_game.dll`
-- Linux：`target/release/libqimen_dynamic_plugin_douluo_game.so`
+- Windows：`qimen_dynamic_plugin_douluo_game-{x86_64|aarch64}-pc-windows-msvc.dll`
+- GNU/Linux：`libqimen_dynamic_plugin_douluo_game-{x86_64|aarch64}-unknown-linux-gnu.so`
+- macOS：`libqimen_dynamic_plugin_douluo_game-{x86_64|aarch64}-apple-darwin.dylib`
+
+GNU/Linux Release 在 Debian 11 构建，最低 glibc 为 `2.31`。发布资产、字节数和 SHA256 见
+[v0.1.1 Release](https://github.com/lvyunqi/douluo-bot/releases/tag/v0.1.1)。
 
 `build.rs` 会执行 `pnpm --dir web run build`，再将 `web/dist` 的哈希 CSS、JavaScript 和本地字体通过 `rust-embed` 编入动态库。部署运行时不需要 Node.js、pnpm、`web/node_modules` 或 `web/dist`。
 
@@ -142,6 +146,25 @@ remote_base_url = ""
 - `挑战 <魂兽>`、`攻击`、`释放技能 <魂技>`、`逃跑`：进行 PVE 战斗。
 
 命令前缀、群聊 @、私聊裸命令和管理员入口由 QimenBot 宿主统一配置。
+
+## Compatibility And Runtime Boundaries
+
+- OneBot 11 已在隔离 QimenBot `0.1.20` 宿主完成私聊、群聊、消息回复与 Base64 图片富消息验收。
+- QQ 官方机器人已覆盖字符串 ID、Markdown、群/C2C 图片调度和合成 payload 回归，但尚未完成真实 Gateway 与客户端回执验收，因此当前商城版本不声明 `qq-official` 驱动兼容。
+- 插件不提供 Webhook，也不读取 Bot AppID、Secret、access token 或宿主凭据。
+- 插件默认不访问外部网络。仅在 `illustrations.mode = "remote"` 时生成管理员配置的 HTTPS 图片 URL；独立 `douluo-media` 服务只读取本地发布目录和媒体 catalog，由部署者自行暴露 HTTPS。
+- 插件在宿主 `data_dir` 下读写 SQLite 游戏数据库、配置指定的内容包和受限 direct 图片目录。管理端 direct 上传只允许已编译 manifest 的资源键。
+- 启用管理 HTTP 服务时会启动一个受控后台线程；`reload` 或卸载时由 `#[shutdown]` 停止并 `join`。未启用时不启动该线程。
+- 游戏命令使用普通消息回复；插件没有定时主动推送、脱离事件的广播任务或常驻扫描器。
+
+## Upgrade, Uninstall And Security
+
+- SQLite 当前数据结构版本为 `42`。启动时按顺序执行内置结构升级并严格校验 schema；发现不兼容旧玩家身份或魂环历史时会拒绝加载，不会自动接管、转换或删除玩家状态。
+- `v0.1.1` 不新增相对于 `v0.1.0` 的数据库迁移。动态库可热重载，但数据库已经升级后不承诺降级到不了解该 schema 的旧版本。
+- 内容 revision 的 publish/rollback 只切换内容目录可见性，不是数据库备份或恢复功能，也不会恢复已剥离的魂环、魂技或其他玩家状态。
+- 卸载插件不会删除 `data_dir` 下的 SQLite、内容包、审计记录或本地图片；需要管理员在停用插件后自行保留或清理。
+- 本项目不提供自动备份、快照、容灾或跨版本数据恢复。生产升级前应由部署者按自身要求备份插件 `data_dir`。
+- 普通问题通过 [GitHub Issues](https://github.com/lvyunqi/douluo-bot/issues) 反馈；安全问题请使用仓库的 [Security advisory](https://github.com/lvyunqi/douluo-bot/security/advisories/new)，不要在公开 Issue 中提交凭据或用户数据。
 
 ## QQ Official Manual Smoke
 
