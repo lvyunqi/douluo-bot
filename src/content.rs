@@ -505,6 +505,21 @@ pub fn parse_package_text(text: &str, source_format: &str) -> Result<LoadedConte
     })
 }
 
+/// 从管理端上传的有界 UTF-8 字节解析内容包，不把原始正文写入文件或日志。
+pub fn parse_package_bytes(
+    bytes: &[u8],
+    source_format: &str,
+) -> Result<LoadedContentPackage, String> {
+    if bytes.len() > MAX_PACKAGE_BYTES {
+        return Err(format!(
+            "内容包超过 {} MiB 大小上限",
+            MAX_PACKAGE_BYTES / 1024 / 1024
+        ));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| "内容包必须是 UTF-8 文本".to_string())?;
+    parse_package_text(text, source_format)
+}
+
 /// 从 data_dir 内的普通文件有界读取并解析内容包。
 pub fn load_package_file(
     data_dir: &Path,
@@ -544,13 +559,12 @@ pub fn load_package_file(
             MAX_PACKAGE_BYTES / 1024 / 1024
         ));
     }
-    let text = String::from_utf8(bytes).map_err(|_| "内容包必须是 UTF-8 文本".to_string())?;
     let source_format = path
         .extension()
         .and_then(|extension| extension.to_str())
         .map(|extension| extension.to_ascii_lowercase())
         .ok_or_else(|| "内容包文件必须使用 .json 或 .toml 扩展名".to_string())?;
-    parse_package_text(&text, &source_format)
+    parse_package_bytes(&bytes, &source_format)
 }
 
 /// 返回内容包的全部结构错误，不访问数据库目录。

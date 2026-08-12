@@ -164,6 +164,12 @@ function writeErrorMessage(error: unknown): string {
     if (error.code === 'invalid_package') {
       return '内容包格式或结构校验失败。'
     }
+    if (error.code === 'invalid_package_format') {
+      return '请选择 .json 或 .toml 内容包。'
+    }
+    if (error.status === 413) {
+      return '内容包不能超过 2 MiB。'
+    }
     if (error.code === 'not_found') {
       return '目标已不存在，请刷新后重新选择。'
     }
@@ -491,7 +497,7 @@ export function ManagementDashboard({
     [draftDiffLoadingId, loading, loadingMore, onSessionExpired, pendingAction],
   )
 
-  function stageDraft(packageFile: string) {
+  function stageDraft(packageFile: File) {
     return runContentWrite(
       'stage',
       () => stageContentDraft(packageFile, session.csrf_token),

@@ -27,7 +27,7 @@ use tokio::{net::TcpListener, runtime::Builder as RuntimeBuilder, sync::oneshot}
 use crate::{
     catalog,
     config::{IllustrationConfig, WebConfig, is_safe_data_relative_path},
-    content::{is_content_key, load_package_file},
+    content::{MAX_PACKAGE_BYTES, is_content_key, load_package_file, parse_package_bytes},
     direct_asset_upload::{self, DirectAssetUploadError, MAX_DIRECT_ASSET_UPLOAD_BYTES},
     embedded_web::ManagementWebAssets,
     player_stage_confirmation::{
@@ -311,7 +311,10 @@ fn build_router(state: Arc<ManagementState>) -> Router {
         .route("/api/v1/content/active", get(active_content_revision))
         .route("/api/v1/content/revisions", get(content_revisions))
         .route("/api/v1/content/drafts", get(content_drafts))
-        .route("/api/v1/content/drafts/stage", post(stage_content_draft))
+        .route(
+            "/api/v1/content/drafts/stage",
+            post(stage_content_draft).layer(DefaultBodyLimit::max(MAX_PACKAGE_BYTES)),
+        )
         .route(
             "/api/v1/player-staging/candidates",
             get(player_stage_candidates),
@@ -914,11 +917,11 @@ async fn content_draft_diff(
     )
 }
 
-/// 暂存 data_dir 内受控内容文件；请求只传安全相对路径，不接收内容正文。
+/// 暂存浏览器上传的内容包；无格式请求头时保留旧版受控相对路径兼容入口。
 async fn stage_content_draft(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
-    Json(request): Json<ContentDraftStageRequest>,
+    body: Bytes,
 ) -> Response {
     let (session_id, session) =
         match require_permission(&state, &headers, AdminPermission::ContentWrite) {
@@ -928,12 +931,27 @@ async fn stage_content_draft(
     if !csrf_matches(&session, &headers) {
         return api_error(StatusCode::FORBIDDEN, "csrf_required");
     }
-    if !valid_content_package_file_path(&request.package_file) {
-        return api_error(StatusCode::BAD_REQUEST, "invalid_package_file");
-    }
-    let loaded = match load_package_file(&state.data_dir, &request.package_file) {
-        Ok(loaded) => loaded,
-        Err(_) => return api_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_package_file"),
+    let loaded = match content_package_upload_format(&headers) {
+        Ok(Some(source_format)) => match parse_package_bytes(&body, source_format) {
+            Ok(loaded) => loaded,
+            Err(_) => return api_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_package"),
+        },
+        Ok(None) => {
+            let request = match serde_json::from_slice::<ContentDraftStageRequest>(&body) {
+                Ok(request) => request,
+                Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid_package_format"),
+            };
+            if !valid_content_package_file_path(&request.package_file) {
+                return api_error(StatusCode::BAD_REQUEST, "invalid_package_file");
+            }
+            match load_package_file(&state.data_dir, &request.package_file) {
+                Ok(loaded) => loaded,
+                Err(_) => {
+                    return api_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_package_file");
+                }
+            }
+        }
+        Err(()) => return api_error(StatusCode::BAD_REQUEST, "invalid_package_format"),
     };
     let session_fingerprint = session_audit_fingerprint(&session_id);
     let actor = ContentAdminAuditActor {
@@ -1429,6 +1447,17 @@ fn content_admin_draft_stage_operation_list_entry(
 
 fn valid_content_draft_identity(package_key: &str, package_revision: i64) -> bool {
     package_revision > 0 && is_content_key(package_key)
+}
+
+fn content_package_upload_format(headers: &HeaderMap) -> Result<Option<&'static str>, ()> {
+    let Some(value) = headers.get("x-content-package-format") else {
+        return Ok(None);
+    };
+    match value.to_str().map(str::trim) {
+        Ok("json") => Ok(Some("json")),
+        Ok("toml") => Ok(Some("toml")),
+        _ => Err(()),
+    }
 }
 
 fn valid_content_package_file_path(package_file: &str) -> bool {
@@ -2773,6 +2802,132 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(response_json(response).await["error"], "invalid_pagination");
+    }
+
+    #[tokio::test]
+    async fn content_stage_route_accepts_direct_json_and_toml_uploads() {
+        let (_directory, state) = state();
+        let app = build_router(state);
+        let package = effect_package("web-upload", "web-upload-effect", "entangle");
+        let json_body = serde_json::to_vec(&package.package).expect("应序列化 JSON 内容包");
+
+        let response = request_bytes(
+            &app,
+            Method::POST,
+            "/api/v1/content/drafts/stage",
+            &[("x-content-package-format", "json")],
+            json_body.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let (cookie, csrf_token) = login_for_test(&app).await;
+        let missing_csrf_headers = [
+            ("cookie", cookie.as_str()),
+            ("x-content-package-format", "json"),
+        ];
+        let response = request_bytes(
+            &app,
+            Method::POST,
+            "/api/v1/content/drafts/stage",
+            &missing_csrf_headers,
+            json_body.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let json_headers = [
+            ("cookie", cookie.as_str()),
+            ("x-csrf-token", csrf_token.as_str()),
+            ("x-content-package-format", "json"),
+        ];
+        let response = request_bytes(
+            &app,
+            Method::POST,
+            "/api/v1/content/drafts/stage",
+            &json_headers,
+            json_body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["draft"]["package_key"], "web-upload");
+        assert_eq!(payload["draft"]["source_format"], "json");
+        assert!(payload["draft"].get("package_json").is_none());
+
+        let toml_package = effect_package("web-upload-toml", "web-upload-toml-effect", "entangle");
+        let toml_body = toml::to_string(&toml_package.package)
+            .expect("应序列化 TOML 内容包")
+            .into_bytes();
+        let toml_headers = [
+            ("cookie", cookie.as_str()),
+            ("x-csrf-token", csrf_token.as_str()),
+            ("x-content-package-format", "toml"),
+        ];
+        let response = request_bytes(
+            &app,
+            Method::POST,
+            "/api/v1/content/drafts/stage",
+            &toml_headers,
+            toml_body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["draft"]["package_key"], "web-upload-toml");
+        assert_eq!(payload["draft"]["source_format"], "toml");
+    }
+
+    #[tokio::test]
+    async fn content_stage_upload_rejects_invalid_format_utf8_and_oversized_bodies() {
+        let (_directory, state) = state();
+        let app = build_router(state);
+        let (cookie, csrf_token) = login_for_test(&app).await;
+
+        let unsupported_headers = [
+            ("cookie", cookie.as_str()),
+            ("x-csrf-token", csrf_token.as_str()),
+            ("x-content-package-format", "yaml"),
+        ];
+        let response = request_bytes(
+            &app,
+            Method::POST,
+            "/api/v1/content/drafts/stage",
+            &unsupported_headers,
+            b"package_key: invalid".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["error"],
+            "invalid_package_format"
+        );
+
+        let json_headers = [
+            ("cookie", cookie.as_str()),
+            ("x-csrf-token", csrf_token.as_str()),
+            ("x-content-package-format", "json"),
+        ];
+        let response = request_bytes(
+            &app,
+            Method::POST,
+            "/api/v1/content/drafts/stage",
+            &json_headers,
+            vec![0xff, 0xfe],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response_json(response).await["error"], "invalid_package");
+
+        let response = request_bytes(
+            &app,
+            Method::POST,
+            "/api/v1/content/drafts/stage",
+            &json_headers,
+            vec![b' '; crate::content::MAX_PACKAGE_BYTES + 1],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

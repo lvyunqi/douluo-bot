@@ -483,11 +483,11 @@ fn dispatch_player_alias_command(request: &CommandRequest) -> CommandResponse {
 
 #[dynamic_plugin(
     id = "douluo-game",
-    version = "0.1.1",
+    version = "0.1.2",
     api = "0.6",
     config_schema = "../config.schema.json",
     config_ui = "../config.ui.json",
-    config_version = 6,
+    config_version = 7,
     config_apply = "reload"
 )]
 mod plugin {

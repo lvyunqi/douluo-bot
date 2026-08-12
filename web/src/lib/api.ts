@@ -321,13 +321,26 @@ export function listStageOperations(afterId?: number): Promise<CursorPage<Conten
 }
 
 // 写操作只复用后端 Store 事务，并把页面内存中的 CSRF token 交给同源请求。
-export function stageContentDraft(
-  packageFile: string,
-  csrfToken: string,
-): Promise<ContentStageResult> {
+export function stageContentDraft(file: File, csrfToken: string): Promise<ContentStageResult> {
+  const lowerName = file.name.toLowerCase()
+  const sourceFormat = lowerName.endsWith('.json')
+    ? 'json'
+    : lowerName.endsWith('.toml')
+      ? 'toml'
+      : null
+  if (!sourceFormat) {
+    return Promise.reject(new ManagementApiError(400, 'invalid_package_format'))
+  }
+  if (file.size > 2 * 1024 * 1024) {
+    return Promise.reject(new ManagementApiError(413, 'payload_too_large'))
+  }
   return request<ContentStageResult>('/api/v1/content/drafts/stage', {
-    body: JSON.stringify({ package_file: packageFile }),
-    headers: { 'x-csrf-token': csrfToken },
+    body: file,
+    headers: {
+      'content-type': file.type || 'application/octet-stream',
+      'x-content-package-format': sourceFormat,
+      'x-csrf-token': csrfToken,
+    },
     method: 'POST',
   })
 }

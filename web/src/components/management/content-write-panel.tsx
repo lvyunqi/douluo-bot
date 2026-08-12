@@ -1,4 +1,4 @@
-import { type FormEvent, useState } from 'react'
+import { type FormEvent, useRef, useState } from 'react'
 import { BadgeCheck, Check, FileUp, LoaderCircle, Send, Undo2 } from 'lucide-react'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -23,7 +23,7 @@ type ContentWritePanelProps = {
   feedback: WriteFeedback | null
   onPublish: (draft: ContentDraft) => Promise<boolean>
   onRollback: (revision: ContentRevision) => Promise<boolean>
-  onStage: (packageFile: string) => Promise<boolean>
+  onStage: (packageFile: File) => Promise<boolean>
   onValidate: (draft: ContentDraft) => Promise<boolean>
   pendingAction: string | null
   revisions: ContentRevisionSummary[]
@@ -79,6 +79,12 @@ function ValidationSummary({ draft }: { draft: ContentDraft }) {
   )
 }
 
+function formatFileSize(byteSize: number) {
+  if (byteSize < 1024) return `${byteSize} B`
+  if (byteSize < 1024 * 1024) return `${(byteSize / 1024).toFixed(1)} KiB`
+  return `${(byteSize / 1024 / 1024).toFixed(2)} MiB`
+}
+
 export function ContentWritePanel({
   activeRevision,
   disabled,
@@ -91,17 +97,20 @@ export function ContentWritePanel({
   pendingAction,
   revisions,
 }: ContentWritePanelProps) {
-  const [packageFile, setPackageFile] = useState('')
+  const [packageFile, setPackageFile] = useState<File | null>(null)
+  const packageInputRef = useRef<HTMLInputElement>(null)
   const [rollbackTarget, setRollbackTarget] = useState<number | null>(null)
 
   async function submitStage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    const value = packageFile.trim()
-    if (!value || disabled) {
+    if (!packageFile || disabled) {
       return
     }
-    if (await onStage(value)) {
-      setPackageFile('')
+    if (await onStage(packageFile)) {
+      setPackageFile(null)
+      if (packageInputRef.current) {
+        packageInputRef.current.value = ''
+      }
     }
   }
 
@@ -131,26 +140,32 @@ export function ContentWritePanel({
 
       <Card className="rounded-lg shadow-sm">
         <CardHeader className="border-b">
-          <CardTitle>暂存内容文件</CardTitle>
-          <CardDescription>输入 data_dir 内已部署的 JSON/TOML 相对路径。</CardDescription>
+          <CardTitle>上传内容包</CardTitle>
+          <CardDescription>选择 UTF-8 JSON 或 TOML 文件并暂存为草稿。</CardDescription>
         </CardHeader>
         <CardContent className="pt-6">
           <form className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end" onSubmit={submitStage}>
             <div className="space-y-2">
               <label className="text-sm font-medium" htmlFor="content-package-file">
-                内容包路径
+                内容包文件
               </label>
               <Input
                 disabled={disabled}
                 id="content-package-file"
-                onChange={(event) => setPackageFile(event.target.value)}
-                placeholder="douluo-game/content/example.toml"
-                value={packageFile}
+                accept=".json,.toml,application/json,application/toml,text/plain"
+                onChange={(event) => setPackageFile(event.target.files?.[0] ?? null)}
+                ref={packageInputRef}
+                type="file"
               />
+              {packageFile ? (
+                <p className="break-all text-xs text-muted-foreground">
+                  {packageFile.name} · {formatFileSize(packageFile.size)}
+                </p>
+              ) : null}
             </div>
-            <Button disabled={disabled || !packageFile.trim()} type="submit">
+            <Button disabled={disabled || !packageFile} type="submit">
               {pendingAction === 'stage' ? <LoaderCircle className="animate-spin" data-icon="inline-start" aria-hidden="true" /> : <FileUp data-icon="inline-start" aria-hidden="true" />}
-              {pendingAction === 'stage' ? '暂存中' : '暂存'}
+              {pendingAction === 'stage' ? '上传中' : '上传并暂存'}
             </Button>
           </form>
         </CardContent>

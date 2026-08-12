@@ -9,8 +9,8 @@ QimenBot 动态插件版斗罗大陆文字游戏，插件 ID 为 `douluo-game`�
 - 跨协议消息：兼容 OneBot 11 与 QQ 官方机器人，回复优先使用通用消息段。
 - 插图支持：支持本地 Base64 图片和公网 HTTPS 图片地址；未配置图片时仍返回完整文本。
 - 可选媒体服务：仓库包含一个独立的静态图片服务示例，可用于向 QQ 官方 Markdown 暴露公网图片。
-- 可选管理服务：默认仅回环监听，提供健康检查、短期管理会话、内容元数据、受限内容文件暂存、草稿校验/发布/回滚、受限 direct 本地插图上传与追加式管理员审计。
-- 内置管理端：使用 React、Vite 和 shadcn/ui 构建，呈现内容 revision、脱敏审计与受限本地插图上传；构建产物编入动态插件，不依赖 QimenBot 宿主页。
+- 可选管理服务：默认仅回环监听，提供健康检查、短期管理会话、内容元数据、JSON/TOML 内容包上传、草稿校验/发布/回滚、受限 direct 本地插图上传与追加式管理员审计。
+- 内置管理端：使用 React、Vite 和 shadcn/ui 构建，呈现内容 revision、脱敏审计、内容包上传与受限本地插图上传；构建产物编入动态插件，不依赖 QimenBot 宿主页。
 
 ## Requirements
 
@@ -64,19 +64,11 @@ douluo-media catalog verify --root <published-root>
 1. 将当前平台的动态库复制到 QimenBot `plugin_bin_dir`。
 2. 在 QimenBot Web 插件页重新扫描动态插件。
 3. 启用 `douluo-game`。
-4. 按需在 `config/plugins/douluo-game.toml` 中配置数据库、授权上下文、内容包、管理服务和插图。
+4. 按需在 QimenBot 插件配置页设置授权上下文、管理服务和插图；首次保存会创建 `config/plugins/douluo-game.toml`。
 
 ## Minimal Config
 
 ```toml
-[database]
-relative_path = "douluo-game/douluo.db"
-busy_timeout_ms = 3000
-
-[content]
-package_file = ""
-auto_publish = false
-
 [web]
 enabled = false
 bind = "127.0.0.1"
@@ -94,7 +86,8 @@ remote_base_url = ""
 
 说明：
 
-- `content.package_file` 必须是插件 `data_dir` 内的安全相对路径，支持 `.json` 和 `.toml`。
+- SQLite 固定默认位于插件 `data_dir/douluo-game/douluo.db`，等待超时固定为 3000 毫秒；在线表单不再暴露这两个内部存储字段。旧配置文件中的 `[database]` 仍兼容读取，避免现有部署切换数据库。
+- 新内容包在斗罗管理端直接选择 UTF-8 `.json`/`.toml` 文件上传，不需要先复制到服务器 `data_dir`。旧配置文件中的 `[content]` 和旧路径暂存 API 仅保留兼容读取。
 - `web.enabled` 默认关闭；启用时 `web.bind` 只能是 IP 地址，默认仅允许 `127.0.0.1`/`::1` 等回环监听。
 - 非回环监听必须同时设置 `web.allow_remote = true` 和公网 HTTPS `web.public_base_url`，并由反向代理终止 TLS。
 - `web.admin_secret` 只用于建立短期 HttpOnly 会话，不会由插件显示或写入日志。
@@ -113,7 +106,7 @@ remote_base_url = ""
 - `GET /api/v1/content/active`：读取当前激活内容 revision，要求 `content_admin` 会话。
 - `GET /api/v1/content/revisions`：读取 revision 元数据和成员数量，使用 `after_id` 游标与 `limit=1..100`。
 - `GET /api/v1/content/drafts`：读取草稿状态、哈希和校验错误，使用相同游标；不返回草稿正文。
-- `POST /api/v1/content/drafts/stage`：只接受 `{ "package_file": "安全相对路径" }`，从插件 `data_dir` 读取既有 UTF-8 `.json`/`.toml` 常规文件并暂存；要求 `content_admin` 会话和 `X-CSRF-Token`，不接收正文且不写文件系统。
+- `POST /api/v1/content/drafts/stage`：正文为不超过 2 MiB 的 UTF-8 JSON/TOML 内容包，必须携带 `X-Content-Package-Format: json|toml`、`content_admin` 会话和 `X-CSRF-Token`；解析后直接复用 Store 暂存事务，不写内容文件。未携带格式头时仍兼容旧版 `{ "package_file": "安全相对路径" }` 请求。
 - `GET /api/v1/content/drafts/{package_key}/{package_revision}/diff`：读取草稿相对当前 active revision 的成员差异；不返回正文且不改变草稿状态。
 - `GET /api/v1/content/activations`：读取追加式 activation 历史，使用相同游标。
 - `POST /api/v1/content/drafts/{package_key}/{package_revision}/validate`：校验已暂存草稿；要求 `content_admin` 会话和 `X-CSRF-Token`，不接收草稿正文。
@@ -123,7 +116,7 @@ remote_base_url = ""
 - `GET /api/v1/content/rollback-operations`：读取 rollback 专用的追加式管理员审计，使用相同游标；不会返回会话指纹。
 - `GET /api/v1/content/stage-operations`：读取受限暂存的追加式管理员审计，使用相同游标；不会返回会话指纹或文件路径。
 
-内容写路由只操作既有文件、已暂存草稿或既有 revision，并通过 Store 事务同步写入管理员审计；不提供草稿正文或目录直写。`/api/v1/illustrations/upload` 是唯一的文件系统写入口，且只允许受限 direct 根、manifest 键和图片字节，不写游戏数据库、catalog、实体绑定或上传历史。暂存不会创建、覆盖或删除内容文件。rollback 不删除目录、草稿或 revision，不恢复已剥离魂环/魂技，也不会迁移或改写任何玩家、魂环或魂技状态。
+内容写路由只操作上传正文、旧版兼容文件、已暂存草稿或既有 revision，并通过 Store 事务同步写入管理员审计；不返回草稿正文，也不提供目录直写。内容包上传只解析并暂存，不创建、覆盖或删除内容文件。`/api/v1/illustrations/upload` 只允许受限 direct 根、manifest 键和图片字节，不写游戏数据库、catalog、实体绑定或上传历史。rollback 不删除目录、草稿或 revision，不恢复已剥离魂环/魂技，也不会迁移或改写任何玩家、魂环或魂技状态。
 
 ## Management UI
 
@@ -153,14 +146,14 @@ remote_base_url = ""
 - QQ 官方机器人已覆盖字符串 ID、Markdown、群/C2C 图片调度和合成 payload 回归，但尚未完成真实 Gateway 与客户端回执验收，因此当前商城版本不声明 `qq-official` 驱动兼容。
 - 插件不提供 Webhook，也不读取 Bot AppID、Secret、access token 或宿主凭据。
 - 插件默认不访问外部网络。仅在 `illustrations.mode = "remote"` 时生成管理员配置的 HTTPS 图片 URL；独立 `douluo-media` 服务只读取本地发布目录和媒体 catalog，由部署者自行暴露 HTTPS。
-- 插件在宿主 `data_dir` 下读写 SQLite 游戏数据库、配置指定的内容包和受限 direct 图片目录。管理端 direct 上传只允许已编译 manifest 的资源键。
+- 插件在宿主 `data_dir` 下读写固定默认位置的 SQLite 游戏数据库和受限 direct 图片目录。管理端内容包上传不落源文件；direct 图片上传只允许已编译 manifest 的资源键。
 - 启用管理 HTTP 服务时会启动一个受控后台线程；`reload` 或卸载时由 `#[shutdown]` 停止并 `join`。未启用时不启动该线程。
 - 游戏命令使用普通消息回复；插件没有定时主动推送、脱离事件的广播任务或常驻扫描器。
 
 ## Upgrade, Uninstall And Security
 
 - SQLite 当前数据结构版本为 `42`。启动时按顺序执行内置结构升级并严格校验 schema；发现不兼容旧玩家身份或魂环历史时会拒绝加载，不会自动接管、转换或删除玩家状态。
-- `v0.1.1` 不新增相对于 `v0.1.0` 的数据库迁移。动态库可热重载，但数据库已经升级后不承诺降级到不了解该 schema 的旧版本。
+- `v0.1.2` 不新增相对于 `v0.1.1` 的数据库迁移，只修复在线配置默认值和管理端内容包上传。动态库可热重载，但数据库已经升级后不承诺降级到不了解该 schema 的旧版本。
 - 内容 revision 的 publish/rollback 只切换内容目录可见性，不是数据库备份或恢复功能，也不会恢复已剥离的魂环、魂技或其他玩家状态。
 - 卸载插件不会删除 `data_dir` 下的 SQLite、内容包、审计记录或本地图片；需要管理员在停用插件后自行保留或清理。
 - 本项目不提供自动备份、快照、容灾或跨版本数据恢复。生产升级前应由部署者按自身要求备份插件 `data_dir`。

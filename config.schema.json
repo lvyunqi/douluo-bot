@@ -1,15 +1,42 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "斗罗大陆文字游戏",
-  "description": "插件启动、内容包、管理服务、身份命名空间、插图和跨协议消息配置。",
+  "description": "插件管理服务、身份命名空间、插图和跨协议消息配置。数据库与启动内容路径使用插件默认值。",
   "type": "object",
   "additionalProperties": false,
+  "default": {
+    "web": {
+      "enabled": false,
+      "bind": "127.0.0.1",
+      "port": 18181,
+      "allow_remote": false,
+      "public_base_url": ""
+    },
+    "identity": {
+      "namespace": "default",
+      "qq_official_account_id": "",
+      "max_character_name_chars": 6
+    },
+    "authorization": {
+      "mode": "allow_all"
+    },
+    "illustrations": {
+      "enabled": true,
+      "mode": "direct",
+      "direct_asset_root": "douluo-game/assets",
+      "remote_base_url": ""
+    },
+    "messages": {
+      "qq_official_markdown": true,
+      "onebot_markdown": false,
+      "legacy_hyphen_arguments": true
+    }
+  },
   "properties": {
     "database": {
       "title": "数据库",
       "type": "object",
       "additionalProperties": false,
-      "default": {},
       "properties": {
         "relative_path": {
           "title": "数据库相对路径",
@@ -35,7 +62,6 @@
       "description": "从 QimenBot data_dir 内的 JSON/TOML 文件创建并校验内容草稿；默认不会自动发布。",
       "type": "object",
       "additionalProperties": false,
-      "default": {},
       "properties": {
         "package_file": {
           "title": "内容包相对路径",
@@ -70,7 +96,13 @@
       "description": "默认关闭并仅允许回环监听；启用后提供独立的游戏管理 API。",
       "type": "object",
       "additionalProperties": false,
-      "default": {},
+      "default": {
+        "enabled": false,
+        "bind": "127.0.0.1",
+        "port": 18181,
+        "allow_remote": false,
+        "public_base_url": ""
+      },
       "properties": {
         "enabled": {
           "title": "启用管理服务",
@@ -142,7 +174,11 @@
       "title": "身份",
       "type": "object",
       "additionalProperties": false,
-      "default": {},
+      "default": {
+        "namespace": "default",
+        "qq_official_account_id": "",
+        "max_character_name_chars": 6
+      },
       "properties": {
         "namespace": {
           "title": "身份命名空间",
@@ -174,7 +210,9 @@
       "description": "控制群聊和频道是否需要显式授权；私聊始终允许。",
       "type": "object",
       "additionalProperties": false,
-      "default": {},
+      "default": {
+        "mode": "allow_all"
+      },
       "properties": {
         "mode": {
           "title": "上下文策略",
@@ -189,7 +227,12 @@
       "title": "插图",
       "type": "object",
       "additionalProperties": false,
-      "default": {},
+      "default": {
+        "enabled": true,
+        "mode": "direct",
+        "direct_asset_root": "douluo-game/assets",
+        "remote_base_url": ""
+      },
       "properties": {
         "enabled": {
           "title": "启用游戏插图",
@@ -242,7 +285,11 @@
       "title": "消息",
       "type": "object",
       "additionalProperties": false,
-      "default": {},
+      "default": {
+        "qq_official_markdown": true,
+        "onebot_markdown": false,
+        "legacy_hyphen_arguments": true
+      },
       "properties": {
         "qq_official_markdown": {
           "title": "QQ 官方机器人使用 Markdown",

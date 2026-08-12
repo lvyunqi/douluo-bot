@@ -474,6 +474,25 @@ mod tests {
     }
 
     #[test]
+    fn schema_default_is_directly_savable_and_hides_internal_storage_fields() {
+        let schema: serde_json::Value = serde_json::from_str(include_str!("../config.schema.json"))
+            .expect("配置 Schema 应有效");
+        let ui: serde_json::Value =
+            serde_json::from_str(include_str!("../config.ui.json")).expect("UI Schema 应有效");
+        assert_eq!(ui["/database"]["hidden"], true);
+        assert_eq!(ui["/content"]["hidden"], true);
+
+        let default_json = serde_json::to_string(&schema["default"]).expect("根默认值应可序列化");
+        let config = parse_config(&default_json).expect("首次打开表单的默认草稿应可直接保存");
+        assert_eq!(config.database, DatabaseConfig::default());
+        assert_eq!(config.content, ContentConfig::default());
+        assert!(!config.web.enabled);
+        assert_eq!(config.web.bind, "127.0.0.1");
+        assert_eq!(config.web.port, 18_181);
+        assert!(config.web.public_base_url.is_empty());
+    }
+
+    #[test]
     fn authorization_mode_is_explicit_and_backward_compatible() {
         assert_eq!(
             parse_config(r#"{"authorization":{"mode":"allowlist"}}"#)

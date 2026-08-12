@@ -2,6 +2,12 @@
   "": {
     "ui:order": ["database", "content", "web", "identity", "authorization", "illustrations", "messages"]
   },
+  "/database": {
+    "hidden": true
+  },
+  "/content": {
+    "hidden": true
+  },
   "/database/busy_timeout_ms": {
     "ui:widget": "slider",
     "unit": "毫秒",
