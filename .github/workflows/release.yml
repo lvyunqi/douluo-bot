@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '要发布的既有 SemVer tag，例如 v0.1.0'
+        description: '要发布的既有 SemVer tag，例如 v0.1.1'
         required: true
         type: string
 
@@ -43,7 +43,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
-      - name: 检查插件身份
+      - name: 检查插件身份与版本
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
@@ -59,13 +59,69 @@ jobs:
           grep -F 'api = "0.6"' src/lib.rs
           test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_TAG"
       - run: pnpm --dir web install --frozen-lockfile
+      - run: pnpm --dir web lint
       - run: cargo +${{ env.RUST_VERSION }} fmt --all -- --check
       - run: cargo +${{ env.RUST_VERSION }} clippy --locked --all-targets -- -D warnings
       - run: cargo +${{ env.RUST_VERSION }} test --locked --all-targets -- --test-threads=8
 
-  build-windows:
+  linux:
     needs: verify
-    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    # Debian 11 将 GNU/Linux 产物的 glibc 基线固定在 2.31。
+    container: rust:1.89-bullseye
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - run: pnpm --dir web install --frozen-lockfile
+      - name: 构建 ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$TARGET"
+      - name: 准备 Marketplace 资产
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          source="target/${TARGET}/release/lib${LIB_STEM}.so"
+          asset="release-assets/lib${LIB_STEM}-${TARGET}.so"
+          cp "$source" "$asset"
+          sha256sum "$asset" > "${asset}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-${{ matrix.target }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  windows:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -82,27 +138,78 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.target }}
       - run: pnpm --dir web install --frozen-lockfile
-      - name: 构建 Windows x64 资产
-        run: cargo +${{ env.RUST_VERSION }} build --locked --release --target x86_64-pc-windows-msvc
-      - name: 准备 Release 资产
+      - name: 构建 ${{ matrix.target }}
+        run: cargo +${{ env.RUST_VERSION }} build --locked --release --target "${{ matrix.target }}"
+      - name: 准备 Marketplace 资产
         shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           New-Item -ItemType Directory -Force release-assets | Out-Null
-          $source = "target/x86_64-pc-windows-msvc/release/$env:LIB_STEM.dll"
-          $asset = "release-assets/$env:LIB_STEM-x86_64-pc-windows-msvc.dll"
+          $source = "target/$env:TARGET/release/$env:LIB_STEM.dll"
+          $asset = "release-assets/$env:LIB_STEM-$env:TARGET.dll"
           Copy-Item $source $asset
           $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower()
           "$hash  $([IO.Path]::GetFileName($asset))" | Set-Content -Encoding ascii "$asset.sha256"
       - uses: actions/upload-artifact@v4
         with:
-          name: plugin-x86_64-pc-windows-msvc
+          name: plugin-${{ matrix.target }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  macos:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
+      - run: pnpm --dir web install --frozen-lockfile
+      - name: 构建 ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo +${{ env.RUST_VERSION }} build --locked --release --target "$TARGET"
+      - name: 准备 Marketplace 资产
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          source="target/${TARGET}/release/lib${LIB_STEM}.dylib"
+          asset="release-assets/lib${LIB_STEM}-${TARGET}.dylib"
+          cp "$source" "$asset"
+          shasum -a 256 "$asset" > "${asset}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-${{ matrix.target }}
           path: release-assets/*
           if-no-files-found: error
 
   publish:
-    needs: [build-windows]
+    needs: [linux, windows, macos]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -110,20 +217,43 @@ jobs:
           ref: ${{ inputs.tag || github.ref_name }}
       - uses: actions/download-artifact@v4
         with:
-          name: plugin-x86_64-pc-windows-msvc
+          pattern: plugin-*
           path: release-assets
-      - name: 校验发布 tag
+          merge-multiple: true
+      - name: 校验 tag 与完整资产集
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_TAG"
+          targets=(
+            x86_64-pc-windows-msvc
+            aarch64-pc-windows-msvc
+            x86_64-unknown-linux-gnu
+            aarch64-unknown-linux-gnu
+            x86_64-apple-darwin
+            aarch64-apple-darwin
+          )
+          for target in "${targets[@]}"; do
+            case "$target" in
+              *windows*) asset="${LIB_STEM}-${target}.dll" ;;
+              *linux*) asset="lib${LIB_STEM}-${target}.so" ;;
+              *apple*) asset="lib${LIB_STEM}-${target}.dylib" ;;
+            esac
+            test -f "release-assets/$asset"
+            test -f "release-assets/$asset.sha256"
+          done
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 12
+          find release-assets -maxdepth 1 -type f -printf '%f\n' | sort
       - name: 生成构建来源证明
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: release-assets/*.dll
-      - name: 创建或更新 GitHub Release
+          subject-path: |
+            release-assets/*.dll
+            release-assets/*.so
+            release-assets/*.dylib
+      - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}

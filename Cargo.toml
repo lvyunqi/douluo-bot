@@ -1,6 +1,6 @@
 [package]
 name = "qimen-dynamic-plugin-douluo-game"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 description = "QimenBot 动态插件：斗罗大陆文字游戏"
