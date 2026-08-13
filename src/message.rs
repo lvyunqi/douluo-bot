@@ -15,9 +15,15 @@ pub struct GameDocument {
     title: String,
     lines: Vec<String>,
     fields: Vec<(String, String)>,
-    commands: Vec<String>,
+    commands: Vec<RecommendedCommand>,
     notice: Option<String>,
     illustration: Option<Illustration>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecommendedCommand {
+    command: String,
+    description: Option<String>,
 }
 
 impl GameDocument {
@@ -39,7 +45,10 @@ impl GameDocument {
     }
 
     pub fn command(mut self, command: impl Into<String>) -> Self {
-        self.commands.push(command.into());
+        self.commands.push(RecommendedCommand {
+            command: command.into(),
+            description: None,
+        });
         self
     }
 
@@ -52,8 +61,10 @@ impl GameDocument {
         command: impl Into<String>,
         description: impl Into<String>,
     ) -> Self {
-        self.commands
-            .push(format!("{}：{}", command.into(), description.into()));
+        self.commands.push(RecommendedCommand {
+            command: command.into(),
+            description: Some(description.into()),
+        });
         self
     }
 
@@ -251,14 +262,14 @@ pub fn response_for(
                 _ => None,
             };
             if markdown {
-                markdown_response(document, illustration_url)
+                markdown_response(document, illustration_url, true)
             } else {
                 CommandResponse::text(&render_text(document))
             }
         }
         Protocol::OneBot11 => match resolved_illustration.as_ref() {
             Some(illustration) => onebot_illustrated_response(document, markdown, illustration),
-            None if markdown => markdown_response(document, None),
+            None if markdown => markdown_response(document, None, false),
             None => CommandResponse::text(&render_text(document)),
         },
     }
@@ -291,7 +302,7 @@ pub(crate) fn qq_official_inline_image_segments(bytes: &[u8]) -> String {
 }
 
 pub fn render_text(document: &GameDocument) -> String {
-    let mut output = vec![format!("== {} ==", document.title)];
+    let mut output = vec![format!("╭═══★{}★═══╮", document.title)];
     output.extend(document.lines.iter().cloned());
     output.extend(
         document
@@ -300,22 +311,18 @@ pub fn render_text(document: &GameDocument) -> String {
             .map(|(label, value)| format!("{label}：{value}")),
     );
     if !document.commands.is_empty() {
-        output.push("可用命令：".to_string());
-        output.extend(
-            document
-                .commands
-                .iter()
-                .map(|command| format!("- {command}")),
-        );
+        output.push("推荐命令".to_string());
+        output.extend(document.commands.iter().map(format_text_command));
     }
     if let Some(notice) = &document.notice {
         output.push(format!("提示：{notice}"));
     }
+    output.push("╰═══★══════★═══╯".to_string());
     output.join("\n")
 }
 
 pub fn render_markdown(document: &GameDocument, illustration_url: Option<&str>) -> String {
-    let mut output = vec![format!("# {}", escape_markdown(&document.title))];
+    let mut output = vec![format!("## {}", escape_markdown(&document.title))];
     if let (Some(illustration), Some(url)) = (&document.illustration, illustration_url) {
         output.push(markdown_image(illustration, url));
     }
@@ -329,13 +336,8 @@ pub fn render_markdown(document: &GameDocument, illustration_url: Option<&str>) 
     }));
     if !document.commands.is_empty() {
         output.push("---".to_string());
-        output.push("## 可用命令".to_string());
-        output.extend(
-            document
-                .commands
-                .iter()
-                .map(|command| format!("- {}", escape_markdown(command))),
-        );
+        output.push("**推荐命令**".to_string());
+        output.extend(document.commands.iter().map(format_markdown_command));
     }
     if let Some(notice) = &document.notice {
         output.push(format!("> {}", escape_markdown(notice)));
@@ -343,14 +345,101 @@ pub fn render_markdown(document: &GameDocument, illustration_url: Option<&str>) 
     output.join("\n")
 }
 
-fn markdown_response(document: &GameDocument, illustration_url: Option<&str>) -> CommandResponse {
-    let segments = json!([{
+fn markdown_response(
+    document: &GameDocument,
+    illustration_url: Option<&str>,
+    include_keyboard: bool,
+) -> CommandResponse {
+    let mut segments = vec![json!({
         "type": "markdown",
         "data": { "content": render_markdown(document, illustration_url) }
-    }]);
-    CommandResponse {
-        action: DynamicActionResponse::rich_reply(&segments.to_string()),
+    })];
+    if include_keyboard && let Some(keyboard) = command_keyboard(document) {
+        segments.push(keyboard);
     }
+    CommandResponse {
+        action: DynamicActionResponse::rich_reply(&Value::Array(segments).to_string()),
+    }
+}
+
+fn format_text_command(command: &RecommendedCommand) -> String {
+    match &command.description {
+        Some(description) => format!("· {}：{}", command.command, description),
+        None => format!("· {}", command.command),
+    }
+}
+
+fn format_markdown_command(command: &RecommendedCommand) -> String {
+    let command_text = format!("`{}`", escape_markdown_code(&command.command));
+    match &command.description {
+        Some(description) => format!("- {command_text}：{}", escape_markdown(description)),
+        None => format!("- {command_text}"),
+    }
+}
+
+fn escape_markdown_code(value: &str) -> String {
+    value.replace('`', "'")
+}
+
+fn command_keyboard(document: &GameDocument) -> Option<Value> {
+    if document.commands.is_empty() {
+        return None;
+    }
+
+    // QQ 官方 Keyboard 只展示前 8 个推荐项，避免长菜单挤满一条消息。
+    let buttons = document
+        .commands
+        .iter()
+        .filter(|command| is_clickable_command(&command.command))
+        .take(8)
+        .enumerate()
+        .map(|(index, command)| {
+            let label = command_button_label(&command.command);
+            json!({
+                "label": label,
+                "visited_label": label,
+                "action_type": 2,
+                "action_data": command.command,
+                "style": if index == 0 { 1 } else { 0 },
+                "permission_type": 2,
+            })
+        })
+        .collect::<Vec<_>>();
+    if buttons.is_empty() {
+        return None;
+    }
+
+    Some(json!({
+        "type": "keyboard",
+        "data": {
+            "content": {
+                "rows": buttons
+                    .chunks(2)
+                    .map(|row| json!({ "buttons": row }))
+                    .collect::<Vec<_>>(),
+            }
+        }
+    }))
+}
+
+fn is_clickable_command(command: &str) -> bool {
+    !command
+        .chars()
+        .any(|character| matches!(character, '<' | '>' | '[' | ']'))
+}
+
+fn command_button_label(command: &str) -> String {
+    const MAX_LABEL_CHARS: usize = 12;
+    if command.chars().count() <= MAX_LABEL_CHARS {
+        return command.to_string();
+    }
+
+    let mut label = command
+        .chars()
+        .take(MAX_LABEL_CHARS - 3)
+        .collect::<String>();
+    label.push_str("...");
+    label
 }
 
 fn onebot_illustrated_response(
@@ -489,10 +578,53 @@ mod tests {
         let output = render_text(
             &GameDocument::new("斗罗系统")
                 .line("欢迎来到斗罗大陆")
-                .command("开始穿越 <角色名> <男|女>"),
+                .command_help("开始穿越 <角色名> <男|女>", "创建角色"),
         );
-        assert!(output.starts_with("== 斗罗系统 =="));
-        assert!(output.contains("- 开始穿越"));
+        assert!(output.starts_with("╭═══★斗罗系统★═══╮"));
+        assert!(output.contains("推荐命令"));
+        assert!(output.contains("· 开始穿越 <角色名> <男|女>：创建角色"));
+        assert!(output.ends_with("╰═══★══════★═══╯"));
+    }
+
+    #[test]
+    fn official_markdown_renders_recommended_commands_as_keyboard_buttons() {
+        let document = GameDocument::new("斗罗系统")
+            .command_help("开始穿越 <角色名> <男|女>", "创建角色")
+            .command("状态");
+        let response = markdown_response(&document, None, true);
+        let segments: Value = serde_json::from_str(response.action.segments_json.as_str())
+            .expect("QQ 官方富消息段应为 JSON");
+        assert_eq!(segments.as_array().map(Vec::len), Some(2));
+        assert_eq!(segments[0]["type"], "markdown");
+        assert_eq!(segments[1]["type"], "keyboard");
+        assert_eq!(
+            segments[1]["data"]["content"]["rows"][0]["buttons"][0]["action_data"],
+            "状态"
+        );
+    }
+
+    #[test]
+    fn onebot_markdown_does_not_receive_qq_keyboard_payload() {
+        let document = GameDocument::new("状态").command("状态");
+        let response = markdown_response(&document, None, false);
+        let segments: Value = serde_json::from_str(response.action.segments_json.as_str())
+            .expect("OneBot Markdown 段应为 JSON");
+        assert_eq!(segments.as_array().map(Vec::len), Some(1));
+        assert_eq!(segments[0]["type"], "markdown");
+    }
+
+    #[test]
+    fn official_keyboard_keeps_full_command_behind_compact_button_label() {
+        let command = "接受决斗 very-long-openid-value";
+        let keyboard = command_keyboard(&GameDocument::new("决斗").command(command))
+            .expect("可直接执行的命令应生成键盘");
+        let button = &keyboard["data"]["content"]["rows"][0]["buttons"][0];
+        assert_eq!(button["action_data"], command);
+        assert_eq!(
+            button["label"].as_str().map(|label| label.chars().count()),
+            Some(12)
+        );
+        assert_eq!(button["style"], 1);
     }
 
     #[test]
@@ -670,8 +802,9 @@ mod tests {
         );
         let segments: Value =
             serde_json::from_str(response.action.segments_json.as_str()).expect("消息段应为 JSON");
-        assert_eq!(segments.as_array().map(Vec::len), Some(1));
+        assert_eq!(segments.as_array().map(Vec::len), Some(2));
         assert_eq!(segments[0]["type"], "markdown");
+        assert_eq!(segments[1]["type"], "keyboard");
         let content = segments[0]["data"]["content"]
             .as_str()
             .expect("Markdown 正文应存在");

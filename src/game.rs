@@ -4703,7 +4703,7 @@ mod tests {
         assert!(shop.contains("魂力恢复药"));
         let markdown = crate::message::render_markdown(&shop_document, None);
         assert!(markdown.contains("# 杂货商人的商店"));
-        assert!(markdown.contains("购买 \\<物品\\> \\[数量\\]"));
+        assert!(markdown.contains("`购买 <物品> [数量]`"));
 
         let purchase = crate::message::render_text(
             &service
