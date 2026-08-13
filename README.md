@@ -40,7 +40,7 @@ cargo build --release --locked
 - macOS：`libqimen_dynamic_plugin_douluo_game-{x86_64|aarch64}-apple-darwin.dylib`
 
 GNU/Linux Release 在 Debian 11 构建，最低 glibc 为 `2.31`。发布资产、字节数和 SHA256 见
-[v0.1.2 Release](https://github.com/lvyunqi/douluo-bot/releases/tag/v0.1.2)。
+[v0.1.3 Release](https://github.com/lvyunqi/douluo-bot/releases/tag/v0.1.3)。
 
 `build.rs` 会执行 `pnpm --dir web run build`，再将 `web/dist` 的哈希 CSS、JavaScript 和本地字体通过 `rust-embed` 编入动态库。部署运行时不需要 Node.js、pnpm、`web/node_modules` 或 `web/dist`。
 
@@ -153,7 +153,7 @@ remote_base_url = ""
 ## Upgrade, Uninstall And Security
 
 - SQLite 当前数据结构版本为 `42`。启动时按顺序执行内置结构升级并严格校验 schema；发现不兼容旧玩家身份或魂环历史时会拒绝加载，不会自动接管、转换或删除玩家状态。
-- `v0.1.2` 不新增相对于 `v0.1.1` 的数据库迁移，只修复在线配置默认值和管理端内容包上传。动态库可热重载，但数据库已经升级后不承诺降级到不了解该 schema 的旧版本。
+- `v0.1.3` 不新增相对于 `v0.1.2` 的数据库迁移；本次只调整纯文本/Markdown 排版，并为 QQ 官方 Markdown 回复追加推荐命令按钮。动态库可热重载，但数据库已经升级后不承诺降级到不了解该 schema 的旧版本。
 - 内容 revision 的 publish/rollback 只切换内容目录可见性，不是数据库备份或恢复功能，也不会恢复已剥离的魂环、魂技或其他玩家状态。
 - 卸载插件不会删除 `data_dir` 下的 SQLite、内容包、审计记录或本地图片；需要管理员在停用插件后自行保留或清理。
 - 本项目不提供自动备份、快照、容灾或跨版本数据恢复。生产升级前应由部署者按自身要求备份插件 `data_dir`。
